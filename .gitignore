@@ -42,3 +42,4 @@ yarn-error.log*
 .stryker-tmp/
 reports/
 .serena
+.claude/settings.local.json
