@@ -93,6 +93,25 @@ export function parseBunTestOutput(stdout: string, stderr: string): ParsedTestRe
       continue;
     }
 
+    // Match failed tests in bail mode: (fail) test name [0.05ms]
+    const bailFailMatch = line.match(/^\(fail\)\s+(.+?)(?:\s+\[([0-9.]+)ms\])?$/);
+    if (bailFailMatch) {
+      if (currentTest && collectingError) {
+        currentTest.failureMessage = errorLines.join('\n').trim();
+        errorLines = [];
+      }
+
+      currentTest = {
+        name: bailFailMatch[1].trim(),
+        status: 'failed',
+        duration: bailFailMatch[2] ? parseFloat(bailFailMatch[2]) : undefined
+      };
+      tests.push(currentTest);
+      failed++;
+      collectingError = true;
+      continue;
+    }
+
     // Match skipped tests: ⏭ test name
     const skipMatch = line.match(/^⏭\s+(.+)$/);
     if (skipMatch) {
@@ -135,9 +154,11 @@ export function parseBunTestOutput(stdout: string, stderr: string): ParsedTestRe
 
   // Match summary lines with flexible whitespace handling
   // Bun outputs lines like: " 2840 pass" or " 10 fail"
+  // Or in bail mode: "Bailed out after 1 failure"
   const passSummary = output.match(/\s(\d+)\s+pass\b/);
   const failSummary = output.match(/\s(\d+)\s+fail\b/);
   const skipSummary = output.match(/\s(\d+)\s+skip\b/);
+  const bailSummary = output.match(/Bailed out after (\d+) failures?/);
 
   if (passSummary) {
     const passCount = parseInt(passSummary[1], 10);
@@ -152,6 +173,11 @@ export function parseBunTestOutput(stdout: string, stderr: string): ParsedTestRe
   if (skipSummary) {
     const skipCount = parseInt(skipSummary[1], 10);
     skipped = Math.max(skipped, skipCount);
+  }
+
+  if (bailSummary) {
+    const bailFailCount = parseInt(bailSummary[1], 10);
+    failed = Math.max(failed, bailFailCount);
   }
 
   // Also try to parse from "Ran N tests" line as ultimate fallback

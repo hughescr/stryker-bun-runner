@@ -440,7 +440,7 @@ tests/example.test.ts:
       expect(result.status).toBe(MutantRunStatus.Timeout);
     });
 
-    it('should return error status on process failure', async () => {
+    it('should return killed status on process failure', async () => {
       mockRunBunTests.mockResolvedValue({
         exitCode: 1,
         stdout: '',
@@ -457,31 +457,7 @@ tests/example.test.ts:
         sandboxFileName: 'sandbox',
       } as any);
 
-      expect(result.status).toBe(MutantRunStatus.Error);
-    });
-
-    it('should use testFilter to create test name pattern', async () => {
-      mockRunBunTests.mockResolvedValue({
-        exitCode: 0,
-        stdout: '✓ test [0.05ms]\n 1 pass',
-        stderr: '',
-        timedOut: false,
-      });
-
-      const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
-      await runner.init();
-
-      await runner.mutantRun({
-        activeMutant: { id: '1' } as any,
-        testFilter: ['test 1', 'test 2'],
-        sandboxFileName: 'sandbox',
-      } as any);
-
-      expect(mockRunBunTests).toHaveBeenCalledWith(
-        expect.objectContaining({
-          testNamePattern: expect.stringContaining('test 1'),
-        })
-      );
+      expect(result.status).toBe(MutantRunStatus.Killed);
     });
 
     it('should set activeMutant in environment', async () => {
@@ -532,7 +508,7 @@ tests/example.test.ts:
       );
     });
 
-    it('should escape regex special characters in test names', async () => {
+    it('should pass preload script to mutant runs', async () => {
       mockRunBunTests.mockResolvedValue({
         exitCode: 0,
         stdout: '✓ test [0.05ms]\n 1 pass',
@@ -545,16 +521,15 @@ tests/example.test.ts:
 
       await runner.mutantRun({
         activeMutant: { id: '1' } as any,
-        testFilter: ['test (with) [special] chars'],
+        testFilter: [],
         sandboxFileName: 'sandbox',
       } as any);
 
-      // Get the last call (not the init call)
-      const lastCallIndex = mockRunBunTests.mock.calls.length - 1;
-      const call = mockRunBunTests.mock.calls[lastCallIndex][0];
-      expect(call.testNamePattern).toBeDefined();
-      expect(call.testNamePattern).toMatch(/\\\(/);
-      expect(call.testNamePattern).toMatch(/\\\[/);
+      expect(mockRunBunTests).toHaveBeenCalledWith(
+        expect.objectContaining({
+          preloadScript: '/tmp/preload.ts',
+        })
+      );
     });
   });
 

@@ -7,10 +7,8 @@
  */
 
 declare const Bun: {
-  write(path: string, content: string): Promise<number>;
+  write(path: string, content: string | Buffer, options?: { append?: boolean }): Promise<number>;
 };
-
-// Note: expect may not be available in preload context, so we access it via globalThis
 
 interface StrykerMutantCoverage {
   static: Record<string, number>;
@@ -23,50 +21,81 @@ interface StrykerGlobal {
   mutantCoverage?: StrykerMutantCoverage;
 }
 
-let currentTestId: string | undefined;
-
 // Initialize or retrieve the __stryker__ global that instrumented code uses
 const strykerGlobal = ((globalThis as any).__stryker__ || ((globalThis as any).__stryker__ = {})) as StrykerGlobal;
 
 // Set active mutant from environment if provided
-if (!strykerGlobal.activeMutant && process.env.__STRYKER_ACTIVE_MUTANT__) {
-  strykerGlobal.activeMutant = parseInt(process.env.__STRYKER_ACTIVE_MUTANT__, 10);
+// Keep as string or number depending on what Stryker's instrumentation expects
+if (strykerGlobal.activeMutant === undefined && process.env.__STRYKER_ACTIVE_MUTANT__) {
+  // Try both string and number forms for compatibility
+  const mutantId = process.env.__STRYKER_ACTIVE_MUTANT__;
+  (strykerGlobal as any).activeMutant = mutantId;
 }
 
 // Hook into Bun's test lifecycle
 import { beforeEach, afterEach, afterAll } from 'bun:test';
 
+// Skip coverage collection entirely during mutant runs
+// Coverage is only needed during dry run to identify which tests cover which mutants
+const isMutantRun = !!process.env.__STRYKER_ACTIVE_MUTANT__;
+
+let currentTestId: string | undefined;
+let testCounter = 0;
+
 beforeEach(() => {
+  // Skip coverage tracking during mutant runs
+  if (isMutantRun) return;
+
   // Get the current test name from Bun's test context
-  // expect may not be available in preload context, so we use a fallback
+  // Bun doesn't have expect.getState() like Jest, so we use a counter-based approach
   let testName: string | undefined;
 
   try {
-    // This might work if called from within a test context
-    const expectGlobal = (globalThis as any).expect;
-    if (expectGlobal && typeof expectGlobal.getState === 'function') {
-      const state = expectGlobal.getState();
-      testName = state?.currentTestName;
+    // Try to access Bun's test context if available
+    const bunTestContext = (globalThis as any).__bunTestContext__;
+    if (bunTestContext && bunTestContext.testName) {
+      testName = bunTestContext.testName;
     }
   } catch {
-    // Ignore - expect not available
+    // Ignore - context not available
   }
 
-  currentTestId = testName ?? `test-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  // Fallback to counter-based approach
+  // Use only counter (no PID) so test IDs are consistent across workers
+  testCounter++;
+  currentTestId = testName ?? `test-${testCounter}`;
   strykerGlobal.currentTestId = currentTestId;
 });
 
 afterEach(() => {
+  // Skip during mutant runs
+  if (isMutantRun) return;
+
   currentTestId = undefined;
   strykerGlobal.currentTestId = undefined;
 });
 
+/**
+ * Write data with timeout to prevent hanging
+ */
+async function writeWithTimeout(path: string, content: string, timeoutMs: number): Promise<void> {
+  const writePromise = Bun.write(path, content, { append: true });
+  const timeoutPromise = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error(`Write timeout after ${timeoutMs}ms`)), timeoutMs)
+  );
+
+  await Promise.race([writePromise, timeoutPromise]);
+}
+
 afterAll(async () => {
+  // Skip coverage collection during mutant runs
+  if (isMutantRun) return;
+
   // Read coverage data from Stryker's built-in coverage tracking
   const mutantCoverage = strykerGlobal.mutantCoverage;
 
   if (!mutantCoverage) {
-    console.warn('[Stryker Coverage] No mutantCoverage found - instrumentation may not be working');
+    // Don't warn - this is normal if no coverage instrumentation was active
     return;
   }
 
@@ -84,10 +113,13 @@ afterAll(async () => {
   };
 
   // Write to temp file - path is provided via environment variable
+  // Use JSON lines format (one JSON object per line) with atomic append
   const coverageFile = process.env.__STRYKER_COVERAGE_FILE__;
   if (coverageFile) {
     try {
-      await Bun.write(coverageFile, JSON.stringify(coverageData, null, 2));
+      // Write as a single line with newline separator for atomic append
+      const jsonLine = JSON.stringify(coverageData) + '\n';
+      await writeWithTimeout(coverageFile, jsonLine, 5000);
     } catch (error) {
       // Silently fail - don't break tests if coverage writing fails
       console.error('Failed to write coverage data:', error);

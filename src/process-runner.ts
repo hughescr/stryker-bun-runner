@@ -50,6 +50,11 @@ export interface BunTestRunOptions {
    * Path where coverage data should be written (set as __STRYKER_COVERAGE_FILE__ env var)
    */
   coverageFile?: string;
+
+  /**
+   * Whether to disable coverage collection (overrides bunfig.toml)
+   */
+  noCoverage?: boolean;
 }
 
 export interface BunProcessResult {
@@ -78,6 +83,11 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
   // Add bail flag if requested
   if (options.bail) {
     args.push('--bail');
+  }
+
+  // Disable coverage if requested (overrides bunfig.toml)
+  if (options.noCoverage) {
+    args.push('--no-coverage');
   }
 
   // Add any additional bun args

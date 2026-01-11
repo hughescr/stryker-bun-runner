@@ -274,25 +274,22 @@ export class BunTestRunner implements TestRunner {
   public async mutantRun(options: MutantRunOptions): Promise<MutantRunResult> {
     this.logger.debug('Running mutant run for mutant %s', options.activeMutant.id);
 
-    // Build test name pattern from testFilter if provided
-    let testNamePattern: string | undefined;
-    if (options.testFilter && options.testFilter.length > 0) {
-      // Create a regex pattern that matches any of the test IDs
-      // Escape special regex characters in test names
-      const escapedNames = options.testFilter.map((testId) =>
-        testId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-      );
-      testNamePattern = escapedNames.join('|');
-    }
-
+    // Run all tests with bail on first failure
+    // We don't filter by testFilter because:
+    // 1. Test IDs from dry run don't match Bun's test name patterns (counter may differ)
+    // 2. Coverage data still helps Stryker optimize which mutants to run
+    // 3. Bail on first failure provides efficiency
+    // IMPORTANT: Preload script IS needed to set globalThis.__stryker__.activeMutant
+    // The preload script skips coverage collection when __STRYKER_ACTIVE_MUTANT__ is set
     const result = await runBunTests({
       bunPath: this.bunPath,
       timeout: this.timeout,
       env: this.env,
       bunArgs: this.bunArgs,
-      testNamePattern,
       activeMutant: options.activeMutant.id,
       bail: true, // Bail on first failure for mutant runs
+      noCoverage: true, // Disable coverage for mutant runs - we only need pass/fail
+      preloadScript: this.preloadScriptPath, // Needed to set globalThis.__stryker__.activeMutant
     });
 
     if (result.timedOut) {
@@ -311,33 +308,26 @@ export class BunTestRunner implements TestRunner {
       exitCode: result.exitCode,
     });
 
-    // Check for errors (process failure, not test failures)
-    if (result.exitCode !== 0 && parsed.failed === 0) {
-      return {
-        status: MutantRunStatus.Error,
-        errorMessage: `Bun test process failed with exit code ${result.exitCode}\n${result.stderr}`,
-      };
-    }
-
-    // If any test failed, the mutant was killed
-    if (parsed.failed > 0) {
+    // Non-zero exit code means tests failed, mutant is killed
+    // Trust exit code over parsed output since bunfig.toml may hide passing tests
+    if (result.exitCode !== 0) {
       const killedBy = parsed.tests
         .filter((test) => test.status === 'failed')
         .map((test) => test.name);
 
       return {
         status: MutantRunStatus.Killed,
-        killedBy,
+        killedBy: killedBy.length > 0 ? killedBy : ['unknown'],
         failureMessage: parsed.tests
           .filter((test) => test.status === 'failed')
           .map((test) => test.failureMessage)
           .filter((msg): msg is string => !!msg)
-          .join('\n\n'),
-        nrOfTests: parsed.totalTests,
+          .join('\n\n') || `Tests failed with exit code ${result.exitCode}`,
+        nrOfTests: parsed.totalTests || 1,
       };
     }
 
-    // All tests passed, mutant survived
+    // Exit code 0 means all tests passed, mutant survived
     return {
       status: MutantRunStatus.Survived,
       nrOfTests: parsed.totalTests,
