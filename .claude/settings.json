@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(feature-dev:feature-dev)",
+      "Skill(commit-commands:commit)",
+      "Skill(codex:codex)",
+      "Skill(typescript:typescript-standards)",
+      "Skill(codex-cli-reference)",
+      "mcp__plugin_generic-dev_DevTools__*",
+      "mcp__plugin_javascript_nodejs-packages__*"
+    ]
+  },
+  "enabledPlugins": {
+    "feature-dev@claude-plugins-official": true,
+    "code-review@claude-plugins-official": true
+  },
+  "sandbox": {
+    "enabled": true,
+    "autoAllowBashIfSandboxed": true
+  }
+}
