@@ -353,6 +353,52 @@ describe('runBunTests', () => {
     });
   });
 
+  describe('noCoverage option', () => {
+    it('should add --no-coverage flag when noCoverage is true', async () => {
+      const resultPromise = runBunTests({
+        bunPath: 'bun',
+        timeout: 5000,
+        noCoverage: true,
+      });
+
+      (mockChildProcess as any).closeHandler?.(0);
+      await resultPromise;
+
+      const spawnCall = mockSpawn.mock.calls[0];
+      const args = spawnCall[1];
+      expect(args).toContain('--no-coverage');
+    });
+
+    it('should not add --no-coverage flag when noCoverage is false', async () => {
+      const resultPromise = runBunTests({
+        bunPath: 'bun',
+        timeout: 5000,
+        noCoverage: false,
+      });
+
+      (mockChildProcess as any).closeHandler?.(0);
+      await resultPromise;
+
+      const spawnCall = mockSpawn.mock.calls[0];
+      const args = spawnCall[1];
+      expect(args).not.toContain('--no-coverage');
+    });
+
+    it('should not add --no-coverage flag when noCoverage is undefined', async () => {
+      const resultPromise = runBunTests({
+        bunPath: 'bun',
+        timeout: 5000,
+      });
+
+      (mockChildProcess as any).closeHandler?.(0);
+      await resultPromise;
+
+      const spawnCall = mockSpawn.mock.calls[0];
+      const args = spawnCall[1];
+      expect(args).not.toContain('--no-coverage');
+    });
+  });
+
   describe('argument ordering', () => {
     it('should maintain correct argument order', async () => {
       const resultPromise = runBunTests({
@@ -379,6 +425,111 @@ describe('runBunTests', () => {
       expect(args[5]).toBe('--bail');
       expect(args[6]).toBe('--no-randomize');
       expect(args[7]).toBe('--only');
+    });
+  });
+
+  describe('bunArgs mutation tests', () => {
+    it('should not add bunArgs when array is empty', async () => {
+      // This test kills mutations on line 105: options.bunArgs.length > 0
+      // If the mutation changes > 0 to >= 0 or changes it to true,
+      // an empty array would incorrectly spread empty elements into args
+      const resultPromise = runBunTests({
+        bunPath: 'bun',
+        timeout: 5000,
+        bunArgs: [],
+      });
+
+      (mockChildProcess as any).closeHandler?.(0);
+      await resultPromise;
+
+      const spawnCall = mockSpawn.mock.calls[0];
+      const args = spawnCall[1];
+
+      // Args should only contain 'test' and '--no-randomize', no extra elements
+      expect(args).toEqual(['test', '--no-randomize']);
+    });
+
+    it('should not add bunArgs when undefined', async () => {
+      // Test that undefined bunArgs doesn't add any extra arguments
+      const resultPromise = runBunTests({
+        bunPath: 'bun',
+        timeout: 5000,
+        bunArgs: undefined,
+      });
+
+      (mockChildProcess as any).closeHandler?.(0);
+      await resultPromise;
+
+      const spawnCall = mockSpawn.mock.calls[0];
+      const args = spawnCall[1];
+
+      expect(args).toEqual(['test', '--no-randomize']);
+    });
+  });
+
+  describe('processKilled state mutation tests', () => {
+    it('should return null exitCode when process is killed by timeout', async () => {
+      // This test kills mutations on line 129 (processKilled = true → false)
+      // and line 165 (processKilled ? null : code)
+      // If processKilled stays false or the ternary is mutated,
+      // exitCode would incorrectly be the signal code instead of null
+      const resultPromise = runBunTests({
+        bunPath: 'bun',
+        timeout: 100,
+      });
+
+      // Wait for timeout to kill the process
+      await new Promise(resolve => setTimeout(resolve, 150));
+
+      // Process was killed, close with no exit code (SIGKILL)
+      (mockChildProcess as any).closeHandler?.(null);
+
+      const result = await resultPromise;
+
+      // When process is killed by timeout, exitCode MUST be null
+      expect(result.exitCode).toBeNull();
+      expect(result.timedOut).toBe(true);
+    });
+
+    it('should return actual exitCode when process exits normally', async () => {
+      // Verify that when processKilled is false, we get the actual exit code
+      const resultPromise = runBunTests({
+        bunPath: 'bun',
+        timeout: 5000,
+      });
+
+      // Process exits normally with code 1
+      (mockChildProcess as any).closeHandler?.(1);
+
+      const result = await resultPromise;
+
+      // When process exits normally, exitCode should be the actual code
+      expect(result.exitCode).toBe(1);
+      expect(result.timedOut).toBe(false);
+    });
+
+    it('should return null exitCode even if close handler receives a code after timeout kill', async () => {
+      // This test specifically targets the mutation: processKilled = true → processKilled = false
+      // Even if the close handler receives a non-null exit code (e.g., 143 for SIGTERM),
+      // we should return null because processKilled should be true
+      const resultPromise = runBunTests({
+        bunPath: 'bun',
+        timeout: 100,
+      });
+
+      // Wait for timeout to kill the process
+      await new Promise(resolve => setTimeout(resolve, 150));
+
+      // Close handler receives exit code 143 (typical for SIGTERM) instead of null
+      // But we should still return null because processKilled was set to true
+      (mockChildProcess as any).closeHandler?.(143);
+
+      const result = await resultPromise;
+
+      // Critical: exitCode must be null even though close handler received 143
+      // This proves processKilled flag is working correctly
+      expect(result.exitCode).toBeNull();
+      expect(result.timedOut).toBe(true);
     });
   });
 });

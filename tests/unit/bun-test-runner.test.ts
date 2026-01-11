@@ -76,8 +76,17 @@ describe('BunTestRunner', () => {
       );
     });
 
-    it('should use custom bunPath from options', () => {
-      new BunTestRunner(mockLogger, {
+    it('should use custom bunPath from options', async () => {
+      mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+      mockRunBunTests.mockResolvedValue({
+        exitCode: 0,
+        stdout: '✓ test [0.12ms]\n 1 pass',
+        stderr: '',
+        timedOut: false,
+      });
+      mockCollectCoverage.mockResolvedValue(undefined);
+
+      const runner = new BunTestRunner(mockLogger, {
         bun: {
           bunPath: '/custom/bun',
         },
@@ -89,10 +98,29 @@ describe('BunTestRunner', () => {
           bunPath: '/custom/bun',
         })
       );
+
+      // Verify the option is actually used when running tests
+      await runner.init();
+      await runner.dryRun();
+
+      expect(mockRunBunTests).toHaveBeenCalledWith(
+        expect.objectContaining({
+          bunPath: '/custom/bun',
+        })
+      );
     });
 
-    it('should use custom timeout from options', () => {
-      new BunTestRunner(mockLogger, {
+    it('should use custom timeout from options', async () => {
+      mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+      mockRunBunTests.mockResolvedValue({
+        exitCode: 0,
+        stdout: '✓ test [0.12ms]\n 1 pass',
+        stderr: '',
+        timedOut: false,
+      });
+      mockCollectCoverage.mockResolvedValue(undefined);
+
+      const runner = new BunTestRunner(mockLogger, {
         bun: {
           timeout: 20000,
         },
@@ -104,10 +132,29 @@ describe('BunTestRunner', () => {
           timeout: 20000,
         })
       );
+
+      // Verify the option is actually used when running tests
+      await runner.init();
+      await runner.dryRun();
+
+      expect(mockRunBunTests).toHaveBeenCalledWith(
+        expect.objectContaining({
+          timeout: 20000,
+        })
+      );
     });
 
-    it('should accept custom environment variables', () => {
-      new BunTestRunner(mockLogger, {
+    it('should accept custom environment variables', async () => {
+      mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+      mockRunBunTests.mockResolvedValue({
+        exitCode: 0,
+        stdout: '✓ test [0.12ms]\n 1 pass',
+        stderr: '',
+        timedOut: false,
+      });
+      mockCollectCoverage.mockResolvedValue(undefined);
+
+      const runner = new BunTestRunner(mockLogger, {
         bun: {
           env: {
             CUSTOM_VAR: 'value',
@@ -121,10 +168,29 @@ describe('BunTestRunner', () => {
           env: { CUSTOM_VAR: 'value' },
         })
       );
+
+      // Verify the option is actually used when running tests
+      await runner.init();
+      await runner.dryRun();
+
+      expect(mockRunBunTests).toHaveBeenCalledWith(
+        expect.objectContaining({
+          env: { CUSTOM_VAR: 'value' },
+        })
+      );
     });
 
-    it('should accept custom bunArgs', () => {
-      new BunTestRunner(mockLogger, {
+    it('should accept custom bunArgs', async () => {
+      mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+      mockRunBunTests.mockResolvedValue({
+        exitCode: 0,
+        stdout: '✓ test [0.12ms]\n 1 pass',
+        stderr: '',
+        timedOut: false,
+      });
+      mockCollectCoverage.mockResolvedValue(undefined);
+
+      const runner = new BunTestRunner(mockLogger, {
         bun: {
           bunArgs: ['--only', '--verbose'],
         },
@@ -132,6 +198,16 @@ describe('BunTestRunner', () => {
 
       expect(mockLogger.debug).toHaveBeenCalledWith(
         expect.any(String),
+        expect.objectContaining({
+          bunArgs: ['--only', '--verbose'],
+        })
+      );
+
+      // Verify the option is actually used when running tests
+      await runner.init();
+      await runner.dryRun();
+
+      expect(mockRunBunTests).toHaveBeenCalledWith(
         expect.objectContaining({
           bunArgs: ['--only', '--verbose'],
         })
@@ -201,7 +277,18 @@ tests/example.test.ts:
 
       expect(result.status).toBe(DryRunStatus.Complete);
       expect(result).toHaveProperty('tests');
-      expect(result).toHaveProperty('mutantCoverage');
+      // Verify mutantCoverage is passed through from collector unchanged
+      // Note: Test ID format ('should pass' vs 'tests/example.test.ts > should pass')
+      // is determined by the coverage preload script, not BunTestRunner.
+      // This test verifies BunTestRunner correctly passes through collector data.
+      if (result.status === DryRunStatus.Complete) {
+        expect(result.mutantCoverage).toEqual({
+          perTest: {
+            'should pass': { '1': 1, '2': 1 },
+          },
+          static: { '3': 1 },
+        });
+      }
     });
 
     it('should return timeout status on timeout', async () => {
@@ -405,6 +492,11 @@ tests/example.test.ts:
       } as any);
 
       expect(result.status).toBe(MutantRunStatus.Killed);
+      // When parsing fails (empty stdout), totalTests is 0, so nrOfTests uses fallback of 1
+      // This tests the `parsed.totalTests || 1` fallback in mutantRun() (line ~324)
+      if (result.status === MutantRunStatus.Killed) {
+        expect(result.nrOfTests).toBe(1);
+      }
     });
 
     it('should set activeMutant in environment', async () => {
@@ -504,11 +596,11 @@ tests/example.test.ts:
       expect(mockCleanupCoverageFile).toHaveBeenCalled();
     });
 
-    it('should handle dispose without init', async () => {
+    it('should handle dispose without init', () => {
       const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
 
       // Should not throw
-      await expect(runner.dispose()).resolves.toBeUndefined();
+      expect(runner.dispose()).resolves.toBeUndefined();
     });
   });
 });

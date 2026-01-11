@@ -113,6 +113,7 @@ export class BunTestRunner implements TestRunner {
     const totalElapsedMs = Date.now() - startTime;
 
     if (result.timedOut) {
+      // Stryker disable next-line all: Logging statement
       this.logger.warn('Dry run timed out');
       return {
         status: DryRunStatus.Timeout,
@@ -120,8 +121,11 @@ export class BunTestRunner implements TestRunner {
     }
 
     // Log raw output for debugging
+    // Stryker disable next-line all: Logging statement
     this.logger.debug('Bun test stdout (first 500 chars): %s', result.stdout.substring(0, 500));
+    // Stryker disable next-line all: Logging statement
     this.logger.debug('Bun test stderr (first 500 chars): %s', result.stderr.substring(0, 500));
+    // Stryker disable next-line all: Logging statement
     this.logger.debug('Bun test exit code: %d', result.exitCode);
 
     const parsed = parseBunTestOutput(result.stdout, result.stderr);
@@ -152,8 +156,10 @@ export class BunTestRunner implements TestRunner {
       if (mutantCoverage) {
         const perTestCount = Object.keys(mutantCoverage.perTest).length;
         const staticCount = Object.keys(mutantCoverage.static).length;
+        // Stryker disable next-line all: Logging statement
         this.logger.debug('Coverage collected: %d tests with coverage, %d static mutants', perTestCount, staticCount);
       } else {
+        // Stryker disable next-line all: Logging statement
         this.logger.debug('No coverage data collected');
       }
 
@@ -174,6 +180,7 @@ export class BunTestRunner implements TestRunner {
         parsed.tests.filter(t => t.status === 'failed').map(t => t.name)
       );
 
+      // Stryker disable next-line all: Logging statement
       this.logger.debug('Building test list: %d tests from coverage, %d failed from output',
         testNames.length, failedTestNames.size);
 
@@ -205,6 +212,7 @@ export class BunTestRunner implements TestRunner {
     } else {
       // Fallback: use parsed tests from console output when no coverage data
       // This happens when: bunfig.toml doesn't have onlyFailures, or coverage preload failed
+      // Stryker disable next-line all: Logging statement
       this.logger.debug('No coverage data available, using parsed test output');
 
       // Calculate time per test for progress reporting
@@ -246,6 +254,7 @@ export class BunTestRunner implements TestRunner {
       // If no tests were parsed from output (e.g., all passing with onlyFailures=true),
       // create synthetic tests from summary counts
       if (tests.length === 0 && parsed.passed > 0) {
+        // Stryker disable next-line all: Logging statement
         this.logger.debug('No individual tests parsed, creating synthetic tests from summary');
         const syntheticTimePerTest = Math.max(1, Math.floor(totalElapsedMs / parsed.passed));
         for (let i = 0; i < parsed.passed; i++) {
@@ -291,6 +300,7 @@ export class BunTestRunner implements TestRunner {
     });
 
     if (result.timedOut) {
+      // Stryker disable next-line all: Logging statement
       this.logger.debug('Mutant run timed out');
       return {
         status: MutantRunStatus.Timeout,

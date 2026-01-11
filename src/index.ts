@@ -16,6 +16,7 @@ export const strykerPlugins = [
 /**
  * JSON Schema validation for plugin options
  */
+// Stryker disable all: Schema definition - validated by Stryker's internal machinery
 export const strykerValidationSchema = {
   $schema: 'http://json-schema.org/draft-07/schema#',
   properties: {
@@ -54,6 +55,7 @@ export const strykerValidationSchema = {
     },
   },
 };
+// Stryker restore all
 
 /**
  * Re-export public API

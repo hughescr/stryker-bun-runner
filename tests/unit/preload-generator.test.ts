@@ -160,29 +160,40 @@ describe('generatePreloadScript', () => {
   });
 
   describe('options handling', () => {
-    it('should use provided tempDir', async () => {
+    it('should write preload script to custom tempDir', async () => {
       const customTempDir = '/custom/temp/dir';
       mockExistsSync.mockReturnValue(true);
+      const templateContent = '// preload template';
+      mockReadFile.mockResolvedValue(templateContent);
 
-      const result = await generatePreloadScript({
+      await generatePreloadScript({
         tempDir: customTempDir,
         coverageFile,
       });
 
-      expect(result).toBe(join(customTempDir, 'stryker-coverage-preload.ts'));
+      // Verify the script is actually written to the custom directory
+      expect(mockWriteFile).toHaveBeenCalled();
+      const [targetPath, content] = mockWriteFile.mock.calls[0];
+      expect(targetPath).toBe(join(customTempDir, 'stryker-coverage-preload.ts'));
+      expect(content).toBe(templateContent);
     });
 
-    it('should accept coverageFile option (for runtime use)', async () => {
+    it('should not inject coverageFile path into template content', async () => {
       mockExistsSync.mockReturnValue(true);
+      const templateContent = '// preload template without coverage path';
+      mockReadFile.mockResolvedValue(templateContent);
 
-      // coverageFile is stored for runtime use via env var, not injected into template
+      // coverageFile is provided at runtime via env var, not injected into template
       await generatePreloadScript({
         tempDir,
         coverageFile: '/custom/coverage.json',
       });
 
-      // Should still generate successfully
+      // Verify template content is written unchanged (coverageFile NOT injected)
       expect(mockWriteFile).toHaveBeenCalled();
+      const [, writtenContent] = mockWriteFile.mock.calls[0];
+      expect(writtenContent).toBe(templateContent);
+      expect(writtenContent).not.toContain('/custom/coverage.json');
     });
   });
 });
