@@ -1,0 +1,53 @@
+{
+  "name": "@hughescr/stryker-bun-runner",
+  "version": "0.1.0",
+  "description": "Stryker test runner plugin for Bun with perTest coverage support",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "templates"
+  ],
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target node --format esm && bunx tsc --emitDeclarationOnly",
+    "typecheck": "bunx tsc --noEmit",
+    "lint": "bunx eslint .",
+    "test": "bun test",
+    "prepublishOnly": "bun run build"
+  },
+  "peerDependencies": {
+    "@stryker-mutator/core": "^9.0.0"
+  },
+  "dependencies": {
+    "@stryker-mutator/api": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@stryker-mutator/core": "^9.0.0",
+    "typescript": "^5.0.0"
+  },
+  "keywords": [
+    "stryker",
+    "stryker-plugin",
+    "bun",
+    "test-runner",
+    "mutation-testing"
+  ],
+  "author": "hughescr",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hughescr/stryker-bun-runner.git"
+  },
+  "bugs": {
+    "url": "https://github.com/hughescr/stryker-bun-runner/issues"
+  },
+  "homepage": "https://github.com/hughescr/stryker-bun-runner#readme"
+}
