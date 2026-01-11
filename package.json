@@ -20,6 +20,7 @@
     "typecheck": "bunx tsc --noEmit",
     "lint": "bunx eslint .",
     "test": "bun test",
+    "mutate": "bunx stryker run",
     "prepublishOnly": "bun run build"
   },
   "peerDependencies": {
@@ -30,6 +31,7 @@
   },
   "devDependencies": {
     "@stryker-mutator/core": "^9.0.0",
+    "@stryker-mutator/typescript-checker": "9.4.0",
     "@types/bun": "latest",
     "typescript": "^5.0.0"
   },

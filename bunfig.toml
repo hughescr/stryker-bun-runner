@@ -4,4 +4,8 @@ exact = true
 [test]
 root = "./tests"
 coverage = true
-coverageThreshold = { line = 0.90, function = 0.90, statement = 0.90 }
+coverageThreshold = { line = 0.95, function = 0.95, statement = 0.95 }
+coverageReporter = ["text", "lcov"]
+onlyFailures = true
+timeout = 5
+randomize = true
