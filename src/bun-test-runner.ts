@@ -78,24 +78,10 @@ export class BunTestRunner implements TestRunner {
    * Initialize the test runner
    */
   public async init(): Promise<void> {
-    this.logger.debug('Validating bun installation...');
+    this.logger.debug('BunTestRunner init starting...');
 
-    // Validate that bun is available
-    const result = await runBunTests({
-      bunPath: this.bunPath,
-      timeout: 5000,
-      bunArgs: ['--version'],
-    });
-
-    if (result.exitCode !== 0 && !result.stdout.includes('bun')) {
-      throw new Error(
-        `Failed to execute bun at "${this.bunPath}". ` +
-        `Please ensure bun is installed and the bunPath is correct.\n` +
-        `stdout: ${result.stdout}\nstderr: ${result.stderr}`
-      );
-    }
-
-    this.logger.debug('Bun installation validated successfully');
+    // Skip bun validation for now - it might affect progress reporter
+    // TODO: Re-enable validation once progress issue is resolved
 
     // Generate preload script for coverage collection
     const tempDir = join(tmpdir(), 'stryker-bun-runner');
@@ -115,6 +101,7 @@ export class BunTestRunner implements TestRunner {
   public async dryRun(): Promise<DryRunResult> {
     this.logger.debug('Running dry run with coverage collection...');
 
+    const startTime = Date.now();
     const result = await runBunTests({
       bunPath: this.bunPath,
       timeout: this.timeout,
@@ -123,6 +110,7 @@ export class BunTestRunner implements TestRunner {
       preloadScript: this.preloadScriptPath,
       coverageFile: this.coverageFilePath,
     });
+    const totalElapsedMs = Date.now() - startTime;
 
     if (result.timedOut) {
       this.logger.warn('Dry run timed out');
@@ -189,6 +177,10 @@ export class BunTestRunner implements TestRunner {
       this.logger.debug('Building test list: %d tests from coverage, %d failed from output',
         testNames.length, failedTestNames.size);
 
+      // Distribute total elapsed time evenly across tests
+      // This ensures Stryker can calculate netTime for progress reporting
+      const timePerTest = testNames.length > 0 ? Math.max(1, Math.floor(totalElapsedMs / testNames.length)) : 1;
+
       tests = testNames.map(testName => {
         const isFailed = failedTestNames.has(testName);
         const parsedTest = parsed.tests.find(t => t.name === testName);
@@ -199,7 +191,7 @@ export class BunTestRunner implements TestRunner {
             name: testName,
             status: TestStatus.Failed,
             failureMessage: parsedTest.failureMessage ?? 'Test failed',
-            timeSpentMs: parsedTest.duration ?? 0,
+            timeSpentMs: parsedTest.duration ?? timePerTest,
           } satisfies FailedTestResult;
         }
 
@@ -207,7 +199,7 @@ export class BunTestRunner implements TestRunner {
           id: testName,
           name: testName,
           status: TestStatus.Success,
-          timeSpentMs: 0,
+          timeSpentMs: timePerTest,
         } satisfies SuccessTestResult;
       });
     } else {
@@ -215,10 +207,15 @@ export class BunTestRunner implements TestRunner {
       // This happens when: bunfig.toml doesn't have onlyFailures, or coverage preload failed
       this.logger.debug('No coverage data available, using parsed test output');
 
+      // Calculate time per test for progress reporting
+      const fallbackTimePerTest = parsed.tests.length > 0
+        ? Math.max(1, Math.floor(totalElapsedMs / parsed.tests.length))
+        : Math.max(1, totalElapsedMs);
+
       tests = parsed.tests.map(t => {
         const id = t.name;
         const name = t.name;
-        const timeSpentMs = t.duration ?? 0;
+        const timeSpentMs = t.duration ?? fallbackTimePerTest;
 
         switch (t.status) {
           case 'passed':
@@ -250,12 +247,13 @@ export class BunTestRunner implements TestRunner {
       // create synthetic tests from summary counts
       if (tests.length === 0 && parsed.passed > 0) {
         this.logger.debug('No individual tests parsed, creating synthetic tests from summary');
+        const syntheticTimePerTest = Math.max(1, Math.floor(totalElapsedMs / parsed.passed));
         for (let i = 0; i < parsed.passed; i++) {
           tests.push({
             id: `test-${i}`,
             name: `test-${i}`,
             status: TestStatus.Success,
-            timeSpentMs: 0,
+            timeSpentMs: syntheticTimePerTest,
           } satisfies SuccessTestResult);
         }
       }

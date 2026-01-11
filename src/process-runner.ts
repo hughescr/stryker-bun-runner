@@ -96,7 +96,7 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
   }
 
   // Prepare environment variables
-  const env = {
+  const env: Record<string, string | undefined> = {
     ...process.env,
     ...options.env,
   };
@@ -112,8 +112,8 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
   }
 
   return new Promise((resolve) => {
-    let stdout = '';
-    let stderr = '';
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
     let timedOut = false;
     let processKilled = false;
 
@@ -130,17 +130,17 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
       childProcess.kill('SIGKILL');
     }, options.timeout);
 
-    // Collect stdout
+    // Collect stdout silently - don't forward to parent to avoid interfering with Stryker's progress reporter
     if (childProcess.stdout) {
       childProcess.stdout.on('data', (data) => {
-        stdout += data.toString();
+        stdoutChunks.push(data);
       });
     }
 
-    // Collect stderr
+    // Collect stderr silently
     if (childProcess.stderr) {
       childProcess.stderr.on('data', (data) => {
-        stderr += data.toString();
+        stderrChunks.push(data);
       });
     }
 
@@ -149,8 +149,8 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
       clearTimeout(timeoutHandle);
 
       resolve({
-        stdout,
-        stderr,
+        stdout: Buffer.concat(stdoutChunks).toString(),
+        stderr: Buffer.concat(stderrChunks).toString(),
         exitCode: processKilled ? null : code,
         timedOut,
       });
@@ -159,10 +159,11 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
     // Handle process errors
     childProcess.on('error', (error) => {
       clearTimeout(timeoutHandle);
+      const stderrOutput = Buffer.concat(stderrChunks).toString();
 
       resolve({
-        stdout,
-        stderr: stderr + '\nProcess error: ' + error.message,
+        stdout: Buffer.concat(stdoutChunks).toString(),
+        stderr: `${stderrOutput}\nProcess error: ${error.message}`,
         exitCode: null,
         timedOut,
       });
