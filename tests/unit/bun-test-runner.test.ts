@@ -152,48 +152,7 @@ describe('BunTestRunner', () => {
   });
 
   describe('init', () => {
-    it('should validate bun installation', async () => {
-      mockRunBunTests.mockResolvedValue({
-        exitCode: 0,
-        stdout: 'bun version 1.0.0',
-        stderr: '',
-        timedOut: false,
-      });
-      mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
-
-      const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
-
-      await runner.init();
-
-      expect(mockRunBunTests).toHaveBeenCalledWith(
-        expect.objectContaining({
-          bunPath: 'bun',
-          bunArgs: ['--version'],
-          timeout: 5000,
-        })
-      );
-    });
-
-    it('should throw error if bun validation fails', async () => {
-      mockRunBunTests.mockResolvedValue({
-        exitCode: 1,
-        stdout: 'command not found',
-        stderr: 'bun: command not found',
-        timedOut: false,
-      });
-
-      const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
-
-      await expect(runner.init()).rejects.toThrow('Failed to execute bun');
-    });
-
     it('should generate preload script', async () => {
-      mockRunBunTests.mockResolvedValue({
-        exitCode: 0,
-        stdout: 'bun version 1.0.0',
-        stderr: '',
-        timedOut: false,
-      });
       mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
 
       const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
@@ -210,13 +169,7 @@ describe('BunTestRunner', () => {
 
   describe('dryRun', () => {
     beforeEach(async () => {
-      // Mock for init validation
-      mockRunBunTests.mockResolvedValueOnce({
-        exitCode: 0,
-        stdout: 'bun version 1.0.0',
-        stderr: '',
-        timedOut: false,
-      });
+      // Init no longer validates bun, so no need to mock runBunTests for init
       mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
     });
 
@@ -313,15 +266,15 @@ tests/example.test.ts:
       expect(result.status).toBe(DryRunStatus.Complete);
       if (result.status === DryRunStatus.Complete) {
         expect(result.tests).toHaveLength(3);
-        expect(result.tests[0].name).toBe('passing test');
+        expect(result.tests[0].name).toBe('tests/example.test.ts > passing test');
         expect(result.tests[0].status).toBe(TestStatus.Success);
         expect(result.tests[0].timeSpentMs).toBe(0.12);
 
-        expect(result.tests[1].name).toBe('failing test');
+        expect(result.tests[1].name).toBe('tests/example.test.ts > failing test');
         expect(result.tests[1].status).toBe(TestStatus.Failed);
         expect(result.tests[1].timeSpentMs).toBe(0.05);
 
-        expect(result.tests[2].name).toBe('skipped test');
+        expect(result.tests[2].name).toBe('tests/example.test.ts > skipped test');
         expect(result.tests[2].status).toBe(TestStatus.Skipped);
       }
     });
@@ -346,13 +299,7 @@ tests/example.test.ts:
 
   describe('mutantRun', () => {
     beforeEach(async () => {
-      // Mock for init validation
-      mockRunBunTests.mockResolvedValueOnce({
-        exitCode: 0,
-        stdout: 'bun version 1.0.0',
-        stderr: '',
-        timedOut: false,
-      });
+      // Init no longer validates bun, so no need to mock runBunTests for init
       mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
     });
 
@@ -385,7 +332,7 @@ tests/example.test.ts:
       expect(result.status).toBe(MutantRunStatus.Killed);
       if (result.status === MutantRunStatus.Killed) {
         expect(result.killedBy).toHaveLength(1);
-        expect(result.killedBy[0]).toBe('should catch mutant');
+        expect(result.killedBy[0]).toBe('tests/example.test.ts > should catch mutant');
         expect(result.nrOfTests).toBe(1);
       }
     });
@@ -535,13 +482,7 @@ tests/example.test.ts:
 
   describe('dispose', () => {
     beforeEach(async () => {
-      // Mock for init validation
-      mockRunBunTests.mockResolvedValueOnce({
-        exitCode: 0,
-        stdout: 'bun version 1.0.0',
-        stderr: '',
-        timedOut: false,
-      });
+      // Init no longer validates bun, so no need to mock runBunTests for init
       mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
     });
 

@@ -42,28 +42,21 @@ const isMutantRun = !!process.env.__STRYKER_ACTIVE_MUTANT__;
 let currentTestId: string | undefined;
 let testCounter = 0;
 
+// Note: We cannot get test filenames or describe hierarchy in beforeEach because:
+// 1. Bun's beforeEach callback doesn't include test file frames in the call stack
+// 2. Bun's module exports are read-only, so we can't wrap describe/test/it
+// 3. Bun doesn't expose expect.getState() like Jest/Vitest
+// 4. Bun's Inspector Protocol TestReporter domain (as of v1.3.5) doesn't fire events
+//
+// Test IDs are therefore counter-based (test-1, test-2, etc.)
+// This requires --no-randomize flag to ensure consistent ordering between runs.
+// The console parser provides filenames in format: "file.test.ts > test name"
+
 beforeEach(() => {
-  // Skip coverage tracking during mutant runs
   if (isMutantRun) return;
 
-  // Get the current test name from Bun's test context
-  // Bun doesn't have expect.getState() like Jest, so we use a counter-based approach
-  let testName: string | undefined;
-
-  try {
-    // Try to access Bun's test context if available
-    const bunTestContext = (globalThis as any).__bunTestContext__;
-    if (bunTestContext && bunTestContext.testName) {
-      testName = bunTestContext.testName;
-    }
-  } catch {
-    // Ignore - context not available
-  }
-
-  // Fallback to counter-based approach
-  // Use only counter (no PID) so test IDs are consistent across workers
   testCounter++;
-  currentTestId = testName ?? `test-${testCounter}`;
+  currentTestId = `test-${testCounter}`;
   strykerGlobal.currentTestId = currentTestId;
 });
 

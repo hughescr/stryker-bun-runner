@@ -90,6 +90,17 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
     args.push('--no-coverage');
   }
 
+  // CRITICAL: Disable randomization to ensure consistent test ordering
+  // Without this, counter-based test IDs (test-1, test-2, etc.) would map to
+  // different actual tests between dry run and mutant runs, breaking coverage data.
+  //
+  // NOTE: We investigated using Bun's Inspector Protocol TestReporter domain
+  // to get proper test names (with describe hierarchy), but as of Bun 1.3.5,
+  // the TestReporter.enable command succeeds but no events are fired.
+  // This limitation means we must rely on counter-based IDs and disable randomization.
+  // See: https://github.com/oven-sh/bun/pull/15194
+  args.push('--no-randomize');
+
   // Add any additional bun args
   if (options.bunArgs && options.bunArgs.length > 0) {
     args.push(...options.bunArgs);

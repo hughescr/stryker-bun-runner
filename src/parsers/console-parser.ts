@@ -5,6 +5,7 @@
 
 export interface TestResult {
   name: string;
+  file?: string;
   status: 'passed' | 'failed' | 'skipped';
   duration?: number;
   failureMessage?: string;
@@ -51,9 +52,17 @@ export function parseBunTestOutput(stdout: string, stderr: string): ParsedTestRe
   let currentTest: TestResult | null = null;
   let collectingError = false;
   let errorLines: string[] = [];
+  let currentFile: string | undefined;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+
+    // Match file header: tests/example.test.ts: or src/foo.test.tsx:
+    const fileMatch = line.match(/^(.+\.(?:test|spec)\.(?:ts|tsx|js|jsx|mts|mjs)):$/);
+    if (fileMatch) {
+      currentFile = fileMatch[1];
+      continue;
+    }
 
     // Match test results: ✓ test name [0.12ms]
     const passMatch = line.match(/^✓\s+(.+?)\s+\[([0-9.]+)ms\]$/);
@@ -64,8 +73,12 @@ export function parseBunTestOutput(stdout: string, stderr: string): ParsedTestRe
         collectingError = false;
       }
 
+      const testName = passMatch[1].trim();
+      const fullName = currentFile ? `${currentFile} > ${testName}` : testName;
+
       currentTest = {
-        name: passMatch[1].trim(),
+        name: fullName,
+        file: currentFile,
         status: 'passed',
         duration: parseFloat(passMatch[2])
       };
@@ -82,8 +95,12 @@ export function parseBunTestOutput(stdout: string, stderr: string): ParsedTestRe
         errorLines = [];
       }
 
+      const testName = failMatch[1].trim();
+      const fullName = currentFile ? `${currentFile} > ${testName}` : testName;
+
       currentTest = {
-        name: failMatch[1].trim(),
+        name: fullName,
+        file: currentFile,
         status: 'failed',
         duration: failMatch[2] ? parseFloat(failMatch[2]) : undefined
       };
@@ -101,8 +118,12 @@ export function parseBunTestOutput(stdout: string, stderr: string): ParsedTestRe
         errorLines = [];
       }
 
+      const testName = bailFailMatch[1].trim();
+      const fullName = currentFile ? `${currentFile} > ${testName}` : testName;
+
       currentTest = {
-        name: bailFailMatch[1].trim(),
+        name: fullName,
+        file: currentFile,
         status: 'failed',
         duration: bailFailMatch[2] ? parseFloat(bailFailMatch[2]) : undefined
       };
@@ -121,8 +142,12 @@ export function parseBunTestOutput(stdout: string, stderr: string): ParsedTestRe
         collectingError = false;
       }
 
+      const testName = skipMatch[1].trim();
+      const fullName = currentFile ? `${currentFile} > ${testName}` : testName;
+
       currentTest = {
-        name: skipMatch[1].trim(),
+        name: fullName,
+        file: currentFile,
         status: 'skipped'
       };
       tests.push(currentTest);

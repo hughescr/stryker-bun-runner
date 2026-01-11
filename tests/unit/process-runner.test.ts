@@ -71,7 +71,7 @@ describe('runBunTests', () => {
 
       expect(mockSpawn).toHaveBeenCalledWith(
         'bun',
-        ['test'],
+        ['test', '--no-randomize'],
         expect.objectContaining({
           stdio: ['ignore', 'pipe', 'pipe'],
         })
@@ -344,6 +344,7 @@ describe('runBunTests', () => {
         '--test-name-pattern',
         'myTest',
         '--bail',
+        '--no-randomize',
         '--verbose',
       ]);
       expect(options.env.__STRYKER_ACTIVE_MUTANT__).toBe('123');
@@ -369,14 +370,15 @@ describe('runBunTests', () => {
       const spawnCall = mockSpawn.mock.calls[0];
       const args = spawnCall[1];
 
-      // Verify order: test, preload, test-name-pattern, bail, then custom args
+      // Verify order: test, preload, test-name-pattern, bail, no-randomize, then custom args
       expect(args[0]).toBe('test');
       expect(args[1]).toBe('--preload');
       expect(args[2]).toBe('/tmp/preload.ts');
       expect(args[3]).toBe('--test-name-pattern');
       expect(args[4]).toBe('test');
       expect(args[5]).toBe('--bail');
-      expect(args[6]).toBe('--only');
+      expect(args[6]).toBe('--no-randomize');
+      expect(args[7]).toBe('--only');
     });
   });
 });

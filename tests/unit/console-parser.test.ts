@@ -25,9 +25,10 @@ tests/example.test.ts:
       expect(result.totalTests).toBe(1);
       expect(result.tests).toHaveLength(1);
       expect(result.tests[0]).toEqual({
-        name: 'should add numbers',
+        name: 'tests/example.test.ts > should add numbers',
         status: 'passed',
         duration: 0.12,
+        file: 'tests/example.test.ts',
       });
     });
 
@@ -49,9 +50,9 @@ tests/example.test.ts:
       expect(result.skipped).toBe(0);
       expect(result.totalTests).toBe(3);
       expect(result.tests).toHaveLength(3);
-      expect(result.tests[0].name).toBe('should add numbers');
-      expect(result.tests[1].name).toBe('should subtract numbers');
-      expect(result.tests[2].name).toBe('should multiply numbers');
+      expect(result.tests[0].name).toBe('tests/example.test.ts > should add numbers');
+      expect(result.tests[1].name).toBe('tests/example.test.ts > should subtract numbers');
+      expect(result.tests[2].name).toBe('tests/example.test.ts > should multiply numbers');
     });
   });
 
@@ -76,9 +77,10 @@ tests/example.test.ts:
       expect(result.totalTests).toBe(1);
       expect(result.tests).toHaveLength(1);
       expect(result.tests[0]).toMatchObject({
-        name: 'should multiply numbers',
+        name: 'tests/example.test.ts > should multiply numbers',
         status: 'failed',
         duration: 0.08,
+        file: 'tests/example.test.ts',
       });
       expect(result.tests[0].failureMessage).toContain('Expected 6 but received 5');
     });
@@ -98,8 +100,9 @@ tests/example.test.ts:
 
       expect(result.failed).toBe(1);
       expect(result.tests[0]).toMatchObject({
-        name: 'should fail',
+        name: 'tests/example.test.ts > should fail',
         status: 'failed',
+        file: 'tests/example.test.ts',
       });
       expect(result.tests[0].duration).toBeUndefined();
     });
@@ -146,8 +149,9 @@ tests/example.test.ts:
       expect(result.totalTests).toBe(1);
       expect(result.tests).toHaveLength(1);
       expect(result.tests[0]).toEqual({
-        name: 'should divide numbers',
+        name: 'tests/example.test.ts > should divide numbers',
         status: 'skipped',
+        file: 'tests/example.test.ts',
       });
     });
 
@@ -278,9 +282,9 @@ tests/example.test.ts:
 `;
       const result = parseBunTestOutput(output, '');
 
-      expect(result.tests[0].name).toBe('should handle "quotes" and \'apostrophes\'');
-      expect(result.tests[1].name).toBe('should handle (parentheses) and [brackets]');
-      expect(result.tests[2].name).toBe('should handle dots.and.underscores_here');
+      expect(result.tests[0].name).toBe('tests/example.test.ts > should handle "quotes" and \'apostrophes\'');
+      expect(result.tests[1].name).toBe('tests/example.test.ts > should handle (parentheses) and [brackets]');
+      expect(result.tests[2].name).toBe('tests/example.test.ts > should handle dots.and.underscores_here');
     });
 
     it('should use summary numbers when individual tests are not parsed', () => {
@@ -311,7 +315,7 @@ tests/example.test.ts:
 `;
       const result = parseBunTestOutput(output, '');
 
-      expect(result.tests[0].name).toBe('should handle extra spaces');
+      expect(result.tests[0].name).toBe('tests/example.test.ts > should handle extra spaces');
     });
 
     it('should handle tests from multiple files', () => {
@@ -330,8 +334,8 @@ tests/file2.test.ts:
 
       expect(result.passed).toBe(2);
       expect(result.tests).toHaveLength(2);
-      expect(result.tests[0].name).toBe('test from file 1');
-      expect(result.tests[1].name).toBe('test from file 2');
+      expect(result.tests[0].name).toBe('tests/file1.test.ts > test from file 1');
+      expect(result.tests[1].name).toBe('tests/file2.test.ts > test from file 2');
     });
   });
 
