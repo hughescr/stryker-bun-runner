@@ -55,6 +55,12 @@ export interface BunTestRunOptions {
    * Whether to disable coverage collection (overrides bunfig.toml)
    */
   noCoverage?: boolean;
+
+  /**
+   * Path where JUnit XML output should be written
+   * When provided, adds --reporter=junit --reporter-outfile=<path> args
+   */
+  junitOutputFile?: string;
 }
 
 export interface BunProcessResult {
@@ -100,6 +106,12 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
   // This limitation means we must rely on counter-based IDs and disable randomization.
   // See: https://github.com/oven-sh/bun/pull/15194
   args.push('--no-randomize');
+
+  // Add JUnit reporter if specified
+  // This enables Stryker's incremental mode by providing test metadata
+  if (options.junitOutputFile) {
+    args.push('--reporter=junit', `--reporter-outfile=${options.junitOutputFile}`);
+  }
 
   // Add any additional bun args
   if (options.bunArgs && options.bunArgs.length > 0) {

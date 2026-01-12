@@ -32,6 +32,9 @@ import {
 } from './coverage/index.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { readFile, unlink } from 'node:fs/promises';
+import { parseJunitXml, type JUnitTestResult } from './parsers/junit-parser.js';
+import { readBunfig, getJunitOutputPath } from './config/bunfig-reader.js';
 
 /**
  * Bun test runner for Stryker mutation testing
@@ -45,6 +48,8 @@ export class BunTestRunner implements TestRunner {
   private readonly bunArgs?: string[];
   private preloadScriptPath?: string;
   private coverageFilePath?: string;
+  private junitOutputPath?: string;
+  private junitFromBunfig: boolean = false;
 
   constructor(
     private readonly logger: Logger,
@@ -93,6 +98,22 @@ export class BunTestRunner implements TestRunner {
       coverageFile: this.coverageFilePath,
     });
     this.logger.debug('Preload script generated at: %s', this.preloadScriptPath);
+
+    // Check bunfig.toml for JUnit reporter configuration
+    const bunfig = await readBunfig(process.cwd());
+    const bunfigJunitPath = getJunitOutputPath(bunfig, process.cwd());
+
+    if (bunfigJunitPath) {
+      // Use user's configured JUnit output path
+      this.junitOutputPath = bunfigJunitPath;
+      this.junitFromBunfig = true;
+      this.logger.debug('Using JUnit output from bunfig.toml: %s', this.junitOutputPath);
+    } else {
+      // Generate temp path for JUnit output
+      this.junitOutputPath = join(tempDir, `junit-${Date.now()}.xml`);
+      this.junitFromBunfig = false;
+      this.logger.debug('JUnit output will be written to temp file: %s', this.junitOutputPath);
+    }
   }
 
   /**
@@ -109,6 +130,8 @@ export class BunTestRunner implements TestRunner {
       bunArgs: this.bunArgs,
       preloadScript: this.preloadScriptPath,
       coverageFile: this.coverageFilePath,
+      // Only pass junitOutputFile if not already configured in bunfig.toml
+      junitOutputFile: this.junitFromBunfig ? undefined : this.junitOutputPath,
     });
     const totalElapsedMs = Date.now() - startTime;
 
@@ -167,25 +190,125 @@ export class BunTestRunner implements TestRunner {
       await cleanupCoverageFile(this.coverageFilePath);
     }
 
-    // Build tests array from coverage data instead of parsed output
-    // This is necessary because Bun's onlyFailures=true hides passing tests from console output
+    // Parse JUnit XML for test metadata (file names, line numbers)
+    // This enables Stryker's incremental mode by providing stable test identifiers
+    let junitTests: JUnitTestResult[] = [];
+    if (this.junitOutputPath) {
+      try {
+        const junitXml = await readFile(this.junitOutputPath, 'utf-8');
+        junitTests = parseJunitXml(junitXml);
+        this.logger.debug('Parsed %d tests from JUnit XML', junitTests.length);
+      } catch (error) {
+        // Stryker disable next-line all: Logging statement
+        this.logger.debug('Failed to read JUnit XML: %s', error);
+      }
+
+      // Clean up JUnit file if we created it (not from bunfig)
+      if (!this.junitFromBunfig) {
+        try {
+          await unlink(this.junitOutputPath);
+        } catch {
+          // Ignore cleanup errors
+        }
+      }
+    }
+
+    // Build tests array
+    // Use JUnit data for test metadata (enables Stryker incremental mode)
+    // Fall back to counter-based IDs if JUnit parsing failed
     let tests: Array<SuccessTestResult | FailedTestResult | SkippedTestResult> = [];
+    let finalMutantCoverage = mutantCoverage;
 
-    if (mutantCoverage && Object.keys(mutantCoverage.perTest).length > 0) {
-      // Get test names from coverage data (these are all the tests that actually ran)
+    if (mutantCoverage && Object.keys(mutantCoverage.perTest).length > 0 && junitTests.length > 0) {
+      // Map coverage data (counter IDs) to JUnit tests (by execution order)
+      // Coverage uses: test-1, test-2, ... (counter order)
+      // JUnit is in execution order (guaranteed by --no-randomize)
+      const coverageTestIds = Object.keys(mutantCoverage.perTest).sort(
+        (a, b) => parseInt(a.split('-')[1]) - parseInt(b.split('-')[1])
+      );
+
+      if (coverageTestIds.length === junitTests.length) {
+        // Stryker disable next-line all: Logging statement
+        this.logger.debug('Mapping %d coverage IDs to JUnit tests', coverageTestIds.length);
+
+        // Build tests with JUnit metadata
+        tests = junitTests.map((junit) => {
+          if (!junit.passed) {
+            return {
+              id: junit.fullName,
+              name: junit.fullName,
+              fileName: junit.fileName,
+              startPosition: { line: junit.line, column: 0 },
+              status: TestStatus.Failed,
+              failureMessage: junit.failureMessage ?? 'Test failed',
+              timeSpentMs: Math.round(junit.time * 1000),
+            } satisfies FailedTestResult;
+          }
+
+          return {
+            id: junit.fullName,
+            name: junit.fullName,
+            fileName: junit.fileName,
+            startPosition: { line: junit.line, column: 0 },
+            status: TestStatus.Success,
+            timeSpentMs: Math.round(junit.time * 1000),
+          } satisfies SuccessTestResult;
+        });
+
+        // Re-key coverage data with JUnit test IDs
+        finalMutantCoverage = {
+          static: mutantCoverage.static,
+          perTest: Object.fromEntries(
+            coverageTestIds.map((oldId, index) => [
+              junitTests[index].fullName,
+              mutantCoverage.perTest[oldId],
+            ])
+          ),
+        };
+      } else {
+        // Count mismatch - fall back to existing logic
+        // Stryker disable next-line all: Logging statement
+        this.logger.debug('Coverage/JUnit count mismatch (%d vs %d), using counter-based IDs',
+          coverageTestIds.length, junitTests.length);
+
+        const testNames = Object.keys(mutantCoverage.perTest);
+        const failedTestNames = new Set(
+          parsed.tests.filter(t => t.status === 'failed').map(t => t.name)
+        );
+        const timePerTest = testNames.length > 0 ? Math.max(1, Math.floor(totalElapsedMs / testNames.length)) : 1;
+
+        tests = testNames.map(testName => {
+          const isFailed = failedTestNames.has(testName);
+          const parsedTest = parsed.tests.find(t => t.name === testName);
+
+          if (isFailed && parsedTest) {
+            return {
+              id: testName,
+              name: testName,
+              status: TestStatus.Failed,
+              failureMessage: parsedTest.failureMessage ?? 'Test failed',
+              timeSpentMs: parsedTest.duration ?? timePerTest,
+            } satisfies FailedTestResult;
+          }
+
+          return {
+            id: testName,
+            name: testName,
+            status: TestStatus.Success,
+            timeSpentMs: timePerTest,
+          } satisfies SuccessTestResult;
+        });
+      }
+    } else if (mutantCoverage && Object.keys(mutantCoverage.perTest).length > 0) {
+      // Coverage data but no JUnit - use counter-based IDs (existing fallback)
       const testNames = Object.keys(mutantCoverage.perTest);
-
-      // Cross-reference with parsed results to find failures
       const failedTestNames = new Set(
         parsed.tests.filter(t => t.status === 'failed').map(t => t.name)
       );
 
       // Stryker disable next-line all: Logging statement
-      this.logger.debug('Building test list: %d tests from coverage, %d failed from output',
-        testNames.length, failedTestNames.size);
+      this.logger.debug('No JUnit data, using counter-based IDs for %d tests', testNames.length);
 
-      // Distribute total elapsed time evenly across tests
-      // This ensures Stryker can calculate netTime for progress reporting
       const timePerTest = testNames.length > 0 ? Math.max(1, Math.floor(totalElapsedMs / testNames.length)) : 1;
 
       tests = testNames.map(testName => {
@@ -211,11 +334,9 @@ export class BunTestRunner implements TestRunner {
       });
     } else {
       // Fallback: use parsed tests from console output when no coverage data
-      // This happens when: bunfig.toml doesn't have onlyFailures, or coverage preload failed
       // Stryker disable next-line all: Logging statement
       this.logger.debug('No coverage data available, using parsed test output');
 
-      // Calculate time per test for progress reporting
       const fallbackTimePerTest = parsed.tests.length > 0
         ? Math.max(1, Math.floor(totalElapsedMs / parsed.tests.length))
         : Math.max(1, totalElapsedMs);
@@ -251,8 +372,7 @@ export class BunTestRunner implements TestRunner {
         }
       });
 
-      // If no tests were parsed from output (e.g., all passing with onlyFailures=true),
-      // create synthetic tests from summary counts
+      // If no tests were parsed from output, create synthetic tests from summary counts
       if (tests.length === 0 && parsed.passed > 0) {
         // Stryker disable next-line all: Logging statement
         this.logger.debug('No individual tests parsed, creating synthetic tests from summary');
@@ -271,7 +391,7 @@ export class BunTestRunner implements TestRunner {
     return {
       status: DryRunStatus.Complete,
       tests,
-      mutantCoverage,
+      mutantCoverage: finalMutantCoverage,
     };
   }
 
@@ -358,6 +478,15 @@ export class BunTestRunner implements TestRunner {
     if (this.coverageFilePath) {
       this.logger.debug('Cleaning up coverage file: %s', this.coverageFilePath);
       await cleanupCoverageFile(this.coverageFilePath);
+    }
+
+    // Clean up JUnit file if we created it (not from bunfig)
+    if (this.junitOutputPath && !this.junitFromBunfig) {
+      try {
+        await unlink(this.junitOutputPath);
+      } catch {
+        // Ignore - file might already be deleted
+      }
     }
   }
 }
