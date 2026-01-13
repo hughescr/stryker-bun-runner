@@ -3,7 +3,7 @@
  * Handles spawning and managing Bun test processes
  */
 
-import { spawn, ChildProcess } from 'node:child_process';
+import { spawn } from 'node:child_process';
 
 export interface BunTestRunOptions {
   /**
@@ -57,10 +57,28 @@ export interface BunTestRunOptions {
   noCoverage?: boolean;
 
   /**
-   * Path where JUnit XML output should be written
-   * When provided, adds --reporter=junit --reporter-outfile=<path> args
+   * Port for --inspect flag
+   * When provided, adds --inspect=<port> flag to enable debugging
    */
-  junitOutputFile?: string;
+  inspectWaitPort?: number;
+
+  /**
+   * Whether to force sequential test execution
+   * When true, adds --concurrency=1 flag
+   */
+  sequentialMode?: boolean;
+
+  /**
+   * Callback invoked when inspector WebSocket URL is detected in stderr
+   * Only called when inspectWaitPort is set
+   */
+  onInspectorReady?: (url: string) => void;
+
+  /**
+   * Port for WebSocket synchronization server
+   * When provided, sets __STRYKER_SYNC_PORT__ env var for preload script
+   */
+  syncPort?: number;
 }
 
 export interface BunProcessResult {
@@ -75,6 +93,14 @@ export interface BunProcessResult {
  */
 export async function runBunTests(options: BunTestRunOptions): Promise<BunProcessResult> {
   const args = ['test'];
+
+  // Add inspector debugging if specified
+  // Note: We use --inspect (not --inspect-wait) because Bun doesn't support
+  // Runtime.runIfWaitingForDebugger to resume after connection.
+  // This means tests start immediately, so we must connect quickly.
+  if (options.inspectWaitPort) {
+    args.push(`--inspect=${options.inspectWaitPort}`);
+  }
 
   // Add preload script if specified
   if (options.preloadScript) {
@@ -96,22 +122,13 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
     args.push('--no-coverage');
   }
 
-  // CRITICAL: Disable randomization to ensure consistent test ordering
-  // Without this, counter-based test IDs (test-1, test-2, etc.) would map to
-  // different actual tests between dry run and mutant runs, breaking coverage data.
-  //
-  // NOTE: We investigated using Bun's Inspector Protocol TestReporter domain
-  // to get proper test names (with describe hierarchy), but as of Bun 1.3.5,
-  // the TestReporter.enable command succeeds but no events are fired.
-  // This limitation means we must rely on counter-based IDs and disable randomization.
-  // See: https://github.com/oven-sh/bun/pull/15194
-  args.push('--no-randomize');
-
-  // Add JUnit reporter if specified
-  // This enables Stryker's incremental mode by providing test metadata
-  if (options.junitOutputFile) {
-    args.push('--reporter=junit', `--reporter-outfile=${options.junitOutputFile}`);
+  // Force sequential execution if requested
+  if (options.sequentialMode) {
+    args.push('--concurrency=1');
   }
+
+  // Disable randomization to ensure consistent test ordering between dry run and mutant runs
+  args.push('--no-randomize');
 
   // Add any additional bun args
   if (options.bunArgs && options.bunArgs.length > 0) {
@@ -134,13 +151,18 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
     env['__STRYKER_COVERAGE_FILE__'] = options.coverageFile;
   }
 
+  // Set sync port if specified
+  if (options.syncPort) {
+    env['__STRYKER_SYNC_PORT__'] = String(options.syncPort);
+  }
+
   return new Promise((resolve) => {
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
     let timedOut = false;
     let processKilled = false;
 
-    const childProcess: ChildProcess = spawn(options.bunPath, args, {
+    const childProcess = spawn(options.bunPath, args, {
       env,
       stdio: ['ignore', 'pipe', 'pipe'],
       cwd: process.cwd(),
@@ -160,10 +182,22 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
       });
     }
 
-    // Collect stderr silently
+    // Collect stderr and watch for inspector WebSocket URL
+    let inspectorUrlExtracted = false;
     if (childProcess.stderr) {
       childProcess.stderr.on('data', (data) => {
         stderrChunks.push(data);
+
+        // If inspector is enabled, parse stderr for WebSocket URL
+        if (options.inspectWaitPort && !inspectorUrlExtracted && options.onInspectorReady) {
+          const text = Buffer.concat(stderrChunks).toString();
+          // Look for pattern: "Listening:\n  ws://localhost:PORT/SESSION_ID"
+          const match = text.match(/Listening:\s*\n\s*(ws:\/\/[^\s]+)/);
+          if (match) {
+            inspectorUrlExtracted = true;
+            options.onInspectorReady(match[1]);
+          }
+        }
       });
     }
 

@@ -21,6 +21,12 @@ export interface BunTestRunnerOptions {
   timeout?: number;
 
   /**
+   * Timeout for inspector connection in ms
+   * @default 5000
+   */
+  inspectorTimeout?: number;
+
+  /**
    * Additional environment variables to pass to bun test
    */
   env?: Record<string, string>;

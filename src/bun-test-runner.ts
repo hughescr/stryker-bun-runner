@@ -23,7 +23,7 @@ import { Logger } from '@stryker-mutator/api/logging';
 import { tokens, commonTokens } from '@stryker-mutator/api/plugin';
 import { StrykerBunOptions } from './options.js';
 import { runBunTests } from './process-runner.js';
-import { parseBunTestOutput } from './parsers/console-parser.js';
+import { parseBunTestOutput, type ParsedTestResults } from './parsers/console-parser.js';
 import {
   generatePreloadScript,
   cleanupPreloadScript,
@@ -32,9 +32,10 @@ import {
 } from './coverage/index.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readFile, unlink } from 'node:fs/promises';
-import { parseJunitXml, type JUnitTestResult } from './parsers/junit-parser.js';
-import { readBunfig, getJunitOutputPath } from './config/bunfig-reader.js';
+import { InspectorClient } from './inspector/index.js';
+import { mapCoverageToInspectorIds } from './coverage/coverage-mapper.js';
+import { getAvailablePort, SyncServer } from './utils/index.js';
+import type { TestInfo } from './inspector/types.js';
 
 /**
  * Bun test runner for Stryker mutation testing
@@ -44,12 +45,11 @@ export class BunTestRunner implements TestRunner {
 
   private readonly bunPath: string;
   private readonly timeout: number;
+  private readonly inspectorTimeout: number;
   private readonly env?: Record<string, string>;
   private readonly bunArgs?: string[];
   private preloadScriptPath?: string;
   private coverageFilePath?: string;
-  private junitOutputPath?: string;
-  private junitFromBunfig: boolean = false;
 
   constructor(
     private readonly logger: Logger,
@@ -59,12 +59,14 @@ export class BunTestRunner implements TestRunner {
 
     this.bunPath = bunOptions.bunPath ?? 'bun';
     this.timeout = bunOptions.timeout ?? 10000;
+    this.inspectorTimeout = bunOptions.inspectorTimeout ?? 5000;
     this.env = bunOptions.env;
     this.bunArgs = bunOptions.bunArgs;
 
     this.logger.debug('BunTestRunner initialized with options: %o', {
       bunPath: this.bunPath,
       timeout: this.timeout,
+      inspectorTimeout: this.inspectorTimeout,
       env: this.env,
       bunArgs: this.bunArgs,
     });
@@ -85,9 +87,6 @@ export class BunTestRunner implements TestRunner {
   public async init(): Promise<void> {
     this.logger.debug('BunTestRunner init starting...');
 
-    // Skip bun validation for now - it might affect progress reporter
-    // TODO: Re-enable validation once progress issue is resolved
-
     // Generate preload script for coverage collection
     const tempDir = join(tmpdir(), 'stryker-bun-runner');
     this.coverageFilePath = join(tempDir, `coverage-${Date.now()}.json`);
@@ -98,295 +97,256 @@ export class BunTestRunner implements TestRunner {
       coverageFile: this.coverageFilePath,
     });
     this.logger.debug('Preload script generated at: %s', this.preloadScriptPath);
+  }
 
-    // Check bunfig.toml for JUnit reporter configuration
-    const bunfig = await readBunfig(process.cwd());
-    const bunfigJunitPath = getJunitOutputPath(bunfig, process.cwd());
-
-    if (bunfigJunitPath) {
-      // Use user's configured JUnit output path
-      this.junitOutputPath = bunfigJunitPath;
-      this.junitFromBunfig = true;
-      this.logger.debug('Using JUnit output from bunfig.toml: %s', this.junitOutputPath);
-    } else {
-      // Generate temp path for JUnit output
-      this.junitOutputPath = join(tempDir, `junit-${Date.now()}.xml`);
-      this.junitFromBunfig = false;
-      this.logger.debug('JUnit output will be written to temp file: %s', this.junitOutputPath);
+  /**
+   * Build test results from inspector data
+   */
+  private buildTestsFromInspector(
+    testHierarchy: TestInfo[],
+    executionOrder: number[],
+    parsed: ParsedTestResults,
+    totalElapsedMs: number
+  ): Array<SuccessTestResult | FailedTestResult | SkippedTestResult> {
+    if (executionOrder.length === 0) {
+      // Fallback: use parsed console output when inspector didn't capture tests
+      return parsed.tests.map((t) => {
+        if (t.status === 'failed') {
+          return {
+            id: t.name,
+            name: t.name,
+            status: TestStatus.Failed,
+            failureMessage: t.failureMessage ?? 'Test failed',
+            timeSpentMs: t.duration ?? 1,
+          } satisfies FailedTestResult;
+        }
+        if (t.status === 'skipped') {
+          return {
+            id: t.name,
+            name: t.name,
+            status: TestStatus.Skipped,
+            timeSpentMs: t.duration ?? 1,
+          } satisfies SkippedTestResult;
+        }
+        return {
+          id: t.name,
+          name: t.name,
+          status: TestStatus.Success,
+          timeSpentMs: t.duration ?? 1,
+        } satisfies SuccessTestResult;
+      });
     }
+
+    const timePerTest = executionOrder.length > 0
+      ? Math.max(1, Math.floor(totalElapsedMs / executionOrder.length))
+      : 1;
+
+    // Create a map for quick lookup
+    const testMap = new Map<number, TestInfo>();
+    for (const test of testHierarchy) {
+      testMap.set(test.id, test);
+    }
+
+    return executionOrder.map((inspectorId) => {
+      const testInfo = testMap.get(inspectorId);
+      if (!testInfo) {
+        return {
+          id: `unknown-${inspectorId}`,
+          name: `unknown-${inspectorId}`,
+          status: TestStatus.Success,
+          timeSpentMs: timePerTest,
+        } satisfies SuccessTestResult;
+      }
+
+      const fullName = testInfo.fullName;
+      const status = testInfo.status;
+      const elapsed = testInfo.elapsed ?? timePerTest;
+
+      if (status === 'fail') {
+        // Find failure message from parsed output
+        const parsedTest = parsed.tests.find((t) => t.name.includes(testInfo.name));
+        return {
+          id: fullName,
+          name: fullName,
+          fileName: testInfo.url,
+          startPosition: testInfo.line ? { line: testInfo.line, column: 0 } : undefined,
+          status: TestStatus.Failed,
+          failureMessage: parsedTest?.failureMessage ?? testInfo.error?.message ?? 'Test failed',
+          timeSpentMs: elapsed,
+        } satisfies FailedTestResult;
+      }
+
+      if (status === 'skip' || status === 'todo') {
+        return {
+          id: fullName,
+          name: fullName,
+          fileName: testInfo.url,
+          startPosition: testInfo.line ? { line: testInfo.line, column: 0 } : undefined,
+          status: TestStatus.Skipped,
+          timeSpentMs: elapsed,
+        } satisfies SkippedTestResult;
+      }
+
+      return {
+        id: fullName,
+        name: fullName,
+        fileName: testInfo.url,
+        startPosition: testInfo.line ? { line: testInfo.line, column: 0 } : undefined,
+        status: TestStatus.Success,
+        timeSpentMs: elapsed,
+      } satisfies SuccessTestResult;
+    });
   }
 
   /**
    * Run all tests (dry run)
    */
   public async dryRun(): Promise<DryRunResult> {
-    this.logger.debug('Running dry run with coverage collection...');
+    this.logger.debug('Running dry run with inspector-based coverage collection...');
 
+    // 1. Get available ports for inspector and sync server
+    const inspectPort = await getAvailablePort();
+    const syncPort = await getAvailablePort();
+    this.logger.debug('Using inspector port: %d, sync port: %d', inspectPort, syncPort);
+
+    // 2. Start sync server
+    const syncServer = new SyncServer({ port: syncPort, timeout: this.inspectorTimeout });
+    try {
+      await syncServer.start();
+      this.logger.debug('Sync server started on port %d', syncPort);
+    } catch (error) {
+      this.logger.error('Failed to start sync server: %s', error);
+      return {
+        status: DryRunStatus.Error,
+        errorMessage: `Failed to start sync server: ${error}`,
+      };
+    }
+
+    // 3. Start bun test with --inspect (process will start immediately)
     const startTime = Date.now();
-    const result = await runBunTests({
+    let inspector: InspectorClient | null = null;
+    let inspectorUrl: string | null = null;
+
+    // Start test process with callback to get inspector URL
+    const testProcess = runBunTests({
       bunPath: this.bunPath,
       timeout: this.timeout,
       env: this.env,
       bunArgs: this.bunArgs,
       preloadScript: this.preloadScriptPath,
       coverageFile: this.coverageFilePath,
-      // Only pass junitOutputFile if not already configured in bunfig.toml
-      junitOutputFile: this.junitFromBunfig ? undefined : this.junitOutputPath,
+      inspectWaitPort: inspectPort,
+      sequentialMode: true,  // Critical for correlation
+      syncPort, // Pass sync port to preload script via env var
+      onInspectorReady: (url: string) => {
+        inspectorUrl = url;
+      },
     });
-    const totalElapsedMs = Date.now() - startTime;
 
-    if (result.timedOut) {
-      // Stryker disable next-line all: Logging statement
-      this.logger.warn('Dry run timed out');
+    // 4. Wait for inspector URL with timeout
+    const waitStart = Date.now();
+    while (!inspectorUrl && Date.now() - waitStart < this.inspectorTimeout) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    if (!inspectorUrl) {
+      this.logger.error('Failed to get inspector URL within timeout');
+      await syncServer.close();
       return {
-        status: DryRunStatus.Timeout,
+        status: DryRunStatus.Error,
+        errorMessage: 'Timeout waiting for inspector URL',
       };
     }
 
-    // Log raw output for debugging
-    // Stryker disable next-line all: Logging statement
-    this.logger.debug('Bun test stdout (first 500 chars): %s', result.stdout.substring(0, 500));
-    // Stryker disable next-line all: Logging statement
-    this.logger.debug('Bun test stderr (first 500 chars): %s', result.stderr.substring(0, 500));
-    // Stryker disable next-line all: Logging statement
-    this.logger.debug('Bun test exit code: %d', result.exitCode);
+    this.logger.debug('Inspector URL: %s', inspectorUrl);
 
-    const parsed = parseBunTestOutput(result.stdout, result.stderr);
-
-    this.logger.debug('Dry run completed: %o', {
-      totalTests: parsed.totalTests,
-      passed: parsed.passed,
-      failed: parsed.failed,
-      skipped: parsed.skipped,
-      parsedTestCount: parsed.tests.length,
+    // 5. Create inspector client
+    inspector = new InspectorClient({
+      url: inspectorUrl,
+      connectionTimeout: this.inspectorTimeout,
+      requestTimeout: this.inspectorTimeout,
     });
 
-    // Check for errors
+    // 6. Connect inspector client and enable test reporting
+    try {
+      await inspector.connect();
+      await inspector.send('TestReporter.enable', {});
+      this.logger.debug('Inspector connected and TestReporter enabled');
+    } catch (error) {
+      this.logger.error('Failed to connect inspector: %s', error);
+      await inspector.close();
+      await syncServer.close();
+      return {
+        status: DryRunStatus.Error,
+        errorMessage: `Failed to connect to Bun inspector: ${error}`,
+      };
+    }
+
+    // 7. Signal preload script to proceed with tests
+    syncServer.signalReady();
+    this.logger.debug('Signaled preload script to proceed');
+
+    // 8. Wait for test process to complete
+    const result = await testProcess;
+    const totalElapsedMs = Date.now() - startTime;
+
+    // 9. Get inspector data before closing
+    const testHierarchy = inspector.getTests();
+    const executionOrder = inspector.getExecutionOrder();
+
+    await inspector.close();
+
+    // 10. Close sync server
+    await syncServer.close();
+
+    this.logger.debug('Inspector collected %d tests in hierarchy, %d in execution order',
+      testHierarchy.length, executionOrder.length);
+
+    // 11. Handle timeout
+    if (result.timedOut) {
+      this.logger.warn('Dry run timed out');
+      return { status: DryRunStatus.Timeout };
+    }
+
+    // 12. Parse console output for failure details (still useful)
+    const parsed = parseBunTestOutput(result.stdout, result.stderr);
+
+    // 13. Check for process errors
     if (result.exitCode !== 0 && parsed.failed === 0) {
-      // Process error, not test failures
       return {
         status: DryRunStatus.Error,
         errorMessage: `Bun test process failed with exit code ${result.exitCode}\n${result.stderr}`,
       };
     }
 
-    // Collect coverage data
+    // 14. Collect coverage data
     let mutantCoverage;
     if (this.coverageFilePath) {
-      this.logger.debug('Collecting coverage data from: %s', this.coverageFilePath);
       mutantCoverage = await collectCoverage(this.coverageFilePath);
-
-      if (mutantCoverage) {
-        const perTestCount = Object.keys(mutantCoverage.perTest).length;
-        const staticCount = Object.keys(mutantCoverage.static).length;
-        // Stryker disable next-line all: Logging statement
-        this.logger.debug('Coverage collected: %d tests with coverage, %d static mutants', perTestCount, staticCount);
-      } else {
-        // Stryker disable next-line all: Logging statement
-        this.logger.debug('No coverage data collected');
-      }
-
-      // Clean up coverage file after reading
       await cleanupCoverageFile(this.coverageFilePath);
     }
 
-    // Parse JUnit XML for test metadata (file names, line numbers)
-    // This enables Stryker's incremental mode by providing stable test identifiers
-    let junitTests: JUnitTestResult[] = [];
-    if (this.junitOutputPath) {
-      try {
-        const junitXml = await readFile(this.junitOutputPath, 'utf-8');
-        junitTests = parseJunitXml(junitXml);
-        this.logger.debug('Parsed %d tests from JUnit XML', junitTests.length);
-      } catch (error) {
-        // Stryker disable next-line all: Logging statement
-        this.logger.debug('Failed to read JUnit XML: %s', error);
-      }
-
-      // Clean up JUnit file if we created it (not from bunfig)
-      if (!this.junitFromBunfig) {
-        try {
-          await unlink(this.junitOutputPath);
-        } catch {
-          // Ignore cleanup errors
-        }
-      }
-    }
-
-    // Build tests array
-    // Use JUnit data for test metadata (enables Stryker incremental mode)
-    // Fall back to counter-based IDs if JUnit parsing failed
-    let tests: Array<SuccessTestResult | FailedTestResult | SkippedTestResult> = [];
+    // 15. Map coverage to inspector IDs
     let finalMutantCoverage = mutantCoverage;
-
-    if (mutantCoverage && Object.keys(mutantCoverage.perTest).length > 0 && junitTests.length > 0) {
-      // Map coverage data (counter IDs) to JUnit tests (by execution order)
-      // Coverage uses: test-1, test-2, ... (counter order)
-      // JUnit is in execution order (guaranteed by --no-randomize)
-      const coverageTestIds = Object.keys(mutantCoverage.perTest).sort(
-        (a, b) => parseInt(a.split('-')[1]) - parseInt(b.split('-')[1])
-      );
-
-      if (coverageTestIds.length === junitTests.length) {
-        // Stryker disable next-line all: Logging statement
-        this.logger.debug('Mapping %d coverage IDs to JUnit tests', coverageTestIds.length);
-
-        // Build tests with JUnit metadata
-        tests = junitTests.map((junit) => {
-          if (!junit.passed) {
-            return {
-              id: junit.fullName,
-              name: junit.fullName,
-              fileName: junit.fileName,
-              startPosition: { line: junit.line, column: 0 },
-              status: TestStatus.Failed,
-              failureMessage: junit.failureMessage ?? 'Test failed',
-              timeSpentMs: Math.round(junit.time * 1000),
-            } satisfies FailedTestResult;
-          }
-
-          return {
-            id: junit.fullName,
-            name: junit.fullName,
-            fileName: junit.fileName,
-            startPosition: { line: junit.line, column: 0 },
-            status: TestStatus.Success,
-            timeSpentMs: Math.round(junit.time * 1000),
-          } satisfies SuccessTestResult;
-        });
-
-        // Re-key coverage data with JUnit test IDs
-        finalMutantCoverage = {
-          static: mutantCoverage.static,
-          perTest: Object.fromEntries(
-            coverageTestIds.map((oldId, index) => [
-              junitTests[index].fullName,
-              mutantCoverage.perTest[oldId],
-            ])
-          ),
-        };
-      } else {
-        // Count mismatch - fall back to existing logic
-        // Stryker disable next-line all: Logging statement
-        this.logger.debug('Coverage/JUnit count mismatch (%d vs %d), using counter-based IDs',
-          coverageTestIds.length, junitTests.length);
-
-        const testNames = Object.keys(mutantCoverage.perTest);
-        const failedTestNames = new Set(
-          parsed.tests.filter(t => t.status === 'failed').map(t => t.name)
-        );
-        const timePerTest = testNames.length > 0 ? Math.max(1, Math.floor(totalElapsedMs / testNames.length)) : 1;
-
-        tests = testNames.map(testName => {
-          const isFailed = failedTestNames.has(testName);
-          const parsedTest = parsed.tests.find(t => t.name === testName);
-
-          if (isFailed && parsedTest) {
-            return {
-              id: testName,
-              name: testName,
-              status: TestStatus.Failed,
-              failureMessage: parsedTest.failureMessage ?? 'Test failed',
-              timeSpentMs: parsedTest.duration ?? timePerTest,
-            } satisfies FailedTestResult;
-          }
-
-          return {
-            id: testName,
-            name: testName,
-            status: TestStatus.Success,
-            timeSpentMs: timePerTest,
-          } satisfies SuccessTestResult;
-        });
+    if (mutantCoverage && executionOrder.length > 0) {
+      // Create a map from the testHierarchy array
+      const testMap = new Map<number, TestInfo>();
+      for (const test of testHierarchy) {
+        testMap.set(test.id, test);
       }
-    } else if (mutantCoverage && Object.keys(mutantCoverage.perTest).length > 0) {
-      // Coverage data but no JUnit - use counter-based IDs (existing fallback)
-      const testNames = Object.keys(mutantCoverage.perTest);
-      const failedTestNames = new Set(
-        parsed.tests.filter(t => t.status === 'failed').map(t => t.name)
+
+      finalMutantCoverage = mapCoverageToInspectorIds(
+        mutantCoverage,
+        executionOrder,
+        testMap
       );
-
-      // Stryker disable next-line all: Logging statement
-      this.logger.debug('No JUnit data, using counter-based IDs for %d tests', testNames.length);
-
-      const timePerTest = testNames.length > 0 ? Math.max(1, Math.floor(totalElapsedMs / testNames.length)) : 1;
-
-      tests = testNames.map(testName => {
-        const isFailed = failedTestNames.has(testName);
-        const parsedTest = parsed.tests.find(t => t.name === testName);
-
-        if (isFailed && parsedTest) {
-          return {
-            id: testName,
-            name: testName,
-            status: TestStatus.Failed,
-            failureMessage: parsedTest.failureMessage ?? 'Test failed',
-            timeSpentMs: parsedTest.duration ?? timePerTest,
-          } satisfies FailedTestResult;
-        }
-
-        return {
-          id: testName,
-          name: testName,
-          status: TestStatus.Success,
-          timeSpentMs: timePerTest,
-        } satisfies SuccessTestResult;
-      });
-    } else {
-      // Fallback: use parsed tests from console output when no coverage data
-      // Stryker disable next-line all: Logging statement
-      this.logger.debug('No coverage data available, using parsed test output');
-
-      const fallbackTimePerTest = parsed.tests.length > 0
-        ? Math.max(1, Math.floor(totalElapsedMs / parsed.tests.length))
-        : Math.max(1, totalElapsedMs);
-
-      tests = parsed.tests.map(t => {
-        const id = t.name;
-        const name = t.name;
-        const timeSpentMs = t.duration ?? fallbackTimePerTest;
-
-        switch (t.status) {
-          case 'passed':
-            return {
-              id,
-              name,
-              status: TestStatus.Success,
-              timeSpentMs,
-            } satisfies SuccessTestResult;
-          case 'failed':
-            return {
-              id,
-              name,
-              status: TestStatus.Failed,
-              failureMessage: t.failureMessage ?? 'Test failed',
-              timeSpentMs,
-            } satisfies FailedTestResult;
-          case 'skipped':
-            return {
-              id,
-              name,
-              status: TestStatus.Skipped,
-              timeSpentMs,
-            } satisfies SkippedTestResult;
-        }
-      });
-
-      // If no tests were parsed from output, create synthetic tests from summary counts
-      if (tests.length === 0 && parsed.passed > 0) {
-        // Stryker disable next-line all: Logging statement
-        this.logger.debug('No individual tests parsed, creating synthetic tests from summary');
-        const syntheticTimePerTest = Math.max(1, Math.floor(totalElapsedMs / parsed.passed));
-        for (let i = 0; i < parsed.passed; i++) {
-          tests.push({
-            id: `test-${i}`,
-            name: `test-${i}`,
-            status: TestStatus.Success,
-            timeSpentMs: syntheticTimePerTest,
-          } satisfies SuccessTestResult);
-        }
-      }
+      this.logger.debug('Mapped coverage from %d counter IDs to %d inspector test names',
+        Object.keys(mutantCoverage.perTest).length,
+        Object.keys(finalMutantCoverage.perTest).length);
     }
+
+    // 16. Build test results from inspector data
+    const tests = this.buildTestsFromInspector(testHierarchy, executionOrder, parsed, totalElapsedMs);
 
     return {
       status: DryRunStatus.Complete,
@@ -478,15 +438,6 @@ export class BunTestRunner implements TestRunner {
     if (this.coverageFilePath) {
       this.logger.debug('Cleaning up coverage file: %s', this.coverageFilePath);
       await cleanupCoverageFile(this.coverageFilePath);
-    }
-
-    // Clean up JUnit file if we created it (not from bunfig)
-    if (this.junitOutputPath && !this.junitFromBunfig) {
-      try {
-        await unlink(this.junitOutputPath);
-      } catch {
-        // Ignore - file might already be deleted
-      }
     }
   }
 }

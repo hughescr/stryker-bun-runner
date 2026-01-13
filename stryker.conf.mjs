@@ -17,6 +17,6 @@ export default {
   reporters: ['progress', 'html', 'clear-text'],
   tempDirName: '.stryker-tmp',
   bun: {
-    bunPath: 'bun',
+    bunPath: 'bun-25986',
   },
 };

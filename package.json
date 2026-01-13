@@ -12,11 +12,10 @@
     }
   },
   "files": [
-    "dist",
-    "templates"
+    "dist"
   ],
   "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target node --format esm && bunx tsc --emitDeclarationOnly",
+    "build": "bun build src/index.ts --outdir dist --target node --format esm && bunx tsc --emitDeclarationOnly && cp -r src/templates dist/",
     "typecheck": "bunx tsc --noEmit",
     "lint": "bunx eslint .",
     "test": "bun test",
@@ -27,12 +26,15 @@
     "@stryker-mutator/core": "^9.0.0"
   },
   "dependencies": {
-    "@stryker-mutator/api": "^9.0.0"
+    "@stryker-mutator/api": "^9.0.0",
+    "ws": "^8.18.0"
   },
   "devDependencies": {
     "@stryker-mutator/core": "^9.0.0",
     "@stryker-mutator/typescript-checker": "9.4.0",
     "@types/bun": "latest",
+    "@types/node": "^22.10.5",
+    "@types/ws": "^8.5.13",
     "typescript": "^5.0.0"
   },
   "keywords": [

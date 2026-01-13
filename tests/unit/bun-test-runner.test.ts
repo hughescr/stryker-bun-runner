@@ -11,6 +11,10 @@ import type { StrykerOptions } from '@stryker-mutator/api/core';
 import * as processRunner from '../../src/process-runner.js';
 import * as coverageCollector from '../../src/coverage/collector.js';
 import * as preloadGenerator from '../../src/coverage/preload-generator.js';
+import * as portUtils from '../../src/utils/port.js';
+import * as syncServerModule from '../../src/utils/sync-server.js';
+import * as inspectorModule from '../../src/inspector/inspector-client.js';
+import * as coverageMapper from '../../src/coverage/coverage-mapper.js';
 
 describe('BunTestRunner', () => {
   let mockLogger: Logger;
@@ -19,6 +23,21 @@ describe('BunTestRunner', () => {
   let mockCleanupCoverageFile: ReturnType<typeof mock>;
   let mockGeneratePreloadScript: ReturnType<typeof mock>;
   let mockCleanupPreloadScript: ReturnType<typeof mock>;
+  let mockGetAvailablePort: ReturnType<typeof mock>;
+  let mockSyncServer: {
+    start: ReturnType<typeof mock>;
+    signalReady: ReturnType<typeof mock>;
+    close: ReturnType<typeof mock>;
+    clientCount: number;
+  };
+  let mockInspectorClient: {
+    connect: ReturnType<typeof mock>;
+    send: ReturnType<typeof mock>;
+    getTests: ReturnType<typeof mock>;
+    getExecutionOrder: ReturnType<typeof mock>;
+    close: ReturnType<typeof mock>;
+  };
+  let mockMapCoverageToInspectorIds: ReturnType<typeof mock>;
 
   beforeEach(() => {
     // Create mock logger
@@ -53,9 +72,46 @@ describe('BunTestRunner', () => {
     spyOn(preloadGenerator, 'generatePreloadScript').mockImplementation(mockGeneratePreloadScript);
     spyOn(preloadGenerator, 'cleanupPreloadScript').mockImplementation(mockCleanupPreloadScript);
 
+    // Mock port utility
+    mockGetAvailablePort = mock();
+    spyOn(portUtils, 'getAvailablePort').mockImplementation(mockGetAvailablePort);
+
+    // Mock sync server
+    mockSyncServer = {
+      start: mock(),
+      signalReady: mock(),
+      close: mock(),
+      clientCount: 0,
+    };
+    spyOn(syncServerModule, 'SyncServer').mockImplementation(() => mockSyncServer as any);
+
+    // Mock inspector client
+    mockInspectorClient = {
+      connect: mock(),
+      send: mock(),
+      getTests: mock(),
+      getExecutionOrder: mock(),
+      close: mock(),
+    };
+    spyOn(inspectorModule, 'InspectorClient').mockImplementation(() => mockInspectorClient as any);
+
+    // Mock coverage mapper
+    mockMapCoverageToInspectorIds = mock();
+    spyOn(coverageMapper, 'mapCoverageToInspectorIds').mockImplementation(mockMapCoverageToInspectorIds);
+
     // Default mock implementations
     mockCleanupCoverageFile.mockResolvedValue(undefined);
     mockCleanupPreloadScript.mockResolvedValue(undefined);
+    let portCounter = 6499;
+    mockGetAvailablePort.mockImplementation(() => Promise.resolve(portCounter++));
+    mockSyncServer.start.mockResolvedValue(undefined);
+    mockSyncServer.signalReady.mockReturnValue(undefined);
+    mockSyncServer.close.mockResolvedValue(undefined);
+    mockInspectorClient.connect.mockResolvedValue(undefined);
+    mockInspectorClient.send.mockResolvedValue(undefined);
+    mockInspectorClient.getTests.mockReturnValue([]);
+    mockInspectorClient.getExecutionOrder.mockReturnValue([]);
+    mockInspectorClient.close.mockResolvedValue(undefined);
   });
 
   afterEach(() => {
@@ -78,11 +134,17 @@ describe('BunTestRunner', () => {
 
     it('should use custom bunPath from options', async () => {
       mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
-      mockRunBunTests.mockResolvedValue({
+      mockRunBunTests.mockImplementation((options: any) => {
+        // Call onInspectorReady immediately if provided
+        if (options.onInspectorReady) {
+          options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+        }
+        return Promise.resolve({
         exitCode: 0,
         stdout: '✓ test [0.12ms]\n 1 pass',
         stderr: '',
         timedOut: false,
+        });
       });
       mockCollectCoverage.mockResolvedValue(undefined);
 
@@ -112,11 +174,17 @@ describe('BunTestRunner', () => {
 
     it('should use custom timeout from options', async () => {
       mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
-      mockRunBunTests.mockResolvedValue({
+      mockRunBunTests.mockImplementation((options: any) => {
+        // Call onInspectorReady immediately if provided
+        if (options.onInspectorReady) {
+          options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+        }
+        return Promise.resolve({
         exitCode: 0,
         stdout: '✓ test [0.12ms]\n 1 pass',
         stderr: '',
         timedOut: false,
+        });
       });
       mockCollectCoverage.mockResolvedValue(undefined);
 
@@ -146,11 +214,17 @@ describe('BunTestRunner', () => {
 
     it('should accept custom environment variables', async () => {
       mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
-      mockRunBunTests.mockResolvedValue({
+      mockRunBunTests.mockImplementation((options: any) => {
+        // Call onInspectorReady immediately if provided
+        if (options.onInspectorReady) {
+          options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+        }
+        return Promise.resolve({
         exitCode: 0,
         stdout: '✓ test [0.12ms]\n 1 pass',
         stderr: '',
         timedOut: false,
+        });
       });
       mockCollectCoverage.mockResolvedValue(undefined);
 
@@ -182,11 +256,17 @@ describe('BunTestRunner', () => {
 
     it('should accept custom bunArgs', async () => {
       mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
-      mockRunBunTests.mockResolvedValue({
+      mockRunBunTests.mockImplementation((options: any) => {
+        // Call onInspectorReady immediately if provided
+        if (options.onInspectorReady) {
+          options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+        }
+        return Promise.resolve({
         exitCode: 0,
         stdout: '✓ test [0.12ms]\n 1 pass',
         stderr: '',
         timedOut: false,
+        });
       });
       mockCollectCoverage.mockResolvedValue(undefined);
 
@@ -250,9 +330,14 @@ describe('BunTestRunner', () => {
     });
 
     it('should run tests with coverage', async () => {
-      mockRunBunTests.mockResolvedValue({
-        exitCode: 0,
-        stdout: `
+      mockRunBunTests.mockImplementation((options: any) => {
+        // Call onInspectorReady immediately if provided
+        if (options.onInspectorReady) {
+          options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+        }
+        return Promise.resolve({
+          exitCode: 0,
+          stdout: `
 bun test v1.1.0
 
 tests/example.test.ts:
@@ -260,8 +345,9 @@ tests/example.test.ts:
 
  1 pass
 `,
-        stderr: '',
-        timedOut: false,
+          stderr: '',
+          timedOut: false,
+        });
       });
       mockCollectCoverage.mockResolvedValue({
         perTest: {
@@ -292,11 +378,17 @@ tests/example.test.ts:
     });
 
     it('should return timeout status on timeout', async () => {
-      mockRunBunTests.mockResolvedValue({
+      mockRunBunTests.mockImplementation((options: any) => {
+        // Call onInspectorReady immediately if provided
+        if (options.onInspectorReady) {
+          options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+        }
+        return Promise.resolve({
         exitCode: null,
         stdout: '',
         stderr: '',
         timedOut: true,
+        });
       });
 
       const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
@@ -308,11 +400,17 @@ tests/example.test.ts:
     });
 
     it('should return error status on process failure', async () => {
-      mockRunBunTests.mockResolvedValue({
+      mockRunBunTests.mockImplementation((options: any) => {
+        // Call onInspectorReady immediately if provided
+        if (options.onInspectorReady) {
+          options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+        }
+        return Promise.resolve({
         exitCode: 1,
         stdout: '',
         stderr: 'Fatal error',
         timedOut: false,
+        });
       });
 
       const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
@@ -325,7 +423,12 @@ tests/example.test.ts:
     });
 
     it('should map test results correctly', async () => {
-      mockRunBunTests.mockResolvedValue({
+      mockRunBunTests.mockImplementation((options: any) => {
+        // Call onInspectorReady immediately if provided
+        if (options.onInspectorReady) {
+          options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+        }
+        return Promise.resolve({
         exitCode: 0,
         stdout: `
 bun test v1.1.0
@@ -342,6 +445,7 @@ tests/example.test.ts:
 `,
         stderr: '',
         timedOut: false,
+        });
       });
       mockCollectCoverage.mockResolvedValue(undefined);
 
@@ -367,11 +471,17 @@ tests/example.test.ts:
     });
 
     it('should cleanup coverage file after reading', async () => {
-      mockRunBunTests.mockResolvedValue({
+      mockRunBunTests.mockImplementation((options: any) => {
+        // Call onInspectorReady immediately if provided
+        if (options.onInspectorReady) {
+          options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+        }
+        return Promise.resolve({
         exitCode: 0,
         stdout: '✓ test [0.12ms]\n 1 pass',
         stderr: '',
         timedOut: false,
+        });
       });
       mockCollectCoverage.mockResolvedValue(undefined);
 
@@ -391,7 +501,12 @@ tests/example.test.ts:
     });
 
     it('should return killed status when tests fail', async () => {
-      mockRunBunTests.mockResolvedValue({
+      mockRunBunTests.mockImplementation((options: any) => {
+        // Call onInspectorReady immediately if provided
+        if (options.onInspectorReady) {
+          options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+        }
+        return Promise.resolve({
         exitCode: 1,
         stdout: `
 bun test v1.1.0
@@ -405,6 +520,7 @@ tests/example.test.ts:
 `,
         stderr: '',
         timedOut: false,
+        });
       });
 
       const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
@@ -425,7 +541,12 @@ tests/example.test.ts:
     });
 
     it('should return survived status when all tests pass', async () => {
-      mockRunBunTests.mockResolvedValue({
+      mockRunBunTests.mockImplementation((options: any) => {
+        // Call onInspectorReady immediately if provided
+        if (options.onInspectorReady) {
+          options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+        }
+        return Promise.resolve({
         exitCode: 0,
         stdout: `
 bun test v1.1.0
@@ -437,6 +558,7 @@ tests/example.test.ts:
 `,
         stderr: '',
         timedOut: false,
+        });
       });
 
       const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
@@ -455,11 +577,17 @@ tests/example.test.ts:
     });
 
     it('should return timeout status on timeout', async () => {
-      mockRunBunTests.mockResolvedValue({
+      mockRunBunTests.mockImplementation((options: any) => {
+        // Call onInspectorReady immediately if provided
+        if (options.onInspectorReady) {
+          options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+        }
+        return Promise.resolve({
         exitCode: null,
         stdout: '',
         stderr: '',
         timedOut: true,
+        });
       });
 
       const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
@@ -475,11 +603,17 @@ tests/example.test.ts:
     });
 
     it('should return killed status on process failure', async () => {
-      mockRunBunTests.mockResolvedValue({
+      mockRunBunTests.mockImplementation((options: any) => {
+        // Call onInspectorReady immediately if provided
+        if (options.onInspectorReady) {
+          options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+        }
+        return Promise.resolve({
         exitCode: 1,
         stdout: '',
         stderr: 'Fatal error',
         timedOut: false,
+        });
       });
 
       const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
@@ -500,11 +634,17 @@ tests/example.test.ts:
     });
 
     it('should set activeMutant in environment', async () => {
-      mockRunBunTests.mockResolvedValue({
+      mockRunBunTests.mockImplementation((options: any) => {
+        // Call onInspectorReady immediately if provided
+        if (options.onInspectorReady) {
+          options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+        }
+        return Promise.resolve({
         exitCode: 0,
         stdout: '✓ test [0.05ms]\n 1 pass',
         stderr: '',
         timedOut: false,
+        });
       });
 
       const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
@@ -524,11 +664,17 @@ tests/example.test.ts:
     });
 
     it('should enable bail for mutant runs', async () => {
-      mockRunBunTests.mockResolvedValue({
+      mockRunBunTests.mockImplementation((options: any) => {
+        // Call onInspectorReady immediately if provided
+        if (options.onInspectorReady) {
+          options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+        }
+        return Promise.resolve({
         exitCode: 0,
         stdout: '✓ test [0.05ms]\n 1 pass',
         stderr: '',
         timedOut: false,
+        });
       });
 
       const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
@@ -548,11 +694,17 @@ tests/example.test.ts:
     });
 
     it('should pass preload script to mutant runs', async () => {
-      mockRunBunTests.mockResolvedValue({
+      mockRunBunTests.mockImplementation((options: any) => {
+        // Call onInspectorReady immediately if provided
+        if (options.onInspectorReady) {
+          options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+        }
+        return Promise.resolve({
         exitCode: 0,
         stdout: '✓ test [0.05ms]\n 1 pass',
         stderr: '',
         timedOut: false,
+        });
       });
 
       const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);

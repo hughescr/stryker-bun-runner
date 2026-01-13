@@ -36,6 +36,12 @@ export const strykerValidationSchema = {
           description: 'Timeout per test in milliseconds (default: 10000)',
           default: 10000,
         },
+        inspectorTimeout: {
+          type: 'number',
+          minimum: 0,
+          description: 'Timeout for inspector connection in milliseconds (default: 5000)',
+          default: 5000,
+        },
         env: {
           type: 'object',
           description: 'Additional environment variables to pass to bun test',

@@ -195,6 +195,22 @@ describe('generatePreloadScript', () => {
       expect(writtenContent).toBe(templateContent);
       expect(writtenContent).not.toContain('/custom/coverage.json');
     });
+
+    it('should write template content unchanged', async () => {
+      mockExistsSync.mockReturnValue(true);
+      const templateContent = '// preload template\nconsole.log("test");';
+      mockReadFile.mockResolvedValue(templateContent);
+
+      await generatePreloadScript({
+        tempDir,
+        coverageFile,
+      });
+
+      // Verify template content is written unchanged
+      expect(mockWriteFile).toHaveBeenCalled();
+      const [, writtenContent] = mockWriteFile.mock.calls[0];
+      expect(writtenContent).toBe(templateContent);
+    });
   });
 });
 
