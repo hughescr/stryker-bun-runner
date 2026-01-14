@@ -2,43 +2,6 @@
   "name": "@hughescr/stryker-bun-runner",
   "version": "1.0.0-beta1",
   "description": "Stryker test runner plugin for Bun with perTest coverage support",
-  "type": "module",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
-  "exports": {
-    ".": {
-      "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
-    }
-  },
-  "files": [
-    "dist",
-    "LICENSE.md"
-  ],
-  "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target node --format esm && dts-bundle-generator --config dts-bundle-generator.config.json && cp -r src/templates dist/",
-    "typecheck": "tsc --noEmit",
-    "lint": "eslint .",
-    "test": "bun test",
-    "mutate": "stryker run",
-    "prepublishOnly": "bun run build"
-  },
-  "peerDependencies": {
-    "@stryker-mutator/core": "^9.0.0"
-  },
-  "dependencies": {
-    "@stryker-mutator/api": "^9.0.0",
-    "ws": "^8.18.0"
-  },
-  "devDependencies": {
-    "@stryker-mutator/core": "^9.0.0",
-    "@stryker-mutator/typescript-checker": "9.4.0",
-    "@types/bun": "latest",
-    "@types/node": "^22.10.5",
-    "@types/ws": "^8.5.13",
-    "dts-bundle-generator": "^9.5.1",
-    "typescript": "^5.0.0"
-  },
   "keywords": [
     "stryker",
     "stryker-plugin",
@@ -46,17 +9,59 @@
     "test-runner",
     "mutation-testing"
   ],
-  "author": "hughescr",
-  "license": "Apache-2.0",
-  "engines": {
-    "bun": ">1.3.6"
+  "homepage": "https://github.com/hughescr/stryker-bun-runner#readme",
+  "bugs": {
+    "url": "https://github.com/hughescr/stryker-bun-runner/issues"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/hughescr/stryker-bun-runner.git"
   },
-  "bugs": {
-    "url": "https://github.com/hughescr/stryker-bun-runner/issues"
+  "license": "Apache-2.0",
+  "author": "hughescr",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
   },
-  "homepage": "https://github.com/hughescr/stryker-bun-runner#readme"
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "LICENSE.md"
+  ],
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target node --format esm && dts-bundle-generator --config dts-bundle-generator.config.json && cp -r src/templates dist/",
+    "lint": "eslint --cache --format unix .",
+    "mutate": "stryker run",
+    "prepublishOnly": "bun run build",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@stryker-mutator/api": "^9.0.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@hughescr/eslint-config-default": "4.0.1",
+    "@stryker-mutator/core": "^9.0.0",
+    "@stryker-mutator/typescript-checker": "9.4.0",
+    "@types/bun": "latest",
+    "@types/node": "^22.10.5",
+    "@types/ws": "^8.5.13",
+    "dts-bundle-generator": "^9.5.1",
+    "eslint": "9.39.2",
+    "eslint-formatter-overview": "2.0.0",
+    "eslint-formatter-unix": "9.0.1",
+    "eslint-plugin-package-json": "0.88.1",
+    "typescript": "^5.0.0"
+  },
+  "peerDependencies": {
+    "@stryker-mutator/core": "^9.0.0"
+  },
+  "engines": {
+    "bun": ">1.3.6"
+  }
 }

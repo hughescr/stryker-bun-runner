@@ -4,28 +4,28 @@
  */
 
 export {
-  InspectorClient,
-  InspectorTimeoutError,
-  InspectorConnectionError,
+    InspectorClient,
+    InspectorTimeoutError,
+    InspectorConnectionError
 } from './inspector-client.js';
 
 export type {
-  InspectorClientOptions,
-  InspectorEventHandlers,
+    InspectorClientOptions,
+    InspectorEventHandlers
 } from './inspector-client.js';
 
 export type {
-  InspectorMessage,
-  TestInfo,
-  TestStatus,
-  TestEntityType,
-  TestReporterFoundEvent,
-  TestReporterStartEvent,
-  TestReporterEndEvent,
+    InspectorMessage,
+    TestInfo,
+    TestStatus,
+    TestEntityType,
+    TestReporterFoundEvent,
+    TestReporterStartEvent,
+    TestReporterEndEvent
 } from './types.js';
 
 export {
-  isTestReporterFoundEvent,
-  isTestReporterStartEvent,
-  isTestReporterEndEvent,
+    isTestReporterFoundEvent,
+    isTestReporterStartEvent,
+    isTestReporterEndEvent
 } from './types.js';

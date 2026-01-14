@@ -11,32 +11,32 @@ import { createServer } from 'net';
  * @throws Error if unable to create server or get port
  */
 export async function getAvailablePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const server = createServer();
+    return new Promise((resolve, reject) => {
+        const server = createServer();
 
-    server.on('error', (err: NodeJS.ErrnoException) => {
-      reject(new Error(`Failed to get available port: ${err.message}`));
+        server.on('error', (err: NodeJS.ErrnoException) => {
+            reject(new Error(`Failed to get available port: ${err.message}`));
+        });
+
+        // Use 127.0.0.1 to explicitly bind to IPv4 and avoid IPv6 issues
+        server.listen(0, '127.0.0.1', () => {
+            const address = server.address();
+
+            if(!address || typeof address === 'string') {
+                server.close();
+                reject(new Error('Failed to get port: server address is invalid'));
+                return;
+            }
+
+            const port = address.port;
+
+            server.close((err) => {
+                if(err) {
+                    reject(new Error(`Failed to close server: ${err.message}`));
+                    return;
+                }
+                resolve(port);
+            });
+        });
     });
-
-    // Use 127.0.0.1 to explicitly bind to IPv4 and avoid IPv6 issues
-    server.listen(0, '127.0.0.1', () => {
-      const address = server.address();
-
-      if (!address || typeof address === 'string') {
-        server.close();
-        reject(new Error('Failed to get port: server address is invalid'));
-        return;
-      }
-
-      const port = address.port;
-
-      server.close((err) => {
-        if (err) {
-          reject(new Error(`Failed to close server: ${err.message}`));
-          return;
-        }
-        resolve(port);
-      });
-    });
-  });
 }
