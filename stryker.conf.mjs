@@ -1,3 +1,5 @@
+const isCI = Boolean(process.env.GITHUB_SHA);
+
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
@@ -7,16 +9,24 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 export default {
   testRunner: 'bun',
   checkers: ['typescript'],
+  incremental: !isCI,
   plugins: [
     resolve(__dirname, 'dist/index.js'),
     '@stryker-mutator/typescript-checker',
   ],
   mutate: ['src/**/*.ts'],
+  thresholds: { high: 100, low: 100, break: 100 },
   coverageAnalysis: 'perTest',
   concurrency: 24,
-  reporters: ['progress', 'html', 'clear-text'],
+  disableBail: true,
+  reporters: isCI ? ['clear-text', 'progress', 'dashboard'] : ['progress', 'json', 'html'],
   tempDirName: '.stryker-tmp',
-  bun: {
-    bunPath: 'bun-25986',
-  },
+  bun: { bunPath: 'bun-25986', },
+  ...(isCI && {
+      dashboard: {
+          project: 'hughescr/isambard',
+          module:  'default',
+          version: process.env.GITHUB_SHA,
+      },
+  }),
 };
