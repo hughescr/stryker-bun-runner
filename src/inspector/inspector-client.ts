@@ -59,7 +59,7 @@ interface InspectorClientState {
 interface PendingRequest {
   resolve: (result: unknown) => void;
   reject: (error: Error) => void;
-  timer: Timer;
+  timer: ReturnType<typeof setTimeout>;
 }
 
 /**

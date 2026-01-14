@@ -16,11 +16,11 @@
     "LICENSE.md"
   ],
   "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target node --format esm && bunx tsc --emitDeclarationOnly && cp -r src/templates dist/",
-    "typecheck": "bunx tsc --noEmit",
-    "lint": "bunx eslint .",
+    "build": "bun build src/index.ts --outdir dist --target node --format esm && dts-bundle-generator --config dts-bundle-generator.config.json && cp -r src/templates dist/",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
     "test": "bun test",
-    "mutate": "bunx stryker run",
+    "mutate": "stryker run",
     "prepublishOnly": "bun run build"
   },
   "peerDependencies": {
@@ -36,6 +36,7 @@
     "@types/bun": "latest",
     "@types/node": "^22.10.5",
     "@types/ws": "^8.5.13",
+    "dts-bundle-generator": "^9.5.1",
     "typescript": "^5.0.0"
   },
   "keywords": [
