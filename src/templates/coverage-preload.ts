@@ -22,9 +22,74 @@ const shouldCollectCoverage = !activeMutant && !!coverageFile;
 
 
 // ============================================================================
-// Section 1: WebSocket Sync (wait for inspector to be ready)
+// Section 1: WebSocket Sync (receive test start events)
 // ============================================================================
-if (syncPort) {
+let ws: WebSocket | null = null;
+
+if (shouldCollectCoverage) {
+  // Track test counter and WebSocket-provided names (only needed when collecting coverage)
+  var testCounter = 0;
+  var counterToName = new Map<string, string>();
+  var pendingTestName: string | undefined;
+}
+
+if (syncPort && shouldCollectCoverage) {
+  try {
+    ws = new WebSocket(`ws://localhost:${syncPort}/sync`);
+
+    ws.onmessage = (event) => {
+      const data = event.data.toString();
+      if (data === 'ready') {
+        // Initial ready signal - tests can start
+        return;
+      }
+      try {
+        const msg = JSON.parse(data);
+        if (msg.type === 'testStart' && msg.name) {
+          // Store the pending test name to be picked up by beforeEach
+          pendingTestName = msg.name as string;
+        }
+      } catch {
+        // Ignore parse errors
+      }
+    };
+
+    // Wait for ready signal
+    await new Promise<void>((resolve) => {
+      const timeout = setTimeout(() => {
+        console.warn('[Stryker] Timeout waiting for ready signal');
+        resolve();
+      }, 5000);
+
+      const wsInstance = ws;
+      if (!wsInstance) {
+        clearTimeout(timeout);
+        resolve();
+        return;
+      }
+
+      const originalOnMessage = wsInstance.onmessage;
+      wsInstance.onmessage = (event) => {
+        if (event.data === 'ready') {
+          clearTimeout(timeout);
+          resolve();
+        }
+        if (originalOnMessage) {
+          originalOnMessage.call(wsInstance, event);
+        }
+      };
+
+      wsInstance.onerror = () => {
+        clearTimeout(timeout);
+        console.warn('[Stryker] Failed to connect to sync server');
+        resolve();
+      };
+    });
+  } catch (error) {
+    console.warn('[Stryker] Error during synchronization:', error);
+  }
+} else if (syncPort && !shouldCollectCoverage) {
+  // No coverage collection, just wait for ready signal
   try {
     const ws = new WebSocket(`ws://localhost:${syncPort}/sync`);
     await new Promise<void>((resolve) => {
@@ -73,17 +138,27 @@ if (activeMutant) {
 }
 
 // ============================================================================
-// Section 3: Test Counter and Hooks (for per-test coverage tracking)
+// Section 3: Test Hooks (for per-test coverage tracking)
 // ============================================================================
-let testCounter = 0;
-
 if (shouldCollectCoverage) {
   beforeEach(() => {
     testCounter++;
-    strykerGlobal.currentTestId = `test-${testCounter}`;
-    // Initialize perTest entry for this test
-    if (!strykerGlobal.mutantCoverage.perTest[strykerGlobal.currentTestId]) {
-      strykerGlobal.mutantCoverage.perTest[strykerGlobal.currentTestId] = {};
+    const counterId = `test-${testCounter}`;
+
+    // If we have a pending test name from WebSocket, use it
+    if (pendingTestName) {
+      counterToName.set(counterId, pendingTestName);
+      strykerGlobal.currentTestId = pendingTestName;
+      if (!strykerGlobal.mutantCoverage.perTest[pendingTestName]) {
+        strykerGlobal.mutantCoverage.perTest[pendingTestName] = {};
+      }
+      pendingTestName = undefined;
+    } else {
+      // Fallback to counter - will be remapped later
+      strykerGlobal.currentTestId = counterId;
+      if (!strykerGlobal.mutantCoverage.perTest[counterId]) {
+        strykerGlobal.mutantCoverage.perTest[counterId] = {};
+      }
     }
   });
 
@@ -91,10 +166,15 @@ if (shouldCollectCoverage) {
     // Clear currentTestId so any subsequent code records to static
     strykerGlobal.currentTestId = undefined;
   });
+
+  afterAll(() => {
+    ws?.close();
+    writeCoverageData();
+  });
 }
 
 // ============================================================================
-// Section 4: Exit Handler - Write Coverage Data
+// Section 4: Coverage Writing Logic
 // ============================================================================
 
 // Shared coverage writing logic
@@ -108,15 +188,16 @@ const writeCoverageData = () => {
     return;
   }
 
-
   // Convert from Record<string, number> to string[] format
+  // Remap counter IDs to test names using the mapping
   const perTest: Record<string, string[]> = {};
   for (const [testId, coverage] of Object.entries(mutantCoverage.perTest || {})) {
-    perTest[testId] = Object.keys(coverage as Record<string, number>);
+    // Check if this is a counter ID that needs remapping
+    const actualName = counterToName.get(testId) || testId;
+    perTest[actualName] = Object.keys(coverage as Record<string, number>);
   }
 
   const staticCoverage = Object.keys(mutantCoverage.static || {});
-
 
   const data: CoverageFileData = {
     perTest,
@@ -129,11 +210,3 @@ const writeCoverageData = () => {
     console.error('[Stryker Coverage] Failed to write coverage:', error);
   }
 };
-
-// Use afterAll hook to write coverage after all tests complete
-// (process.on('beforeExit') and process.on('exit') don't fire in Bun's test runner)
-if (shouldCollectCoverage) {
-  afterAll(() => {
-    writeCoverageData();
-  });
-}

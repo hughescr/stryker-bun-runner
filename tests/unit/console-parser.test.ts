@@ -867,13 +867,10 @@ Bailed out after 1 failure`;
       expect(result.tests).toHaveLength(0);
     });
 
-    it('should match file header even with prefix due to greedy capture', () => {
-      // KNOWN ISSUE: The file header regex uses .+ which is greedy
-      // So "some prefix tests/example.test.ts:" will match with capture group
-      // including "some prefix tests/example.test". The ^ anchor prevents
-      // mid-line matches, but doesn't prevent the greedy .+ from consuming prefixes.
-      // This test documents current behavior. If this starts failing, it means
-      // someone fixed the greedy .+ issue (e.g., by making it non-greedy or more specific).
+    it('should NOT match file header with prefix (fixed greedy capture)', () => {
+      // FIXED: The file header regex now uses [\w./-]+ which only matches valid path characters
+      // So "some prefix tests/example.test.ts:" will NOT match because "some prefix " contains spaces
+      // This prevents matching error output lines like "111 |         // Match file header: tests/example.test.ts:"
       const output = `bun test v1.1.0
 
 some prefix tests/example.test.ts:
@@ -881,8 +878,9 @@ some prefix tests/example.test.ts:
 
  1 pass`;
       const result = parseBunTestOutput(output, '');
-      // Currently DOES match due to greedy .+
-      expect(result.tests[0].file).toBe('some prefix tests/example.test.ts');
+      // Should NOT match because of the prefix
+      expect(result.tests[0].file).toBeUndefined();
+      expect(result.tests[0].name).toBe('test');
     });
 
     it('should not match file header with suffix text after colon', () => {

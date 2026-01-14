@@ -40,6 +40,8 @@ describe('mapCoverageToInspectorIds', () => {
 
       const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
 
+      // Maps based on execution order:
+      // test-1 -> ID 42 (Suite > test1), test-2 -> ID 43 (Suite > Nested > test2), test-3 -> ID 44 (Suite > test3)
       expect(result).toEqual({
         static: { '1': 1 },
         perTest: {
@@ -242,7 +244,8 @@ describe('mapCoverageToInspectorIds', () => {
 
       const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
 
-      // Should skip test-2 (mapped to inspector ID 43 which is missing)
+      // Maps based on execution order:
+      // test-1 -> ID 42 (Suite > test1), test-2 -> ID 43 (missing, skipped), test-3 -> ID 44 (Suite > test3)
       expect(result.perTest).toEqual({
         'Suite > test1': { '1': 1 },
         'Suite > test3': { '3': 1 },
@@ -320,6 +323,8 @@ describe('mapCoverageToInspectorIds', () => {
 
       const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
 
+      // Maps based on execution order:
+      // test-1 -> ID 1 (quotes), test-2 -> ID 2 (apostrophes)
       expect(result.perTest).toEqual({
         'Suite > test with "quotes"': { '1': 1 },
         "Suite > test with 'apostrophes'": { '2': 1 },
@@ -351,6 +356,8 @@ describe('mapCoverageToInspectorIds', () => {
       const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
 
       expect(Object.keys(result.perTest)).toHaveLength(numTests);
+      // Maps based on execution order:
+      // test-1 -> ID 1 (Suite > test1), test-1000 -> ID 1000 (Suite > test1000)
       expect(result.perTest['Suite > test1']).toEqual({ '1': 1 });
       expect(result.perTest['Suite > test1000']).toEqual({ '1000': 1 });
     });

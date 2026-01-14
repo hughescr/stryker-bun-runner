@@ -83,7 +83,8 @@ describe('BunTestRunner', () => {
       close: mock(),
       clientCount: 0,
     };
-    spyOn(syncServerModule, 'SyncServer').mockImplementation(() => mockSyncServer as any);
+    // @ts-expect-error - Mocking constructor, type system doesn't understand this pattern
+    spyOn(syncServerModule, 'SyncServer').mockImplementation(() => mockSyncServer);
 
     // Mock inspector client
     mockInspectorClient = {
@@ -93,11 +94,14 @@ describe('BunTestRunner', () => {
       getExecutionOrder: mock(),
       close: mock(),
     };
-    spyOn(inspectorModule, 'InspectorClient').mockImplementation(() => mockInspectorClient as any);
+    // @ts-expect-error - Mocking constructor, type system doesn't understand this pattern
+    spyOn(inspectorModule, 'InspectorClient').mockImplementation(() => mockInspectorClient);
 
     // Mock coverage mapper
     mockMapCoverageToInspectorIds = mock();
     spyOn(coverageMapper, 'mapCoverageToInspectorIds').mockImplementation(mockMapCoverageToInspectorIds);
+    // Default: pass through coverage unchanged (tests can override if needed)
+    mockMapCoverageToInspectorIds.mockImplementation((coverage: any) => coverage);
 
     // Default mock implementations
     mockCleanupCoverageFile.mockResolvedValue(undefined);
@@ -457,16 +461,21 @@ tests/example.test.ts:
       expect(result.status).toBe(DryRunStatus.Complete);
       if (result.status === DryRunStatus.Complete) {
         expect(result.tests).toHaveLength(3);
-        expect(result.tests[0].name).toBe('tests/example.test.ts > passing test');
-        expect(result.tests[0].status).toBe(TestStatus.Success);
-        expect(result.tests[0].timeSpentMs).toBe(0.12);
 
-        expect(result.tests[1].name).toBe('tests/example.test.ts > failing test');
-        expect(result.tests[1].status).toBe(TestStatus.Failed);
-        expect(result.tests[1].timeSpentMs).toBe(0.05);
+        // Tests are sorted alphabetically, so check for each test independently
+        const passingTest = result.tests.find(t => t.name === 'tests/example.test.ts > passing test');
+        expect(passingTest).toBeDefined();
+        expect(passingTest?.status).toBe(TestStatus.Success);
+        expect(passingTest?.timeSpentMs).toBe(0.12);
 
-        expect(result.tests[2].name).toBe('tests/example.test.ts > skipped test');
-        expect(result.tests[2].status).toBe(TestStatus.Skipped);
+        const failingTest = result.tests.find(t => t.name === 'tests/example.test.ts > failing test');
+        expect(failingTest).toBeDefined();
+        expect(failingTest?.status).toBe(TestStatus.Failed);
+        expect(failingTest?.timeSpentMs).toBe(0.05);
+
+        const skippedTest = result.tests.find(t => t.name === 'tests/example.test.ts > skipped test');
+        expect(skippedTest).toBeDefined();
+        expect(skippedTest?.status).toBe(TestStatus.Skipped);
       }
     });
 
@@ -535,7 +544,7 @@ tests/example.test.ts:
       expect(result.status).toBe(MutantRunStatus.Killed);
       if (result.status === MutantRunStatus.Killed) {
         expect(result.killedBy).toHaveLength(1);
-        expect(result.killedBy[0]).toBe('tests/example.test.ts > should catch mutant');
+        expect(result.killedBy[0]).toBe('should catch mutant');
         expect(result.nrOfTests).toBe(1);
       }
     });

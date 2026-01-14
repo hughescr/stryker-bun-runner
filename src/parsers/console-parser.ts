@@ -58,7 +58,8 @@ export function parseBunTestOutput(stdout: string, stderr: string): ParsedTestRe
     const line = lines[i];
 
     // Match file header: tests/example.test.ts: or src/foo.test.tsx:
-    const fileMatch = line.match(/^(.+\.(?:test|spec)\.(?:ts|tsx|js|jsx|mts|mjs)):$/);
+    // Ensure it only matches valid file paths (no line numbers, pipes, or comment markers)
+    const fileMatch = line.match(/^([\w./-]+\.(?:test|spec)\.(?:ts|tsx|js|jsx|mts|mjs)):$/);
     if (fileMatch) {
       currentFile = fileMatch[1];
       continue;

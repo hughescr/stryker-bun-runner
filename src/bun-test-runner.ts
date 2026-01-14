@@ -30,12 +30,49 @@ import {
   collectCoverage,
   cleanupCoverageFile,
 } from './coverage/index.js';
+import { mapCoverageToInspectorIds } from './coverage/coverage-mapper.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { InspectorClient } from './inspector/index.js';
-import { mapCoverageToInspectorIds } from './coverage/coverage-mapper.js';
 import { getAvailablePort, SyncServer } from './utils/index.js';
 import type { TestInfo } from './inspector/types.js';
+
+/**
+ * Normalize a sandbox file path to a relative path.
+ * Stryker runs tests in a sandbox directory, but the incremental file
+ * uses relative paths. We need to strip the sandbox prefix to enable caching.
+ *
+ * Input:  /path/to/project/.stryker-tmp/sandbox-ABC123/tests/unit/foo.test.ts
+ * Output: tests/unit/foo.test.ts
+ */
+function normalizeTestFilePath(url: string | undefined): string | undefined {
+  if (!url) return undefined;
+
+  // Look for .stryker-tmp/sandbox-XXXXX/ pattern and extract path after it
+  const sandboxMatch = url.match(/\.stryker-tmp\/sandbox-[^/]+\/(.+)$/);
+  if (sandboxMatch) {
+    return sandboxMatch[1];
+  }
+
+  // If no sandbox pattern, return as-is (might already be relative or a different format)
+  return url;
+}
+
+/**
+ * Strip file prefix from test names for consistency with inspector format.
+ * Console parser includes file prefixes like "tests/file.test.ts > Suite > Test"
+ * but inspector provides "Suite > Test" without the file prefix.
+ * This normalizes console parser output to match inspector format for killedBy.
+ *
+ * Input:  "tests/unit/something.test.ts > Suite > Test"
+ * Output: "Suite > Test"
+ */
+function stripFilePrefix(testName: string): string {
+  // Pattern: "path/to/file.test.ts > " or "path/to/file.spec.ts > " at the start
+  // Strip everything up to and including the first " > " if it looks like a file path
+  const match = testName.match(/^[^\s>]+\.(?:test|spec)\.[jt]sx?\s+>\s+(.+)$/);
+  return match ? match[1] : testName;
+}
 
 /**
  * Bun test runner for Stryker mutation testing
@@ -168,8 +205,8 @@ export class BunTestRunner implements TestRunner {
         return {
           id: fullName,
           name: fullName,
-          fileName: testInfo.url,
-          startPosition: testInfo.line ? { line: testInfo.line, column: 0 } : undefined,
+          fileName: normalizeTestFilePath(testInfo.url),
+          startPosition: undefined,
           status: TestStatus.Failed,
           failureMessage: parsedTest?.failureMessage ?? testInfo.error?.message ?? 'Test failed',
           timeSpentMs: elapsed,
@@ -180,8 +217,8 @@ export class BunTestRunner implements TestRunner {
         return {
           id: fullName,
           name: fullName,
-          fileName: testInfo.url,
-          startPosition: testInfo.line ? { line: testInfo.line, column: 0 } : undefined,
+          fileName: normalizeTestFilePath(testInfo.url),
+          startPosition: undefined,
           status: TestStatus.Skipped,
           timeSpentMs: elapsed,
         } satisfies SkippedTestResult;
@@ -190,8 +227,8 @@ export class BunTestRunner implements TestRunner {
       return {
         id: fullName,
         name: fullName,
-        fileName: testInfo.url,
-        startPosition: testInfo.line ? { line: testInfo.line, column: 0 } : undefined,
+        fileName: normalizeTestFilePath(testInfo.url),
+        startPosition: undefined,
         status: TestStatus.Success,
         timeSpentMs: elapsed,
       } satisfies SuccessTestResult;
@@ -260,11 +297,17 @@ export class BunTestRunner implements TestRunner {
 
     this.logger.debug('Inspector URL: %s', inspectorUrl);
 
-    // 5. Create inspector client
+    // 5. Create inspector client with test start handler
     inspector = new InspectorClient({
       url: inspectorUrl,
       connectionTimeout: this.inspectorTimeout,
       requestTimeout: this.inspectorTimeout,
+      handlers: {
+        onTestStart: (test) => {
+          // Relay test name to preload script via sync server
+          syncServer.sendTestStart(test.fullName);
+        },
+      },
     });
 
     // 6. Connect inspector client and enable test reporting
@@ -326,32 +369,24 @@ export class BunTestRunner implements TestRunner {
       await cleanupCoverageFile(this.coverageFilePath);
     }
 
-    // 15. Map coverage to inspector IDs
-    let finalMutantCoverage = mutantCoverage;
-    if (mutantCoverage && executionOrder.length > 0) {
-      // Create a map from the testHierarchy array
-      const testMap = new Map<number, TestInfo>();
-      for (const test of testHierarchy) {
-        testMap.set(test.id, test);
-      }
-
-      finalMutantCoverage = mapCoverageToInspectorIds(
-        mutantCoverage,
-        executionOrder,
-        testMap
-      );
-      this.logger.debug('Mapped coverage from %d counter IDs to %d inspector test names',
-        Object.keys(mutantCoverage.perTest).length,
-        Object.keys(finalMutantCoverage.perTest).length);
+    // 14a. Remap coverage from counter-based IDs (test-1, test-2) to full test names
+    if (mutantCoverage) {
+      const testMap = new Map(testHierarchy.map(t => [t.id, t]));
+      mutantCoverage = mapCoverageToInspectorIds(mutantCoverage, executionOrder, testMap);
     }
 
-    // 16. Build test results from inspector data
+    // 15. Build test results from inspector data
     const tests = this.buildTestsFromInspector(testHierarchy, executionOrder, parsed, totalElapsedMs);
+
+    // Sort tests by name to ensure consistent order across runs
+    // This is critical for Stryker's incremental mode - test IDs are assigned
+    // based on order, so inconsistent order breaks coveredBy correlation
+    tests.sort((a, b) => a.name.localeCompare(b.name));
 
     return {
       status: DryRunStatus.Complete,
       tests,
-      mutantCoverage: finalMutantCoverage,
+      mutantCoverage,
     };
   }
 
@@ -401,7 +436,7 @@ export class BunTestRunner implements TestRunner {
     if (result.exitCode !== 0) {
       const killedBy = parsed.tests
         .filter((test) => test.status === 'failed')
-        .map((test) => test.name);
+        .map((test) => stripFilePrefix(test.name));
 
       return {
         status: MutantRunStatus.Killed,
