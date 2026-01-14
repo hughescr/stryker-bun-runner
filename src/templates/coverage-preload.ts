@@ -12,6 +12,21 @@ interface CoverageFileData {
     'static': string[]
 }
 
+interface StrykerGlobal {
+    __stryker__?: {
+        mutantCoverage?: {
+            'static': Record<string, number>
+            perTest:  Record<string, Record<string, number>>
+        }
+        currentTestId?: string
+        activeMutant?:  string
+    }
+    __mutantCoverage__?: {
+        'static': Record<string, number>
+        perTest:  Record<string, Record<string, number>>
+    }
+}
+
 // Get environment variables
 const syncPort = process.env.__STRYKER_SYNC_PORT__;
 const coverageFile = process.env.__STRYKER_COVERAGE_FILE__;
@@ -25,11 +40,13 @@ const shouldCollectCoverage = !activeMutant && !!coverageFile;
 // ============================================================================
 let ws: WebSocket | null = null;
 
+// Track test counter and WebSocket-provided names (only needed when collecting coverage)
+let testCounter = 0;
+const counterToName = new Map<string, string>();
+let pendingTestName: string | undefined;
+
 if(shouldCollectCoverage) {
-    // Track test counter and WebSocket-provided names (only needed when collecting coverage)
-    var testCounter = 0;
-    var counterToName = new Map<string, string>();
-    var pendingTestName: string | undefined;
+    // Coverage collection will use these variables
 }
 
 if(syncPort && shouldCollectCoverage) {
@@ -37,16 +54,16 @@ if(syncPort && shouldCollectCoverage) {
         ws = new WebSocket(`ws://localhost:${syncPort}/sync`);
 
         ws.onmessage = (event) => {
-            const data = event.data.toString();
+            const data = String(event.data);
             if(data === 'ready') {
                 // Initial ready signal - tests can start
                 return;
             }
             try {
-                const msg = JSON.parse(data);
+                const msg = JSON.parse(data) as { type?: string, name?: string };
                 if(msg.type === 'testStart' && msg.name) {
                     // Store the pending test name to be picked up by beforeEach
-                    pendingTestName = msg.name as string;
+                    pendingTestName = msg.name;
                 }
             } catch{
                 // Ignore parse errors
@@ -120,16 +137,17 @@ if(syncPort && shouldCollectCoverage) {
 // ============================================================================
 // Section 2: Initialize Stryker Namespace
 // ============================================================================
-const strykerGlobal = (globalThis as any).__stryker__ || ((globalThis as any).__stryker__ = {});
+const g = globalThis as unknown as StrykerGlobal;
+g.__stryker__ ??= { mutantCoverage: { 'static': {}, perTest: {} } };
+const strykerGlobal = g.__stryker__;
 
 // Initialize mutantCoverage structure (may already exist from instrumented code)
-if(!strykerGlobal.mutantCoverage) {
-    strykerGlobal.mutantCoverage = { 'static': {}, perTest: {} };
-}
+strykerGlobal.mutantCoverage ??= { 'static': {}, perTest: {} };
+const mutantCoverage = strykerGlobal.mutantCoverage;
 
 // CRITICAL: Stryker's ChildProcessTestRunnerWorker expects global.__mutantCoverage__
 // Set up a reference to the same object so both locations point to the same data
-(globalThis as any).__mutantCoverage__ = strykerGlobal.mutantCoverage;
+g.__mutantCoverage__ = mutantCoverage;
 
 // Set active mutant for mutant runs
 if(activeMutant) {
@@ -137,43 +155,7 @@ if(activeMutant) {
 }
 
 // ============================================================================
-// Section 3: Test Hooks (for per-test coverage tracking)
-// ============================================================================
-if(shouldCollectCoverage) {
-    beforeEach(() => {
-        testCounter++;
-        const counterId = `test-${testCounter}`;
-
-        // If we have a pending test name from WebSocket, use it
-        if(pendingTestName) {
-            counterToName.set(counterId, pendingTestName);
-            strykerGlobal.currentTestId = pendingTestName;
-            if(!strykerGlobal.mutantCoverage.perTest[pendingTestName]) {
-                strykerGlobal.mutantCoverage.perTest[pendingTestName] = {};
-            }
-            pendingTestName = undefined;
-        } else {
-            // Fallback to counter - will be remapped later
-            strykerGlobal.currentTestId = counterId;
-            if(!strykerGlobal.mutantCoverage.perTest[counterId]) {
-                strykerGlobal.mutantCoverage.perTest[counterId] = {};
-            }
-        }
-    });
-
-    afterEach(() => {
-    // Clear currentTestId so any subsequent code records to static
-        strykerGlobal.currentTestId = undefined;
-    });
-
-    afterAll(() => {
-        ws?.close();
-        writeCoverageData();
-    });
-}
-
-// ============================================================================
-// Section 4: Coverage Writing Logic
+// Section 3: Coverage Writing Logic
 // ============================================================================
 
 // Shared coverage writing logic
@@ -190,13 +172,13 @@ const writeCoverageData = () => {
     // Convert from Record<string, number> to string[] format
     // Remap counter IDs to test names using the mapping
     const perTest: Record<string, string[]> = {};
-    for(const [testId, coverage] of Object.entries(mutantCoverage.perTest || {})) {
+    for(const [testId, coverage] of Object.entries(mutantCoverage.perTest ?? {})) {
     // Check if this is a counter ID that needs remapping
-        const actualName = counterToName.get(testId) || testId;
-        perTest[actualName] = Object.keys(coverage as Record<string, number>);
+        const actualName = counterToName.get(testId) ?? testId;
+        perTest[actualName] = Object.keys(coverage);
     }
 
-    const staticCoverage = Object.keys(mutantCoverage.static || {});
+    const staticCoverage = Object.keys(mutantCoverage.static ?? {});
 
     const data: CoverageFileData = {
         perTest,
@@ -204,8 +186,41 @@ const writeCoverageData = () => {
     };
 
     try {
+        // eslint-disable-next-line n/no-sync -- sync required in afterAll hook to ensure write completes before process exit
         appendFileSync(coverageFile, JSON.stringify(data) + '\n', 'utf-8');
     } catch (error) {
         console.error('[Stryker Coverage] Failed to write coverage:', error);
     }
 };
+
+// ============================================================================
+// Section 4: Test Hooks (for per-test coverage tracking)
+// ============================================================================
+if(shouldCollectCoverage) {
+    beforeEach(() => {
+        testCounter++;
+        const counterId = `test-${testCounter}`;
+
+        // If we have a pending test name from WebSocket, use it
+        if(pendingTestName) {
+            counterToName.set(counterId, pendingTestName);
+            strykerGlobal.currentTestId = pendingTestName;
+            mutantCoverage.perTest[pendingTestName] ??= {};
+            pendingTestName = undefined;
+        } else {
+            // Fallback to counter - will be remapped later
+            strykerGlobal.currentTestId = counterId;
+            mutantCoverage.perTest[counterId] ??= {};
+        }
+    });
+
+    afterEach(() => {
+    // Clear currentTestId so any subsequent code records to static
+        strykerGlobal.currentTestId = undefined;
+    });
+
+    afterAll(() => {
+        ws?.close();
+        writeCoverageData();
+    });
+}

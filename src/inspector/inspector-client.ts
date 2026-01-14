@@ -166,7 +166,7 @@ export class InspectorClient {
             });
 
             ws.addEventListener('message', (event) => {
-                this.handleMessage(event.data);
+                this.handleMessage(event.data as string);
             });
         });
     }
@@ -179,7 +179,8 @@ export class InspectorClient {
    * @throws {InspectorTimeoutError} if request times out
    */
     async send(method: string, params?: unknown): Promise<unknown> {
-        if(this.ws?.readyState !== WebSocket.OPEN) {
+        // eslint-disable-next-line @typescript-eslint/prefer-optional-chain -- optional chain doesn't work here because null?.readyState === undefined, not !== OPEN
+        if(!this.ws || this.ws.readyState !== WebSocket.OPEN) {
             throw new InspectorConnectionError('WebSocket not connected');
         }
 
@@ -199,7 +200,7 @@ export class InspectorClient {
             } catch (error) {
                 this.pendingRequests.delete(id);
                 clearTimeout(timer);
-                reject(error);
+                reject(error instanceof Error ? error : new Error(String(error)));
             }
         });
     }
@@ -257,7 +258,7 @@ export class InspectorClient {
    */
     private handleMessage(data: string | Buffer): void {
         try {
-            const message: InspectorMessage = JSON.parse(data.toString());
+            const message = JSON.parse(data.toString()) as InspectorMessage;
 
             // Handle response to a request
             if(message.id !== undefined) {

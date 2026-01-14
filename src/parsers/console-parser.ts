@@ -21,6 +21,187 @@ export interface ParsedTestResults {
 }
 
 /**
+ * Parse file path from line
+ */
+function parseFilePath(line: string): string | null {
+    // Match file header: tests/example.test.ts: or src/foo.test.tsx:
+    // Ensure it only matches valid file paths (no line numbers, pipes, or comment markers)
+    const fileMatch = /^([\w./-]+\.(?:test|spec)\.(?:ts|tsx|js|jsx|mts|mjs)):$/.exec(line);
+    return fileMatch ? fileMatch[1] : null;
+}
+
+interface TestLineParseResult {
+    test?:                   TestResult
+    startedCollectingError?: boolean
+}
+
+/**
+ * Parse individual test result line
+ */
+function parseTestLine(line: string, currentFile: string | undefined): TestLineParseResult {
+    // Match test results: ✓ test name [0.12ms]
+    // eslint-disable-next-line regexp/no-super-linear-backtracking -- bounded line input
+    const passMatch = /^✓ +(.+) \[([0-9.]+)ms\]$/.exec(line);
+    if(passMatch) {
+        const testName = passMatch[1].trim();
+        const fullName = currentFile ? `${currentFile} > ${testName}` : testName;
+        return {
+            test: {
+                name:     fullName,
+                file:     currentFile,
+                status:   'passed',
+                duration: parseFloat(passMatch[2])
+            }
+        };
+    }
+
+    // Match failed tests: ✗ test name [0.05ms] (timing is optional)
+    // eslint-disable-next-line regexp/no-super-linear-backtracking -- bounded line input
+    const failMatch = /^✗ +(.+?)(?: \[([0-9.]+)ms\])?$/.exec(line);
+    if(failMatch) {
+        const testName = failMatch[1].trim();
+        const fullName = currentFile ? `${currentFile} > ${testName}` : testName;
+        return {
+            test: {
+                name:     fullName,
+                file:     currentFile,
+                status:   'failed',
+                duration: failMatch[2] ? parseFloat(failMatch[2]) : undefined
+            },
+            startedCollectingError: true
+        };
+    }
+
+    // Match failed tests in bail mode: (fail) test name [0.05ms] (timing is optional)
+    // eslint-disable-next-line regexp/no-super-linear-backtracking -- bounded line input
+    const bailFailMatch = /^\(fail\) +(.+?)(?: \[([0-9.]+)ms\])?$/.exec(line);
+    if(bailFailMatch) {
+        const testName = bailFailMatch[1].trim();
+        const fullName = currentFile ? `${currentFile} > ${testName}` : testName;
+        return {
+            test: {
+                name:     fullName,
+                file:     currentFile,
+                status:   'failed',
+                duration: bailFailMatch[2] ? parseFloat(bailFailMatch[2]) : undefined
+            },
+            startedCollectingError: true
+        };
+    }
+
+    // Match skipped tests: ⏭ test name
+    // eslint-disable-next-line regexp/no-super-linear-backtracking -- bounded line input
+    const skipMatch = /^⏭ +(.+)$/.exec(line);
+    if(skipMatch) {
+        const testName = skipMatch[1].trim();
+        const fullName = currentFile ? `${currentFile} > ${testName}` : testName;
+        return {
+            test: {
+                name:   fullName,
+                file:   currentFile,
+                status: 'skipped'
+            }
+        };
+    }
+
+    return {};
+}
+
+/**
+ * Finalize error message for current test
+ */
+function finalizeErrorMessage(currentTest: TestResult | null, errorLines: string[]): void {
+    if(currentTest && errorLines.length > 0) {
+        currentTest.failureMessage = errorLines.join('\n').trim();
+    }
+}
+
+/**
+ * Check if line should be collected as error message
+ */
+function shouldCollectErrorLine(line: string): boolean {
+    if(!line.trim()) {
+        return false;
+    }
+    // Skip summary lines
+    return !(/^\s*\d+\s+(?:pass|fail|skip)/.exec(line));
+}
+
+interface TestCounters {
+    passed:  number
+    failed:  number
+    skipped: number
+}
+
+/**
+ * Update test counters based on test status
+ */
+function updateCounters(test: TestResult, counters: TestCounters, parseResult: TestLineParseResult): boolean {
+    if(test.status === 'passed') {
+        counters.passed++;
+        return false; // not collecting error
+    } else if(test.status === 'failed') {
+        counters.failed++;
+        return parseResult.startedCollectingError ?? false;
+    } else if(test.status === 'skipped') {
+        counters.skipped++;
+        return false; // not collecting error
+    }
+    return false;
+}
+
+interface SummaryCounts {
+    passed:  number
+    failed:  number
+    skipped: number
+}
+
+/**
+ * Parse summary lines from output
+ */
+function parseSummaryLines(output: string): SummaryCounts {
+    const counts = { passed: 0, failed: 0, skipped: 0 };
+
+    // Match summary lines with flexible whitespace handling
+    // Bun outputs lines like: " 2840 pass" or " 10 fail"
+    // Or in bail mode: "Bailed out after 1 failure"
+    const passSummary = /\s(\d+)\s+pass\b/.exec(output);
+    const failSummary = /\s(\d+)\s+fail\b/.exec(output);
+    const skipSummary = /\s(\d+)\s+skip\b/.exec(output);
+    const bailSummary = /Bailed out after (\d+) failures?/.exec(output);
+
+    if(passSummary) {
+        counts.passed = parseInt(passSummary[1], 10);
+    }
+
+    if(failSummary) {
+        counts.failed = parseInt(failSummary[1], 10);
+    }
+
+    if(skipSummary) {
+        counts.skipped = parseInt(skipSummary[1], 10);
+    }
+
+    if(bailSummary) {
+        counts.failed = Math.max(counts.failed, parseInt(bailSummary[1], 10));
+    }
+
+    // Also try to parse from "Ran N tests" line as ultimate fallback
+    const ranTestsSummary = /Ran\s+(\d+)\s+tests?/.exec(output);
+    if(ranTestsSummary) {
+        const totalFromRan = parseInt(ranTestsSummary[1], 10);
+        // Use this as source of truth for total, and derive passed if needed
+        const totalParsed = counts.passed + counts.failed + counts.skipped;
+        if(totalParsed !== totalFromRan && counts.passed === 0 && counts.failed === 0) {
+            // No individual counts parsed, assume all passed
+            counts.passed = totalFromRan;
+        }
+    }
+
+    return counts;
+}
+
+/**
  * Parse Bun test console output
  *
  * Example Bun output:
@@ -41,9 +222,7 @@ export interface ParsedTestResults {
  */
 export function parseBunTestOutput(stdout: string, stderr: string): ParsedTestResults {
     const tests: TestResult[] = [];
-    let passed = 0;
-    let failed = 0;
-    let skipped = 0;
+    const counters: TestCounters = { passed: 0, failed: 0, skipped: 0 };
 
     // Combine stdout and stderr for parsing
     const output = stdout + '\n' + stderr;
@@ -54,175 +233,53 @@ export function parseBunTestOutput(stdout: string, stderr: string): ParsedTestRe
     let errorLines: string[] = [];
     let currentFile: string | undefined;
 
-    for(let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-
-        // Match file header: tests/example.test.ts: or src/foo.test.tsx:
-        // Ensure it only matches valid file paths (no line numbers, pipes, or comment markers)
-        const fileMatch = /^([\w./-]+\.(?:test|spec)\.(?:ts|tsx|js|jsx|mts|mjs)):$/.exec(line);
-        if(fileMatch) {
-            currentFile = fileMatch[1];
+    for(const line of lines) {
+        // Check if line is a file path
+        const filePath = parseFilePath(line);
+        if(filePath) {
+            currentFile = filePath;
             continue;
         }
 
-        // Match test results: ✓ test name [0.12ms]
-        const passMatch = /^✓\s+(.+?)\s+\[([0-9.]+)ms\]$/.exec(line);
-        if(passMatch) {
+        // Try to parse as a test result line
+        const parseResult = parseTestLine(line, currentFile);
+        if(parseResult.test) {
+            // Finalize previous test's error message if needed
             if(currentTest && collectingError) {
-                currentTest.failureMessage = errorLines.join('\n').trim();
-                errorLines = [];
-                collectingError = false;
-            }
-
-            const testName = passMatch[1].trim();
-            const fullName = currentFile ? `${currentFile} > ${testName}` : testName;
-
-            currentTest = {
-                name:     fullName,
-                file:     currentFile,
-                status:   'passed',
-                duration: parseFloat(passMatch[2])
-            };
-            tests.push(currentTest);
-            passed++;
-            continue;
-        }
-
-        // Match failed tests: ✗ test name [0.05ms]
-        const failMatch = /^✗\s+(.+?)(?:\s+\[([0-9.]+)ms\])?$/.exec(line);
-        if(failMatch) {
-            if(currentTest && collectingError) {
-                currentTest.failureMessage = errorLines.join('\n').trim();
+                finalizeErrorMessage(currentTest, errorLines);
                 errorLines = [];
             }
 
-            const testName = failMatch[1].trim();
-            const fullName = currentFile ? `${currentFile} > ${testName}` : testName;
-
-            currentTest = {
-                name:     fullName,
-                file:     currentFile,
-                status:   'failed',
-                duration: failMatch[2] ? parseFloat(failMatch[2]) : undefined
-            };
+            currentTest = parseResult.test;
             tests.push(currentTest);
-            failed++;
-            collectingError = true;
-            continue;
-        }
 
-        // Match failed tests in bail mode: (fail) test name [0.05ms]
-        const bailFailMatch = /^\(fail\)\s+(.+?)(?:\s+\[([0-9.]+)ms\])?$/.exec(line);
-        if(bailFailMatch) {
-            if(currentTest && collectingError) {
-                currentTest.failureMessage = errorLines.join('\n').trim();
-                errorLines = [];
-            }
-
-            const testName = bailFailMatch[1].trim();
-            const fullName = currentFile ? `${currentFile} > ${testName}` : testName;
-
-            currentTest = {
-                name:     fullName,
-                file:     currentFile,
-                status:   'failed',
-                duration: bailFailMatch[2] ? parseFloat(bailFailMatch[2]) : undefined
-            };
-            tests.push(currentTest);
-            failed++;
-            collectingError = true;
-            continue;
-        }
-
-        // Match skipped tests: ⏭ test name
-        const skipMatch = /^⏭\s+(.+)$/.exec(line);
-        if(skipMatch) {
-            if(currentTest && collectingError) {
-                currentTest.failureMessage = errorLines.join('\n').trim();
-                errorLines = [];
-                collectingError = false;
-            }
-
-            const testName = skipMatch[1].trim();
-            const fullName = currentFile ? `${currentFile} > ${testName}` : testName;
-
-            currentTest = {
-                name:   fullName,
-                file:   currentFile,
-                status: 'skipped'
-            };
-            tests.push(currentTest);
-            skipped++;
+            // Update counters based on test status
+            collectingError = updateCounters(currentTest, counters, parseResult);
             continue;
         }
 
         // Collect error messages for failed tests
-        if(collectingError && currentTest && line.trim()) {
-            // Skip summary lines
-            if(!(/^\s*\d+\s+(pass|fail|skip)/.exec(line))) {
-                errorLines.push(line);
-            }
+        if(collectingError && currentTest && shouldCollectErrorLine(line)) {
+            errorLines.push(line);
         }
     }
 
     // Finalize last test's error message if any
-    if(currentTest && collectingError && errorLines.length > 0) {
-        currentTest.failureMessage = errorLines.join('\n').trim();
+    if(currentTest && collectingError) {
+        finalizeErrorMessage(currentTest, errorLines);
     }
 
-    // Try to parse summary for totals (fallback if individual tests not parsed correctly)
-    // Summary format:
-    //  N pass
-    //  M fail  (may be missing if 0)
-    //  K skip  (may be missing if 0)
-    //  P expect() calls
-    // Ran N tests across M files. [123.00ms]
-
-    // Match summary lines with flexible whitespace handling
-    // Bun outputs lines like: " 2840 pass" or " 10 fail"
-    // Or in bail mode: "Bailed out after 1 failure"
-    const passSummary = /\s(\d+)\s+pass\b/.exec(output);
-    const failSummary = /\s(\d+)\s+fail\b/.exec(output);
-    const skipSummary = /\s(\d+)\s+skip\b/.exec(output);
-    const bailSummary = /Bailed out after (\d+) failures?/.exec(output);
-
-    if(passSummary) {
-        const passCount = parseInt(passSummary[1], 10);
-        passed = Math.max(passed, passCount);
-    }
-
-    if(failSummary) {
-        const failCount = parseInt(failSummary[1], 10);
-        failed = Math.max(failed, failCount);
-    }
-
-    if(skipSummary) {
-        const skipCount = parseInt(skipSummary[1], 10);
-        skipped = Math.max(skipped, skipCount);
-    }
-
-    if(bailSummary) {
-        const bailFailCount = parseInt(bailSummary[1], 10);
-        failed = Math.max(failed, bailFailCount);
-    }
-
-    // Also try to parse from "Ran N tests" line as ultimate fallback
-    const ranTestsSummary = /Ran\s+(\d+)\s+tests?/.exec(output);
-    if(ranTestsSummary) {
-        const totalFromRan = parseInt(ranTestsSummary[1], 10);
-        // Use this as source of truth for total, and derive passed if needed
-        const totalParsed = passed + failed + skipped;
-        if(totalParsed !== totalFromRan && passed === 0 && failed === 0) {
-            // No individual counts parsed, assume all passed
-            passed = totalFromRan;
-        }
-    }
+    // Parse summary lines and use them as fallback for counts
+    const summaryCounts = parseSummaryLines(output);
+    counters.passed = Math.max(counters.passed, summaryCounts.passed);
+    counters.failed = Math.max(counters.failed, summaryCounts.failed);
+    counters.skipped = Math.max(counters.skipped, summaryCounts.skipped);
 
     return {
         tests,
-        totalTests: passed + failed + skipped,
-        passed,
-        failed,
-        skipped
+        totalTests: counters.passed + counters.failed + counters.skipped,
+        passed:     counters.passed,
+        failed:     counters.failed,
+        skipped:    counters.skipped
     };
 }

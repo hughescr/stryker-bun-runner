@@ -177,7 +177,7 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
 
         // Collect stdout silently - don't forward to parent to avoid interfering with Stryker's progress reporter
         if(childProcess.stdout) {
-            childProcess.stdout.on('data', (data) => {
+            childProcess.stdout.on('data', (data: Buffer) => {
                 stdoutChunks.push(data);
             });
         }
@@ -185,7 +185,7 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
         // Collect stderr and watch for inspector WebSocket URL
         let inspectorUrlExtracted = false;
         if(childProcess.stderr) {
-            childProcess.stderr.on('data', (data) => {
+            childProcess.stderr.on('data', (data: Buffer) => {
                 stderrChunks.push(data);
 
                 // If inspector is enabled, parse stderr for WebSocket URL

@@ -46,7 +46,9 @@ import type { TestInfo } from './inspector/types.js';
  * Output: tests/unit/foo.test.ts
  */
 function normalizeTestFilePath(url: string | undefined): string | undefined {
-    if(!url) { return undefined; }
+    if(!url) {
+        return undefined;
+    }
 
     // Look for .stryker-tmp/sandbox-XXXXX/ pattern and extract path after it
     const sandboxMatch = /\.stryker-tmp\/sandbox-[^/]+\/(.+)$/.exec(url);
@@ -70,7 +72,7 @@ function normalizeTestFilePath(url: string | undefined): string | undefined {
 function stripFilePrefix(testName: string): string {
     // Pattern: "path/to/file.test.ts > " or "path/to/file.spec.ts > " at the start
     // Strip everything up to and including the first " > " if it looks like a file path
-    const match = /^[^\s>]+\.(?:test|spec)\.[jt]sx?\s+>\s+(.+)$/.exec(testName);
+    const match = /^[^\s>]+\.(?:test|spec)\.[jt]sx? > (.+)$/.exec(testName);
     return match ? match[1] : testName;
 }
 
@@ -252,10 +254,11 @@ export class BunTestRunner implements TestRunner {
             await syncServer.start();
             this.logger.debug('Sync server started on port %d', syncPort);
         } catch (error) {
-            this.logger.error('Failed to start sync server: %s', error);
+            const errorMsg = error instanceof Error ? error.message : String(error);
+            this.logger.error('Failed to start sync server: %s', errorMsg);
             return {
                 status:       DryRunStatus.Error,
-                errorMessage: `Failed to start sync server: ${error}`,
+                errorMessage: `Failed to start sync server: ${errorMsg}`,
             };
         }
 
@@ -282,6 +285,7 @@ export class BunTestRunner implements TestRunner {
 
         // 4. Wait for inspector URL with timeout
         const waitStart = Date.now();
+        // eslint-disable-next-line no-unmodified-loop-condition -- modified by async callback in runBunTests
         while(!inspectorUrl && Date.now() - waitStart < this.inspectorTimeout) {
             await new Promise(resolve => setTimeout(resolve, 50));
         }
@@ -316,12 +320,13 @@ export class BunTestRunner implements TestRunner {
             await inspector.send('TestReporter.enable', {});
             this.logger.debug('Inspector connected and TestReporter enabled');
         } catch (error) {
-            this.logger.error('Failed to connect inspector: %s', error);
+            const errorMsg = error instanceof Error ? error.message : String(error);
+            this.logger.error('Failed to connect inspector: %s', errorMsg);
             await inspector.close();
             await syncServer.close();
             return {
                 status:       DryRunStatus.Error,
-                errorMessage: `Failed to connect to Bun inspector: ${error}`,
+                errorMessage: `Failed to connect to Bun inspector: ${errorMsg}`,
             };
         }
 

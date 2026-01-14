@@ -81,7 +81,7 @@ export class SyncServer {
                     resolve();
                 });
             } catch (error) {
-                reject(error);
+                reject(error instanceof Error ? error : new Error(String(error)));
             }
         });
     }
@@ -95,7 +95,7 @@ export class SyncServer {
                 if(client.readyState === WebSocket.OPEN) {
                     client.send('ready');
                 }
-            } catch (error) {
+            } catch{
                 // Ignore send errors - client may have disconnected
             }
         }
@@ -111,7 +111,7 @@ export class SyncServer {
                 if(client.readyState === WebSocket.OPEN) {
                     client.send(message);
                 }
-            } catch (error) {
+            } catch{
                 // Ignore send errors - client may have disconnected
             }
         }
