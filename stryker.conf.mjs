@@ -24,7 +24,7 @@ export default {
     bun:              { bunPath: 'bun-25986' },
     ...(isCI && {
         dashboard: {
-            project: 'hughescr/isambard',
+            project: 'hughescr/stryker-bun-runner',
             module:  'default',
             version: process.env.GITHUB_SHA,
         },
