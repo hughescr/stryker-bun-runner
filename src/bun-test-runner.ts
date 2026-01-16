@@ -163,7 +163,7 @@ export class BunTestRunner implements TestRunner {
                         status:         TestStatus.Failed,
                         // Stryker disable next-line StringLiteral: fallback error message has no behavioral impact
                         failureMessage: t.failureMessage ?? 'Test failed',
-                        timeSpentMs:    t.duration ?? 1,
+                        timeSpentMs:    Math.round(t.duration ?? 1),
                     } satisfies FailedTestResult;
                 }
                 if(t.status === 'skipped') {
@@ -171,21 +171,21 @@ export class BunTestRunner implements TestRunner {
                         id:          t.name,
                         name:        t.name,
                         status:      TestStatus.Skipped,
-                        timeSpentMs: t.duration ?? 1,
+                        timeSpentMs: Math.round(t.duration ?? 1),
                     } satisfies SkippedTestResult;
                 }
                 return {
                     id:          t.name,
                     name:        t.name,
                     status:      TestStatus.Success,
-                    timeSpentMs: t.duration ?? 1,
+                    timeSpentMs: Math.round(t.duration ?? 1),
                 } satisfies SuccessTestResult;
             });
         }
 
         // Stryker disable next-line EqualityOperator, ConditionalExpression: >= 0 is equivalent to .length check; true is equivalent when array has elements
         const timePerTest = executionOrder.length > 0
-            ? Math.max(1, Math.floor(totalElapsedMs / executionOrder.length))
+            ? Math.max(1, Math.round(totalElapsedMs / executionOrder.length))
             : 1;
 
         // Create a map for quick lookup
@@ -207,7 +207,9 @@ export class BunTestRunner implements TestRunner {
 
             const fullName = testInfo.fullName;
             const status = testInfo.status;
-            const elapsed = testInfo.elapsed ?? timePerTest;
+            const elapsed = testInfo.elapsed !== undefined
+                ? Math.round(testInfo.elapsed / 1_000_000)  // Convert nanoseconds to milliseconds and round
+                : timePerTest;                               // Already in milliseconds
 
             if(status === 'fail') {
                 // Find failure message from parsed output

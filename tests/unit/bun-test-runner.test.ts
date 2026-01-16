@@ -532,12 +532,12 @@ tests/example.test.ts:
                 const passingTest = result.tests.find(t => t.name === 'tests/example.test.ts > passing test');
                 expect(passingTest).toBeDefined();
                 expect(passingTest?.status).toBe(TestStatus.Success);
-                expect(passingTest?.timeSpentMs).toBe(0.12);
+                expect(passingTest?.timeSpentMs).toBe(0);  // 0.12ms rounds to 0
 
                 const failingTest = result.tests.find(t => t.name === 'tests/example.test.ts > failing test');
                 expect(failingTest).toBeDefined();
                 expect(failingTest?.status).toBe(TestStatus.Failed);
-                expect(failingTest?.timeSpentMs).toBe(0.05);
+                expect(failingTest?.timeSpentMs).toBe(0);  // 0.05ms rounds to 0
 
                 const skippedTest = result.tests.find(t => t.name === 'tests/example.test.ts > skipped test');
                 expect(skippedTest).toBeDefined();
@@ -2643,6 +2643,62 @@ error: Message 2
                     expect(result.tests[0].timeSpentMs).toBeLessThan(100);
                     expect(result.tests[1].timeSpentMs).toBeGreaterThanOrEqual(1);
                     expect(result.tests[1].timeSpentMs).toBeLessThan(100);
+                }
+            });
+
+            // Kill mutation #81: line 211 - ArithmeticOperator / to *
+            it('should convert elapsed nanoseconds to milliseconds correctly', async () => {
+                mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+                    if(options.onInspectorReady) {
+                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({
+                        exitCode: 0,
+                        stdout:   '✓ test1 [5.00ms]\n✓ test2 [10.00ms]\n 2 pass',
+                        stderr:   '',
+                        timedOut: false,
+                    });
+                });
+                mockCollectCoverage.mockResolvedValue(undefined);
+
+                // Provide elapsed times in nanoseconds (as per TestInfo interface)
+                // 5_000_000 ns = 5 ms
+                // 10_000_000 ns = 10 ms
+                const testHierarchy: TestInfo[] = [
+                    {
+                        id:       1,
+                        name:     'test1',
+                        fullName: 'test1',
+                        type:     'test',
+                        status:   'pass',
+                        elapsed:  5_000_000,  // 5 million nanoseconds = 5ms
+                    },
+                    {
+                        id:       2,
+                        name:     'test2',
+                        fullName: 'test2',
+                        type:     'test',
+                        status:   'pass',
+                        elapsed:  10_000_000, // 10 million nanoseconds = 10ms
+                    },
+                ];
+                mockInspectorClient.getTests.mockReturnValue(testHierarchy);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([1, 2]);
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                const result = await runner.dryRun();
+
+                expect(result.status).toBe(DryRunStatus.Complete);
+                if(result.status === DryRunStatus.Complete) {
+                    // Correct conversion: 5_000_000 / 1_000_000 = 5ms
+                    // Mutation would produce: 5_000_000 * 1_000_000 = 5_000_000_000_000ms (absurdly large)
+                    expect(result.tests[0].timeSpentMs).toBe(5);
+                    expect(result.tests[1].timeSpentMs).toBe(10);
                 }
             });
         });

@@ -71,7 +71,7 @@ export interface TestReporterEndEvent {
     id:      number
     /** Final status of the test */
     status:  TestStatus
-    /** Execution time in milliseconds */
+    /** Execution time in nanoseconds (Bun uses nanosecond precision) */
     elapsed: number
     /** Error information if the test failed */
     error?: {
@@ -101,7 +101,7 @@ export interface TestInfo {
     line?:     number
     /** Current status (undefined if not started) */
     status?:   TestStatus
-    /** Execution time in milliseconds (undefined if not completed) */
+    /** Execution time in nanoseconds (undefined if not completed) */
     elapsed?:  number
     /** Error information if the test failed */
     error?: {
