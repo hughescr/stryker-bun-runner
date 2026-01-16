@@ -58,6 +58,27 @@ describe('generatePreloadScript', () => {
     });
 
     describe('template reading and copying', () => {
+        it('should replace __PRELOAD_LOGIC_PATH__ placeholder with actual path - line 47 mutation', async () => {
+            // Kills mutation on line 47: StringLiteral path change
+            // The template placeholder must be replaced with the correct preload-logic.js path
+            const templateContent = 'import * as logic from "__PRELOAD_LOGIC_PATH__";\n// rest of template';
+            mockReadFile.mockResolvedValue(templateContent);
+
+            await generatePreloadScript({ tempDir, coverageFile });
+
+            // Verify the placeholder was replaced with actual path
+            expect(mockWriteFile).toHaveBeenCalled();
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing mock call data
+            const [, writtenContent] = mockWriteFile.mock.calls[0];
+
+            // The placeholder should be REPLACED, not present in output
+            expect(writtenContent).not.toContain('__PRELOAD_LOGIC_PATH__');
+
+            // The actual path should be present and point to preload-logic.js
+            expect(writtenContent).toContain('preload-logic.js');
+            expect(writtenContent).toContain('coverage/preload-logic.js');
+        });
+
         it('should read template from templates directory', async () => {
             const templateContent = '// preload template';
             mockReadFile.mockResolvedValue(templateContent);

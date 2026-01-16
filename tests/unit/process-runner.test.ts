@@ -3,7 +3,7 @@
  * Tests the Bun process spawning and management utilities
  */
 
-import { describe, it, expect, beforeEach, afterEach, mock, spyOn } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, mock, spyOn, jest } from 'bun:test';
 import { runBunTests } from '../../src/process-runner.js';
 import type { ChildProcess } from 'node:child_process';
 import * as childProcess from 'node:child_process';
@@ -74,7 +74,7 @@ describe('runBunTests', () => {
             });
 
             // Wait a tick for spawn to be called
-            await new Promise(resolve => setTimeout(resolve, 10));
+            await Promise.resolve();
 
             // Simulate successful test run
             mockChildProcess.stdoutHandler?.(Buffer.from('test output'));
@@ -179,13 +179,15 @@ describe('runBunTests', () => {
 
     describe('timeout handling', () => {
         it('should timeout and kill process after timeout period', async () => {
+            jest.useFakeTimers();
+
             const resultPromise = runBunTests({
                 bunPath: 'bun',
                 timeout: 100, // Short timeout for testing
             });
 
-            // Wait for timeout to trigger
-            await new Promise(resolve => setTimeout(resolve, 150));
+            // Advance timers past the timeout
+            jest.advanceTimersByTime(150);
 
             // Simulate process close after kill
             mockChildProcess.closeHandler?.(null);
@@ -195,6 +197,8 @@ describe('runBunTests', () => {
             expect(result.timedOut).toBe(true);
             expect(result.exitCode).toBeNull();
             expect(mockChildProcess.kill).toHaveBeenCalledWith('SIGKILL');
+
+            jest.useRealTimers();
         });
 
         it('should not timeout if process completes in time', async () => {
@@ -269,6 +273,23 @@ describe('runBunTests', () => {
             const spawnOptions = spawnCall[2];
             // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing env property from mock options
             expect(spawnOptions.env.__STRYKER_COVERAGE_FILE__).toBe('/tmp/coverage.json');
+        });
+
+        it('should set __STRYKER_SYNC_PORT__ when syncPort is provided', async () => {
+            const resultPromise = runBunTests({
+                bunPath:  'bun',
+                timeout:  5000,
+                syncPort: 8080,
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const spawnCall = mockSpawn.mock.calls[0];
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing spawn options from mock
+            const spawnOptions = spawnCall[2];
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing env property from mock options
+            expect(spawnOptions.env.__STRYKER_SYNC_PORT__).toBe('8080');
         });
     });
 
@@ -380,6 +401,40 @@ describe('runBunTests', () => {
         });
     });
 
+    describe('sequentialMode option', () => {
+        it('should add --concurrency=1 flag when sequentialMode is true', async () => {
+            const resultPromise = runBunTests({
+                bunPath:        'bun',
+                timeout:        5000,
+                sequentialMode: true,
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const spawnCall = mockSpawn.mock.calls[0];
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing args from mock
+            const args = spawnCall[1];
+            expect(args).toContain('--concurrency=1');
+        });
+
+        it('should not add --concurrency flag when sequentialMode is false', async () => {
+            const resultPromise = runBunTests({
+                bunPath:        'bun',
+                timeout:        5000,
+                sequentialMode: false,
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const spawnCall = mockSpawn.mock.calls[0];
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing args from mock
+            const args = spawnCall[1];
+            expect(args).not.toContain('--concurrency=1');
+        });
+    });
+
     describe('noCoverage option', () => {
         it('should add --no-coverage flag when noCoverage is true', async () => {
             const resultPromise = runBunTests({
@@ -461,11 +516,73 @@ describe('runBunTests', () => {
         });
     });
 
+    describe('inspector debugging', () => {
+        it('should add --inspect flag when inspectWaitPort is specified', async () => {
+            const resultPromise = runBunTests({
+                bunPath:         'bun',
+                timeout:         5000,
+                inspectWaitPort: 9229,
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const spawnCall = mockSpawn.mock.calls[0];
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing args from mock
+            const args = spawnCall[1];
+            expect(args).toContain('--inspect=9229');
+        });
+
+        it('should call onInspectorReady when inspector URL is found in stderr', async () => {
+            // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
+            const onInspectorReady = mock(() => {});
+
+            const resultPromise = runBunTests({
+                bunPath:         'bun',
+                timeout:         5000,
+                inspectWaitPort: 9229,
+                onInspectorReady,
+            });
+
+            // Simulate Bun's inspector URL output in stderr
+            mockChildProcess.stderrHandler?.(Buffer.from('Debugger listening on:\nListening:\n  ws://localhost:9229/abc123def456\n'));
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            expect(onInspectorReady).toHaveBeenCalledWith('ws://localhost:9229/abc123def456');
+        });
+
+        it('should only extract inspector URL once even with multiple stderr chunks', async () => {
+            // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
+            const onInspectorReady = mock(() => {});
+
+            const resultPromise = runBunTests({
+                bunPath:         'bun',
+                timeout:         5000,
+                inspectWaitPort: 9229,
+                onInspectorReady,
+            });
+
+            // Simulate inspector URL in multiple chunks
+            mockChildProcess.stderrHandler?.(Buffer.from('Debugger listening on:\n'));
+            mockChildProcess.stderrHandler?.(Buffer.from('Listening:\n  ws://localhost:9229/session1\n'));
+            mockChildProcess.stderrHandler?.(Buffer.from('More stderr output\n'));
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            // Should be called exactly once
+            expect(onInspectorReady).toHaveBeenCalledTimes(1);
+            expect(onInspectorReady).toHaveBeenCalledWith('ws://localhost:9229/session1');
+        });
+    });
+
     describe('bunArgs mutation tests', () => {
         it('should not add bunArgs when array is empty', async () => {
-            // This test kills mutations on line 105: options.bunArgs.length > 0
-            // If the mutation changes > 0 to >= 0 or changes it to true,
-            // an empty array would incorrectly spread empty elements into args
+            // This test kills mutations on line 134: options.bunArgs.length > 0
+            // If the mutation changes > 0 to >= 0, empty array would pass the check
+            // but spreading empty array is harmless, so this may not kill that mutation
             const resultPromise = runBunTests({
                 bunPath: 'bun',
                 timeout: 5000,
@@ -483,8 +600,11 @@ describe('runBunTests', () => {
             expect(args).toEqual(['test', '--no-randomize']);
         });
 
-        it('should not add bunArgs when undefined', async () => {
-            // Test that undefined bunArgs doesn't add any extra arguments
+        it('should not add bunArgs when undefined - kills line 134 ConditionalExpression mutation', async () => {
+            // CRITICAL: This test kills the mutation on line 134: if(options.bunArgs && options.bunArgs.length > 0) → if(true)
+            // If mutated to if(true), the code would execute args.push(...options.bunArgs) with undefined bunArgs
+            // This would throw: "Cannot spread undefined" or similar error
+            // We expect this to NOT throw and work correctly
             const resultPromise = runBunTests({
                 bunPath: 'bun',
                 timeout: 5000,
@@ -498,7 +618,374 @@ describe('runBunTests', () => {
             // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing args from mock
             const args = spawnCall[1];
 
+            // Should work fine with no bunArgs added
             expect(args).toEqual(['test', '--no-randomize']);
+        });
+
+        it('should not crash when bunArgs is null - additional safety test', async () => {
+            // Additional test to ensure null is handled (not just undefined)
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+                bunArgs: null as unknown as string[] | undefined,
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const spawnCall = mockSpawn.mock.calls[0];
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing args from mock
+            const args = spawnCall[1];
+
+            expect(args).toEqual(['test', '--no-randomize']);
+        });
+    });
+
+    describe('conditional check mutation tests', () => {
+        it('should not add empty bunArgs array elements - line 134 mutation', async () => {
+            // Kills mutation on line 134: if(options.bunArgs && options.bunArgs.length > 0)
+            // If mutated to if(true), empty bunArgs would be spread incorrectly
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+                bunArgs: [], // Empty array should not add anything to args
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const spawnCall = mockSpawn.mock.calls[0];
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing args from mock
+            const args = spawnCall[1];
+
+            // Should only have 'test' and '--no-randomize', not any empty bunArgs
+            expect(args).toEqual(['test', '--no-randomize']);
+        });
+
+        it('should skip testNameFilter when not provided - line 145 mutation', async () => {
+            // Kills mutation on line 145: if(options.testNamePattern) → if(true)
+            // If mutated to always true, would crash trying to access undefined testNamePattern
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+                // testNamePattern intentionally not provided
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const spawnCall = mockSpawn.mock.calls[0];
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing args from mock
+            const args = spawnCall[1];
+
+            // Should not include --test-name-pattern flag
+            expect(args).not.toContain('--test-name-pattern');
+        });
+
+        it('should skip bail when not provided - line 150 mutation', async () => {
+            // Kills mutation on line 150: if(options.bail) → if(true)
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+                bail:    false, // Explicitly false
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const spawnCall = mockSpawn.mock.calls[0];
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing args from mock
+            const args = spawnCall[1];
+
+            // Should not include --bail flag
+            expect(args).not.toContain('--bail');
+        });
+
+        it('should skip noCoverage when not provided - line 155 mutation', async () => {
+            // Kills mutation on line 155: if(options.noCoverage) → if(true)
+            const resultPromise = runBunTests({
+                bunPath:    'bun',
+                timeout:    5000,
+                noCoverage: false, // Explicitly false
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const spawnCall = mockSpawn.mock.calls[0];
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing args from mock
+            const args = spawnCall[1];
+
+            // Should not include --no-coverage flag
+            expect(args).not.toContain('--no-coverage');
+        });
+
+        it('should skip onInspectorReady callback when not provided - line 179 mutation', async () => {
+            // Kills mutation on line 179: if(options.onInspectorReady) → if(true)
+            // If mutated to always true, would crash trying to call undefined callback
+            const resultPromise = runBunTests({
+                bunPath:         'bun',
+                timeout:         5000,
+                inspectWaitPort: 9229,
+                // onInspectorReady intentionally not provided
+            });
+
+            // Simulate inspector output
+            mockChildProcess.stderrHandler?.(Buffer.from('Listening:\n  ws://localhost:9229/abc123\n'));
+            mockChildProcess.closeHandler?.(0);
+
+            // Should not crash despite onInspectorReady being undefined
+            await expect(resultPromise).resolves.toBeDefined();
+        });
+
+        it('should only extract inspector URL when stderr contains expected pattern - line 187 mutation', async () => {
+            // Kills mutation on line 187: if(match) → if(true)
+            // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
+            const onInspectorReady = mock(() => {});
+
+            const resultPromise = runBunTests({
+                bunPath:         'bun',
+                timeout:         5000,
+                inspectWaitPort: 9229,
+                onInspectorReady,
+            });
+
+            // Send stderr that DOESN'T contain the inspector URL pattern
+            mockChildProcess.stderrHandler?.(Buffer.from('Some random stderr output\n'));
+            mockChildProcess.stderrHandler?.(Buffer.from('Error: something happened\n'));
+            mockChildProcess.closeHandler?.(0);
+
+            await resultPromise;
+
+            // Callback should NOT be called because pattern didn't match
+            expect(onInspectorReady).not.toHaveBeenCalled();
+        });
+
+        it('should not set __STRYKER_ACTIVE_MUTANT__ when activeMutant is undefined - line 145 mutation', async () => {
+            // Kills mutation on line 145: if(options.activeMutant) → if(true)
+            // If mutated to always true, would set env var to undefined
+            // Store original value from process.env before test
+            const originalValue = process.env.__STRYKER_ACTIVE_MUTANT__;
+
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+                // activeMutant intentionally not provided
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const spawnCall = mockSpawn.mock.calls[0];
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing spawn options from mock
+            const spawnOptions = spawnCall[2];
+
+            // Check that env matches process.env (not set to 'undefined' string)
+            // When running in Stryker, process.env has this set; when running normally it's undefined
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock spawn options
+            expect(spawnOptions.env.__STRYKER_ACTIVE_MUTANT__).toBe(originalValue);
+        });
+
+        it('should not set __STRYKER_COVERAGE_FILE__ when coverageFile is undefined - kills line 150 mutation', async () => {
+            // CRITICAL: Kills mutation on line 150: if(options.coverageFile) → if(true)
+            // If mutated to if(true), would execute: env.__STRYKER_COVERAGE_FILE__ = undefined
+            // This explicitly sets the property to undefined, which is observable
+
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+                // coverageFile intentionally not provided (undefined)
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const spawnCall = mockSpawn.mock.calls[0];
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing spawn options from mock
+            const spawnOptions = spawnCall[2];
+
+            // The mutation would set the property to undefined explicitly
+            // We check that the behavior matches: if process.env has it, we inherit it; if not, we don't set it
+            // This test will fail if the mutation makes it always execute the assignment
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment -- accessing mock spawn options
+            const actualValue = spawnOptions.env.__STRYKER_COVERAGE_FILE__;
+            const expectedValue = process.env.__STRYKER_COVERAGE_FILE__;
+
+            // Both should be undefined (not set) when coverageFile option is not provided
+            expect(actualValue).toBe(expectedValue);
+
+            // Additionally verify it's actually undefined, not the string 'undefined'
+            if(expectedValue === undefined) {
+                expect(actualValue).toBeUndefined();
+            }
+        });
+
+        it('should not set __STRYKER_SYNC_PORT__ when syncPort is undefined - line 155 mutation', async () => {
+            // Kills mutation on line 155: if(options.syncPort) → if(true)
+            // If mutated to always true, would set env var to string 'undefined'
+            // Store original value from process.env before test
+            const originalValue = process.env.__STRYKER_SYNC_PORT__;
+
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+                // syncPort intentionally not provided
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const spawnCall = mockSpawn.mock.calls[0];
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing spawn options from mock
+            const spawnOptions = spawnCall[2];
+
+            // Should match process.env value (could be undefined or inherited from parent)
+            // The key check: if mutation changes condition to if(true), it would set to string 'undefined'
+            // which would differ from originalValue (either undefined stays undefined correctly, or
+            // if Stryker set a value, it should remain that value, not become 'undefined')
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock spawn options
+            expect(spawnOptions.env.__STRYKER_SYNC_PORT__).toBe(originalValue);
+        });
+    });
+
+    describe('null stdout/stderr handling mutation tests', () => {
+        it('should handle null stdout gracefully - line 179 mutation', async () => {
+            // Kills mutation on line 179: if(childProcess.stdout) → if(true)
+            // If mutated to always true, would crash trying to call .on() on null stdout
+            // Create a child process with null stdout
+            const mockChildProcessNullStdout: MockChildProcess = {
+                stdout: null, // Explicitly null
+                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock child process with any-typed properties
+                stderr: {
+                    on: mock((event: string, handler: (data: Buffer) => void) => {
+                        if(event === 'data') {
+                            mockChildProcessNullStdout.stderrHandler = handler;
+                        }
+                    }),
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock child process with any-typed properties
+                } as any,
+                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- mock requires any-typed handler
+                on: mock((event: string, handler: (...args: any[]) => void) => {
+                    if(event === 'close') {
+                        mockChildProcessNullStdout.closeHandler = handler;
+                    } else if(event === 'error') {
+                        mockChildProcessNullStdout.errorHandler = handler;
+                    }
+                    return mockChildProcessNullStdout as ChildProcess;
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock child process with any-typed properties
+                }) as any,
+
+                kill: mock(() => true),
+            };
+
+            const mockSpawnNull = mock(() => mockChildProcessNullStdout);
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-argument -- mock implementation needs any type
+            spyOn(childProcess, 'spawn').mockImplementation(mockSpawnNull as any);
+
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+            });
+
+            // Only stderr data, no stdout
+            mockChildProcessNullStdout.stderrHandler?.(Buffer.from('stderr output\n'));
+            mockChildProcessNullStdout.closeHandler?.(0);
+
+            const result = await resultPromise;
+
+            // Should not crash and stdout should be empty
+            expect(result.stdout).toBe('');
+            expect(result.stderr).toBe('stderr output\n');
+            expect(result.exitCode).toBe(0);
+        });
+
+        it('should handle null stderr gracefully - line 187 mutation', async () => {
+            // Kills mutation on line 187: if(childProcess.stderr) → if(true)
+            // If mutated to always true, would crash trying to call .on() on null stderr
+            // Create a child process with null stderr
+            const mockChildProcessNullStderr: MockChildProcess = {
+                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock child process with any-typed properties
+                stdout: {
+                    on: mock((event: string, handler: (data: Buffer) => void) => {
+                        if(event === 'data') {
+                            mockChildProcessNullStderr.stdoutHandler = handler;
+                        }
+                    }),
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock child process with any-typed properties
+                } as any,
+                stderr: null, // Explicitly null
+                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- mock requires any-typed handler
+                on:     mock((event: string, handler: (...args: any[]) => void) => {
+                    if(event === 'close') {
+                        mockChildProcessNullStderr.closeHandler = handler;
+                    } else if(event === 'error') {
+                        mockChildProcessNullStderr.errorHandler = handler;
+                    }
+                    return mockChildProcessNullStderr as ChildProcess;
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock child process with any-typed properties
+                }) as any,
+
+                kill: mock(() => true),
+            };
+
+            const mockSpawnNull = mock(() => mockChildProcessNullStderr);
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-argument -- mock implementation needs any type
+            spyOn(childProcess, 'spawn').mockImplementation(mockSpawnNull as any);
+
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+            });
+
+            // Only stdout data, no stderr
+            mockChildProcessNullStderr.stdoutHandler?.(Buffer.from('stdout output\n'));
+            mockChildProcessNullStderr.closeHandler?.(0);
+
+            const result = await resultPromise;
+
+            // Should not crash and stderr should be empty
+            expect(result.stdout).toBe('stdout output\n');
+            expect(result.stderr).toBe('');
+            expect(result.exitCode).toBe(0);
+        });
+
+        it('should handle both stdout and stderr being null - comprehensive test', async () => {
+            // Test that both null stdout and null stderr are handled correctly
+            const mockChildProcessBothNull: MockChildProcess = {
+                stdout: null, // Explicitly null
+                stderr: null, // Explicitly null
+                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- mock requires any-typed handler
+                on:     mock((event: string, handler: (...args: any[]) => void) => {
+                    if(event === 'close') {
+                        mockChildProcessBothNull.closeHandler = handler;
+                    } else if(event === 'error') {
+                        mockChildProcessBothNull.errorHandler = handler;
+                    }
+                    return mockChildProcessBothNull as ChildProcess;
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock child process with any-typed properties
+                }) as any,
+
+                kill: mock(() => true),
+            };
+
+            const mockSpawnNull = mock(() => mockChildProcessBothNull);
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-argument -- mock implementation needs any type
+            spyOn(childProcess, 'spawn').mockImplementation(mockSpawnNull as any);
+
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+            });
+
+            // Process completes with no output
+            mockChildProcessBothNull.closeHandler?.(0);
+
+            const result = await resultPromise;
+
+            // Should not crash and both outputs should be empty
+            expect(result.stdout).toBe('');
+            expect(result.stderr).toBe('');
+            expect(result.exitCode).toBe(0);
         });
     });
 
@@ -508,13 +995,15 @@ describe('runBunTests', () => {
             // and line 165 (processKilled ? null : code)
             // If processKilled stays false or the ternary is mutated,
             // exitCode would incorrectly be the signal code instead of null
+            jest.useFakeTimers();
+
             const resultPromise = runBunTests({
                 bunPath: 'bun',
                 timeout: 100,
             });
 
-            // Wait for timeout to kill the process
-            await new Promise(resolve => setTimeout(resolve, 150));
+            // Advance timers past the timeout
+            jest.advanceTimersByTime(150);
 
             // Process was killed, close with no exit code (SIGKILL)
             mockChildProcess.closeHandler?.(null);
@@ -524,6 +1013,8 @@ describe('runBunTests', () => {
             // When process is killed by timeout, exitCode MUST be null
             expect(result.exitCode).toBeNull();
             expect(result.timedOut).toBe(true);
+
+            jest.useRealTimers();
         });
 
         it('should return actual exitCode when process exits normally', async () => {
@@ -547,13 +1038,15 @@ describe('runBunTests', () => {
             // This test specifically targets the mutation: processKilled = true → processKilled = false
             // Even if the close handler receives a non-null exit code (e.g., 143 for SIGTERM),
             // we should return null because processKilled should be true
+            jest.useFakeTimers();
+
             const resultPromise = runBunTests({
                 bunPath: 'bun',
                 timeout: 100,
             });
 
-            // Wait for timeout to kill the process
-            await new Promise(resolve => setTimeout(resolve, 150));
+            // Advance timers past the timeout
+            jest.advanceTimersByTime(150);
 
             // Close handler receives exit code 143 (typical for SIGTERM) instead of null
             // But we should still return null because processKilled was set to true
@@ -565,6 +1058,8 @@ describe('runBunTests', () => {
             // This proves processKilled flag is working correctly
             expect(result.exitCode).toBeNull();
             expect(result.timedOut).toBe(true);
+
+            jest.useRealTimers();
         });
     });
 });

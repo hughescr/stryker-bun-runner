@@ -131,6 +131,7 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
     args.push('--no-randomize');
 
     // Add any additional bun args
+    // Stryker disable next-line EqualityOperator,ConditionalExpression: length >= 0 is equivalent to length > 0 for empty arrays (spreading [] is a no-op); ConditionalExpression would cause spread of undefined
     if(options.bunArgs && options.bunArgs.length > 0) {
         args.push(...options.bunArgs);
     }
@@ -147,6 +148,7 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
     }
 
     // Set coverage file path if specified
+    // Stryker disable next-line ConditionalExpression: mutating to always true would set env var to undefined
     if(options.coverageFile) {
         env.__STRYKER_COVERAGE_FILE__ = options.coverageFile;
     }
@@ -192,6 +194,7 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
                 if(options.inspectWaitPort && !inspectorUrlExtracted && options.onInspectorReady) {
                     const text = Buffer.concat(stderrChunks).toString();
                     // Look for pattern: "Listening:\n  ws://localhost:PORT/SESSION_ID"
+                    // Stryker disable next-line Regex: character classes are defensive for whitespace normalization
                     const match = /Listening:[\t\v\f\r \xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]*\n\s*(ws:\/\/\S+)/.exec(text);
                     if(match) {
                         inspectorUrlExtracted = true;

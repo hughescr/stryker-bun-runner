@@ -1,26 +1,25 @@
 /**
  * Coverage preload script
  * This script is loaded before tests run to collect mutation coverage data
+ * Note: This is a template file with a placeholder import that gets replaced at runtime
  */
 
-import { appendFileSync } from 'node:fs';
 import { beforeEach, afterEach, afterAll } from 'bun:test';
-
-// Define the coverage data type inline (avoid import path issues)
-interface CoverageFileData {
-    perTest:  Record<string, string[]>
-    'static': string[]
-}
+import {
+    getPreloadConfig,
+    shouldCollectCoverage as shouldCollect,
+    initializeStrykerNamespace,
+    setActiveMutant,
+    formatCoverageData,
+    writeCoverageToFile,
+    parseWebSocketMessage,
+    createTestCounter,
+    type StrykerNamespace
+} from '__PRELOAD_LOGIC_PATH__';
 
 interface StrykerGlobal {
-    __stryker__?: {
-        mutantCoverage?: {
-            'static': Record<string, number>
-            perTest:  Record<string, Record<string, number>>
-        }
-        currentTestId?: string
-        activeMutant?:  string
-    }
+    [key: string]:       unknown
+    __stryker__?:        StrykerNamespace
     __mutantCoverage__?: {
         'static': Record<string, number>
         perTest:  Record<string, Record<string, number>>
@@ -28,12 +27,14 @@ interface StrykerGlobal {
 }
 
 // Get environment variables
-const syncPort = process.env.__STRYKER_SYNC_PORT__;
-const coverageFile = process.env.__STRYKER_COVERAGE_FILE__;
-const activeMutant = process.env.__STRYKER_ACTIVE_MUTANT__;
+// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
+const config = getPreloadConfig();
+// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- Config from placeholder import
+const { syncPort, coverageFile, activeMutant } = config;
 
 // Skip coverage collection during mutant runs (only need pass/fail)
-const shouldCollectCoverage = !activeMutant && !!coverageFile;
+// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
+const shouldCollectCoverage = shouldCollect(config);
 
 // ============================================================================
 // Section 1: WebSocket Sync (receive test start events)
@@ -41,8 +42,8 @@ const shouldCollectCoverage = !activeMutant && !!coverageFile;
 let ws: WebSocket | null = null;
 
 // Track test counter and WebSocket-provided names (only needed when collecting coverage)
-let testCounter = 0;
-const counterToName = new Map<string, string>();
+// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
+const testCounter = createTestCounter();
 let pendingTestName: string | undefined;
 
 if(shouldCollectCoverage) {
@@ -55,18 +56,19 @@ if(syncPort && shouldCollectCoverage) {
 
         ws.onmessage = (event) => {
             const data = String(event.data);
-            if(data === 'ready') {
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
+            const parsedMessage = parseWebSocketMessage(data);
+
+            if(parsedMessage === 'ready') {
                 // Initial ready signal - tests can start
                 return;
             }
-            try {
-                const msg = JSON.parse(data) as { type?: string, name?: string };
-                if(msg.type === 'testStart' && msg.name) {
-                    // Store the pending test name to be picked up by beforeEach
-                    pendingTestName = msg.name;
-                }
-            } catch{
-                // Ignore parse errors
+
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- Parsed message has dynamic type
+            if(parsedMessage && typeof parsedMessage === 'object' && parsedMessage.type === 'testStart') {
+                // Store the pending test name to be picked up by beforeEach
+                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access -- Parsed message has dynamic type
+                pendingTestName = parsedMessage.name;
             }
         };
 
@@ -138,20 +140,15 @@ if(syncPort && shouldCollectCoverage) {
 // Section 2: Initialize Stryker Namespace
 // ============================================================================
 const g = globalThis as unknown as StrykerGlobal;
-g.__stryker__ ??= { mutantCoverage: { 'static': {}, perTest: {} } };
-const strykerGlobal = g.__stryker__;
-
-// Initialize mutantCoverage structure (may already exist from instrumented code)
-strykerGlobal.mutantCoverage ??= { 'static': {}, perTest: {} };
-const mutantCoverage = strykerGlobal.mutantCoverage;
-
-// CRITICAL: Stryker's ChildProcessTestRunnerWorker expects global.__mutantCoverage__
-// Set up a reference to the same object so both locations point to the same data
-g.__mutantCoverage__ = mutantCoverage;
+// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
+const strykerGlobal = initializeStrykerNamespace(g as Record<string, unknown>);
+// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access -- StrykerGlobal from placeholder import
+const mutantCoverage = strykerGlobal.mutantCoverage!;
 
 // Set active mutant for mutant runs
 if(activeMutant) {
-    strykerGlobal.activeMutant = activeMutant;
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
+    setActiveMutant(strykerGlobal, activeMutant);
 }
 
 // ============================================================================
@@ -164,30 +161,12 @@ const writeCoverageData = () => {
         return;
     }
 
-    const mutantCoverage = strykerGlobal.mutantCoverage;
-    if(!mutantCoverage) {
-        return;
-    }
-
-    // Convert from Record<string, number> to string[] format
-    // Remap counter IDs to test names using the mapping
-    const perTest: Record<string, string[]> = {};
-    for(const [testId, coverage] of Object.entries(mutantCoverage.perTest ?? {})) {
-    // Check if this is a counter ID that needs remapping
-        const actualName = counterToName.get(testId) ?? testId;
-        perTest[actualName] = Object.keys(coverage);
-    }
-
-    const staticCoverage = Object.keys(mutantCoverage.static ?? {});
-
-    const data: CoverageFileData = {
-        perTest,
-        'static': staticCoverage,
-    };
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Placeholder import replaced at runtime
+    const data = formatCoverageData(strykerGlobal.mutantCoverage, testCounter.getCounterToNameMap());
 
     try {
-        // eslint-disable-next-line n/no-sync -- sync required in afterAll hook to ensure write completes before process exit
-        appendFileSync(coverageFile, JSON.stringify(data) + '\n', 'utf-8');
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
+        writeCoverageToFile(coverageFile, data);
     } catch (error) {
         console.error('[Stryker Coverage] Failed to write coverage:', error);
     }
@@ -198,24 +177,30 @@ const writeCoverageData = () => {
 // ============================================================================
 if(shouldCollectCoverage) {
     beforeEach(() => {
-        testCounter++;
-        const counterId = `test-${testCounter}`;
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- TestCounter from placeholder import
+        const counterId = testCounter.increment();
 
         // If we have a pending test name from WebSocket, use it
         if(pendingTestName) {
-            counterToName.set(counterId, pendingTestName);
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- TestCounter from placeholder import
+            testCounter.setName(counterId, pendingTestName);
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- StrykerGlobal from placeholder import
             strykerGlobal.currentTestId = pendingTestName;
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- MutantCoverage from placeholder import
             mutantCoverage.perTest[pendingTestName] ??= {};
             pendingTestName = undefined;
         } else {
             // Fallback to counter - will be remapped later
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access -- StrykerGlobal from placeholder import
             strykerGlobal.currentTestId = counterId;
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- MutantCoverage from placeholder import
             mutantCoverage.perTest[counterId] ??= {};
         }
     });
 
     afterEach(() => {
     // Clear currentTestId so any subsequent code records to static
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- StrykerGlobal from placeholder import
         strykerGlobal.currentTestId = undefined;
     });
 

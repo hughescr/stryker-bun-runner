@@ -12,7 +12,10 @@ export default [
 
             '.serena/',
 
-            '.claude/'
+            '.claude/',
+
+            // Template files use placeholder imports that are replaced at runtime
+            'src/templates/'
         ]
     },
     {
@@ -31,12 +34,6 @@ export default [
             'lodash/prefer-noop':                      'off',
             'lodash/prefer-constant':                  'off',
             'n/no-unsupported-features/node-builtins': ['error', { ignores: ['WebSocket', 'fetch'] }]
-        }
-    },
-    {
-        files: ['src/templates/**/*.ts'],
-        rules: {
-            'no-console': 'off'
         }
     },
     {

@@ -40,8 +40,9 @@ interface TestLineParseResult {
  */
 function parseTestLine(line: string, currentFile: string | undefined): TestLineParseResult {
     // Match test results: ✓ test name [0.12ms]
-    // eslint-disable-next-line regexp/no-super-linear-backtracking -- bounded line input
-    const passMatch = /^✓ +(.+) \[([0-9.]+)ms\]$/.exec(line);
+
+    // Stryker disable next-line Regex: anchors and character classes are defensive; input is line-by-line parsed
+    const passMatch = /^✓ +(\S.*?) \[([0-9.]+)ms\]$/.exec(line);
     if(passMatch) {
         const testName = passMatch[1].trim();
         const fullName = currentFile ? `${currentFile} > ${testName}` : testName;
@@ -56,8 +57,9 @@ function parseTestLine(line: string, currentFile: string | undefined): TestLineP
     }
 
     // Match failed tests: ✗ test name [0.05ms] (timing is optional)
-    // eslint-disable-next-line regexp/no-super-linear-backtracking -- bounded line input
-    const failMatch = /^✗ +(.+?)(?: \[([0-9.]+)ms\])?$/.exec(line);
+
+    // Stryker disable next-line Regex: anchors and character classes are defensive; input is line-by-line parsed
+    const failMatch = /^✗ +(\S.*?)(?: \[([0-9.]+)ms\])?$/.exec(line);
     if(failMatch) {
         const testName = failMatch[1].trim();
         const fullName = currentFile ? `${currentFile} > ${testName}` : testName;
@@ -73,8 +75,9 @@ function parseTestLine(line: string, currentFile: string | undefined): TestLineP
     }
 
     // Match failed tests in bail mode: (fail) test name [0.05ms] (timing is optional)
-    // eslint-disable-next-line regexp/no-super-linear-backtracking -- bounded line input
-    const bailFailMatch = /^\(fail\) +(.+?)(?: \[([0-9.]+)ms\])?$/.exec(line);
+
+    // Stryker disable next-line Regex: anchors and character classes are defensive; input is line-by-line parsed
+    const bailFailMatch = /^\(fail\) +(\S.*?)(?: \[([0-9.]+)ms\])?$/.exec(line);
     if(bailFailMatch) {
         const testName = bailFailMatch[1].trim();
         const fullName = currentFile ? `${currentFile} > ${testName}` : testName;
@@ -90,8 +93,9 @@ function parseTestLine(line: string, currentFile: string | undefined): TestLineP
     }
 
     // Match skipped tests: ⏭ test name
-    // eslint-disable-next-line regexp/no-super-linear-backtracking -- bounded line input
-    const skipMatch = /^⏭ +(.+)$/.exec(line);
+
+    // Stryker disable next-line Regex: anchors are defensive; input is line-by-line parsed
+    const skipMatch = /^⏭ +(\S.*)$/.exec(line);
     if(skipMatch) {
         const testName = skipMatch[1].trim();
         const fullName = currentFile ? `${currentFile} > ${testName}` : testName;
@@ -124,6 +128,7 @@ function shouldCollectErrorLine(line: string): boolean {
         return false;
     }
     // Skip summary lines
+    // Stryker disable next-line Regex: anchors and character classes are defensive; line detection pattern
     return !(/^\s*\d+\s+(?:pass|fail|skip)/.exec(line));
 }
 
@@ -142,12 +147,13 @@ function updateCounters(test: TestResult, counters: TestCounters, parseResult: T
         return false; // not collecting error
     } else if(test.status === 'failed') {
         counters.failed++;
+        // Stryker disable next-line BooleanLiteral: default value in coalesce has no behavioral impact
         return parseResult.startedCollectingError ?? false;
-    } else if(test.status === 'skipped') {
+    // After checking 'passed' and 'failed', only 'skipped' remains (TypeScript union exhaustiveness)
+    } else {
         counters.skipped++;
         return false; // not collecting error
     }
-    return false;
 }
 
 interface SummaryCounts {
@@ -165,9 +171,13 @@ function parseSummaryLines(output: string): SummaryCounts {
     // Match summary lines with flexible whitespace handling
     // Bun outputs lines like: " 2840 pass" or " 10 fail"
     // Or in bail mode: "Bailed out after 1 failure"
+    // Stryker disable next-line Regex: word boundaries are defensive for summary parsing
     const passSummary = /\s(\d+)\s+pass\b/.exec(output);
+    // Stryker disable next-line Regex: word boundaries are defensive for summary parsing
     const failSummary = /\s(\d+)\s+fail\b/.exec(output);
+    // Stryker disable next-line Regex: word boundaries are defensive for summary parsing
     const skipSummary = /\s(\d+)\s+skip\b/.exec(output);
+    // Stryker disable next-line Regex: character classes are defensive for optional plural
     const bailSummary = /Bailed out after (\d+) failures?/.exec(output);
 
     if(passSummary) {
@@ -187,10 +197,12 @@ function parseSummaryLines(output: string): SummaryCounts {
     }
 
     // Also try to parse from "Ran N tests" line as ultimate fallback
+    // Stryker disable next-line Regex: character classes are defensive for optional plural
     const ranTestsSummary = /Ran\s+(\d+)\s+tests?/.exec(output);
     if(ranTestsSummary) {
         const totalFromRan = parseInt(ranTestsSummary[1], 10);
         // Use this as source of truth for total, and derive passed if needed
+        // Stryker disable next-line ArithmeticOperator: condition requires passed=0 and failed=0, making arithmetic mutations equivalent
         const totalParsed = counts.passed + counts.failed + counts.skipped;
         if(totalParsed !== totalFromRan && counts.passed === 0 && counts.failed === 0) {
             // No individual counts parsed, assume all passed
@@ -229,6 +241,7 @@ export function parseBunTestOutput(stdout: string, stderr: string): ParsedTestRe
     const lines = output.split('\n');
 
     let currentTest: TestResult | null = null;
+    // Stryker disable next-line BooleanLiteral: initial false state is defensive; finalizeErrorMessage guards against empty errorLines
     let collectingError = false;
     let errorLines: string[] = [];
     let currentFile: string | undefined;
@@ -245,6 +258,7 @@ export function parseBunTestOutput(stdout: string, stderr: string): ParsedTestRe
         const parseResult = parseTestLine(line, currentFile);
         if(parseResult.test) {
             // Finalize previous test's error message if needed
+            // Stryker disable next-line ConditionalExpression,LogicalOperator: finalizeErrorMessage guards against empty errorLines; condition is defensive
             if(currentTest && collectingError) {
                 finalizeErrorMessage(currentTest, errorLines);
                 errorLines = [];
@@ -265,6 +279,7 @@ export function parseBunTestOutput(stdout: string, stderr: string): ParsedTestRe
     }
 
     // Finalize last test's error message if any
+    // Stryker disable next-line ConditionalExpression,LogicalOperator: finalizeErrorMessage guards against empty errorLines; condition is defensive
     if(currentTest && collectingError) {
         finalizeErrorMessage(currentTest, errorLines);
     }

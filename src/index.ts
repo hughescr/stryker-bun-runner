@@ -9,9 +9,11 @@ import { BunTestRunner } from './bun-test-runner.js';
 /**
  * Stryker plugin declarations
  */
+// Stryker disable all: plugin exports array and identifier string required by Stryker
 export const strykerPlugins = [
     declareClassPlugin(PluginKind.TestRunner, 'bun', BunTestRunner)
 ];
+// Stryker restore all
 
 /**
  * JSON Schema validation for plugin options

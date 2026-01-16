@@ -18,6 +18,24 @@ export interface SyncServerOptions {
    * @default 5000
    */
     timeout?: number
+
+    /**
+   * Optional HTTP server factory for dependency injection (testing)
+   * @default createServer
+   */
+    createHttpServer?: typeof createServer
+
+    /**
+   * Optional WebSocketServer class for dependency injection (testing)
+   * @default WebSocketServer
+   */
+    WebSocketServerClass?: typeof WebSocketServer
+
+    /**
+   * Optional WebSocket OPEN state constant for dependency injection (testing)
+   * @default WebSocket.OPEN
+   */
+    webSocketOpenState?: number
 }
 
 /**
@@ -25,13 +43,19 @@ export interface SyncServerOptions {
  * Allows preload script to wait for "ready" signal before proceeding with tests
  */
 export class SyncServer {
-    private httpServer:    HTTPServer | null = null;
-    private wss:           WebSocketServer | null = null;
+    private httpServer:                    HTTPServer | null = null;
+    private wss:                           WebSocketServer | null = null;
     private clients = new Set<WebSocket>();
-    private readonly port: number;
+    private readonly port:                 number;
+    private readonly createHttpServer:     typeof createServer;
+    private readonly WebSocketServerClass: typeof WebSocketServer;
+    private readonly webSocketOpenState:   number;
 
     constructor(options: SyncServerOptions) {
         this.port = options.port;
+        this.createHttpServer = options.createHttpServer ?? createServer;
+        this.WebSocketServerClass = options.WebSocketServerClass ?? WebSocketServer;
+        this.webSocketOpenState = options.webSocketOpenState ?? WebSocket.OPEN;
     }
 
     /**
@@ -41,7 +65,7 @@ export class SyncServer {
         return new Promise((resolve, reject) => {
             try {
                 // Create HTTP server to handle WebSocket upgrades and 404s
-                this.httpServer = createServer((req, res) => {
+                this.httpServer = this.createHttpServer((req, res) => {
                     // Non-WebSocket requests get 404
                     if(req.url !== '/sync') {
                         res.writeHead(404);
@@ -54,7 +78,7 @@ export class SyncServer {
                 });
 
                 // Create WebSocket server attached to HTTP server
-                this.wss = new WebSocketServer({
+                this.wss = new this.WebSocketServerClass({
                     server: this.httpServer,
                     path:   '/sync',
                 });
@@ -80,9 +104,13 @@ export class SyncServer {
                 this.httpServer.listen(this.port, () => {
                     resolve();
                 });
-            } catch (error) {
+            // eslint-disable-next-line @stylistic/brace-style -- required for Stryker disable to work
+            }
+            // Stryker disable all: defensive error handling, rejects promise
+            catch (error) {
                 reject(error instanceof Error ? error : new Error(String(error)));
             }
+            // Stryker restore all
         });
     }
 
@@ -92,7 +120,7 @@ export class SyncServer {
     signalReady(): void {
         for(const client of this.clients) {
             try {
-                if(client.readyState === WebSocket.OPEN) {
+                if(client.readyState === this.webSocketOpenState) {
                     client.send('ready');
                 }
             } catch{
@@ -108,7 +136,7 @@ export class SyncServer {
         const message = JSON.stringify({ type: 'testStart', name: testName });
         for(const client of this.clients) {
             try {
-                if(client.readyState === WebSocket.OPEN) {
+                if(client.readyState === this.webSocketOpenState) {
                     client.send(message);
                 }
             } catch{

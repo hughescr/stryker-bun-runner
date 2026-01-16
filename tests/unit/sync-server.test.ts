@@ -1,321 +1,526 @@
 /**
  * Unit tests for utils/sync-server
- * Tests WebSocket synchronization server
+ * Tests WebSocket synchronization server using mock injection
  */
 
-import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
-import { SyncServer } from '../../src/utils/sync-server.js';
+import { describe, it, expect, beforeEach, mock } from 'bun:test';
+import { SyncServer } from '../../src/utils/sync-server';
 
-// Mock getAvailablePort to return predictable, widely-spaced ports
-// Use atomic counter with immediate return to avoid race conditions
-let nextPort = 50000;
-void mock.module('../../src/utils/port.js', () => ({
-    getAvailablePort: () => Promise.resolve(nextPort++)
-}));
+// Mock WebSocket client
+interface MockClient {
+    readyState: number
+    send:       ReturnType<typeof mock>
+    close:      ReturnType<typeof mock>
+    on:         ReturnType<typeof mock>
+}
 
-import { getAvailablePort } from '../../src/utils/port.js';
+const createMockClient = (readyState = 1): MockClient => ({
+    readyState,
+    // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
+    send:  mock(() => {}),
+    // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
+    close: mock(() => {}),
+    // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
+    on:    mock(() => {}),
+});
 
-// Skip: These tests require real WebSocket connections and Bun.serve() which are blocked in sandbox mode.
-// Run manually with: bun test tests/unit/sync-server.test.ts --no-sandbox
-describe.skip('SyncServer', () => {
-    let server: SyncServer;
-    let testPort: number;
+// Mock WebSocketServer
+interface MockWss {
+    on:                ReturnType<typeof mock>
+    close:             ReturnType<typeof mock>
+    triggerConnection: (client: MockClient) => void
+}
 
-    afterEach(async () => {
-        if(server) {
-            await server.close();
-        }
+const createMockWss = (): MockWss => {
+    const handlers = new Map<string, (arg: unknown) => void>();
+    return {
+        on: mock((event: string, handler: (arg: unknown) => void) => {
+            handlers.set(event, handler);
+        }),
+        // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
+        close: mock(() => {}),
+        triggerConnection(client: MockClient) {
+            const handler = handlers.get('connection');
+            if(handler) {
+                handler(client);
+            }
+        },
+    };
+};
+
+// Mock HTTP Server
+interface MockHttpServer {
+    on:                ReturnType<typeof mock>
+    listen:            ReturnType<typeof mock>
+    close:             ReturnType<typeof mock>
+    triggerError:      (err: Error) => void
+    getRequestHandler: () => ((req: { url?: string }, res: { writeHead: (code: number) => void, end: (msg: string) => void }) => void) | null
+}
+
+const createMockHttpServer = (): MockHttpServer => {
+    const handlers = new Map<string, (arg: unknown) => void>();
+    let requestHandler: ((req: { url?: string }, res: { writeHead: (code: number) => void, end: (msg: string) => void }) => void) | null = null;
+
+    const mockServer: MockHttpServer = {
+        on: mock((event: string, handler: (arg: unknown) => void) => {
+            handlers.set(event, handler);
+        }),
+        listen: mock((_port: number, callback: () => void) => {
+            setImmediate(callback);
+        }),
+        close: mock((callback?: () => void) => {
+            if(callback) {
+                return callback();
+            }
+        }),
+        triggerError(err: Error) {
+            const handler = handlers.get('error');
+            if(handler) {
+                handler(err);
+            }
+        },
+        getRequestHandler() {
+            return requestHandler;
+        },
+    };
+
+    // Store the setter function on the mockServer object for factory to call
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access -- mock object extension
+    (mockServer as any)._setRequestHandler = (handler: unknown) => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-assignment -- type cast for mock
+        requestHandler = handler as any;
+    };
+
+    return mockServer;
+};
+
+describe('SyncServer', () => {
+    let mockHttpServer: MockHttpServer;
+    let mockWss: MockWss;
+    let mockWssClass: ReturnType<typeof mock>;
+    let mockHttpServerFactory: ReturnType<typeof mock>;
+
+    beforeEach(() => {
+        mockHttpServer = createMockHttpServer();
+        mockWss = createMockWss();
+        mockHttpServerFactory = mock((handler: unknown) => {
+            // Capture the request handler that's passed to createHttpServer
+            const mockServerWithSetter = mockHttpServer as MockHttpServer & {
+                _setRequestHandler: (handler: unknown) => void
+            };
+            mockServerWithSetter._setRequestHandler(handler);
+            return mockHttpServer;
+        });
+        mockWssClass = mock(() => mockWss);
     });
 
-    describe('initialization', () => {
-        it('should create server with specified port', async () => {
-            testPort = await getAvailablePort();
-            server = new SyncServer({ port: testPort });
+    const createServer = (port = 8080) => {
+        return new SyncServer({
+            port,
+            createHttpServer:     mockHttpServerFactory as never,
+            WebSocketServerClass: mockWssClass as never,
+            webSocketOpenState:   1,
+        });
+    };
+
+    describe('constructor', () => {
+        it('stores the port', () => {
+            const server = createServer(9000);
             expect(server).toBeDefined();
         });
+    });
 
-        it('should use default timeout when not specified', async () => {
-            testPort = await getAvailablePort();
-            server = new SyncServer({ port: testPort });
-            expect(server).toBeDefined();
+    describe('HTTP request handler', () => {
+        it('returns 404 for non-/sync paths', async () => {
+            const server = createServer();
+            await server.start();
+
+            const requestHandler = mockHttpServer.getRequestHandler();
+            expect(requestHandler).toBeDefined();
+
+            const mockRes = {
+                // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
+                writeHead: mock(() => {}),
+                // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
+                end:       mock(() => {}),
+            };
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-argument -- mock response object
+            requestHandler!({ url: '/other-path' }, mockRes as any);
+
+            expect(mockRes.writeHead).toHaveBeenCalledWith(404);
+            expect(mockRes.end).toHaveBeenCalledWith('Not found');
         });
 
-        it('should accept custom timeout', async () => {
-            testPort = await getAvailablePort();
-            server = new SyncServer({ port: testPort, timeout: 10000 });
-            expect(server).toBeDefined();
+        it('returns 400 for /sync path (failed WS upgrade)', async () => {
+            const server = createServer();
+            await server.start();
+
+            const requestHandler = mockHttpServer.getRequestHandler();
+            expect(requestHandler).toBeDefined();
+
+            const mockRes = {
+                // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
+                writeHead: mock(() => {}),
+                // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
+                end:       mock(() => {}),
+            };
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-argument -- mock response object
+            requestHandler!({ url: '/sync' }, mockRes as any);
+
+            expect(mockRes.writeHead).toHaveBeenCalledWith(400);
+            expect(mockRes.end).toHaveBeenCalledWith('WebSocket upgrade failed');
+        });
+
+        it('handles undefined url as non-/sync', async () => {
+            const server = createServer();
+            await server.start();
+
+            const requestHandler = mockHttpServer.getRequestHandler();
+            expect(requestHandler).toBeDefined();
+
+            const mockRes = {
+                // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
+                writeHead: mock(() => {}),
+                // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
+                end:       mock(() => {}),
+            };
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-argument -- mock response object
+            requestHandler!({}, mockRes as any);
+
+            expect(mockRes.writeHead).toHaveBeenCalledWith(404);
+            expect(mockRes.end).toHaveBeenCalledWith('Not found');
         });
     });
 
     describe('start', () => {
-        it('should start server successfully', async () => {
-            testPort = await getAvailablePort();
-            server = new SyncServer({ port: testPort });
+        it('creates HTTP server', async () => {
+            const server = createServer();
+            await server.start();
+            expect(mockHttpServerFactory).toHaveBeenCalled();
+        });
+
+        it('creates WebSocketServer with correct options', async () => {
+            const server = createServer();
+            await server.start();
+            expect(mockWssClass).toHaveBeenCalledWith({
+                server: mockHttpServer,
+                path:   '/sync',
+            });
+        });
+
+        it('registers connection handler on WSS', async () => {
+            const server = createServer();
+            await server.start();
+            expect(mockWss.on).toHaveBeenCalledWith('connection', expect.any(Function));
+        });
+
+        it('registers error handler on HTTP server', async () => {
+            const server = createServer();
+            await server.start();
+            expect(mockHttpServer.on).toHaveBeenCalledWith('error', expect.any(Function));
+        });
+
+        it('starts listening on specified port', async () => {
+            const server = createServer(3000);
+            await server.start();
+            expect(mockHttpServer.listen).toHaveBeenCalledWith(3000, expect.any(Function));
+        });
+
+        it('resolves when listen completes', async () => {
+            const server = createServer();
             await expect(server.start()).resolves.toBeUndefined();
         });
 
-        it('should reject if port is already in use', async () => {
-            testPort = await getAvailablePort();
-            server = new SyncServer({ port: testPort });
-            await server.start();
+        it('rejects when server emits error', async () => {
+            const errorServer = createMockHttpServer();
+            errorServer.listen = mock((_port: number, _callback: () => void) => {
+                // Don't call callback - let error happen first
+            });
+            const errorFactory = mock(() => errorServer);
 
-            // Try to start another server on same port
-            const server2 = new SyncServer({ port: testPort });
-            await expect(server2.start()).rejects.toThrow();
-            await server2.close();
+            const server = new SyncServer({
+                port:                 8080,
+                createHttpServer:     errorFactory as never,
+                WebSocketServerClass: mockWssClass as never,
+                webSocketOpenState:   1,
+            });
+
+            const startPromise = server.start();
+            errorServer.triggerError(new Error('EADDRINUSE'));
+
+            await expect(startPromise).rejects.toThrow('EADDRINUSE');
         });
     });
 
     describe('client connections', () => {
-        beforeEach(async () => {
-            testPort = await getAvailablePort();
-            server = new SyncServer({ port: testPort });
+        it('tracks connected clients', async () => {
+            const server = createServer();
             await server.start();
-        });
 
-        it('should accept WebSocket connections', async () => {
-            const ws = new WebSocket(`ws://localhost:${testPort}/sync`);
-
-            await new Promise<void>((resolve, reject) => {
-                ws.onopen = () => {
-                    ws.close();
-                    resolve();
-                };
-                ws.onerror = reject;
-                setTimeout(() => reject(new Error('Connection timeout')), 1000);
-            });
-        });
-
-        it('should track connected clients', async () => {
             expect(server.clientCount).toBe(0);
 
-            const ws = new WebSocket(`ws://localhost:${testPort}/sync`);
+            const client = createMockClient();
+            mockWss.triggerConnection(client);
 
-            await new Promise<void>((resolve) => {
-                ws.onopen = () => {
-                    // Give server a moment to register the client
-                    setTimeout(() => {
-                        expect(server.clientCount).toBe(1);
-                        ws.close();
-                        resolve();
-                    }, 50);
-                };
+            expect(server.clientCount).toBe(1);
+        });
+
+        it('registers close handler on client', async () => {
+            const server = createServer();
+            await server.start();
+
+            const client = createMockClient();
+            mockWss.triggerConnection(client);
+
+            expect(client.on).toHaveBeenCalledWith('close', expect.any(Function));
+        });
+
+        it('registers message handler on client', async () => {
+            const server = createServer();
+            await server.start();
+
+            const client = createMockClient();
+            mockWss.triggerConnection(client);
+
+            expect(client.on).toHaveBeenCalledWith('message', expect.any(Function));
+        });
+
+        it('removes client on close', async () => {
+            const server = createServer();
+            await server.start();
+
+            const client = createMockClient();
+            // eslint-disable-next-line @typescript-eslint/no-empty-function -- default handler
+            let closeHandler: () => void = () => {};
+            client.on = mock((event: string, handler: () => void) => {
+                if(event === 'close') {
+                    closeHandler = handler;
+                }
             });
 
-            // Wait for cleanup
-            await new Promise(resolve => setTimeout(resolve, 50));
+            mockWss.triggerConnection(client);
+            expect(server.clientCount).toBe(1);
+
+            closeHandler();
             expect(server.clientCount).toBe(0);
         });
 
-        it('should handle multiple simultaneous connections', async () => {
-            const ws1 = new WebSocket(`ws://localhost:${testPort}/sync`);
-            const ws2 = new WebSocket(`ws://localhost:${testPort}/sync`);
+        it('handles multiple clients', async () => {
+            const server = createServer();
+            await server.start();
 
-            await Promise.all([
-                new Promise<void>((resolve) => {
-                    ws1.onopen = () => resolve();
-                }),
-                new Promise<void>((resolve) => {
-                    ws2.onopen = () => resolve();
-                }),
-            ]);
+            mockWss.triggerConnection(createMockClient());
+            mockWss.triggerConnection(createMockClient());
+            mockWss.triggerConnection(createMockClient());
 
-            // Give server a moment to register clients
-            await new Promise(resolve => setTimeout(resolve, 50));
-            expect(server.clientCount).toBe(2);
-
-            ws1.close();
-            ws2.close();
-        });
-
-        it('should reject connections to wrong path', async () => {
-            const response = await fetch(`http://localhost:${testPort}/wrong-path`);
-            expect(response.status).toBe(404);
+            expect(server.clientCount).toBe(3);
         });
     });
 
     describe('signalReady', () => {
-        beforeEach(async () => {
-            testPort = await getAvailablePort();
-            server = new SyncServer({ port: testPort });
+        it('sends ready to connected clients', async () => {
+            const server = createServer();
             await server.start();
-        });
 
-        it('should send ready message to connected clients', async () => {
-            const ws = new WebSocket(`ws://localhost:${testPort}/sync`);
-
-            const messageReceived = new Promise<string>((resolve) => {
-                ws.onmessage = (event: MessageEvent<string>) => {
-                    resolve(event.data);
-                };
-            });
-
-            await new Promise<void>((resolve) => {
-                ws.onopen = () => resolve();
-            });
+            const client = createMockClient(1);
+            mockWss.triggerConnection(client);
 
             server.signalReady();
 
-            const message = await messageReceived;
-            expect(message).toBe('ready');
-
-            ws.close();
+            expect(client.send).toHaveBeenCalledWith('ready');
         });
 
-        it('should send ready to all connected clients', async () => {
-            const ws1 = new WebSocket(`ws://localhost:${testPort}/sync`);
-            const ws2 = new WebSocket(`ws://localhost:${testPort}/sync`);
+        it('sends to all connected clients', async () => {
+            const server = createServer();
+            await server.start();
 
-            const message1 = new Promise<string>((resolve) => {
-                ws1.onmessage = (event: MessageEvent<string>) => resolve(event.data);
-            });
-
-            const message2 = new Promise<string>((resolve) => {
-                ws2.onmessage = (event: MessageEvent<string>) => resolve(event.data);
-            });
-
-            await Promise.all([
-                new Promise<void>((resolve) => {
-                    ws1.onopen = () => resolve();
-                }),
-                new Promise<void>((resolve) => {
-                    ws2.onopen = () => resolve();
-                }),
-            ]);
+            const client1 = createMockClient(1);
+            const client2 = createMockClient(1);
+            mockWss.triggerConnection(client1);
+            mockWss.triggerConnection(client2);
 
             server.signalReady();
 
-            const [msg1, msg2] = await Promise.all([message1, message2]);
-            expect(msg1).toBe('ready');
-            expect(msg2).toBe('ready');
-
-            ws1.close();
-            ws2.close();
+            expect(client1.send).toHaveBeenCalledWith('ready');
+            expect(client2.send).toHaveBeenCalledWith('ready');
         });
 
-        it('should not throw if no clients connected', () => {
+        it('skips clients not in OPEN state', async () => {
+            const server = createServer();
+            await server.start();
+
+            const openClient = createMockClient(1);
+            const closedClient = createMockClient(3); // CLOSED state
+            mockWss.triggerConnection(openClient);
+            mockWss.triggerConnection(closedClient);
+
+            server.signalReady();
+
+            expect(openClient.send).toHaveBeenCalledWith('ready');
+            expect(closedClient.send).not.toHaveBeenCalled();
+        });
+
+        it('handles no connected clients', async () => {
+            const server = createServer();
+            await server.start();
+
             expect(() => server.signalReady()).not.toThrow();
         });
 
-        it('should gracefully handle disconnected clients', async () => {
-            const ws = new WebSocket(`ws://localhost:${testPort}/sync`);
+        it('ignores send errors', async () => {
+            const server = createServer();
+            await server.start();
 
-            await new Promise<void>((resolve) => {
-                ws.onopen = () => resolve();
+            const client = createMockClient(1);
+            client.send = mock(() => {
+                throw new Error('Send failed');
             });
+            mockWss.triggerConnection(client);
 
-            // Close client before signaling
-            ws.close();
-            await new Promise(resolve => setTimeout(resolve, 50));
-
-            // Should not throw
             expect(() => server.signalReady()).not.toThrow();
+        });
+    });
+
+    describe('sendTestStart', () => {
+        it('sends JSON message with test name', async () => {
+            const server = createServer();
+            await server.start();
+
+            const client = createMockClient(1);
+            mockWss.triggerConnection(client);
+
+            server.sendTestStart('my test');
+
+            expect(client.send).toHaveBeenCalledWith(
+                JSON.stringify({ type: 'testStart', name: 'my test' })
+            );
+        });
+
+        it('sends to all connected clients', async () => {
+            const server = createServer();
+            await server.start();
+
+            const client1 = createMockClient(1);
+            const client2 = createMockClient(1);
+            mockWss.triggerConnection(client1);
+            mockWss.triggerConnection(client2);
+
+            server.sendTestStart('test');
+
+            expect(client1.send).toHaveBeenCalled();
+            expect(client2.send).toHaveBeenCalled();
+        });
+
+        it('skips clients not in OPEN state', async () => {
+            const server = createServer();
+            await server.start();
+
+            const closedClient = createMockClient(2); // CLOSING state
+            mockWss.triggerConnection(closedClient);
+
+            server.sendTestStart('test');
+
+            expect(closedClient.send).not.toHaveBeenCalled();
+        });
+
+        it('ignores send errors', async () => {
+            const server = createServer();
+            await server.start();
+
+            const client = createMockClient(1);
+            client.send = mock(() => {
+                throw new Error('Send failed');
+            });
+            mockWss.triggerConnection(client);
+
+            expect(() => server.sendTestStart('test')).not.toThrow();
         });
     });
 
     describe('close', () => {
-        it('should close server successfully', async () => {
-            testPort = await getAvailablePort();
-            server = new SyncServer({ port: testPort });
+        it('closes all client connections', async () => {
+            const server = createServer();
             await server.start();
+
+            const client1 = createMockClient();
+            const client2 = createMockClient();
+            mockWss.triggerConnection(client1);
+            mockWss.triggerConnection(client2);
+
+            await server.close();
+
+            expect(client1.close).toHaveBeenCalled();
+            expect(client2.close).toHaveBeenCalled();
+        });
+
+        it('ignores client close errors', async () => {
+            const server = createServer();
+            await server.start();
+
+            const client = createMockClient();
+            client.close = mock(() => {
+                throw new Error('Already closed');
+            });
+            mockWss.triggerConnection(client);
+
             await expect(server.close()).resolves.toBeUndefined();
         });
 
-        it('should close all client connections', async () => {
-            testPort = await getAvailablePort();
-            server = new SyncServer({ port: testPort });
+        it('clears client count', async () => {
+            const server = createServer();
             await server.start();
 
-            const ws = new WebSocket(`ws://localhost:${testPort}/sync`);
-
-            const closedPromise = new Promise<void>((resolve) => {
-                ws.onclose = () => resolve();
-            });
-
-            await new Promise<void>((resolve) => {
-                ws.onopen = () => resolve();
-            });
-
-            await server.close();
-            await closedPromise;
-        });
-
-        it('should clear client count after closing', async () => {
-            testPort = await getAvailablePort();
-            server = new SyncServer({ port: testPort });
-            await server.start();
-
-            const ws = new WebSocket(`ws://localhost:${testPort}/sync`);
-
-            await new Promise<void>((resolve) => {
-                ws.onopen = () => resolve();
-            });
-
-            await new Promise(resolve => setTimeout(resolve, 50));
-            expect(server.clientCount).toBeGreaterThan(0);
+            mockWss.triggerConnection(createMockClient());
+            expect(server.clientCount).toBe(1);
 
             await server.close();
             expect(server.clientCount).toBe(0);
         });
 
-        it('should be safe to call close multiple times', async () => {
-            testPort = await getAvailablePort();
-            server = new SyncServer({ port: testPort });
+        it('closes WebSocketServer', async () => {
+            const server = createServer();
+            await server.start();
+
+            await server.close();
+
+            expect(mockWss.close).toHaveBeenCalled();
+        });
+
+        it('closes HTTP server', async () => {
+            const server = createServer();
+            await server.start();
+
+            await server.close();
+
+            expect(mockHttpServer.close).toHaveBeenCalled();
+        });
+
+        it('is safe to call multiple times', async () => {
+            const server = createServer();
             await server.start();
 
             await server.close();
             await expect(server.close()).resolves.toBeUndefined();
         });
 
-        it('should allow restarting on same port after close', async () => {
-            testPort = await getAvailablePort();
-            server = new SyncServer({ port: testPort });
-            await server.start();
-            await server.close();
-
-            const server2 = new SyncServer({ port: testPort });
-            await expect(server2.start()).resolves.toBeUndefined();
-            await server2.close();
+        it('is safe to call before start', async () => {
+            const server = createServer();
+            await expect(server.close()).resolves.toBeUndefined();
         });
     });
 
-    describe('integration scenario', () => {
-        it('should complete full sync workflow', async () => {
-            // Start server
-            testPort = await getAvailablePort();
-            server = new SyncServer({ port: testPort });
+    describe('clientCount', () => {
+        it('returns number of connected clients', async () => {
+            const server = createServer();
             await server.start();
 
-            // Client connects
-            const ws = new WebSocket(`ws://localhost:${testPort}/sync`);
-
-            const readyReceived = new Promise<boolean>((resolve) => {
-                ws.onmessage = (event) => {
-                    if(event.data === 'ready') {
-                        resolve(true);
-                    }
-                };
-            });
-
-            await new Promise<void>((resolve) => {
-                ws.onopen = () => resolve();
-            });
-
-            expect(server.clientCount).toBeGreaterThan(0);
-
-            // Server signals ready
-            server.signalReady();
-
-            // Client receives ready
-            const received = await readyReceived;
-            expect(received).toBe(true);
-
-            // Client closes
-            ws.close();
-
-            // Server closes
-            await server.close();
             expect(server.clientCount).toBe(0);
+
+            mockWss.triggerConnection(createMockClient());
+            expect(server.clientCount).toBe(1);
+
+            mockWss.triggerConnection(createMockClient());
+            expect(server.clientCount).toBe(2);
         });
     });
 });

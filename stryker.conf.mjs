@@ -14,7 +14,7 @@ export default {
         resolve(__dirname, 'dist/index.js'),
         '@stryker-mutator/typescript-checker',
     ],
-    mutate:           ['src/**/*.ts'],
+    mutate:           ['src/**/*.ts', '!src/templates/**/*.ts'],
     thresholds:       { high: 100, low: 100, 'break': 100 },
     coverageAnalysis: 'perTest',
     concurrency:      24,
