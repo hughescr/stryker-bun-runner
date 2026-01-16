@@ -70,3 +70,5 @@ jobs:
 
       - name: Run mutation testing
         run: bun run mutate
+        env:
+          STRYKER_DASHBOARD_API_KEY: ${{ secrets.STRYKER_DASHBOARD_API_KEY }}
