@@ -22,11 +22,4 @@ export default {
     reporters:        isCI ? ['clear-text', 'progress', 'dashboard'] : ['progress', 'json', 'html'],
     tempDirName:      '.stryker-tmp',
     bun:              { bunPath: 'bun-25986' },
-    ...(isCI && {
-        dashboard: {
-            project: 'hughescr/stryker-bun-runner',
-            module:  'default',
-            version: process.env.GITHUB_SHA,
-        },
-    }),
 };
