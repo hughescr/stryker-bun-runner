@@ -2,16 +2,13 @@
 node_modules/
 
 # Build output
-dist/
-*.d.ts
-*.d.ts.map
+/dist/
 
 # Coverage
-coverage/
-.nyc_output/
+/coverage/
+/.nyc_output/
 
 # IDE
-.vscode/
 .idea/
 *.swp
 *.swo
@@ -38,8 +35,8 @@ yarn-error.log*
 .tmp/
 
 # Stryker
-.stryker-tmp/
-reports/
-.serena
+/.stryker-tmp/
+/reports/
+/.serena/
 .claude/settings.local.json
 .eslintcache
