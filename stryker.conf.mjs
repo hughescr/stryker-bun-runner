@@ -17,7 +17,7 @@ export default {
     mutate:           ['src/**/*.ts', '!src/templates/**/*.ts'],
     thresholds:       { high: 100, low: 100, 'break': 100 },
     coverageAnalysis: 'perTest',
-    concurrency:      24,
+    concurrency:      isCI ? 4 : 24,
     disableBail:      true,
     reporters:        isCI ? ['clear-text', 'progress', 'dashboard'] : ['progress', 'json', 'html'],
     tempDirName:      '.stryker-tmp',
