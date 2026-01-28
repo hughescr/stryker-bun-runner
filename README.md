@@ -2,12 +2,7 @@
 
 Stryker test runner plugin for Bun with perTest coverage support.
 
-[![npm version](https://img.shields.io/npm/v/@hughescr/stryker-bun-runner)](https://www.npmjs.com/package/@hughescr/stryker-bun-runner) [![LICENSE](https://img.shields.io/badge/LICENSE-Apache--2.0-blue)](LICENSE.md) [![Bun](https://img.shields.io/badge/Bun-%3E1.3.6-f9f1e1?logo=bun)](https://bun.sh) [![Stryker](https://img.shields.io/badge/Stryker-Plugin-e74c3c?logo=stryker)](https://stryker-mutator.io) [![Mutation testing badge](https://img.shields.io/endpoint?url=https%3A%2F%2Fbadge-api.stryker-mutator.io%2Fgithub.com%2Fhughescr%2Fstryker-bun-runner%2Fmain)](https://dashboard.stryker-mutator.io/reports/github.com/hughescr/stryker-bun-runner/main) [![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-3178c6?logo=typescript&logoColor=white)](https://www.typescriptlang.org)
-
-> **Beta Status**: This package is published as `1.0.0-beta1` because it requires
-> a pre-release build of Bun with [PR #25986](https://github.com/oven-sh/bun/pull/25986)
-> merged. Once this fix is available in mainline Bun, we will release version `1.0.0`.
-> The plugin itself is feature-complete and stable.
+[![npm version](https://img.shields.io/npm/v/@hughescr/stryker-bun-runner)](https://www.npmjs.com/package/@hughescr/stryker-bun-runner) [![LICENSE](https://img.shields.io/badge/LICENSE-Apache--2.0-blue)](LICENSE.md) [![Bun](https://img.shields.io/badge/Bun-%3E%3D1.3.7-f9f1e1?logo=bun)](https://bun.sh) [![Stryker](https://img.shields.io/badge/Stryker-Plugin-e74c3c?logo=stryker)](https://stryker-mutator.io) [![Mutation testing badge](https://img.shields.io/endpoint?url=https%3A%2F%2Fbadge-api.stryker-mutator.io%2Fgithub.com%2Fhughescr%2Fstryker-bun-runner%2Fmain)](https://dashboard.stryker-mutator.io/reports/github.com/hughescr/stryker-bun-runner/main) [![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-3178c6?logo=typescript&logoColor=white)](https://www.typescriptlang.org)
 
 ## Features
 
@@ -20,17 +15,21 @@ Stryker test runner plugin for Bun with perTest coverage support.
 
 ### Bun Version
 
-This plugin currently requires **bun-25986** (a pre-release build with [oven-sh/bun#25986](https://github.com/oven-sh/bun/pull/25986)) for full functionality. This PR fixes the TestReporter WebSocket events that enable proper test-to-mutant correlation.
+This plugin requires **Bun 1.3.7 or later** for full functionality. Bun 1.3.7 includes the TestReporter WebSocket events (from [PR #25986](https://github.com/oven-sh/bun/pull/25986)) that enable proper test-to-mutant correlation.
 
-**To install bun-25986:**
+**Important:** Bun versions prior to 1.3.7 will NOT work with this plugin due to missing TestReporter events.
+
+**To install Bun 1.3.7 or later:**
 
 ```bash
-bunx bun-pr 25986
+bun upgrade
 ```
 
-**Important:** You must also configure Stryker to use `bun-25986` by setting `bunPath` in your config (see Configuration section below).
+Or install a specific version:
 
-Once PR 25986 is merged into a stable Bun release, the default `bunPath` of `bun` will work and you can remove the `bunPath` setting entirely.
+```bash
+curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.7"
+```
 
 ### Other Requirements
 
@@ -52,7 +51,7 @@ export default {
   coverageAnalysis: 'perTest',
   mutate: ['src/**/*.ts'],
   bun: {
-    bunPath: 'bun-25986',            // Use bun-25986 until PR #25986 is merged (then use 'bun')
+    // bunPath defaults to 'bun' - only set if using a custom Bun installation
     inspectorTimeout: 5000,          // Inspector connection timeout in ms (default: 5000)
   },
 };
@@ -83,7 +82,7 @@ This approach provides reliable test-to-mutant correlation, even with multiple t
 
 ```javascript
 bun: {
-  bunPath: 'bun-25986',      // Custom bun executable
+  bunPath: '/path/to/bun',   // Custom bun executable (defaults to 'bun')
   timeout: 30000,            // 30 second test timeout
   inspectorTimeout: 10000,   // 10 second connection timeout
   env: { DEBUG: 'true' },    // Extra environment variables

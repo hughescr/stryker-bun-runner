@@ -40,7 +40,7 @@ describe('Inspector Integration', () => {
         await rm(tempDir, { recursive: true, force: true });
     });
 
-    // Skip: requires running with bun-25986 which supports TestReporter events
+    // FIXME: Test fails with port allocation error - needs investigation
     test.skip('collects test names via inspector', async () => {
     // Create a mock logger
         const logs: string[] = [];
@@ -97,7 +97,7 @@ describe('Inspector Integration', () => {
 
         const runner = new BunTestRunner(mockLogger as unknown as Logger, {
             bun: {
-                bunPath:          'bun-25986',  // Use the fixed bun version
+                bunPath:          'bun',  // Use the default bun
                 timeout:          30000,
                 inspectorTimeout: 10000,
                 bunArgs:          [testFilePath],  // Point to our test file

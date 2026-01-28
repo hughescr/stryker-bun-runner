@@ -1,6 +1,6 @@
 /**
  * TypeScript types for Bun Inspector Protocol
- * Based on the actual inspector events observed from bun-25986
+ * Based on the actual inspector events available in Bun 1.3.7+
  */
 
 /**

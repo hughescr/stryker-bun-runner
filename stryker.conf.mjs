@@ -21,5 +21,4 @@ export default {
     disableBail:      true,
     reporters:        isCI ? ['clear-text', 'progress', 'dashboard'] : ['progress', 'json', 'html'],
     tempDirName:      '.stryker-tmp',
-    bun:              { bunPath: 'bun-25986' },
 };
