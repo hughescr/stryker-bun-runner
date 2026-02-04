@@ -3,27 +3,32 @@
  * Tests coverage data collection and conversion
  */
 
-import { describe, it, expect, beforeEach, afterEach, mock, spyOn } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
 import { collectCoverage, cleanupCoverageFile } from '../../src/coverage/collector.js';
-import * as fs from 'node:fs/promises';
+import { mockReadFile, mockUnlink, resetFsMocks } from '../test-preload.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 describe('collectCoverage', () => {
-    let mockReadFile: ReturnType<typeof mock>;
     let tempCoverageFile: string;
+    let mockConsoleWarn: ReturnType<typeof mock>;
+    const originalConsoleWarn = console.warn;
 
     beforeEach(() => {
         tempCoverageFile = join(tmpdir(), `test-coverage-${Date.now()}.json`);
-        mockReadFile = mock();
-        spyOn(fs, 'readFile').mockImplementation(mockReadFile);
+        // Clear the mock state before each test
+        mockReadFile.mockClear();
         // Suppress expected console.warn messages from error handling tests
         // eslint-disable-next-line @typescript-eslint/no-empty-function -- intentional mock to suppress test output
-        spyOn(console, 'warn').mockImplementation(() => {});
+        mockConsoleWarn = mock(() => {});
+        console.warn = mockConsoleWarn as unknown as typeof console.warn;
     });
 
     afterEach(() => {
-        mock.restore();
+        // Restore console.warn to prevent leakage to other tests
+        console.warn = originalConsoleWarn;
+        // Reset fs mocks to prevent leakage to other tests
+        resetFsMocks();
     });
 
     describe('successful collection', () => {
@@ -301,8 +306,7 @@ describe('collectCoverage', () => {
             // Mutation 260: removes the catch block body (lines 90-96)
             // The catch block should log a warning when JSON parsing fails
             // Reset the console.warn mock to verify it's called
-            const consoleWarnMock = console.warn as unknown as ReturnType<typeof mock>;
-            consoleWarnMock.mockClear();
+            mockConsoleWarn.mockClear();
 
             const jsonLines
                 = JSON.stringify({ perTest: { 'test-1': ['1'] }, 'static': [] }) + '\n'
@@ -319,8 +323,8 @@ describe('collectCoverage', () => {
 
             // CRITICAL: The catch block must execute and log the warning
             // If mutation 260 removes the catch block body, console.warn won't be called
-            expect(consoleWarnMock).toHaveBeenCalled();
-            expect(consoleWarnMock).toHaveBeenCalledWith(
+            expect(mockConsoleWarn).toHaveBeenCalled();
+            expect(mockConsoleWarn).toHaveBeenCalledWith(
                 expect.stringContaining('[Stryker Coverage] Failed to parse coverage line:')
             );
         });
@@ -674,15 +678,14 @@ describe('collectCoverage', () => {
 });
 
 describe('cleanupCoverageFile', () => {
-    let mockUnlink: ReturnType<typeof mock>;
-
     beforeEach(() => {
-        mockUnlink = mock();
-        spyOn(fs, 'unlink').mockImplementation(mockUnlink);
+        // Clear the mock state before each test
+        mockUnlink.mockClear();
     });
 
     afterEach(() => {
-        mock.restore();
+        // Reset fs mocks to prevent leakage to other tests
+        resetFsMocks();
     });
 
     it('should delete the coverage file', async () => {

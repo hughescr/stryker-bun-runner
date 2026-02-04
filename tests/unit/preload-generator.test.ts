@@ -3,16 +3,13 @@
  * Tests preload script generation and cleanup
  */
 
-import { describe, it, expect, beforeEach, afterEach, mock, spyOn } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { generatePreloadScript, cleanupPreloadScript } from '../../src/coverage/preload-generator.js';
-import * as fs from 'node:fs/promises';
+import { mockMkdir, mockReadFile, mockWriteFile, mockUnlink, resetFsMocks } from '../test-preload.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 describe('generatePreloadScript', () => {
-    let mockMkdir: ReturnType<typeof mock>;
-    let mockReadFile: ReturnType<typeof mock>;
-    let mockWriteFile: ReturnType<typeof mock>;
     let tempDir: string;
     let coverageFile: string;
 
@@ -20,16 +17,10 @@ describe('generatePreloadScript', () => {
         tempDir = join(tmpdir(), `stryker-test-${Date.now()}`);
         coverageFile = join(tempDir, 'coverage.json');
 
-        // Mock file system operations
-        mockMkdir = mock();
-        mockReadFile = mock();
-        mockWriteFile = mock();
-
-        spyOn(fs, 'mkdir').mockImplementation(mockMkdir);
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any -- mock function requires any type
-        spyOn(fs, 'readFile').mockImplementation(mockReadFile as any);
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-explicit-any -- mock function requires any type
-        spyOn(fs, 'writeFile').mockImplementation(mockWriteFile as any);
+        // Clear the mock state before each test
+        mockMkdir.mockClear();
+        mockReadFile.mockClear();
+        mockWriteFile.mockClear();
 
         // Setup default return values
         mockMkdir.mockResolvedValue(undefined);
@@ -38,7 +29,8 @@ describe('generatePreloadScript', () => {
     });
 
     afterEach(() => {
-        mock.restore();
+        // Reset all fs mocks to pass-through state for next test
+        resetFsMocks();
     });
 
     describe('directory creation', () => {
@@ -68,15 +60,15 @@ describe('generatePreloadScript', () => {
 
             // Verify the placeholder was replaced with actual path
             expect(mockWriteFile).toHaveBeenCalled();
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing mock call data
+
             const [, writtenContent] = mockWriteFile.mock.calls[0];
 
             // The placeholder should be REPLACED, not present in output
             expect(writtenContent).not.toContain('__PRELOAD_LOGIC_PATH__');
 
-            // The actual path should be present and point to preload-logic.js
-            expect(writtenContent).toContain('preload-logic.js');
-            expect(writtenContent).toContain('coverage/preload-logic.js');
+            // The actual path should be present and point to preload-logic (extension varies: .ts for source, .js for bundled)
+            expect(writtenContent).toMatch(/preload-logic\.(js|ts)/);
+            expect(writtenContent).toMatch(/coverage\/preload-logic\.(js|ts)/);
         });
 
         it('should read template from templates directory', async () => {
@@ -87,7 +79,7 @@ describe('generatePreloadScript', () => {
 
             // Verify readFile was called with path to template
             expect(mockReadFile).toHaveBeenCalled();
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing mock call data
+
             const [templatePath, encoding] = mockReadFile.mock.calls[0];
             expect(templatePath).toContain('templates');
             expect(templatePath).toContain('coverage-preload.ts');
@@ -101,7 +93,7 @@ describe('generatePreloadScript', () => {
             await generatePreloadScript({ tempDir, coverageFile });
 
             expect(mockWriteFile).toHaveBeenCalled();
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing mock call data
+
             const [targetPath, content, encoding] = mockWriteFile.mock.calls[0];
             expect(targetPath).toBe(join(tempDir, 'stryker-coverage-preload.ts'));
             expect(content).toBe(templateContent);
@@ -119,7 +111,6 @@ describe('generatePreloadScript', () => {
         it('should resolve template path relative to module location', async () => {
             await generatePreloadScript({ tempDir, coverageFile });
 
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing mock call data
             const [templatePath] = mockReadFile.mock.calls[0];
             // Should reference templates/coverage-preload.ts
             expect(templatePath).toContain('templates/coverage-preload.ts');
@@ -172,7 +163,7 @@ describe('generatePreloadScript', () => {
 
             // Verify the script is actually written to the custom directory
             expect(mockWriteFile).toHaveBeenCalled();
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing mock call data
+
             const [targetPath, content] = mockWriteFile.mock.calls[0];
             expect(targetPath).toBe(join(customTempDir, 'stryker-coverage-preload.ts'));
             expect(content).toBe(templateContent);
@@ -190,7 +181,7 @@ describe('generatePreloadScript', () => {
 
             // Verify template content is written unchanged (coverageFile NOT injected)
             expect(mockWriteFile).toHaveBeenCalled();
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing mock call data
+
             const [, writtenContent] = mockWriteFile.mock.calls[0];
             expect(writtenContent).toBe(templateContent);
             expect(writtenContent).not.toContain('/custom/coverage.json');
@@ -207,7 +198,7 @@ describe('generatePreloadScript', () => {
 
             // Verify template content is written unchanged
             expect(mockWriteFile).toHaveBeenCalled();
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing mock call data
+
             const [, writtenContent] = mockWriteFile.mock.calls[0];
             expect(writtenContent).toBe(templateContent);
         });
@@ -215,15 +206,14 @@ describe('generatePreloadScript', () => {
 });
 
 describe('cleanupPreloadScript', () => {
-    let mockUnlink: ReturnType<typeof mock>;
-
     beforeEach(() => {
-        mockUnlink = mock();
-        spyOn(fs, 'unlink').mockImplementation(mockUnlink);
+        // Clear the mock state before each test
+        mockUnlink.mockClear();
     });
 
     afterEach(() => {
-        mock.restore();
+        // Reset all fs mocks to pass-through state for next test
+        resetFsMocks();
     });
 
     it('should delete the preload script', async () => {

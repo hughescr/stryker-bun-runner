@@ -41,14 +41,9 @@ const shouldCollectCoverage = shouldCollect(config);
 // ============================================================================
 let ws: WebSocket | null = null;
 
-// Track test counter and WebSocket-provided names (only needed when collecting coverage)
+// Track test counter (only needed when collecting coverage)
 // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
 const testCounter = createTestCounter();
-let pendingTestName: string | undefined;
-
-if(shouldCollectCoverage) {
-    // Coverage collection will use these variables
-}
 
 if(syncPort && shouldCollectCoverage) {
     try {
@@ -62,13 +57,6 @@ if(syncPort && shouldCollectCoverage) {
             if(parsedMessage === 'ready') {
                 // Initial ready signal - tests can start
                 return;
-            }
-
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- Parsed message has dynamic type
-            if(parsedMessage && typeof parsedMessage === 'object' && parsedMessage.type === 'testStart') {
-                // Store the pending test name to be picked up by beforeEach
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access -- Parsed message has dynamic type
-                pendingTestName = parsedMessage.name;
             }
         };
 
@@ -179,23 +167,11 @@ if(shouldCollectCoverage) {
     beforeEach(() => {
         // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- TestCounter from placeholder import
         const counterId = testCounter.increment();
-
-        // If we have a pending test name from WebSocket, use it
-        if(pendingTestName) {
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- TestCounter from placeholder import
-            testCounter.setName(counterId, pendingTestName);
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- StrykerGlobal from placeholder import
-            strykerGlobal.currentTestId = pendingTestName;
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- MutantCoverage from placeholder import
-            mutantCoverage.perTest[pendingTestName] ??= {};
-            pendingTestName = undefined;
-        } else {
-            // Fallback to counter - will be remapped later
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access -- StrykerGlobal from placeholder import
-            strykerGlobal.currentTestId = counterId;
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- MutantCoverage from placeholder import
-            mutantCoverage.perTest[counterId] ??= {};
-        }
+        // Always use counter-based IDs - coverage-mapper remaps to full names using inspector data
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access -- StrykerGlobal from placeholder import
+        strykerGlobal.currentTestId = counterId;
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- MutantCoverage from placeholder import
+        mutantCoverage.perTest[counterId] ??= {};
     });
 
     afterEach(() => {

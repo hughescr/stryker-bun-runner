@@ -381,62 +381,6 @@ describe('SyncServer', () => {
         });
     });
 
-    describe('sendTestStart', () => {
-        it('sends JSON message with test name', async () => {
-            const server = createServer();
-            await server.start();
-
-            const client = createMockClient(1);
-            mockWss.triggerConnection(client);
-
-            server.sendTestStart('my test');
-
-            expect(client.send).toHaveBeenCalledWith(
-                JSON.stringify({ type: 'testStart', name: 'my test' })
-            );
-        });
-
-        it('sends to all connected clients', async () => {
-            const server = createServer();
-            await server.start();
-
-            const client1 = createMockClient(1);
-            const client2 = createMockClient(1);
-            mockWss.triggerConnection(client1);
-            mockWss.triggerConnection(client2);
-
-            server.sendTestStart('test');
-
-            expect(client1.send).toHaveBeenCalled();
-            expect(client2.send).toHaveBeenCalled();
-        });
-
-        it('skips clients not in OPEN state', async () => {
-            const server = createServer();
-            await server.start();
-
-            const closedClient = createMockClient(2); // CLOSING state
-            mockWss.triggerConnection(closedClient);
-
-            server.sendTestStart('test');
-
-            expect(closedClient.send).not.toHaveBeenCalled();
-        });
-
-        it('ignores send errors', async () => {
-            const server = createServer();
-            await server.start();
-
-            const client = createMockClient(1);
-            client.send = mock(() => {
-                throw new Error('Send failed');
-            });
-            mockWss.triggerConnection(client);
-
-            expect(() => server.sendTestStart('test')).not.toThrow();
-        });
-    });
-
     describe('close', () => {
         it('closes all client connections', async () => {
             const server = createServer();

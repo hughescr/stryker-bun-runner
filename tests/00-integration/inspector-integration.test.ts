@@ -1,7 +1,8 @@
-import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll, afterEach, jest } from 'bun:test';
 import { BunTestRunner } from '../../src/bun-test-runner.js';
 import { DryRunStatus } from '@stryker-mutator/api/test-runner';
 import { writeFile, mkdir, rm } from 'node:fs/promises';
+import { resetAllMocks } from '../test-preload.js';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { Logger } from '@stryker-mutator/api/logging';
@@ -12,7 +13,10 @@ describe('Inspector Integration', () => {
     let testFilePath: string;
 
     beforeAll(async () => {
-    // Create temp directory with a simple test file
+        // Reset all mocks to ensure clean state (unit tests may have set mock implementations)
+        resetAllMocks();
+
+        // Create temp directory with a simple test file
         tempDir = join(tmpdir(), 'inspector-test-' + Date.now());
         await mkdir(tempDir, { recursive: true });
 
@@ -36,12 +40,17 @@ describe('Inspector Integration', () => {
     `);
     });
 
+    afterEach(() => {
+        // Reset all mocks and timers to prevent leakage to other tests
+        resetAllMocks();
+        jest.useRealTimers();
+    });
+
     afterAll(async () => {
         await rm(tempDir, { recursive: true, force: true });
     });
 
-    // FIXME: Test fails with port allocation error - needs investigation
-    test.skip('collects test names via inspector', async () => {
+    test('collects test names via inspector', async () => {
     // Create a mock logger
         const logs: string[] = [];
         const formatArg = (arg: unknown): string => {
@@ -98,8 +107,8 @@ describe('Inspector Integration', () => {
         const runner = new BunTestRunner(mockLogger as unknown as Logger, {
             bun: {
                 bunPath:          'bun',  // Use the default bun
-                timeout:          30000,
-                inspectorTimeout: 10000,
+                timeout:          60000,
+                inspectorTimeout: 30000,  // Increased for resource contention during full test suite
                 bunArgs:          [testFilePath],  // Point to our test file
             },
             testRunner: { name: 'bun' },
@@ -112,7 +121,11 @@ describe('Inspector Integration', () => {
 
         await runner.dispose();
 
-        // Verify results
+        // Verify results - log error details if failed
+        if(result.status !== DryRunStatus.Complete) {
+            console.error('DryRun failed with result:', JSON.stringify(result, null, 2));
+            console.error('Logs:', logs.join('\n'));
+        }
         expect(result.status).toBe(DryRunStatus.Complete);
 
         // Type narrowing: only CompleteDryRunResult has tests property
