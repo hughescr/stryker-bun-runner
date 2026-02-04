@@ -218,7 +218,7 @@ export class BunTestRunner implements TestRunner {
                     id:             fullName,
                     name:           fullName,
                     fileName:       normalizeTestFilePath(testInfo.url),
-                    startPosition:  undefined,
+                    startPosition:  testInfo.line !== undefined ? { line: testInfo.line, column: 0 } : undefined,
                     status:         TestStatus.Failed,
                     // Stryker disable next-line StringLiteral: fallback error message has no behavioral impact
                     failureMessage: parsedTest?.failureMessage ?? testInfo.error?.message ?? 'Test failed',
@@ -231,7 +231,7 @@ export class BunTestRunner implements TestRunner {
                     id:            fullName,
                     name:          fullName,
                     fileName:      normalizeTestFilePath(testInfo.url),
-                    startPosition: undefined,
+                    startPosition: testInfo.line !== undefined ? { line: testInfo.line, column: 0 } : undefined,
                     status:        TestStatus.Skipped,
                     timeSpentMs:   elapsed,
                 } satisfies SkippedTestResult;
@@ -241,7 +241,7 @@ export class BunTestRunner implements TestRunner {
                 id:            fullName,
                 name:          fullName,
                 fileName:      normalizeTestFilePath(testInfo.url),
-                startPosition: undefined,
+                startPosition: testInfo.line !== undefined ? { line: testInfo.line, column: 0 } : undefined,
                 status:        TestStatus.Success,
                 timeSpentMs:   elapsed,
             } satisfies SuccessTestResult;
