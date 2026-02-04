@@ -34,17 +34,31 @@ export async function generatePreloadScript(options: PreloadOptions): Promise<st
     await mkdir(options.tempDir, { recursive: true });
 
     // Get the path to the template file
-    // Note: When bundled, all code lives in dist/index.js, so __dirname is dist/
-    // The templates folder is copied to dist/templates/ during build
+    // Path differs between source and bundled builds:
+    // - Bundled: __dirname is dist/, templates at dist/templates/, logic at dist/coverage/preload-logic.js
+    // - Source: __dirname is src/coverage/, templates at src/templates/, logic at src/coverage/preload-logic.ts
     const __dirname = dirname(fileURLToPath(import.meta.url));
-    const templatePath = join(__dirname, 'templates/coverage-preload.ts');
+
+    // Detect if running from bundled dist (has templates/ subdirectory) or source
+    // Stryker disable next-line ConditionalExpression,LogicalOperator,MethodExpression: bundled path detection only testable with actual dist build
+    const isBundled = __dirname.endsWith('dist') || __dirname.includes('dist/');
+
+    // Stryker disable StringLiteral: bundled paths only used when running from dist/
+    const templatePath = isBundled
+        ? join(__dirname, 'templates/coverage-preload.ts')
+        : join(__dirname, '../templates/coverage-preload.ts');
+    // Stryker restore StringLiteral
 
     // Read the template
     const template = await readFile(templatePath, 'utf-8');
 
-    // Calculate the absolute path to preload-logic.js
-    // When bundled, __dirname is dist/, so preload-logic.js is at dist/coverage/preload-logic.js
-    const preloadLogicPath = join(__dirname, 'coverage/preload-logic.js');
+    // Calculate the absolute path to preload-logic
+    // Extension differs: .js for bundled, .ts for source (Bun handles both)
+    // Stryker disable StringLiteral: bundled paths only used when running from dist/
+    const preloadLogicPath = isBundled
+        ? join(__dirname, 'coverage/preload-logic.js')
+        : join(__dirname, 'preload-logic.ts');
+    // Stryker restore StringLiteral
 
     // Replace the placeholder with the absolute path
     const content = template.replace('__PRELOAD_LOGIC_PATH__', preloadLogicPath);

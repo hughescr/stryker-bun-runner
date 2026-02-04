@@ -3,10 +3,10 @@
  * Tests the Bun process spawning and management utilities
  */
 
-import { describe, it, expect, beforeEach, afterEach, mock, spyOn, jest } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, mock, jest } from 'bun:test';
 import { runBunTests } from '../../src/process-runner.js';
 import type { ChildProcess } from 'node:child_process';
-import * as childProcess from 'node:child_process';
+import { mockSpawn, resetChildProcessMocks } from '../test-preload.js';
 
 /**
  * Extended mock interface for ChildProcess with handler storage
@@ -20,7 +20,6 @@ interface MockChildProcess extends Partial<ChildProcess> {
 }
 
 describe('runBunTests', () => {
-    let mockSpawn: ReturnType<typeof mock>;
     let mockChildProcess: MockChildProcess;
 
     beforeEach(() => {
@@ -56,13 +55,15 @@ describe('runBunTests', () => {
         };
         /* eslint-enable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- re-enable after mock setup */
 
-        // Mock spawn to return our mock child process
-        mockSpawn = mock(() => mockChildProcess as ChildProcess);
-        spyOn(childProcess, 'spawn').mockImplementation(mockSpawn);
+        // Configure preload mock spawn to return our mock child process
+        mockSpawn.mockClear();
+        mockSpawn.mockImplementation(() => mockChildProcess as ChildProcess);
     });
 
     afterEach(() => {
-        mock.restore();
+        // Reset preload mocks and timers to prevent leakage to other tests
+        resetChildProcessMocks();
+        jest.useRealTimers();
     });
 
     describe('successful test runs', () => {
@@ -232,9 +233,9 @@ describe('runBunTests', () => {
             await resultPromise;
 
             const spawnCall = mockSpawn.mock.calls[0];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing spawn options from mock
+
             const spawnOptions = spawnCall[2];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing env property from mock options
+
             expect(spawnOptions.env).toMatchObject({
                 CUSTOM_VAR:  'custom_value',
                 ANOTHER_VAR: 'another_value',
@@ -252,10 +253,10 @@ describe('runBunTests', () => {
             await resultPromise;
 
             const spawnCall = mockSpawn.mock.calls[0];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing spawn options from mock
+
             const spawnOptions = spawnCall[2];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing env property from mock options
-            expect(spawnOptions.env.__STRYKER_ACTIVE_MUTANT__).toBe('42');
+
+            expect(spawnOptions.env!.__STRYKER_ACTIVE_MUTANT__).toBe('42');
         });
 
         it('should set __STRYKER_COVERAGE_FILE__ when coverageFile is provided', async () => {
@@ -269,10 +270,10 @@ describe('runBunTests', () => {
             await resultPromise;
 
             const spawnCall = mockSpawn.mock.calls[0];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing spawn options from mock
+
             const spawnOptions = spawnCall[2];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing env property from mock options
-            expect(spawnOptions.env.__STRYKER_COVERAGE_FILE__).toBe('/tmp/coverage.json');
+
+            expect(spawnOptions.env!.__STRYKER_COVERAGE_FILE__).toBe('/tmp/coverage.json');
         });
 
         it('should set __STRYKER_SYNC_PORT__ when syncPort is provided', async () => {
@@ -286,10 +287,10 @@ describe('runBunTests', () => {
             await resultPromise;
 
             const spawnCall = mockSpawn.mock.calls[0];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing spawn options from mock
+
             const spawnOptions = spawnCall[2];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing env property from mock options
-            expect(spawnOptions.env.__STRYKER_SYNC_PORT__).toBe('8080');
+
+            expect(spawnOptions.env!.__STRYKER_SYNC_PORT__).toBe('8080');
         });
     });
 
@@ -305,7 +306,7 @@ describe('runBunTests', () => {
             await resultPromise;
 
             const spawnCall = mockSpawn.mock.calls[0];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing args from mock
+
             const args = spawnCall[1];
             expect(args).toContain('--test-name-pattern');
             expect(args).toContain('should.*add');
@@ -322,7 +323,7 @@ describe('runBunTests', () => {
             await resultPromise;
 
             const spawnCall = mockSpawn.mock.calls[0];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing args from mock
+
             const args = spawnCall[1];
             expect(args).toContain('--bail');
         });
@@ -338,7 +339,7 @@ describe('runBunTests', () => {
             await resultPromise;
 
             const spawnCall = mockSpawn.mock.calls[0];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing args from mock
+
             const args = spawnCall[1];
             expect(args).toContain('--preload');
             expect(args).toContain('/tmp/preload.ts');
@@ -355,7 +356,7 @@ describe('runBunTests', () => {
             await resultPromise;
 
             const spawnCall = mockSpawn.mock.calls[0];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing args from mock
+
             const args = spawnCall[1];
             expect(args).toContain('--only');
             expect(args).toContain('--verbose');
@@ -378,7 +379,7 @@ describe('runBunTests', () => {
             await resultPromise;
 
             const spawnCall = mockSpawn.mock.calls[0];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- destructuring mock call data
+
             const [bunPath, args, options] = spawnCall;
 
             expect(bunPath).toBe('/custom/bun');
@@ -392,12 +393,12 @@ describe('runBunTests', () => {
                 '--no-randomize',
                 '--verbose',
             ]);
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing env property from mock options
-            expect(options.env.__STRYKER_ACTIVE_MUTANT__).toBe('123');
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing env property from mock options
-            expect(options.env.__STRYKER_COVERAGE_FILE__).toBe('/tmp/coverage.json');
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing env property from mock options
-            expect(options.env.CUSTOM).toBe('value');
+
+            expect(options.env!.__STRYKER_ACTIVE_MUTANT__).toBe('123');
+
+            expect(options.env!.__STRYKER_COVERAGE_FILE__).toBe('/tmp/coverage.json');
+
+            expect(options.env!.CUSTOM).toBe('value');
         });
     });
 
@@ -413,7 +414,7 @@ describe('runBunTests', () => {
             await resultPromise;
 
             const spawnCall = mockSpawn.mock.calls[0];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing args from mock
+
             const args = spawnCall[1];
             expect(args).toContain('--concurrency=1');
         });
@@ -429,7 +430,7 @@ describe('runBunTests', () => {
             await resultPromise;
 
             const spawnCall = mockSpawn.mock.calls[0];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing args from mock
+
             const args = spawnCall[1];
             expect(args).not.toContain('--concurrency=1');
         });
@@ -447,7 +448,7 @@ describe('runBunTests', () => {
             await resultPromise;
 
             const spawnCall = mockSpawn.mock.calls[0];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing args from mock
+
             const args = spawnCall[1];
             expect(args).toContain('--no-coverage');
         });
@@ -463,7 +464,7 @@ describe('runBunTests', () => {
             await resultPromise;
 
             const spawnCall = mockSpawn.mock.calls[0];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing args from mock
+
             const args = spawnCall[1];
             expect(args).not.toContain('--no-coverage');
         });
@@ -478,7 +479,7 @@ describe('runBunTests', () => {
             await resultPromise;
 
             const spawnCall = mockSpawn.mock.calls[0];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing args from mock
+
             const args = spawnCall[1];
             expect(args).not.toContain('--no-coverage');
         });
@@ -499,10 +500,9 @@ describe('runBunTests', () => {
             await resultPromise;
 
             const spawnCall = mockSpawn.mock.calls[0];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing args from mock
+
             const args = spawnCall[1];
 
-            /* eslint-disable @typescript-eslint/no-unsafe-member-access -- accessing array indices from mock args */
             // Verify order: test, preload, test-name-pattern, bail, no-randomize, then custom args
             expect(args[0]).toBe('test');
             expect(args[1]).toBe('--preload');
@@ -512,7 +512,6 @@ describe('runBunTests', () => {
             expect(args[5]).toBe('--bail');
             expect(args[6]).toBe('--no-randomize');
             expect(args[7]).toBe('--only');
-            /* eslint-enable @typescript-eslint/no-unsafe-member-access -- re-enable after array index access */
         });
     });
 
@@ -528,7 +527,7 @@ describe('runBunTests', () => {
             await resultPromise;
 
             const spawnCall = mockSpawn.mock.calls[0];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing args from mock
+
             const args = spawnCall[1];
             expect(args).toContain('--inspect=9229');
         });
@@ -593,7 +592,7 @@ describe('runBunTests', () => {
             await resultPromise;
 
             const spawnCall = mockSpawn.mock.calls[0];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing args from mock
+
             const args = spawnCall[1];
 
             // Args should only contain 'test' and '--no-randomize', no extra elements
@@ -615,7 +614,7 @@ describe('runBunTests', () => {
             await resultPromise;
 
             const spawnCall = mockSpawn.mock.calls[0];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing args from mock
+
             const args = spawnCall[1];
 
             // Should work fine with no bunArgs added
@@ -634,7 +633,7 @@ describe('runBunTests', () => {
             await resultPromise;
 
             const spawnCall = mockSpawn.mock.calls[0];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing args from mock
+
             const args = spawnCall[1];
 
             expect(args).toEqual(['test', '--no-randomize']);
@@ -655,7 +654,7 @@ describe('runBunTests', () => {
             await resultPromise;
 
             const spawnCall = mockSpawn.mock.calls[0];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing args from mock
+
             const args = spawnCall[1];
 
             // Should only have 'test' and '--no-randomize', not any empty bunArgs
@@ -675,7 +674,7 @@ describe('runBunTests', () => {
             await resultPromise;
 
             const spawnCall = mockSpawn.mock.calls[0];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing args from mock
+
             const args = spawnCall[1];
 
             // Should not include --test-name-pattern flag
@@ -694,7 +693,7 @@ describe('runBunTests', () => {
             await resultPromise;
 
             const spawnCall = mockSpawn.mock.calls[0];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing args from mock
+
             const args = spawnCall[1];
 
             // Should not include --bail flag
@@ -713,7 +712,7 @@ describe('runBunTests', () => {
             await resultPromise;
 
             const spawnCall = mockSpawn.mock.calls[0];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing args from mock
+
             const args = spawnCall[1];
 
             // Should not include --no-coverage flag
@@ -777,13 +776,13 @@ describe('runBunTests', () => {
             await resultPromise;
 
             const spawnCall = mockSpawn.mock.calls[0];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing spawn options from mock
+
             const spawnOptions = spawnCall[2];
 
             // Check that env matches process.env (not set to 'undefined' string)
             // When running in Stryker, process.env has this set; when running normally it's undefined
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock spawn options
-            expect(spawnOptions.env.__STRYKER_ACTIVE_MUTANT__).toBe(originalValue);
+
+            expect(spawnOptions.env!.__STRYKER_ACTIVE_MUTANT__).toBe(originalValue);
         });
 
         it('should not set __STRYKER_COVERAGE_FILE__ when coverageFile is undefined - kills line 150 mutation', async () => {
@@ -801,14 +800,14 @@ describe('runBunTests', () => {
             await resultPromise;
 
             const spawnCall = mockSpawn.mock.calls[0];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing spawn options from mock
+
             const spawnOptions = spawnCall[2];
 
             // The mutation would set the property to undefined explicitly
             // We check that the behavior matches: if process.env has it, we inherit it; if not, we don't set it
             // This test will fail if the mutation makes it always execute the assignment
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment -- accessing mock spawn options
-            const actualValue = spawnOptions.env.__STRYKER_COVERAGE_FILE__;
+
+            const actualValue = spawnOptions.env!.__STRYKER_COVERAGE_FILE__;
             const expectedValue = process.env.__STRYKER_COVERAGE_FILE__;
 
             // Both should be undefined (not set) when coverageFile option is not provided
@@ -836,15 +835,15 @@ describe('runBunTests', () => {
             await resultPromise;
 
             const spawnCall = mockSpawn.mock.calls[0];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- accessing spawn options from mock
+
             const spawnOptions = spawnCall[2];
 
             // Should match process.env value (could be undefined or inherited from parent)
             // The key check: if mutation changes condition to if(true), it would set to string 'undefined'
             // which would differ from originalValue (either undefined stays undefined correctly, or
             // if Stryker set a value, it should remain that value, not become 'undefined')
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock spawn options
-            expect(spawnOptions.env.__STRYKER_SYNC_PORT__).toBe(originalValue);
+
+            expect(spawnOptions.env!.__STRYKER_SYNC_PORT__).toBe(originalValue);
         });
     });
 
@@ -878,9 +877,9 @@ describe('runBunTests', () => {
                 kill: mock(() => true),
             };
 
-            const mockSpawnNull = mock(() => mockChildProcessNullStdout);
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-argument -- mock implementation needs any type
-            spyOn(childProcess, 'spawn').mockImplementation(mockSpawnNull as any);
+            // Override preload mock to return our custom child process
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-return -- mock implementation needs any type
+            mockSpawn.mockImplementation(() => mockChildProcessNullStdout as any);
 
             const resultPromise = runBunTests({
                 bunPath: 'bun',
@@ -928,9 +927,9 @@ describe('runBunTests', () => {
                 kill: mock(() => true),
             };
 
-            const mockSpawnNull = mock(() => mockChildProcessNullStderr);
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-argument -- mock implementation needs any type
-            spyOn(childProcess, 'spawn').mockImplementation(mockSpawnNull as any);
+            // Override preload mock to return our custom child process
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-return -- mock implementation needs any type
+            mockSpawn.mockImplementation(() => mockChildProcessNullStderr as any);
 
             const resultPromise = runBunTests({
                 bunPath: 'bun',
@@ -968,9 +967,9 @@ describe('runBunTests', () => {
                 kill: mock(() => true),
             };
 
-            const mockSpawnNull = mock(() => mockChildProcessBothNull);
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-argument -- mock implementation needs any type
-            spyOn(childProcess, 'spawn').mockImplementation(mockSpawnNull as any);
+            // Override preload mock to return our custom child process
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-return -- mock implementation needs any type
+            mockSpawn.mockImplementation(() => mockChildProcessBothNull as any);
 
             const resultPromise = runBunTests({
                 bunPath: 'bun',

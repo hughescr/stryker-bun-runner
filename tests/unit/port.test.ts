@@ -1,20 +1,17 @@
-import { describe, it, expect, mock, spyOn, beforeEach, afterEach } from 'bun:test';
-import * as net from 'net';
+import { describe, it, expect, mock, beforeEach, afterEach } from 'bun:test';
+import type * as net from 'net';
 import { getAvailablePort } from '../../src/utils/port';
+import { mockCreateServer, resetNetMocks } from '../test-preload.js';
 
 describe('getAvailablePort', () => {
-    let createServerSpy: ReturnType<typeof spyOn>;
-
     beforeEach(() => {
-        // Clear any previous spies
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- optional chaining on mock
-        createServerSpy?.mockRestore?.();
+        // Clear call history before each test
+        mockCreateServer.mockClear();
     });
 
     afterEach(() => {
-        // Clean up spy after each test
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- optional chaining on mock
-        createServerSpy?.mockRestore?.();
+        // Reset net mocks to prevent leakage to other tests
+        resetNetMocks();
     });
 
     it('returns a valid port number on success', async () => {
@@ -30,7 +27,7 @@ describe('getAvailablePort', () => {
             }),
         };
 
-        createServerSpy = spyOn(net, 'createServer').mockReturnValue(mockServer as unknown as net.Server);
+        mockCreateServer.mockReturnValue(mockServer as unknown as net.Server);
 
         const port = await getAvailablePort();
 
@@ -56,7 +53,7 @@ describe('getAvailablePort', () => {
             }),
         };
 
-        createServerSpy = spyOn(net, 'createServer').mockReturnValue(mockServer as unknown as net.Server);
+        mockCreateServer.mockReturnValue(mockServer as unknown as net.Server);
 
         const port = await getAvailablePort();
 
@@ -80,7 +77,7 @@ describe('getAvailablePort', () => {
             close:   mock(() => {}),
         };
 
-        createServerSpy = spyOn(net, 'createServer').mockReturnValue(mockServer as unknown as net.Server);
+        mockCreateServer.mockReturnValue(mockServer as unknown as net.Server);
 
         await expect(getAvailablePort()).rejects.toThrow('Failed to get available port');
         await expect(getAvailablePort()).rejects.toThrow('EADDRINUSE');
@@ -103,7 +100,7 @@ describe('getAvailablePort', () => {
             close:   mock(() => {}),
         };
 
-        createServerSpy = spyOn(net, 'createServer').mockReturnValue(mockServer as unknown as net.Server);
+        mockCreateServer.mockReturnValue(mockServer as unknown as net.Server);
 
         await expect(getAvailablePort()).rejects.toThrow(`Failed to get available port: ${errorMessage}`);
     });
@@ -120,7 +117,7 @@ describe('getAvailablePort', () => {
             close:   mock(() => {}),
         };
 
-        createServerSpy = spyOn(net, 'createServer').mockReturnValue(mockServer as unknown as net.Server);
+        mockCreateServer.mockReturnValue(mockServer as unknown as net.Server);
 
         await expect(getAvailablePort()).rejects.toThrow('Failed to get port: server address is invalid');
         await expect(getAvailablePort()).rejects.toThrow('server address is invalid');
@@ -139,7 +136,7 @@ describe('getAvailablePort', () => {
             close:   mock(() => {}),
         };
 
-        createServerSpy = spyOn(net, 'createServer').mockReturnValue(mockServer as unknown as net.Server);
+        mockCreateServer.mockReturnValue(mockServer as unknown as net.Server);
 
         await expect(getAvailablePort()).rejects.toThrow('Failed to get port: server address is invalid');
         await expect(getAvailablePort()).rejects.toThrow('invalid');
@@ -160,7 +157,7 @@ describe('getAvailablePort', () => {
             }),
         };
 
-        createServerSpy = spyOn(net, 'createServer').mockReturnValue(mockServer as unknown as net.Server);
+        mockCreateServer.mockReturnValue(mockServer as unknown as net.Server);
 
         await expect(getAvailablePort()).rejects.toThrow('Failed to close server');
         await expect(getAvailablePort()).rejects.toThrow('Failed to release socket');
@@ -182,7 +179,7 @@ describe('getAvailablePort', () => {
             }),
         };
 
-        createServerSpy = spyOn(net, 'createServer').mockReturnValue(mockServer as unknown as net.Server);
+        mockCreateServer.mockReturnValue(mockServer as unknown as net.Server);
 
         await expect(getAvailablePort()).rejects.toThrow(`Failed to close server: ${errorMessage}`);
     });
@@ -200,7 +197,7 @@ describe('getAvailablePort', () => {
             }),
         };
 
-        createServerSpy = spyOn(net, 'createServer').mockReturnValue(mockServer as unknown as net.Server);
+        mockCreateServer.mockReturnValue(mockServer as unknown as net.Server);
 
         await getAvailablePort();
 
@@ -224,7 +221,7 @@ describe('getAvailablePort', () => {
             }),
         };
 
-        createServerSpy = spyOn(net, 'createServer').mockReturnValue(mockServer as unknown as net.Server);
+        mockCreateServer.mockReturnValue(mockServer as unknown as net.Server);
 
         await getAvailablePort();
 
@@ -258,7 +255,7 @@ describe('getAvailablePort', () => {
             }),
         };
 
-        createServerSpy = spyOn(net, 'createServer').mockReturnValue(mockServer as unknown as net.Server);
+        mockCreateServer.mockReturnValue(mockServer as unknown as net.Server);
 
         await getAvailablePort();
 
@@ -283,7 +280,7 @@ describe('getAvailablePort', () => {
             close:   mock(() => {}),
         };
 
-        createServerSpy = spyOn(net, 'createServer').mockReturnValue(mockServer as unknown as net.Server);
+        mockCreateServer.mockReturnValue(mockServer as unknown as net.Server);
 
         await expect(getAvailablePort()).rejects.toThrow();
 
@@ -309,7 +306,7 @@ describe('getAvailablePort', () => {
             }),
         };
 
-        createServerSpy = spyOn(net, 'createServer').mockReturnValue(mockServer as unknown as net.Server);
+        mockCreateServer.mockReturnValue(mockServer as unknown as net.Server);
 
         const port = await getAvailablePort();
 

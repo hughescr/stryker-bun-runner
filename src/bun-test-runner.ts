@@ -319,17 +319,12 @@ export class BunTestRunner implements TestRunner {
         // Stryker disable next-line StringLiteral: logging message only
         this.logger.debug('Inspector URL: %s', inspectorUrl);
 
-        // 5. Create inspector client with test start handler
+        // 5. Create inspector client
         inspector = new InspectorClient({
             url:               inspectorUrl,
             connectionTimeout: this.inspectorTimeout,
             requestTimeout:    this.inspectorTimeout,
-            handlers:          {
-                onTestStart: (test) => {
-                    // Relay test name to preload script via sync server
-                    syncServer.sendTestStart(test.fullName);
-                },
-            },
+            handlers:          {},  // No longer relaying test names - coverage uses counter-based IDs
         });
 
         // 6. Connect inspector client and enable test reporting

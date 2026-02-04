@@ -3,7 +3,7 @@
  * Integration-level tests for the main TestRunner implementation
  */
 
-import { describe, it, expect, beforeEach, afterEach, mock, spyOn } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, mock, spyOn, jest } from 'bun:test';
 import { BunTestRunner, normalizeTestFilePath, stripFilePrefix } from '../../src/bun-test-runner.js';
 import { DryRunStatus, MutantRunStatus, TestStatus } from '@stryker-mutator/api/test-runner';
 import type { Logger } from '@stryker-mutator/api/logging';
@@ -11,7 +11,7 @@ import type { StrykerOptions } from '@stryker-mutator/api/core';
 import * as processRunner from '../../src/process-runner.js';
 import * as coverageCollector from '../../src/coverage/collector.js';
 import * as preloadGenerator from '../../src/coverage/preload-generator.js';
-import * as portUtils from '../../src/utils/port.js';
+import { mockGetAvailablePort, resetAllMocks } from '../test-preload.js';
 import * as syncServerModule from '../../src/utils/sync-server.js';
 import * as inspectorModule from '../../src/inspector/inspector-client.js';
 import * as coverageMapper from '../../src/coverage/coverage-mapper.js';
@@ -24,7 +24,6 @@ describe('BunTestRunner', () => {
     let mockCleanupCoverageFile: ReturnType<typeof mock>;
     let mockGeneratePreloadScript: ReturnType<typeof mock>;
     let mockCleanupPreloadScript: ReturnType<typeof mock>;
-    let mockGetAvailablePort: ReturnType<typeof mock>;
     let mockSyncServer: {
         start:         ReturnType<typeof mock>
         signalReady:   ReturnType<typeof mock>
@@ -41,8 +40,21 @@ describe('BunTestRunner', () => {
     };
     let mockMapCoverageToInspectorIds: ReturnType<typeof mock>;
 
+    // Store spy instances for cleanup in afterEach
+    let runBunTestsSpy: ReturnType<typeof spyOn>;
+    let collectCoverageSpy: ReturnType<typeof spyOn>;
+    let cleanupCoverageFileSpy: ReturnType<typeof spyOn>;
+    let generatePreloadScriptSpy: ReturnType<typeof spyOn>;
+    let cleanupPreloadScriptSpy: ReturnType<typeof spyOn>;
+    let syncServerSpy: ReturnType<typeof spyOn>;
+    let inspectorClientSpy: ReturnType<typeof spyOn>;
+    let mapCoverageToInspectorIdsSpy: ReturnType<typeof spyOn>;
+
     beforeEach(() => {
-    // Create mock logger
+        // Note: Global fake timers cause tests to hang when running full suite
+        // Tests that need fake timers enable them locally within the test
+
+        // Create mock logger
         mockLogger = {
             debug:          mock(),
             info:           mock(),
@@ -60,23 +72,22 @@ describe('BunTestRunner', () => {
 
         // Mock process runner
         mockRunBunTests = mock();
-        spyOn(processRunner, 'runBunTests').mockImplementation(mockRunBunTests);
+        runBunTestsSpy = spyOn(processRunner, 'runBunTests').mockImplementation(mockRunBunTests);
 
         // Mock coverage collector
         mockCollectCoverage = mock();
         mockCleanupCoverageFile = mock();
-        spyOn(coverageCollector, 'collectCoverage').mockImplementation(mockCollectCoverage);
-        spyOn(coverageCollector, 'cleanupCoverageFile').mockImplementation(mockCleanupCoverageFile);
+        collectCoverageSpy = spyOn(coverageCollector, 'collectCoverage').mockImplementation(mockCollectCoverage);
+        cleanupCoverageFileSpy = spyOn(coverageCollector, 'cleanupCoverageFile').mockImplementation(mockCleanupCoverageFile);
 
         // Mock preload generator
         mockGeneratePreloadScript = mock();
         mockCleanupPreloadScript = mock();
-        spyOn(preloadGenerator, 'generatePreloadScript').mockImplementation(mockGeneratePreloadScript);
-        spyOn(preloadGenerator, 'cleanupPreloadScript').mockImplementation(mockCleanupPreloadScript);
+        generatePreloadScriptSpy = spyOn(preloadGenerator, 'generatePreloadScript').mockImplementation(mockGeneratePreloadScript);
+        cleanupPreloadScriptSpy = spyOn(preloadGenerator, 'cleanupPreloadScript').mockImplementation(mockCleanupPreloadScript);
 
-        // Mock port utility
-        mockGetAvailablePort = mock();
-        spyOn(portUtils, 'getAvailablePort').mockImplementation(mockGetAvailablePort);
+        // Port utility mock comes from preload - just clear its state
+        mockGetAvailablePort.mockClear();
 
         // Mock sync server
         mockSyncServer = {
@@ -87,7 +98,7 @@ describe('BunTestRunner', () => {
             clientCount:   0,
         };
         // @ts-expect-error - Mocking constructor, type system doesn't understand this pattern
-        spyOn(syncServerModule, 'SyncServer').mockImplementation(() => mockSyncServer);
+        syncServerSpy = spyOn(syncServerModule, 'SyncServer').mockImplementation(() => mockSyncServer);
 
         // Mock inspector client
         mockInspectorClient = {
@@ -98,11 +109,11 @@ describe('BunTestRunner', () => {
             close:             mock(),
         };
         // @ts-expect-error - Mocking constructor, type system doesn't understand this pattern
-        spyOn(inspectorModule, 'InspectorClient').mockImplementation(() => mockInspectorClient);
+        inspectorClientSpy = spyOn(inspectorModule, 'InspectorClient').mockImplementation(() => mockInspectorClient);
 
         // Mock coverage mapper
         mockMapCoverageToInspectorIds = mock();
-        spyOn(coverageMapper, 'mapCoverageToInspectorIds').mockImplementation(mockMapCoverageToInspectorIds);
+        mapCoverageToInspectorIdsSpy = spyOn(coverageMapper, 'mapCoverageToInspectorIds').mockImplementation(mockMapCoverageToInspectorIds);
         // Default: pass through coverage unchanged (tests can override if needed)
         // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-return -- intentional pass-through mock
         mockMapCoverageToInspectorIds.mockImplementation((coverage: any) => coverage);
@@ -124,7 +135,26 @@ describe('BunTestRunner', () => {
     });
 
     afterEach(() => {
-        mock.restore();
+        // Restore all spies to prevent test pollution
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+        runBunTestsSpy.mockRestore();
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+        collectCoverageSpy.mockRestore();
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+        cleanupCoverageFileSpy.mockRestore();
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+        generatePreloadScriptSpy.mockRestore();
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+        cleanupPreloadScriptSpy.mockRestore();
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+        syncServerSpy.mockRestore();
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+        inspectorClientSpy.mockRestore();
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+        mapCoverageToInspectorIdsSpy.mockRestore();
+        // Reset preload mocks and timers
+        resetAllMocks();
+        jest.useRealTimers();
     });
 
     describe('constructor', () => {
@@ -586,111 +616,134 @@ tests/example.test.ts:
         });
 
         it('should wait in 50ms intervals while waiting for inspector URL', async () => {
-            const delays: number[] = [];
-            let callCount = 0;
+            // Enable fake timers for this test only
+            jest.useFakeTimers();
+            try {
+                const delays: number[] = [];
 
-            // Mock runBunTests to call onInspectorReady after a short delay
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
-            mockRunBunTests.mockImplementation((options: any) => {
-                // Call onInspectorReady after 3 polling cycles (160ms)
-                setTimeout(() => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- invoking mock callback
-                    if(options.onInspectorReady) {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
-                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
-                    }
-                }, 160);
-                return Promise.resolve({
-                    exitCode: 0,
-                    stdout:   '✓ test [0.12ms]\n 1 pass',
-                    stderr:   '',
-                    timedOut: false,
+                // Mock runBunTests to call onInspectorReady after 160ms (will be triggered by fake timers)
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    // Schedule callback after 160ms (3+ polling cycles)
+                    setTimeout(() => {
+                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- invoking mock callback
+                        if(options.onInspectorReady) {
+                            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
+                            options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                        }
+                    }, 160);
+                    return Promise.resolve({
+                        exitCode: 0,
+                        stdout:   '✓ test [0.12ms]\n 1 pass',
+                        stderr:   '',
+                        timedOut: false,
+                    });
                 });
-            });
-            mockCollectCoverage.mockResolvedValue(undefined);
+                mockCollectCoverage.mockResolvedValue(undefined);
 
-            // Spy on setTimeout to verify 50ms delays
-            const originalSetTimeout = globalThis.setTimeout;
-            globalThis.setTimeout = ((fn: () => void, delay?: number) => {
-                if(delay === 50) {
-                    delays.push(delay);
-                    callCount++;
+                // Spy on setTimeout to verify 50ms delays
+                const setTimeoutSpy = jest.spyOn(globalThis, 'setTimeout');
+
+                const runner = new BunTestRunner(mockLogger, {
+                    bun: {
+                        inspectorTimeout: 500,
+                    },
+                } as unknown as StrykerOptions);
+                await runner.init();
+
+                // Start the dryRun (don't await yet)
+                const resultPromise = runner.dryRun();
+
+                // Advance fake timers in steps to allow async code to progress
+                // Each iteration: advance time, then let microtasks/promises settle
+                for(let i = 0; i < 10; i++) {
+                    jest.advanceTimersByTime(50);
+                    await Promise.resolve();
                 }
-                return originalSetTimeout(fn, delay);
-            }) as typeof setTimeout;
 
-            const runner = new BunTestRunner(mockLogger, {
-                bun: {
-                    inspectorTimeout: 500,
-                },
-            } as unknown as StrykerOptions);
-            await runner.init();
+                const result = await resultPromise;
 
-            const result = await runner.dryRun();
+                // Check all setTimeout calls with 50ms delay
+                for(const call of setTimeoutSpy.mock.calls) {
+                    if(call[1] === 50) {
+                        delays.push(50);
+                    }
+                }
 
-            // Restore original setTimeout
-            globalThis.setTimeout = originalSetTimeout;
+                setTimeoutSpy.mockRestore();
 
-            expect(result.status).toBe(DryRunStatus.Complete);
-            // Verify we had at least 3 polling cycles with 50ms delays
-            expect(callCount).toBeGreaterThanOrEqual(3);
-            // Verify all delays were exactly 50ms
-            for(const delay of delays) {
-                expect(delay).toBe(50);
+                expect(result.status).toBe(DryRunStatus.Complete);
+                // Verify we had at least 3 polling cycles with 50ms delays
+                expect(delays.length).toBeGreaterThanOrEqual(3);
+                // Verify all delays were exactly 50ms
+                for(const delay of delays) {
+                    expect(delay).toBe(50);
+                }
+            } finally {
+                jest.useRealTimers();
             }
         });
 
         it('should exit wait loop when inspector URL is received before timeout', async () => {
-            let waitLoopIterations = 0;
+            jest.useFakeTimers();
+            try {
+                let waitLoopIterations = 0;
 
-            // Mock runBunTests to call onInspectorReady immediately
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
-            mockRunBunTests.mockImplementation((options: any) => {
-                // Call onInspectorReady after just one polling cycle
-                setTimeout(() => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- invoking mock callback
-                    if(options.onInspectorReady) {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
-                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
-                    }
-                }, 60);
-                return Promise.resolve({
-                    exitCode: 0,
-                    stdout:   '✓ test [0.12ms]\n 1 pass',
-                    stderr:   '',
-                    timedOut: false,
+                // Mock runBunTests to call onInspectorReady after 60ms (just over one polling cycle)
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    setTimeout(() => {
+                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- invoking mock callback
+                        if(options.onInspectorReady) {
+                            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
+                            options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                        }
+                    }, 60);
+                    return Promise.resolve({
+                        exitCode: 0,
+                        stdout:   '✓ test [0.12ms]\n 1 pass',
+                        stderr:   '',
+                        timedOut: false,
+                    });
                 });
-            });
-            mockCollectCoverage.mockResolvedValue(undefined);
+                mockCollectCoverage.mockResolvedValue(undefined);
 
-            // Track setTimeout calls to count loop iterations
-            const originalSetTimeout = globalThis.setTimeout;
-            globalThis.setTimeout = ((fn: () => void, delay?: number) => {
-                if(delay === 50) {
-                    waitLoopIterations++;
+                // Track setTimeout calls to count loop iterations
+                const setTimeoutSpy = jest.spyOn(globalThis, 'setTimeout');
+
+                const runner = new BunTestRunner(mockLogger, {
+                    bun: {
+                        inspectorTimeout: 5000, // Long timeout, but should exit early
+                    },
+                } as unknown as StrykerOptions);
+                await runner.init();
+
+                // Start the dryRun (don't await yet)
+                const resultPromise = runner.dryRun();
+
+                // Advance fake timers - only need a few iterations since URL arrives at 60ms
+                for(let i = 0; i < 5; i++) {
+                    jest.advanceTimersByTime(50);
+                    await Promise.resolve();
                 }
-                return originalSetTimeout(fn, delay);
-            }) as typeof setTimeout;
 
-            const runner = new BunTestRunner(mockLogger, {
-                bun: {
-                    inspectorTimeout: 5000, // Long timeout, but should exit early
-                },
-            } as unknown as StrykerOptions);
-            await runner.init();
+                const result = await resultPromise;
 
-            const startTime = Date.now();
-            const result = await runner.dryRun();
-            const elapsed = Date.now() - startTime;
+                // Count the 50ms delay calls
+                for(const call of setTimeoutSpy.mock.calls) {
+                    if(call[1] === 50) {
+                        waitLoopIterations++;
+                    }
+                }
 
-            // Restore original setTimeout
-            globalThis.setTimeout = originalSetTimeout;
+                setTimeoutSpy.mockRestore();
 
-            expect(result.status).toBe(DryRunStatus.Complete);
-            // Should have exited loop early (well before 5000ms timeout)
-            expect(elapsed).toBeLessThan(1000);
-            // Should have had only a few iterations before URL arrived
-            expect(waitLoopIterations).toBeLessThan(20);
+                expect(result.status).toBe(DryRunStatus.Complete);
+                // Should have had only a few iterations before URL arrived (well under 20)
+                expect(waitLoopIterations).toBeLessThan(20);
+            } finally {
+                jest.useRealTimers();
+            }
         });
 
         it('should return specific error message on inspector connection failure', async () => {
@@ -799,73 +852,76 @@ tests/example.test.ts:
         });
 
         it('should calculate timePerTest correctly when executionOrder has items', async () => {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
-            mockRunBunTests.mockImplementation((options: any) => {
-                // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
-                if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
-                    options.onInspectorReady('ws://127.0.0.1:6499/inspector');
-                }
-                // Simulate a small delay that will result in timePerTest calculation
-                return new Promise((resolve) => {
-                    setTimeout(() => {
-                        resolve({
-                            exitCode: 0,
-                            stdout:   '✓ test [0.12ms]\n 1 pass',
-                            stderr:   '',
-                            timedOut: false,
-                        });
-                    }, 10); // Small delay
+            jest.useFakeTimers();
+            try {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    // Call onInspectorReady immediately if provided
+                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+                    if(options.onInspectorReady) {
+                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    // Simulate a small delay that will result in timePerTest calculation
+                    // Use fake timer advancement for consistent timing
+                    jest.advanceTimersByTime(10);
+                    return Promise.resolve({
+                        exitCode: 0,
+                        stdout:   '✓ test [0.12ms]\n 1 pass',
+                        stderr:   '',
+                        timedOut: false,
+                    });
                 });
-            });
-            mockCollectCoverage.mockResolvedValue(undefined);
-            // Return execution order with 4 tests
-            mockInspectorClient.getExecutionOrder.mockReturnValue([1, 2, 3, 4]);
-            mockInspectorClient.getTests.mockReturnValue([
-                {
-                    id:       1,
-                    name:     'test 1',
-                    fullName: 'test 1',
-                    status:   'pass',
-                    url:      '/project/tests/test.ts',
-                },
-                {
-                    id:       2,
-                    name:     'test 2',
-                    fullName: 'test 2',
-                    status:   'pass',
-                    url:      '/project/tests/test.ts',
-                },
-                {
-                    id:       3,
-                    name:     'test 3',
-                    fullName: 'test 3',
-                    status:   'pass',
-                    url:      '/project/tests/test.ts',
-                },
-                {
-                    id:       4,
-                    name:     'test 4',
-                    fullName: 'test 4',
-                    status:   'pass',
-                    url:      '/project/tests/test.ts',
-                },
-            ]);
+                mockCollectCoverage.mockResolvedValue(undefined);
+                // Return execution order with 4 tests
+                mockInspectorClient.getExecutionOrder.mockReturnValue([1, 2, 3, 4]);
+                mockInspectorClient.getTests.mockReturnValue([
+                    {
+                        id:       1,
+                        name:     'test 1',
+                        fullName: 'test 1',
+                        status:   'pass',
+                        url:      '/project/tests/test.ts',
+                    },
+                    {
+                        id:       2,
+                        name:     'test 2',
+                        fullName: 'test 2',
+                        status:   'pass',
+                        url:      '/project/tests/test.ts',
+                    },
+                    {
+                        id:       3,
+                        name:     'test 3',
+                        fullName: 'test 3',
+                        status:   'pass',
+                        url:      '/project/tests/test.ts',
+                    },
+                    {
+                        id:       4,
+                        name:     'test 4',
+                        fullName: 'test 4',
+                        status:   'pass',
+                        url:      '/project/tests/test.ts',
+                    },
+                ]);
 
-            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
-            await runner.init();
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
 
-            const result = await runner.dryRun();
+                const result = await runner.dryRun();
 
-            expect(result.status).toBe(DryRunStatus.Complete);
-            if(result.status === DryRunStatus.Complete) {
-                expect(result.tests).toHaveLength(4);
-                // timePerTest = Math.max(1, Math.floor(totalElapsedMs / 4))
-                // With small delay, should be at least 1ms per test
-                for(const test of result.tests) {
-                    expect(test.timeSpentMs).toBeGreaterThanOrEqual(1);
+                expect(result.status).toBe(DryRunStatus.Complete);
+                if(result.status === DryRunStatus.Complete) {
+                    expect(result.tests).toHaveLength(4);
+                    // timePerTest = Math.max(1, Math.floor(totalElapsedMs / 4))
+                    // With small delay, should be at least 1ms per test
+                    for(const test of result.tests) {
+                        expect(test.timeSpentMs).toBeGreaterThanOrEqual(1);
+                    }
                 }
+            } finally {
+                jest.useRealTimers();
             }
         });
 
@@ -1943,46 +1999,49 @@ tests/example.test.ts:
 
         describe('Lines 185-186: timePerTest calculation mutations', () => {
             it('should use division (/) not multiplication (*) for timePerTest', async () => {
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
-                mockRunBunTests.mockImplementation((options: any) => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- test mock
-                    if(options.onInspectorReady) {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
-                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
-                    }
-                    // Return after small delay with 2 tests
-                    return new Promise((resolve) => {
-                        setTimeout(() => {
-                            resolve({
-                                exitCode: 0,
-                                stdout:   '2 passed',
-                                stderr:   '',
-                                timedOut: false,
-                            });
-                        }, 20);
+                jest.useFakeTimers();
+                try {
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                    mockRunBunTests.mockImplementation((options: any) => {
+                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- test mock
+                        if(options.onInspectorReady) {
+                            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
+                            options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                        }
+                        // Return after small delay with 2 tests
+                        // Use fake timer advancement for consistent timing
+                        jest.advanceTimersByTime(20);
+                        return Promise.resolve({
+                            exitCode: 0,
+                            stdout:   '2 passed',
+                            stderr:   '',
+                            timedOut: false,
+                        });
                     });
-                });
 
-                mockInspectorClient.getTests.mockReturnValue([
-                    { id: 1, name: 'test1', fullName: 'test1', status: 'pass', url: 'test.ts' },
-                    { id: 2, name: 'test2', fullName: 'test2', status: 'pass', url: 'test.ts' },
-                ]);
-                mockInspectorClient.getExecutionOrder.mockReturnValue([1, 2]);
+                    mockInspectorClient.getTests.mockReturnValue([
+                        { id: 1, name: 'test1', fullName: 'test1', status: 'pass', url: 'test.ts' },
+                        { id: 2, name: 'test2', fullName: 'test2', status: 'pass', url: 'test.ts' },
+                    ]);
+                    mockInspectorClient.getExecutionOrder.mockReturnValue([1, 2]);
 
-                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
-                await runner.init();
+                    const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                    await runner.init();
 
-                const result = await runner.dryRun();
+                    const result = await runner.dryRun();
 
-                expect(result.status).toBe(DryRunStatus.Complete);
-                if(result.status === DryRunStatus.Complete) {
-                    // With elapsed time and 2 tests: elapsed/2 = timePerTest (division)
-                    // If mutation used *: elapsed*2 (wrong, would be much larger)
-                    // Verify timeSpentMs is reasonable
-                    for(const test of result.tests) {
-                        expect(test.timeSpentMs).toBeLessThan(100);
-                        expect(test.timeSpentMs).toBeGreaterThan(1);
+                    expect(result.status).toBe(DryRunStatus.Complete);
+                    if(result.status === DryRunStatus.Complete) {
+                        // With elapsed time and 2 tests: elapsed/2 = timePerTest (division)
+                        // If mutation used *: elapsed*2 (wrong, would be much larger)
+                        // Verify timeSpentMs is reasonable
+                        for(const test of result.tests) {
+                            expect(test.timeSpentMs).toBeLessThan(100);
+                            expect(test.timeSpentMs).toBeGreaterThan(1);
+                        }
                     }
+                } finally {
+                    jest.useRealTimers();
                 }
             });
 
@@ -2129,49 +2188,63 @@ tests/example.test.ts:
 
         describe('Line 299: timeout boundary check (<= vs <)', () => {
             it('should use < not <= for timeout comparison', async () => {
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
-                mockRunBunTests.mockImplementation((options: any) => {
-                    // Call onInspectorReady after exactly inspectorTimeout ms
-                    setTimeout(() => {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- test mock
-                        if(options.onInspectorReady) {
-                            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
-                            options.onInspectorReady('ws://127.0.0.1:6499/inspector');
-                        }
-                    }, 110); // Wait slightly past the boundary
+                jest.useFakeTimers();
+                try {
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                    mockRunBunTests.mockImplementation((options: any) => {
+                        // Call onInspectorReady after 110ms (slightly past the 100ms timeout boundary)
+                        setTimeout(() => {
+                            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- test mock
+                            if(options.onInspectorReady) {
+                                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
+                                options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                            }
+                        }, 110);
 
-                    return Promise.resolve({
-                        exitCode: 0,
-                        stdout:   '',
-                        stderr:   '',
-                        timedOut: false,
+                        return Promise.resolve({
+                            exitCode: 0,
+                            stdout:   '',
+                            stderr:   '',
+                            timedOut: false,
+                        });
                     });
-                });
 
-                mockInspectorClient.getTests.mockReturnValue([]);
-                mockInspectorClient.getExecutionOrder.mockReturnValue([]);
+                    mockInspectorClient.getTests.mockReturnValue([]);
+                    mockInspectorClient.getExecutionOrder.mockReturnValue([]);
 
-                const runner = new BunTestRunner(mockLogger, {
-                    bun: {
-                        inspectorTimeout: 100,
-                    },
-                } as unknown as StrykerOptions);
-                await runner.init();
+                    const runner = new BunTestRunner(mockLogger, {
+                        bun: {
+                            inspectorTimeout: 100,
+                        },
+                    } as unknown as StrykerOptions);
+                    await runner.init();
 
-                const result = await runner.dryRun();
+                    // Start the dryRun (don't await yet)
+                    const resultPromise = runner.dryRun();
 
-                // With < (correct), timeout at exactly 100ms should fail
-                // With <= (mutation), timeout at exactly 100ms would succeed
-                // Since we're calling onInspectorReady at 110ms (after timeout),
-                // it should timeout with <, but might succeed with <=
-                if(result.status === DryRunStatus.Error) {
-                    expect(result.errorMessage).toContain('Timeout waiting for inspector URL');
+                    // Advance fake timers past the timeout (100ms) but before callback (110ms)
+                    for(let i = 0; i < 5; i++) {
+                        jest.advanceTimersByTime(50);
+                        await Promise.resolve();
+                    }
+
+                    const result = await resultPromise;
+
+                    // With < (correct), timeout at exactly 100ms should fail
+                    // With <= (mutation), timeout at exactly 100ms would succeed
+                    // Since we're calling onInspectorReady at 110ms (after timeout),
+                    // it should timeout with <, but might succeed with <=
+                    if(result.status === DryRunStatus.Error) {
+                        expect(result.errorMessage).toContain('Timeout waiting for inspector URL');
+                    }
+                } finally {
+                    jest.useRealTimers();
                 }
             });
         });
 
         describe('Lines 321, 451: ObjectLiteral handlers invocation', () => {
-            it('should invoke onTestStart handler when provided (line 321)', async () => {
+            it('should pass empty handlers object to InspectorClient (line 321)', async () => {
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
                     // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- test mock
@@ -2188,7 +2261,7 @@ tests/example.test.ts:
                 });
 
                 // Spy on InspectorClient constructor to capture handlers
-                let capturedHandlers: { onTestStart?: (test: TestInfo) => void } | undefined;
+                let capturedHandlers: Record<string, unknown> | undefined;
 
                 // @ts-expect-error - Mocking constructor with implementation
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
@@ -2208,24 +2281,9 @@ tests/example.test.ts:
 
                 await runner.dryRun();
 
-                // Verify handlers were provided (not empty object)
+                // Verify handlers is empty object (no longer relaying test names)
                 expect(capturedHandlers).toBeDefined();
-                expect(capturedHandlers?.onTestStart).toBeDefined();
-
-                // Invoke the handler to verify it's functional
-                if(capturedHandlers?.onTestStart) {
-                    capturedHandlers.onTestStart({
-                        id:       1,
-                        name:     'test',
-                        fullName: 'Suite > test',
-                        type:     'test',
-                        status:   'pass',
-                        url:      'test.ts',
-                    });
-                }
-
-                // Verify sendTestStart was called
-                expect(mockSyncServer.sendTestStart).toHaveBeenCalledWith('Suite > test');
+                expect(Object.keys(capturedHandlers ?? {})).toHaveLength(0);
             });
 
             it('should log exact debug message after enabling TestReporter (line 332)', async () => {
@@ -2481,62 +2539,65 @@ error: Message 2
             });
 
             it('should calculate timePerTest correctly when executionOrder has tests', async () => {
-                mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
-                const totalTime = 20;
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
-                mockRunBunTests.mockImplementation((options: any) => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
-                    if(options.onInspectorReady) {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
-                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
-                    }
+                jest.useFakeTimers();
+                try {
+                    mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+                    const totalTime = 20;
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                    mockRunBunTests.mockImplementation((options: any) => {
+                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+                        if(options.onInspectorReady) {
+                            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
+                            options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                        }
 
-                    return new Promise((resolve) => {
-                        setTimeout(() => {
-                            resolve({
-                                exitCode: 0,
-                                stdout:   '✓ test1 [0.12ms]\n✓ test2 [0.12ms]\n 2 pass',
-                                stderr:   '',
-                                timedOut: false,
-                            });
-                        }, totalTime);
+                        // Use fake timer advancement for consistent timing
+                        jest.advanceTimersByTime(totalTime);
+                        return Promise.resolve({
+                            exitCode: 0,
+                            stdout:   '✓ test1 [0.12ms]\n✓ test2 [0.12ms]\n 2 pass',
+                            stderr:   '',
+                            timedOut: false,
+                        });
                     });
-                });
-                mockCollectCoverage.mockResolvedValue(undefined);
+                    mockCollectCoverage.mockResolvedValue(undefined);
 
-                // Return non-empty execution order
-                const testHierarchy: TestInfo[] = [
-                    {
-                        id:       1,
-                        name:     'test1',
-                        fullName: 'test1',
-                        type:     'test',
-                        status:   'pass',
-                        elapsed:  undefined,
-                    },
-                    {
-                        id:       2,
-                        name:     'test2',
-                        fullName: 'test2',
-                        type:     'test',
-                        status:   'pass',
-                        elapsed:  undefined,
-                    },
-                ];
-                mockInspectorClient.getTests.mockReturnValue(testHierarchy);
-                mockInspectorClient.getExecutionOrder.mockReturnValue([1, 2]);
+                    // Return non-empty execution order
+                    const testHierarchy: TestInfo[] = [
+                        {
+                            id:       1,
+                            name:     'test1',
+                            fullName: 'test1',
+                            type:     'test',
+                            status:   'pass',
+                            elapsed:  undefined,
+                        },
+                        {
+                            id:       2,
+                            name:     'test2',
+                            fullName: 'test2',
+                            type:     'test',
+                            status:   'pass',
+                            elapsed:  undefined,
+                        },
+                    ];
+                    mockInspectorClient.getTests.mockReturnValue(testHierarchy);
+                    mockInspectorClient.getExecutionOrder.mockReturnValue([1, 2]);
 
-                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
-                await runner.init();
+                    const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                    await runner.init();
 
-                const result = await runner.dryRun();
+                    const result = await runner.dryRun();
 
-                expect(result.status).toBe(DryRunStatus.Complete);
-                if(result.status === DryRunStatus.Complete) {
-                    // Each test should have roughly totalTime / 2 ms
-                    // The mutation would make all tests get 1ms if > 0 becomes >= 0
-                    expect(result.tests[0].timeSpentMs).toBeGreaterThan(1);
-                    expect(result.tests[1].timeSpentMs).toBeGreaterThan(1);
+                    expect(result.status).toBe(DryRunStatus.Complete);
+                    if(result.status === DryRunStatus.Complete) {
+                        // Each test should have roughly totalTime / 2 ms
+                        // The mutation would make all tests get 1ms if > 0 becomes >= 0
+                        expect(result.tests[0].timeSpentMs).toBeGreaterThan(1);
+                        expect(result.tests[1].timeSpentMs).toBeGreaterThan(1);
+                    }
+                } finally {
+                    jest.useRealTimers();
                 }
             });
 
@@ -2586,63 +2647,66 @@ error: Message 2
 
             // Kill mutation #3: line 187 - ArithmeticOperator * instead of /
             it('should use division not multiplication for timePerTest', async () => {
-                mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
-                const totalTime = 100; // Use larger time to make difference obvious
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
-                mockRunBunTests.mockImplementation((options: any) => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
-                    if(options.onInspectorReady) {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
-                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
-                    }
+                jest.useFakeTimers();
+                try {
+                    mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+                    const totalTime = 100; // Use larger time to make difference obvious
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                    mockRunBunTests.mockImplementation((options: any) => {
+                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+                        if(options.onInspectorReady) {
+                            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
+                            options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                        }
 
-                    return new Promise((resolve) => {
-                        setTimeout(() => {
-                            resolve({
-                                exitCode: 0,
-                                stdout:   '✓ test1 [0.12ms]\n✓ test2 [0.12ms]\n 2 pass',
-                                stderr:   '',
-                                timedOut: false,
-                            });
-                        }, totalTime);
+                        // Use fake timer advancement for consistent timing
+                        jest.advanceTimersByTime(totalTime);
+                        return Promise.resolve({
+                            exitCode: 0,
+                            stdout:   '✓ test1 [0.12ms]\n✓ test2 [0.12ms]\n 2 pass',
+                            stderr:   '',
+                            timedOut: false,
+                        });
                     });
-                });
-                mockCollectCoverage.mockResolvedValue(undefined);
+                    mockCollectCoverage.mockResolvedValue(undefined);
 
-                const testHierarchy: TestInfo[] = [
-                    {
-                        id:       1,
-                        name:     'test1',
-                        fullName: 'test1',
-                        type:     'test',
-                        status:   'pass',
-                        elapsed:  undefined,
-                    },
-                    {
-                        id:       2,
-                        name:     'test2',
-                        fullName: 'test2',
-                        type:     'test',
-                        status:   'pass',
-                        elapsed:  undefined,
-                    },
-                ];
-                mockInspectorClient.getTests.mockReturnValue(testHierarchy);
-                mockInspectorClient.getExecutionOrder.mockReturnValue([1, 2]);
+                    const testHierarchy: TestInfo[] = [
+                        {
+                            id:       1,
+                            name:     'test1',
+                            fullName: 'test1',
+                            type:     'test',
+                            status:   'pass',
+                            elapsed:  undefined,
+                        },
+                        {
+                            id:       2,
+                            name:     'test2',
+                            fullName: 'test2',
+                            type:     'test',
+                            status:   'pass',
+                            elapsed:  undefined,
+                        },
+                    ];
+                    mockInspectorClient.getTests.mockReturnValue(testHierarchy);
+                    mockInspectorClient.getExecutionOrder.mockReturnValue([1, 2]);
 
-                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
-                await runner.init();
-                const result = await runner.dryRun();
+                    const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                    await runner.init();
+                    const result = await runner.dryRun();
 
-                expect(result.status).toBe(DryRunStatus.Complete);
-                if(result.status === DryRunStatus.Complete) {
-                    // Correct: timePerTest = floor(100 / 2) = 50ms per test
-                    // Mutation (*): timePerTest = floor(100 * 2) = 200ms per test
-                    // Both tests should be roughly 50ms, definitely less than 100ms
-                    expect(result.tests[0].timeSpentMs).toBeGreaterThanOrEqual(1);
-                    expect(result.tests[0].timeSpentMs).toBeLessThan(100);
-                    expect(result.tests[1].timeSpentMs).toBeGreaterThanOrEqual(1);
-                    expect(result.tests[1].timeSpentMs).toBeLessThan(100);
+                    expect(result.status).toBe(DryRunStatus.Complete);
+                    if(result.status === DryRunStatus.Complete) {
+                        // Correct: timePerTest = floor(100 / 2) = 50ms per test
+                        // Mutation (*): timePerTest = floor(100 * 2) = 200ms per test
+                        // Both tests should be roughly 50ms, definitely less than 100ms
+                        expect(result.tests[0].timeSpentMs).toBeGreaterThanOrEqual(1);
+                        expect(result.tests[0].timeSpentMs).toBeLessThan(100);
+                        expect(result.tests[1].timeSpentMs).toBeGreaterThanOrEqual(1);
+                        expect(result.tests[1].timeSpentMs).toBeLessThan(100);
+                    }
+                } finally {
+                    jest.useRealTimers();
                 }
             });
 
@@ -2732,16 +2796,16 @@ error: Message 2
             it('should succeed when inspector URL provided just before timeout', async () => {
                 mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
 
-                // Mock runBunTests to call onInspectorReady quickly
+                // Mock runBunTests to call onInspectorReady immediately (synchronously)
+                // This tests the success path without needing fake timers
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
-                    setTimeout(() => {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
-                        if(options.onInspectorReady) {
-                            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
-                            options.onInspectorReady('ws://127.0.0.1:6499/inspector');
-                        }
-                    }, 90); // Just before 100ms timeout
+                    // Call onInspectorReady immediately - simulates URL arriving quickly
+                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+                    if(options.onInspectorReady) {
+                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
 
                     return Promise.resolve({
                         exitCode: 0,
@@ -2763,51 +2827,65 @@ error: Message 2
 
                 const result = await runner.dryRun();
 
-                // Should succeed - the mutation would change < to <= causing off-by-one error
+                // Should succeed - URL was provided before timeout
                 expect(result.status).toBe(DryRunStatus.Complete);
             });
 
             // Kill mutation #4: line 301 - EqualityOperator < to >=
             it('should use < not >= for timeout check boundary condition', async () => {
-                mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+                jest.useFakeTimers();
+                try {
+                    mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
 
-                // Mock runBunTests to call onInspectorReady AFTER the timeout
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
-                mockRunBunTests.mockImplementation((options: any) => {
-                    setTimeout(() => {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
-                        if(options.onInspectorReady) {
-                            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
-                            options.onInspectorReady('ws://127.0.0.1:6499/inspector');
-                        }
-                    }, 110); // After the timeout
+                    // Mock runBunTests to call onInspectorReady at 110ms (AFTER the 100ms timeout)
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                    mockRunBunTests.mockImplementation((options: any) => {
+                        setTimeout(() => {
+                            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+                            if(options.onInspectorReady) {
+                                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
+                                options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                            }
+                        }, 110);
 
-                    return Promise.resolve({
-                        exitCode: 0,
-                        stdout:   '✓ test [0.12ms]\n 1 pass',
-                        stderr:   '',
-                        timedOut: false,
+                        return Promise.resolve({
+                            exitCode: 0,
+                            stdout:   '✓ test [0.12ms]\n 1 pass',
+                            stderr:   '',
+                            timedOut: false,
+                        });
                     });
-                });
-                mockCollectCoverage.mockResolvedValue(undefined);
-                mockInspectorClient.getTests.mockReturnValue([]);
-                mockInspectorClient.getExecutionOrder.mockReturnValue([]);
+                    mockCollectCoverage.mockResolvedValue(undefined);
+                    mockInspectorClient.getTests.mockReturnValue([]);
+                    mockInspectorClient.getExecutionOrder.mockReturnValue([]);
 
-                const runner = new BunTestRunner(mockLogger, {
-                    bun: {
-                        inspectorTimeout: 100,
-                    },
-                } as unknown as StrykerOptions);
-                await runner.init();
+                    const runner = new BunTestRunner(mockLogger, {
+                        bun: {
+                            inspectorTimeout: 100,
+                        },
+                    } as unknown as StrykerOptions);
+                    await runner.init();
 
-                const result = await runner.dryRun();
+                    // Start the dryRun (don't await yet)
+                    const resultPromise = runner.dryRun();
 
-                // With < (correct): timeout after 100ms should error
-                // With >= (mutation): would incorrectly pass the first iteration
-                // This test verifies strict < behavior
-                expect(result.status).toBe(DryRunStatus.Error);
-                if(result.status === DryRunStatus.Error) {
-                    expect(result.errorMessage).toContain('Timeout waiting for inspector URL');
+                    // Advance fake timers past the timeout (100ms) but before callback (110ms)
+                    for(let i = 0; i < 5; i++) {
+                        jest.advanceTimersByTime(50);
+                        await Promise.resolve();
+                    }
+
+                    const result = await resultPromise;
+
+                    // With < (correct): timeout after 100ms should error
+                    // With >= (mutation): would incorrectly pass the first iteration
+                    // This test verifies strict < behavior
+                    expect(result.status).toBe(DryRunStatus.Error);
+                    if(result.status === DryRunStatus.Error) {
+                        expect(result.errorMessage).toContain('Timeout waiting for inspector URL');
+                    }
+                } finally {
+                    jest.useRealTimers();
                 }
             });
         });

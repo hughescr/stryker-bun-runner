@@ -130,22 +130,6 @@ export class SyncServer {
     }
 
     /**
-   * Send test start event to all connected clients
-   */
-    sendTestStart(testName: string): void {
-        const message = JSON.stringify({ type: 'testStart', name: testName });
-        for(const client of this.clients) {
-            try {
-                if(client.readyState === this.webSocketOpenState) {
-                    client.send(message);
-                }
-            } catch{
-                // Ignore send errors - client may have disconnected
-            }
-        }
-    }
-
-    /**
    * Close the server and all client connections
    */
     async close(): Promise<void> {
