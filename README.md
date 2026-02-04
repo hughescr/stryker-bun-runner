@@ -100,6 +100,17 @@ bunx stryker run
 
 - **Sequential execution required** - Tests run with `--concurrency=1` to ensure accurate coverage tracking. This is slower than parallel execution but necessary for correct test-to-mutant correlation.
 
+## Concurrent Tests
+
+This plugin automatically patches `describe.concurrent()`, `test.concurrent()`, and `it.concurrent()` to run sequentially during mutation testing. Your tests will work without modification.
+
+**Why?** Coverage tracking requires knowing which test exercised which code. With concurrent execution, the `beforeEach` hook assigns test IDs in the order tests *start*, but coverage is recorded in the order tests *complete*. These orders differ with concurrency, causing coverage to be attributed to the wrong tests.
+
+**What this means:**
+- ✅ Your `.concurrent()` tests work automatically with Stryker
+- ✅ Normal test runs (without Stryker) still use concurrent execution
+- ⏱️ Mutation testing runs are slower due to sequential execution
+
 ## License
 
 Apache-2.0

@@ -4,7 +4,7 @@
  * Note: This is a template file with a placeholder import that gets replaced at runtime
  */
 
-import { beforeEach, afterEach, afterAll } from 'bun:test';
+import { beforeEach, afterEach, afterAll, describe, test, it } from 'bun:test';
 import {
     getPreloadConfig,
     shouldCollectCoverage as shouldCollect,
@@ -16,6 +16,14 @@ import {
     createTestCounter,
     type StrykerNamespace
 } from '__PRELOAD_LOGIC_PATH__';
+
+// Patch .concurrent() to be regular sequential execution
+// This ensures accurate coverage tracking during mutation testing
+// Users can still use .concurrent() for faster normal test runs
+// Use Object.defineProperty to override readonly properties
+Object.defineProperty(describe, 'concurrent', { value: describe, writable: true, configurable: true });
+Object.defineProperty(test, 'concurrent', { value: test, writable: true, configurable: true });
+Object.defineProperty(it, 'concurrent', { value: it, writable: true, configurable: true });
 
 interface StrykerGlobal {
     [key: string]:       unknown

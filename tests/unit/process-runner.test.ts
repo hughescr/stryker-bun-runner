@@ -85,7 +85,7 @@ describe('runBunTests', () => {
 
             expect(mockSpawn).toHaveBeenCalledWith(
                 'bun',
-                ['test', '--no-randomize'],
+                ['test'],
                 expect.objectContaining({
                     stdio: ['ignore', 'pipe', 'pipe'],
                 })
@@ -390,7 +390,6 @@ describe('runBunTests', () => {
                 '--test-name-pattern',
                 'myTest',
                 '--bail',
-                '--no-randomize',
                 '--verbose',
             ]);
 
@@ -503,15 +502,14 @@ describe('runBunTests', () => {
 
             const args = spawnCall[1];
 
-            // Verify order: test, preload, test-name-pattern, bail, no-randomize, then custom args
+            // Verify order: test, preload, test-name-pattern, bail, then custom args
             expect(args[0]).toBe('test');
             expect(args[1]).toBe('--preload');
             expect(args[2]).toBe('/tmp/preload.ts');
             expect(args[3]).toBe('--test-name-pattern');
             expect(args[4]).toBe('test');
             expect(args[5]).toBe('--bail');
-            expect(args[6]).toBe('--no-randomize');
-            expect(args[7]).toBe('--only');
+            expect(args[6]).toBe('--only');
         });
     });
 
@@ -595,8 +593,8 @@ describe('runBunTests', () => {
 
             const args = spawnCall[1];
 
-            // Args should only contain 'test' and '--no-randomize', no extra elements
-            expect(args).toEqual(['test', '--no-randomize']);
+            // Args should only contain 'test', no extra elements
+            expect(args).toEqual(['test']);
         });
 
         it('should not add bunArgs when undefined - kills line 134 ConditionalExpression mutation', async () => {
@@ -618,7 +616,7 @@ describe('runBunTests', () => {
             const args = spawnCall[1];
 
             // Should work fine with no bunArgs added
-            expect(args).toEqual(['test', '--no-randomize']);
+            expect(args).toEqual(['test']);
         });
 
         it('should not crash when bunArgs is null - additional safety test', async () => {
@@ -636,7 +634,7 @@ describe('runBunTests', () => {
 
             const args = spawnCall[1];
 
-            expect(args).toEqual(['test', '--no-randomize']);
+            expect(args).toEqual(['test']);
         });
     });
 
@@ -657,8 +655,8 @@ describe('runBunTests', () => {
 
             const args = spawnCall[1];
 
-            // Should only have 'test' and '--no-randomize', not any empty bunArgs
-            expect(args).toEqual(['test', '--no-randomize']);
+            // Should only have 'test', not any empty bunArgs
+            expect(args).toEqual(['test']);
         });
 
         it('should skip testNameFilter when not provided - line 145 mutation', async () => {

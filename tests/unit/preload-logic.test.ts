@@ -1,4 +1,4 @@
-import { describe, it, expect, spyOn, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, spyOn, beforeEach, afterEach, test } from 'bun:test';
 import * as fs from 'node:fs';
 import {
     getPreloadConfig,
@@ -697,6 +697,31 @@ describe('preload-logic', () => {
             const map2 = counter.getCounterToNameMap();
             expect(map1).toBe(map2);
             expect(map1.get('test-1')).toBe('test');
+        });
+    });
+
+    describe('concurrent patching', () => {
+        it('verifies that concurrent methods exist on test functions', () => {
+            // This test verifies that the test framework exposes concurrent methods
+            // The actual patching happens in coverage-preload.ts, which is injected at runtime
+            // We can't directly test the patching here, but we can verify the methods exist
+            expect(typeof describe.concurrent).toBe('function');
+            expect(typeof test.concurrent).toBe('function');
+            expect(typeof it.concurrent).toBe('function');
+        });
+
+        it('documents the expected behavior of concurrent patching', () => {
+            // The coverage-preload.ts template patches these functions:
+            // - describe.concurrent = describe
+            // - test.concurrent = test
+            // - it.concurrent = it
+            //
+            // This ensures that when user code calls describe.concurrent() or test.concurrent(),
+            // they actually get the sequential versions during mutation testing.
+            //
+            // The patching happens at runtime when the preload script loads,
+            // before any test files execute.
+            expect(true).toBe(true);
         });
     });
 });

@@ -127,9 +127,6 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
         args.push('--concurrency=1');
     }
 
-    // Disable randomization to ensure consistent test ordering between dry run and mutant runs
-    args.push('--no-randomize');
-
     // Add any additional bun args
     // Stryker disable next-line EqualityOperator,ConditionalExpression: length >= 0 is equivalent to length > 0 for empty arrays (spreading [] is a no-op); ConditionalExpression would cause spread of undefined
     if(options.bunArgs && options.bunArgs.length > 0) {
