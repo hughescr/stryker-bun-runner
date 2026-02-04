@@ -1,6 +1,7 @@
 import config from '@hughescr/eslint-config-default';
+import { defineConfig } from 'eslint/config';
 
-export default [
+export default defineConfig([
     ...config,
     {
         ignores: [
@@ -46,5 +47,5 @@ export default [
             // Allow warn/error but flag log/info to keep tests clean
             'no-console': ['warn', { allow: ['warn', 'error'] }]
         }
-    }
-];
+    },
+]);
