@@ -6,7 +6,7 @@ root = "./tests"
 preload = ["./tests/test-preload.ts"]
 coverage = true
 coverageThreshold = { line = 0.95, function = 0.95, statement = 0.95 }
-coverageReporter = ["text", "lcov"]
+coverageReporter = ["text"]
 onlyFailures = true
 timeout = 5
 randomize = true
