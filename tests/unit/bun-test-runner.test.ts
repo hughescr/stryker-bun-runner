@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, mock, spyOn, jest } from 'bun:test';
-import { BunTestRunner, normalizeTestFilePath, stripFilePrefix } from '../../src/bun-test-runner.js';
+import { BunTestRunner, normalizeTestFilePath, stripFilePrefix, normalizeTestName, buildUniqueTestName } from '../../src/bun-test-runner.js';
 import { DryRunStatus, MutantRunStatus, TestStatus } from '@stryker-mutator/api/test-runner';
 import type { Logger } from '@stryker-mutator/api/logging';
 import type { StrykerOptions } from '@stryker-mutator/api/core';
@@ -1270,6 +1270,71 @@ tests/example.test.ts:
             expect(mockLogger.debug).toHaveBeenCalledWith('Inspector collected %d tests in hierarchy, %d in execution order',
                 1, 1);
         });
+
+        it('should deduplicate test names by appending index suffix', async () => {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+            mockRunBunTests.mockImplementation((options: any) => {
+                // Call onInspectorReady immediately if provided
+                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+                if(options.onInspectorReady) {
+                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
+                    options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                }
+                return Promise.resolve({
+                    exitCode: 0,
+                    stdout:   '✓ test with %s [0.12ms]\n✓ test with %s [0.12ms]\n✓ test with %s [0.12ms]\n 3 pass',
+                    stderr:   '',
+                    timedOut: false,
+                });
+            });
+            mockCollectCoverage.mockResolvedValue(undefined);
+
+            // Simulate it.each with %s placeholder - inspector reports same name for all iterations
+            mockInspectorClient.getExecutionOrder.mockReturnValue([1, 2, 3]);
+            mockInspectorClient.getTests.mockReturnValue([
+                {
+                    id:       1,
+                    name:     'test with %s',
+                    fullName: 'test with %s',
+                    status:   'pass',
+                    url:      'file:///project/tests/test.ts',
+                },
+                {
+                    id:       2,
+                    name:     'test with %s',
+                    fullName: 'test with %s',
+                    status:   'pass',
+                    url:      'file:///project/tests/test.ts',
+                },
+                {
+                    id:       3,
+                    name:     'test with %s',
+                    fullName: 'test with %s',
+                    status:   'pass',
+                    url:      'file:///project/tests/test.ts',
+                },
+            ]);
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+
+            const result = await runner.dryRun();
+
+            expect(result.status).toBe(DryRunStatus.Complete);
+            if(result.status === DryRunStatus.Complete) {
+                expect(result.tests).toHaveLength(3);
+                // Tests should be deduplicated with [0], [1], [2] suffixes
+                const testNames = result.tests.map(t => t.name);
+                expect(testNames).toContain('file:///project/tests/test.ts > test with %s [0]');
+                expect(testNames).toContain('file:///project/tests/test.ts > test with %s [1]');
+                expect(testNames).toContain('file:///project/tests/test.ts > test with %s [2]');
+                // IDs should match names
+                const testIds = result.tests.map(t => t.id);
+                expect(testIds).toContain('file:///project/tests/test.ts > test with %s [0]');
+                expect(testIds).toContain('file:///project/tests/test.ts > test with %s [1]');
+                expect(testIds).toContain('file:///project/tests/test.ts > test with %s [2]');
+            }
+        });
     });
 
     describe('mutantRun', () => {
@@ -1355,8 +1420,8 @@ tests/example.test.ts:
 
             expect(result.status).toBe(MutantRunStatus.Killed);
             if(result.status === MutantRunStatus.Killed) {
-                expect(result.killedBy).toContain('test 1');
-                expect(result.killedBy).toContain('test 2');
+                expect(result.killedBy).toContain('tests/example.test.ts > test 1');
+                expect(result.killedBy).toContain('tests/example.test.ts > test 2');
                 expect(result.failureMessage).toBe('error: Expected 2 but received 3');
             }
         });
@@ -1405,7 +1470,7 @@ tests/example.test.ts:
 
             expect(result.status).toBe(MutantRunStatus.Killed);
             if(result.status === MutantRunStatus.Killed) {
-                expect(result.killedBy).toEqual(['test alpha', 'test beta', 'test gamma']);
+                expect(result.killedBy).toEqual(['tests/example.test.ts > test alpha', 'tests/example.test.ts > test beta', 'tests/example.test.ts > test gamma']);
                 expect(result.failureMessage).toBe('error: Alpha failed\n\nerror: Beta failed\n\nerror: Gamma failed');
             }
         });
@@ -1451,7 +1516,7 @@ tests/example.test.ts:
             expect(result.status).toBe(MutantRunStatus.Killed);
             if(result.status === MutantRunStatus.Killed) {
                 expect(result.killedBy).toHaveLength(1);
-                expect(result.killedBy[0]).toBe('should catch mutant');
+                expect(result.killedBy[0]).toBe('tests/example.test.ts > should catch mutant');
                 expect(result.nrOfTests).toBe(1);
             }
         });
@@ -1718,12 +1783,11 @@ tests/example.test.ts:
 
             expect(result.status).toBe(MutantRunStatus.Killed);
             if(result.status === MutantRunStatus.Killed) {
-                // Tests filter(test => test.status === 'failed') on line 443
+                // Console parser includes file path, so killedBy should have full paths
                 expect(result.killedBy).toHaveLength(2);
-                expect(result.killedBy).toContain('failing test 1');
-                expect(result.killedBy).toContain('failing test 2');
-                // Tests map(test => stripFilePrefix(test.name)) on line 444
-                // and filter/map chain on lines 450-452
+                expect(result.killedBy).toContain('tests/example.test.ts > failing test 1');
+                expect(result.killedBy).toContain('tests/example.test.ts > failing test 2');
+                // Tests filter/map chain for failure messages
                 expect(result.failureMessage).toBe('error: First error\n\nerror: Second error');
             }
         });
@@ -1961,6 +2025,154 @@ tests/example.test.ts:
 
         it('handles single-level test name', () => {
             expect(stripFilePrefix('file.test.ts > Test')).toBe('Test');
+        });
+
+        it('logs debug message when regex does not match and logger provided', () => {
+            const testLogger = {
+                debug:          mock(),
+                info:           mock(),
+                warn:           mock(),
+                error:          mock(),
+                trace:          mock(),
+                fatal:          mock(),
+                isDebugEnabled: mock(() => true),
+                isInfoEnabled:  mock(() => true),
+                isWarnEnabled:  mock(() => true),
+                isErrorEnabled: mock(() => true),
+                isTraceEnabled: mock(() => true),
+                isFatalEnabled: mock(() => true),
+            };
+            const result = stripFilePrefix('Suite > Test', testLogger as unknown as Logger);
+            expect(result).toBe('Suite > Test');
+            expect(testLogger.debug).toHaveBeenCalledWith(
+                'stripFilePrefix: regex did not match for input: "%s"',
+                'Suite > Test'
+            );
+        });
+
+        it('does not log when regex matches', () => {
+            const testLogger = {
+                debug:          mock(),
+                info:           mock(),
+                warn:           mock(),
+                error:          mock(),
+                trace:          mock(),
+                fatal:          mock(),
+                isDebugEnabled: mock(() => true),
+                isInfoEnabled:  mock(() => true),
+                isWarnEnabled:  mock(() => true),
+                isErrorEnabled: mock(() => true),
+                isTraceEnabled: mock(() => true),
+                isFatalEnabled: mock(() => true),
+            };
+            const result = stripFilePrefix('file.test.ts > Test', testLogger as unknown as Logger);
+            expect(result).toBe('Test');
+            expect(testLogger.debug).not.toHaveBeenCalled();
+        });
+
+        it('does not throw when logger not provided and regex does not match', () => {
+            expect(() => stripFilePrefix('Suite > Test')).not.toThrow();
+            expect(stripFilePrefix('Suite > Test')).toBe('Suite > Test');
+        });
+    });
+
+    describe('normalizeTestName', () => {
+        it('keeps printable ASCII characters unchanged', () => {
+            const input = 'Suite > Test name with spaces and punctuation!?.,;:\'"-_()[]{}@#$%&*+=/<>|~`';
+            expect(normalizeTestName(input)).toBe(input);
+        });
+
+        it('replaces newlines with underscores', () => {
+            expect(normalizeTestName('Line 1\nLine 2')).toBe('Line 1_Line 2');
+            expect(normalizeTestName('Line 1\r\nLine 2')).toBe('Line 1__Line 2');
+        });
+
+        it('replaces tabs with underscores', () => {
+            expect(normalizeTestName('Part1\tPart2')).toBe('Part1_Part2');
+        });
+
+        it('replaces control characters with underscores', () => {
+            expect(normalizeTestName('before\x00after')).toBe('before_after');
+            expect(normalizeTestName('before\x1Fafter')).toBe('before_after');
+        });
+
+        it('replaces non-ASCII characters with underscores', () => {
+            expect(normalizeTestName('café')).toBe('caf_');
+            expect(normalizeTestName('日本語')).toBe('___');
+            expect(normalizeTestName('emoji 😀 test')).toBe('emoji __ test');
+        });
+
+        it('preserves character count (1:1 replacement)', () => {
+            const input = 'a\n\nb'; // 4 chars: a, \n, \n, b
+            const output = normalizeTestName(input);
+            expect(output).toBe('a__b');
+            expect(output.length).toBe(4);
+        });
+
+        it('handles empty string', () => {
+            expect(normalizeTestName('')).toBe('');
+        });
+
+        it('handles string with only unsafe characters', () => {
+            expect(normalizeTestName('\n\t\r')).toBe('___');
+        });
+
+        it('preserves the > hierarchy separator', () => {
+            expect(normalizeTestName('Suite > Nested > Test')).toBe('Suite > Nested > Test');
+        });
+    });
+
+    describe('buildUniqueTestName', () => {
+        it('includes file path when URL is provided', () => {
+            const fullName = 'Suite > test';
+            const url = 'file:///path/.stryker-tmp/sandbox-ABC123/tests/unit/foo.test.ts';
+            expect(buildUniqueTestName(fullName, url)).toBe('tests/unit/foo.test.ts > Suite > test');
+        });
+
+        it('returns just normalized name when URL is undefined', () => {
+            const fullName = 'Suite > test';
+            expect(buildUniqueTestName(fullName, undefined)).toBe('Suite > test');
+        });
+
+        it('strips sandbox path from file URL', () => {
+            const fullName = 'My Suite > My Test';
+            const url = 'file:///Users/me/project/.stryker-tmp/sandbox-XYZ789/src/utils.test.ts';
+            expect(buildUniqueTestName(fullName, url)).toBe('src/utils.test.ts > My Suite > My Test');
+        });
+
+        it('normalizes special characters in both path and name', () => {
+            const fullName = 'Suite\nwith\nnewlines > test\twith\ttabs';
+            const url = 'file:///.stryker-tmp/sandbox-123/path/to/file.test.ts';
+            expect(buildUniqueTestName(fullName, url)).toBe('path/to/file.test.ts > Suite_with_newlines > test_with_tabs');
+        });
+
+        it('handles deeply nested test hierarchies', () => {
+            const fullName = 'Level1 > Level2 > Level3 > Level4 > test';
+            const url = 'file:///.stryker-tmp/sandbox-ABC/tests/deep/nested.test.ts';
+            expect(buildUniqueTestName(fullName, url)).toBe('tests/deep/nested.test.ts > Level1 > Level2 > Level3 > Level4 > test');
+        });
+
+        it('handles file paths without sandbox pattern', () => {
+            const fullName = 'Suite > test';
+            const url = 'file:///direct/path/tests/file.test.ts';
+            expect(buildUniqueTestName(fullName, url)).toBe('file:///direct/path/tests/file.test.ts > Suite > test');
+        });
+
+        it('normalizes non-ASCII characters in path and name', () => {
+            const fullName = 'café > test';
+            const url = 'file:///.stryker-tmp/sandbox-123/tests/café.test.ts';
+            expect(buildUniqueTestName(fullName, url)).toBe('tests/caf_.test.ts > caf_ > test');
+        });
+
+        it('handles empty string URL', () => {
+            const fullName = 'Suite > test';
+            expect(buildUniqueTestName(fullName, '')).toBe('Suite > test');
+        });
+
+        it('preserves original behavior when normalizeTestFilePath returns undefined', () => {
+            const fullName = 'Suite > test';
+            const url = undefined;
+            expect(buildUniqueTestName(fullName, url)).toBe('Suite > test');
         });
     });
 
@@ -2420,9 +2632,9 @@ error: Expected 1 but got 2
                 if(result.status === MutantRunStatus.Killed) {
                     // Verify ONLY failed tests are in killedBy (not the passing one)
                     expect(result.killedBy).toHaveLength(2);
-                    expect(result.killedBy).toContain('failing test 1');
-                    expect(result.killedBy).toContain('failing test 2');
-                    expect(result.killedBy).not.toContain('passing test');
+                    expect(result.killedBy).toContain('test/file.test.ts > failing test 1');
+                    expect(result.killedBy).toContain('test/file.test.ts > failing test 2');
+                    expect(result.killedBy).not.toContain('test/file.test.ts > passing test');
                 }
             });
 
@@ -2458,8 +2670,8 @@ error: Failed B
                 if(result.status === MutantRunStatus.Killed) {
                     // If filter was removed or condition changed, we'd get wrong tests
                     expect(result.killedBy).toHaveLength(2);
-                    expect(result.killedBy).toContain('test A');
-                    expect(result.killedBy).toContain('test B');
+                    expect(result.killedBy).toContain('test/file.test.ts > test A');
+                    expect(result.killedBy).toContain('test/file.test.ts > test B');
                 }
             });
 
@@ -2982,8 +3194,8 @@ error: Test failure
                 expect(result.status).toBe(MutantRunStatus.Killed);
                 if(result.status === MutantRunStatus.Killed) {
                     // Should only contain the failed test, not the passing one
-                    expect(result.killedBy).toEqual(['failed test']);
-                    expect(result.killedBy).not.toContain('passing test');
+                    expect(result.killedBy).toEqual(['test/file.test.ts > failed test']);
+                    expect(result.killedBy).not.toContain('test/file.test.ts > passing test');
                 }
             });
 
@@ -3128,9 +3340,9 @@ error: Expected error
                     // If .filter() was removed, we'd get 3 items (including passing tests with undefined messages)
                     expect(result.failureMessage).toBe('error: Expected error');
                     // Verify killedBy also uses filter correctly
-                    expect(result.killedBy).toEqual(['failed test']);
-                    expect(result.killedBy).not.toContain('passing test A');
-                    expect(result.killedBy).not.toContain('passing test B');
+                    expect(result.killedBy).toEqual(['test/file.test.ts > failed test']);
+                    expect(result.killedBy).not.toContain('test/file.test.ts > passing test A');
+                    expect(result.killedBy).not.toContain('test/file.test.ts > passing test B');
                 }
             });
 
@@ -3207,12 +3419,12 @@ error: Third failure message
 
                 expect(result.status).toBe(MutantRunStatus.Killed);
                 if(result.status === MutantRunStatus.Killed) {
-                    // Verify killedBy has all 3 tests (tests line 471: killedBy.length > 0)
-                    // stripFilePrefix removes "test/file.test.ts > " prefix
+                    // Verify killedBy has all 3 tests with file paths included
+                    // Console parser includes file path in test names
                     expect(result.killedBy).toHaveLength(3);
-                    expect(result.killedBy).toContain('test > suite > first failing test');
-                    expect(result.killedBy).toContain('test > suite > second failing test');
-                    expect(result.killedBy).toContain('test > suite > third failing test');
+                    expect(result.killedBy).toContain('test/file.test.ts > test > suite > first failing test');
+                    expect(result.killedBy).toContain('test/file.test.ts > test > suite > second failing test');
+                    expect(result.killedBy).toContain('test/file.test.ts > test > suite > third failing test');
 
                     // Verify failureMessage joins all 3 messages with '\n\n' (tests line 470: filter chain)
                     expect(result.failureMessage).toContain('error: First failure message');

@@ -62,6 +62,57 @@ export function normalizeTestFilePath(url: string | undefined): string | undefin
 }
 
 /**
+ * Normalize test names by replacing non-printable ASCII characters with underscores.
+ * This ensures consistent test name matching between dry run (inspector) and mutant run (console parser).
+ *
+ * Safe characters: ASCII 32-126 (printable ASCII: space through tilde)
+ * Unsafe characters: Control chars, newlines, tabs, non-ASCII → replaced with underscore 1:1
+ *
+ * Note: The ' > ' sequence is used as a hierarchy delimiter by Bun. If a test name
+ * literally contains ' > ', it will cause parsing ambiguity. This is a known limitation.
+ *
+ * @param testName - The test name to normalize
+ * @returns Normalized test name with unsafe characters replaced by underscores
+ */
+export function normalizeTestName(testName: string): string {
+    // Replace any character outside printable ASCII range (32-126) with underscore
+    // This handles newlines, tabs, control chars, and non-ASCII characters
+    // Each unsafe character is replaced with exactly one underscore to preserve uniqueness
+    // Also trim whitespace to handle cases like "should %s" where %s is empty string
+    // Stryker disable next-line Regex: character class defines safe ASCII range
+    return testName.replace(/[^\x20-\x7E]/g, '_').trim();
+}
+
+/**
+ * Builds a unique test identifier by combining file path and test hierarchy.
+ * This prevents test name collisions when multiple files have identical describe blocks.
+ *
+ * Format: "path/to/file.test.ts > describe > test name"
+ *
+ * If no URL is provided, returns just the normalized test name without path prefix.
+ *
+ * @param fullName - The full hierarchical test name from inspector (e.g., "Suite > test")
+ * @param url - The file URL from inspector (e.g., "file:///path/.stryker-tmp/sandbox-ABC/tests/foo.test.ts")
+ * @returns Unique test identifier with file path prefix, or just normalized name if no URL
+ *
+ * @example
+ * ```typescript
+ * buildUniqueTestName("Suite > test", "file:///path/.stryker-tmp/sandbox-ABC/tests/foo.test.ts")
+ * // Returns: "tests/foo.test.ts > Suite > test"
+ *
+ * buildUniqueTestName("Suite > test", undefined)
+ * // Returns: "Suite > test"
+ * ```
+ */
+export function buildUniqueTestName(fullName: string, url: string | undefined): string {
+    const normalizedPath = normalizeTestFilePath(url);
+    if(normalizedPath) {
+        return normalizeTestName(`${normalizedPath} > ${fullName}`);
+    }
+    return normalizeTestName(fullName);
+}
+
+/**
  * Strip file prefix from test names for consistency with inspector format.
  * Console parser includes file prefixes like "tests/file.test.ts > Suite > Test"
  * but inspector provides "Suite > Test" without the file prefix.
@@ -69,12 +120,19 @@ export function normalizeTestFilePath(url: string | undefined): string | undefin
  *
  * Input:  "tests/unit/something.test.ts > Suite > Test"
  * Output: "Suite > Test"
+ *
+ * @param testName - The test name potentially with file prefix
+ * @param logger - Optional logger for diagnostic output when regex doesn't match
  */
-export function stripFilePrefix(testName: string): string {
+export function stripFilePrefix(testName: string, logger?: Logger): string {
     // Pattern: "path/to/file.test.ts > " or "path/to/file.spec.ts > " at the start
     // Strip everything up to and including the first " > " if it looks like a file path
     // Stryker disable next-line Regex: character classes are defensive for test name parsing
     const match = /^[^\s>]+\.(?:test|spec)\.[jt]sx? > (.+)$/.exec(testName);
+    if(!match && logger) {
+        // Stryker disable next-line StringLiteral: diagnostic logging message
+        logger.debug('stripFilePrefix: regex did not match for input: "%s"', testName);
+    }
     return match ? match[1] : testName;
 }
 
@@ -91,6 +149,7 @@ export class BunTestRunner implements TestRunner {
     private readonly bunArgs?:         string[];
     private preloadScriptPath?:        string;
     private coverageFilePath?:         string;
+    private cachedTestNames?:          Set<string>;
 
     constructor(
         private readonly logger: Logger,
@@ -156,10 +215,11 @@ export class BunTestRunner implements TestRunner {
         if(executionOrder.length === 0) {
             // Fallback: use parsed console output when inspector didn't capture tests
             return parsed.tests.map((t) => {
+                const normalizedName = normalizeTestName(t.name);
                 if(t.status === 'failed') {
                     return {
-                        id:             t.name,
-                        name:           t.name,
+                        id:             normalizedName,
+                        name:           normalizedName,
                         status:         TestStatus.Failed,
                         // Stryker disable next-line StringLiteral: fallback error message has no behavioral impact
                         failureMessage: t.failureMessage ?? 'Test failed',
@@ -168,15 +228,15 @@ export class BunTestRunner implements TestRunner {
                 }
                 if(t.status === 'skipped') {
                     return {
-                        id:          t.name,
-                        name:        t.name,
+                        id:          normalizedName,
+                        name:        normalizedName,
                         status:      TestStatus.Skipped,
                         timeSpentMs: Math.round(t.duration ?? 1),
                     } satisfies SkippedTestResult;
                 }
                 return {
-                    id:          t.name,
-                    name:        t.name,
+                    id:          normalizedName,
+                    name:        normalizedName,
                     status:      TestStatus.Success,
                     timeSpentMs: Math.round(t.duration ?? 1),
                 } satisfies SuccessTestResult;
@@ -194,7 +254,7 @@ export class BunTestRunner implements TestRunner {
             testMap.set(test.id, test);
         }
 
-        return executionOrder.map((inspectorId) => {
+        const tests = executionOrder.map((inspectorId) => {
             const testInfo = testMap.get(inspectorId);
             if(!testInfo) {
                 return {
@@ -205,7 +265,7 @@ export class BunTestRunner implements TestRunner {
                 } satisfies SuccessTestResult;
             }
 
-            const fullName = testInfo.fullName;
+            const uniqueName = buildUniqueTestName(testInfo.fullName, testInfo.url);
             const status = testInfo.status;
             const elapsed = testInfo.elapsed !== undefined
                 ? Math.round(testInfo.elapsed / 1_000_000)  // Convert nanoseconds to milliseconds and round
@@ -215,8 +275,8 @@ export class BunTestRunner implements TestRunner {
                 // Find failure message from parsed output
                 const parsedTest = parsed.tests.find(t => t.name.includes(testInfo.name));
                 return {
-                    id:             fullName,
-                    name:           fullName,
+                    id:             uniqueName,
+                    name:           uniqueName,
                     fileName:       normalizeTestFilePath(testInfo.url),
                     startPosition:  testInfo.line !== undefined ? { line: testInfo.line, column: 0 } : undefined,
                     status:         TestStatus.Failed,
@@ -228,8 +288,8 @@ export class BunTestRunner implements TestRunner {
 
             if(status === 'skip' || status === 'todo') {
                 return {
-                    id:            fullName,
-                    name:          fullName,
+                    id:            uniqueName,
+                    name:          uniqueName,
                     fileName:      normalizeTestFilePath(testInfo.url),
                     startPosition: testInfo.line !== undefined ? { line: testInfo.line, column: 0 } : undefined,
                     status:        TestStatus.Skipped,
@@ -238,14 +298,37 @@ export class BunTestRunner implements TestRunner {
             }
 
             return {
-                id:            fullName,
-                name:          fullName,
+                id:            uniqueName,
+                name:          uniqueName,
                 fileName:      normalizeTestFilePath(testInfo.url),
                 startPosition: testInfo.line !== undefined ? { line: testInfo.line, column: 0 } : undefined,
                 status:        TestStatus.Success,
                 timeSpentMs:   elapsed,
             } satisfies SuccessTestResult;
         });
+
+        // Handle duplicate test names (e.g., from it.each with %s placeholders)
+        // Bun's inspector reports the template literal instead of interpolated values
+        const nameCounts = new Map<string, number>();
+        for(const test of tests) {
+            nameCounts.set(test.name, (nameCounts.get(test.name) ?? 0) + 1);
+        }
+
+        // For names that appear multiple times, append index suffix [0], [1], etc.
+        const nameIndexes = new Map<string, number>();
+        for(const test of tests) {
+            const originalName = test.name;
+            const count = nameCounts.get(originalName) ?? 1;
+            if(count > 1) {
+                const index = nameIndexes.get(originalName) ?? 0;
+                const uniqueName = `${originalName} [${index}]`;
+                test.id = uniqueName;
+                test.name = uniqueName;
+                nameIndexes.set(originalName, index + 1);
+            }
+        }
+
+        return tests;
     }
 
     /**
@@ -406,6 +489,28 @@ export class BunTestRunner implements TestRunner {
         // based on order, so inconsistent order breaks coveredBy correlation
         tests.sort((a, b) => a.name.localeCompare(b.name));
 
+        // Cache test names for diagnostic validation in mutantRun
+        this.cachedTestNames = new Set(tests.map(t => t.name));
+        // Diagnostic: find duplicate test names
+        if(tests.length !== this.cachedTestNames.size) {
+            const nameCount = new Map<string, number>();
+            for(const test of tests) {
+                nameCount.set(test.name, (nameCount.get(test.name) ?? 0) + 1);
+            }
+            const duplicates = Array.from(nameCount.entries())
+                .filter(([_, count]) => count > 1)
+                .map(([name, count]) => `"${name}" (${count}x)`);
+            this.logger.warn(
+                'Found %d duplicate test names (total: %d, unique: %d): %s',
+                tests.length - this.cachedTestNames.size,
+                tests.length,
+                this.cachedTestNames.size,
+                duplicates.join(', ')
+            );
+        }
+        // Stryker disable next-line StringLiteral: diagnostic logging message
+        this.logger.debug('Cached %d test names from dry run for killedBy validation', this.cachedTestNames.size);
+
         return {
             status: DryRunStatus.Complete,
             tests,
@@ -461,7 +566,88 @@ export class BunTestRunner implements TestRunner {
         if(result.exitCode !== 0) {
             const killedBy = parsed.tests
         .filter(test => test.status === 'failed')
-        .map(test => stripFilePrefix(test.name));
+        .map(test => normalizeTestName(test.name));
+
+            // Check for runtime errors: tests couldn't run due to module/syntax errors
+            // These should be RuntimeError, not Killed, and don't need killedBy for caching
+            if(killedBy.length === 0 && parsed.tests.length === 0) {
+                const stderr = result.stderr ?? '';
+                const isRuntimeError
+                    = stderr.includes('Unhandled error')
+                      || stderr.includes('Cannot find module')
+                      || stderr.includes('SyntaxError')
+                      || stderr.includes('TypeError')
+                      || stderr.includes('ReferenceError')
+                      || stderr.includes('is not defined')
+                      || stderr.includes('Unexpected token');
+
+                if(isRuntimeError) {
+                    // Stryker disable next-line StringLiteral: diagnostic logging message
+                    this.logger.debug(
+                        'Mutant %s caused runtime error (tests could not run): %s',
+                        options.activeMutant.id,
+                        stderr.slice(0, 200)
+                    );
+                    return {
+                        status:       MutantRunStatus.Error,
+                        errorMessage: stderr.slice(0, 500) || `Runtime error with exit code ${result.exitCode}`,
+                    };
+                }
+            }
+
+            // Diagnostic: Log when no failed tests identified by console parser
+            // This results in killedBy: ['unknown'] which breaks Stryker's incremental cache
+            if(killedBy.length === 0) {
+                // Stryker disable all: diagnostic logging block
+                this.logger.debug(
+                    'CACHE WARNING: No failed tests identified for mutant %s (will use "unknown" fallback). '
+                    + 'Exit code: %d, Parser found: %d total / %d passed / %d failed. '
+                    + 'Parsed tests: %o',
+                    options.activeMutant.id,
+                    result.exitCode,
+                    parsed.totalTests,
+                    parsed.passed,
+                    parsed.failed,
+                    parsed.tests.map(t => ({ name: t.name, status: t.status }))
+                );
+                // Log first 500 chars of stdout/stderr to help diagnose parsing issues
+                if(result.stdout || result.stderr) {
+                    const stdoutPreview = result.stdout?.slice(0, 500) || '(empty)';
+                    const stderrPreview = result.stderr?.slice(0, 500) || '(empty)';
+                    this.logger.debug(
+                        'CACHE WARNING: Raw output for mutant %s - stdout: %s%s - stderr: %s%s',
+                        options.activeMutant.id,
+                        stdoutPreview,
+                        result.stdout && result.stdout.length > 500 ? '...(truncated)' : '',
+                        stderrPreview,
+                        result.stderr && result.stderr.length > 500 ? '...(truncated)' : ''
+                    );
+                }
+                // Stryker restore all
+            }
+
+            // Diagnostic: Validate killedBy entries exist in test registry from dry run
+            if(killedBy.length > 0 && this.cachedTestNames) {
+                const unknownKillers = killedBy.filter(k => !this.cachedTestNames!.has(k));
+                if(unknownKillers.length > 0) {
+                    // Stryker disable all: diagnostic logging block
+                    this.logger.debug(
+                        'CACHE WARNING: killedBy for mutant %s contains %d test name(s) not in registry '
+                        + '(will break incremental cache): %s',
+                        options.activeMutant.id,
+                        unknownKillers.length,
+                        unknownKillers.join(', ')
+                    );
+                    // Log a sample of known test names for comparison
+                    const sampleKnown = Array.from(this.cachedTestNames).slice(0, 5);
+                    this.logger.debug(
+                        'CACHE WARNING: Sample of known test names from registry (first 5 of %d): %s',
+                        this.cachedTestNames.size,
+                        sampleKnown.join(', ')
+                    );
+                    // Stryker restore all
+                }
+            }
 
             return {
                 status:         MutantRunStatus.Killed,
