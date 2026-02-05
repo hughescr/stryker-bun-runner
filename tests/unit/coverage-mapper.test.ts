@@ -23,7 +23,7 @@ describe('mapCoverageToInspectorIds', () => {
     });
 
     describe('successful mapping', () => {
-        it('should map counter IDs to inspector full names', () => {
+        it('should map counter IDs to inspector full names with file paths', () => {
             const rawCoverage: MutantCoverage = {
                 'static': { '1': 1 },
                 perTest:  {
@@ -35,28 +35,30 @@ describe('mapCoverageToInspectorIds', () => {
 
             const executionOrder = [42, 43, 44];
             const testHierarchy = new Map<number, TestInfo>([
-                [42, { id: 42, name: 'test1', fullName: 'Suite > test1', type: 'test' }],
-                [43, { id: 43, name: 'test2', fullName: 'Suite > Nested > test2', type: 'test' }],
-                [44, { id: 44, name: 'test3', fullName: 'Suite > test3', type: 'test' }],
+                [42, { id: 42, name: 'test1', fullName: 'Suite > test1', type: 'test', url: 'file:///.stryker-tmp/sandbox-ABC/tests/foo.test.ts' }],
+                [43, { id: 43, name: 'test2', fullName: 'Suite > Nested > test2', type: 'test', url: 'file:///.stryker-tmp/sandbox-ABC/tests/foo.test.ts' }],
+                [44, { id: 44, name: 'test3', fullName: 'Suite > test3', type: 'test', url: 'file:///.stryker-tmp/sandbox-ABC/tests/bar.test.ts' }],
             ]);
 
             const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
 
-            // Maps based on execution order:
-            // test-1 -> ID 42 (Suite > test1), test-2 -> ID 43 (Suite > Nested > test2), test-3 -> ID 44 (Suite > test3)
+            // Maps based on execution order with file paths included:
+            // test-1 -> ID 42 (tests/foo.test.ts > Suite > test1)
+            // test-2 -> ID 43 (tests/foo.test.ts > Suite > Nested > test2)
+            // test-3 -> ID 44 (tests/bar.test.ts > Suite > test3)
             expect(result).toEqual({
                 'static': { '1': 1 },
                 perTest:  {
-                    'Suite > test1':          { '2': 1, '3': 1 },
-                    'Suite > Nested > test2': { '4': 1 },
-                    'Suite > test3':          { '5': 1, '6': 1, '7': 1 },
+                    'tests/foo.test.ts > Suite > test1':          { '2': 1, '3': 1 },
+                    'tests/foo.test.ts > Suite > Nested > test2': { '4': 1 },
+                    'tests/bar.test.ts > Suite > test3':          { '5': 1, '6': 1, '7': 1 },
                 },
             });
 
             expect(consoleWarnSpy).not.toHaveBeenCalled();
         });
 
-        it('should handle single test', () => {
+        it('should handle single test without URL', () => {
             const rawCoverage: MutantCoverage = {
                 'static': {},
                 perTest:  {
@@ -66,7 +68,7 @@ describe('mapCoverageToInspectorIds', () => {
 
             const executionOrder = [100];
             const testHierarchy = new Map<number, TestInfo>([
-                [100, { id: 100, name: 'only test', fullName: 'only test', type: 'test' }],
+                [100, { id: 100, name: 'only test', fullName: 'only test', type: 'test', url: undefined }],
             ]);
 
             const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
@@ -109,9 +111,9 @@ describe('mapCoverageToInspectorIds', () => {
 
             const executionOrder = [1, 2, 10];
             const testHierarchy = new Map<number, TestInfo>([
-                [1, { id: 1, name: 'first', fullName: 'first', type: 'test' }],
-                [2, { id: 2, name: 'second', fullName: 'second', type: 'test' }],
-                [10, { id: 10, name: 'tenth', fullName: 'tenth', type: 'test' }],
+                [1, { id: 1, name: 'first', fullName: 'first', type: 'test', url: undefined }],
+                [2, { id: 2, name: 'second', fullName: 'second', type: 'test', url: undefined }],
+                [10, { id: 10, name: 'tenth', fullName: 'tenth', type: 'test', url: undefined }],
             ]);
 
             const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
@@ -121,6 +123,29 @@ describe('mapCoverageToInspectorIds', () => {
                 first:  { '1': 1 },
                 second: { '2': 1 },
                 tenth:  { '10': 1 },
+            });
+        });
+
+        it('should include file paths from URLs in mapped keys', () => {
+            const rawCoverage: MutantCoverage = {
+                'static': {},
+                perTest:  {
+                    'test-1': { '1': 1 },
+                    'test-2': { '2': 1 },
+                },
+            };
+
+            const executionOrder = [1, 2];
+            const testHierarchy = new Map<number, TestInfo>([
+                [1, { id: 1, name: 'test1', fullName: 'Suite > test1', type: 'test', url: 'file:///.stryker-tmp/sandbox-XYZ/src/utils.test.ts' }],
+                [2, { id: 2, name: 'test2', fullName: 'Suite > test2', type: 'test', url: 'file:///.stryker-tmp/sandbox-XYZ/tests/integration.test.ts' }],
+            ]);
+
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+
+            expect(result.perTest).toEqual({
+                'src/utils.test.ts > Suite > test1':         { '1': 1 },
+                'tests/integration.test.ts > Suite > test2': { '2': 1 },
             });
         });
     });

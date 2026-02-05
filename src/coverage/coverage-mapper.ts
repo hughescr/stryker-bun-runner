@@ -5,6 +5,7 @@
 
 import type { MutantCoverage } from '@stryker-mutator/api/core';
 import type { TestInfo } from '../inspector/types.js';
+import { buildUniqueTestName } from '../bun-test-runner.js';
 
 /**
  * Maps coverage data from counter-based test IDs (test-1, test-2, ...) to inspector test IDs
@@ -79,9 +80,29 @@ export function mapCoverageToInspectorIds(
         );
     }
 
-    // Map counter IDs to inspector full names
-    const remappedPerTest: Record<string, Record<string, number>> = {};
+    // First pass: build unique names and count occurrences (same logic as buildTestsFromInspector)
     const maxIndex = Math.min(counterIds.length, executionOrder.length);
+    const testNames: string[] = [];
+
+    for(let i = 0; i < maxIndex; i++) {
+        const inspectorId = executionOrder[i];
+        const testInfo = testHierarchy.get(inspectorId);
+        if(testInfo) {
+            testNames.push(buildUniqueTestName(testInfo.fullName, testInfo.url));
+        } else {
+            testNames.push(`unknown-${inspectorId}`);
+        }
+    }
+
+    // Count occurrences for deduplication (handles it.each with %s placeholders)
+    const nameCounts = new Map<string, number>();
+    for(const name of testNames) {
+        nameCounts.set(name, (nameCounts.get(name) ?? 0) + 1);
+    }
+
+    // Second pass: map coverage with deduplicated names
+    const remappedPerTest: Record<string, Record<string, number>> = {};
+    const nameIndexes = new Map<string, number>();
 
     for(let i = 0; i < maxIndex; i++) {
         const counterId = counterIds[i];
@@ -98,8 +119,18 @@ export function mapCoverageToInspectorIds(
             continue;
         }
 
-        // Use fullName from TestInfo as the new key
-        remappedPerTest[testInfo.fullName] = rawCoverage.perTest[counterId];
+        // Build unique test name, applying deduplication suffix if needed
+        const baseName = buildUniqueTestName(testInfo.fullName, testInfo.url);
+        const count = nameCounts.get(baseName) ?? 1;
+        let finalName = baseName;
+
+        if(count > 1) {
+            const index = nameIndexes.get(baseName) ?? 0;
+            finalName = `${baseName} [${index}]`;
+            nameIndexes.set(baseName, index + 1);
+        }
+
+        remappedPerTest[finalName] = rawCoverage.perTest[counterId];
     }
 
     // Return new coverage with remapped perTest and original static

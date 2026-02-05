@@ -15,6 +15,7 @@ export default {
         '@stryker-mutator/typescript-checker',
     ],
     mutate:           ['src/**/*.ts', '!src/templates/**/*.ts'],
+    ignorePatterns:   ['**', '!src/**/*.ts', '!tests/**/*.ts', '!bunfig.toml', '!tsconfig.json', '!*.mjs'], // Only include source and test files in the mutation testing process
     thresholds:       { high: 100, low: 100, 'break': 100 },
     coverageAnalysis: 'perTest',
     concurrency:      isCI ? 4 : 24,
