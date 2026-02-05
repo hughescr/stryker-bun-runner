@@ -2120,6 +2120,13 @@ tests/example.test.ts:
         it('preserves the > hierarchy separator', () => {
             expect(normalizeTestName('Suite > Nested > Test')).toBe('Suite > Nested > Test');
         });
+
+        it('trims leading and trailing whitespace', () => {
+            expect(normalizeTestName(' test ')).toBe('test');
+            expect(normalizeTestName('  multiple spaces  ')).toBe('multiple spaces');
+            expect(normalizeTestName(' leading')).toBe('leading');
+            expect(normalizeTestName('trailing ')).toBe('trailing');
+        });
     });
 
     describe('buildUniqueTestName', () => {
