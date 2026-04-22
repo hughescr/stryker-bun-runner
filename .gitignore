@@ -40,3 +40,4 @@ yarn-error.log*
 /.serena/
 .claude/settings.local.json
 .eslintcache
+.claude/scheduled_tasks.lock
