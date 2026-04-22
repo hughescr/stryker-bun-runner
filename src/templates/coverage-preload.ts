@@ -12,8 +12,6 @@ import {
     setActiveMutant,
     formatCoverageData,
     writeCoverageToFile,
-    parseWebSocketMessage,
-    createTestCounter,
     type StrykerNamespace
 } from '__PRELOAD_LOGIC_PATH__';
 
@@ -34,6 +32,14 @@ interface StrykerGlobal {
     }
 }
 
+// Eager modules list — placeholder replaced at generation time with a sorted JSON array of absolute
+// paths to all source files being mutated.  Importing each module here (before any test code runs,
+// while strykerGlobal.currentTestId is undefined) ensures that all module-level top-level code is
+// executed in the "static" coverage bucket rather than the "perTest" bucket of whichever test
+// happened to trigger the first import.  This makes coverage collection deterministic across runs.
+// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- Placeholder replaced at generation time; value is always a valid JSON array literal
+const EAGER_MODULES: string[] = __EAGER_MODULES__;
+
 // Get environment variables
 // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
 const config = getPreloadConfig();
@@ -49,23 +55,37 @@ const shouldCollectCoverage = shouldCollect(config);
 // ============================================================================
 let ws: WebSocket | null = null;
 
-// Track test counter (only needed when collecting coverage)
-// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
-const testCounter = createTestCounter();
+// Per-file test counters for per-test coverage tracking.
+//
+// Bun runs multiple test files sequentially inside the same worker process,
+// sharing a single preload module instance.  A module-level counter would
+// increment globally across all files, making position N for file B mean
+// "the (N)th test of ALL files combined" rather than "the (N)th test of B".
+// The coverage mapper expects per-file counters that restart at 1 for each
+// file, so we keep a Map<filePrefix, count> and reset per-file naturally.
+//
+// Bun.main is read DYNAMICALLY inside beforeEach (not at module init time)
+// because it changes to reflect the currently-executing test file.
+const perFileCounters = new Map<string, number>();
+
+// Helper: extract a stable relative file prefix from a Bun.main absolute path.
+// Strips the Stryker sandbox prefix so keys are portable across runs.
+function extractFilePrefix(bunMain: string): string {
+    if(!bunMain) {
+        return 'unknown';
+    }
+    // Stryker disable next-line Regex: sandbox path extraction pattern
+    const sandboxMatch = /\.stryker-tmp\/sandbox-[^/]+\/(.+)$/.exec(bunMain);
+    return sandboxMatch ? sandboxMatch[1] : bunMain.replace(/^.*\//, '');
+}
 
 if(syncPort && shouldCollectCoverage) {
     try {
         ws = new WebSocket(`ws://localhost:${syncPort}/sync`);
 
-        ws.onmessage = (event) => {
-            const data = String(event.data);
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
-            const parsedMessage = parseWebSocketMessage(data);
-
-            if(parsedMessage === 'ready') {
-                // Initial ready signal - tests can start
-                return;
-            }
+        ws.onmessage = (_event) => {
+            // Messages from the sync server are only 'ready' signals.
+            // No per-test relay needed — coverage keys are file-prefixed counters.
         };
 
         // Wait for ready signal
@@ -148,7 +168,29 @@ if(activeMutant) {
 }
 
 // ============================================================================
-// Section 3: Coverage Writing Logic
+// Section 3: Eager Module Imports (deterministic static coverage)
+// ============================================================================
+// Force all src modules to execute their top-level code during preload,
+// while strykerGlobal.currentTestId is undefined.  Module-level mutants
+// then deterministically record to the `static` bucket instead of the
+// `perTest` entry of whichever test happened to trigger the import first.
+//
+// This block is skipped during mutant runs (shouldCollectCoverage is false)
+// so mutant runs do not pay the startup cost of importing every source file.
+if(shouldCollectCoverage) {
+    for(const modPath of EAGER_MODULES) {
+        try {
+            // eslint-disable-next-line no-await-in-loop -- Sequential eager imports are intentional; parallel import would race on module-level side effects
+            await import(modPath);
+        } catch(err) {
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- err.message may exist at runtime
+            console.warn(`[Stryker] Eager import failed for ${modPath}:`, err);
+        }
+    }
+}
+
+// ============================================================================
+// Section 4: Coverage Writing Logic
 // ============================================================================
 
 // Shared coverage writing logic
@@ -157,8 +199,10 @@ const writeCoverageData = () => {
         return;
     }
 
+    // counterToName is not populated (test names are resolved by coverage-mapper
+    // from the inspector data, not stored here), so pass an empty Map.
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Placeholder import replaced at runtime
-    const data = formatCoverageData(strykerGlobal.mutantCoverage, testCounter.getCounterToNameMap());
+    const data = formatCoverageData(strykerGlobal.mutantCoverage, new Map<string, string>());
 
     try {
         // eslint-disable-next-line @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
@@ -169,17 +213,34 @@ const writeCoverageData = () => {
 };
 
 // ============================================================================
-// Section 4: Test Hooks (for per-test coverage tracking)
+// Section 5: Test Hooks (for per-test coverage tracking)
 // ============================================================================
 if(shouldCollectCoverage) {
     beforeEach(() => {
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- TestCounter from placeholder import
-        const counterId = testCounter.increment();
-        // Always use counter-based IDs - coverage-mapper remaps to full names using inspector data
+        // Assign a stable, per-file test ID by combining the normalized test
+        // file path with a per-file counter.
+        //
+        // Key design constraints:
+        //   1. Bun runs multiple test files sequentially in one worker process,
+        //      so the preload module is initialized ONCE for the whole run.
+        //   2. However, Bun.main IS updated to the currently-running test file
+        //      by the time each beforeEach fires.
+        //   3. The coverage-mapper expects counters to restart at 1 per file
+        //      (e.g. "tests/foo.test.ts@@test-1", "tests/bar.test.ts@@test-1"),
+        //      so we track a separate counter per file prefix.
+        //
+        // @ts-expect-error -- Bun global is available at runtime but not in TS typings
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- Bun global accessed at runtime
+        const bunMain = String((globalThis as unknown as { Bun?: { main?: string } }).Bun?.main ?? '');
+        const filePrefix = extractFilePrefix(bunMain);
+        const prevCount = perFileCounters.get(filePrefix) ?? 0;
+        const nextCount = prevCount + 1;
+        perFileCounters.set(filePrefix, nextCount);
+        const testId = `${filePrefix}@@test-${nextCount}`;
         // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access -- StrykerGlobal from placeholder import
-        strykerGlobal.currentTestId = counterId;
+        strykerGlobal.currentTestId = testId;
         // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- MutantCoverage from placeholder import
-        mutantCoverage.perTest[counterId] ??= {};
+        mutantCoverage.perTest[testId] ??= {};
     });
 
     afterEach(() => {

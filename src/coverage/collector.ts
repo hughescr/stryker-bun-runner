@@ -4,6 +4,7 @@
  */
 
 import type { MutantCoverage } from '@stryker-mutator/api/core';
+import type { Logger } from '@stryker-mutator/api/logging';
 import { readFile, unlink } from 'node:fs/promises';
 import type { CoverageFileData } from './types.js';
 
@@ -73,10 +74,12 @@ function mergeCoverageData(dataList: CoverageFileData[]): CoverageFileData {
  * atomic appends from multiple test files running in parallel.
  *
  * @param coverageFile - Path to the coverage data file
+ * @param logger - Optional logger for diagnostic warnings
  * @returns MutantCoverage object, or undefined if no coverage was collected
  */
 export async function collectCoverage(
-    coverageFile: string
+    coverageFile: string,
+    logger?: Pick<Logger, 'warn'>
 ): Promise<MutantCoverage | undefined> {
     try {
         const content = await readFile(coverageFile, 'utf-8');
@@ -95,8 +98,7 @@ export async function collectCoverage(
                 // Skip invalid lines - log but don't fail
                 const errorMsg = parseError instanceof Error ? parseError.message : String(parseError);
                 // Stryker disable next-line all: Logging statement
-                // eslint-disable-next-line no-console -- intentional warning for debug purposes
-                console.warn(`[Stryker Coverage] Failed to parse coverage line: ${errorMsg}`);
+                logger?.warn('[Stryker Coverage] Failed to parse coverage line: %s', errorMsg);
             }
         }
 

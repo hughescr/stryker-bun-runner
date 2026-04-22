@@ -435,40 +435,49 @@ describe('runBunTests', () => {
         });
     });
 
-    describe('noCoverage option', () => {
-        it('should add --no-coverage flag when noCoverage is true', async () => {
+    describe('bunfigPath option', () => {
+        // bun requires the equals-joined form `--config=PATH`.  With a space-
+        // separated pair, bun silently ignores the flag and treats PATH as a
+        // positional test-file filter, so the project's own bunfig.toml is used
+        // and the sanitized overrides never take effect.
+        it('should pass --config=<path> as a single joined argument when bunfigPath is set', async () => {
             const resultPromise = runBunTests({
                 bunPath:    'bun',
                 timeout:    5000,
-                noCoverage: true,
+                bunfigPath: '/tmp/sanitized-bunfig.toml',
             });
 
             mockChildProcess.closeHandler?.(0);
             await resultPromise;
 
-            const spawnCall = mockSpawn.mock.calls[0];
-
-            const args = spawnCall[1];
-            expect(args).toContain('--no-coverage');
+            const args: readonly string[] = mockSpawn.mock.calls[0][1];
+            expect(args).toContain('--config=/tmp/sanitized-bunfig.toml');
+            // Regression guard: reject the space-separated form entirely.
+            expect(args).not.toContain('--config');
+            expect(args).not.toContain('/tmp/sanitized-bunfig.toml');
         });
 
-        it('should not add --no-coverage flag when noCoverage is false', async () => {
+        it('should place --config=<path> before --preload in arg order', async () => {
             const resultPromise = runBunTests({
-                bunPath:    'bun',
-                timeout:    5000,
-                noCoverage: false,
+                bunPath:       'bun',
+                timeout:       5000,
+                bunfigPath:    '/tmp/sanitized.toml',
+                preloadScript: '/tmp/preload.ts',
             });
 
             mockChildProcess.closeHandler?.(0);
             await resultPromise;
 
-            const spawnCall = mockSpawn.mock.calls[0];
+            const args: readonly string[] = mockSpawn.mock.calls[0][1];
+            const configIdx  = args.indexOf('--config=/tmp/sanitized.toml');
+            const preloadIdx = args.indexOf('--preload');
 
-            const args = spawnCall[1];
-            expect(args).not.toContain('--no-coverage');
+            expect(configIdx).toBeGreaterThan(-1);
+            expect(preloadIdx).toBeGreaterThan(-1);
+            expect(configIdx).toBeLessThan(preloadIdx);
         });
 
-        it('should not add --no-coverage flag when noCoverage is undefined', async () => {
+        it('should not add --config flag when bunfigPath is undefined', async () => {
             const resultPromise = runBunTests({
                 bunPath: 'bun',
                 timeout: 5000,
@@ -477,10 +486,8 @@ describe('runBunTests', () => {
             mockChildProcess.closeHandler?.(0);
             await resultPromise;
 
-            const spawnCall = mockSpawn.mock.calls[0];
-
-            const args = spawnCall[1];
-            expect(args).not.toContain('--no-coverage');
+            const args: readonly string[] = mockSpawn.mock.calls[0][1];
+            expect(args.some(a => a.startsWith('--config'))).toBe(false);
         });
     });
 
@@ -510,6 +517,104 @@ describe('runBunTests', () => {
             expect(args[4]).toBe('test');
             expect(args[5]).toBe('--bail');
             expect(args[6]).toBe('--only');
+        });
+    });
+
+    describe('testFiles positional args', () => {
+        it('should append testFiles as positional args after all flags', async () => {
+            const resultPromise = runBunTests({
+                bunPath:   'bun',
+                timeout:   5000,
+                bail:      true,
+                testFiles: ['tests/alpha.test.ts', 'tests/beta.test.ts'],
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const args: readonly string[] = mockSpawn.mock.calls[0][1];
+
+            // Flags must come before positional file args
+            const bailIdx  = args.indexOf('--bail');
+            const alphaIdx = args.indexOf('tests/alpha.test.ts');
+            const betaIdx  = args.indexOf('tests/beta.test.ts');
+
+            expect(bailIdx).toBeGreaterThan(-1);
+            expect(alphaIdx).toBeGreaterThan(-1);
+            expect(betaIdx).toBeGreaterThan(-1);
+            expect(alphaIdx).toBeGreaterThan(bailIdx);
+            expect(betaIdx).toBe(alphaIdx + 1);
+        });
+
+        it('should preserve testFiles order (sorted lexicographically by caller)', async () => {
+            const resultPromise = runBunTests({
+                bunPath:   'bun',
+                timeout:   5000,
+                testFiles: ['tests/a.test.ts', 'tests/b.test.ts', 'tests/c.test.ts'],
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const args: readonly string[] = mockSpawn.mock.calls[0][1];
+            const aIdx = args.indexOf('tests/a.test.ts');
+            const bIdx = args.indexOf('tests/b.test.ts');
+            const cIdx = args.indexOf('tests/c.test.ts');
+
+            expect(aIdx).toBeGreaterThan(-1);
+            expect(bIdx).toBe(aIdx + 1);
+            expect(cIdx).toBe(aIdx + 2);
+        });
+
+        it('should place testFiles after bunArgs', async () => {
+            const resultPromise = runBunTests({
+                bunPath:   'bun',
+                timeout:   5000,
+                bunArgs:   ['--only'],
+                testFiles: ['tests/foo.test.ts'],
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const args: readonly string[] = mockSpawn.mock.calls[0][1];
+            const onlyIdx = args.indexOf('--only');
+            const fooIdx  = args.indexOf('tests/foo.test.ts');
+
+            expect(onlyIdx).toBeGreaterThan(-1);
+            expect(fooIdx).toBeGreaterThan(-1);
+            expect(fooIdx).toBeGreaterThan(onlyIdx);
+        });
+
+        it('should not add any positional file args when testFiles is undefined', async () => {
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+                bail:    true,
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const args: readonly string[] = mockSpawn.mock.calls[0][1];
+
+            // Only flags, no unexpected positional args
+            expect(args).toEqual(['test', '--bail']);
+        });
+
+        it('should not add any positional file args when testFiles is empty', async () => {
+            const resultPromise = runBunTests({
+                bunPath:   'bun',
+                timeout:   5000,
+                testFiles: [],
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const args: readonly string[] = mockSpawn.mock.calls[0][1];
+
+            expect(args).toEqual(['test']);
         });
     });
 
@@ -698,12 +803,12 @@ describe('runBunTests', () => {
             expect(args).not.toContain('--bail');
         });
 
-        it('should skip noCoverage when not provided - line 155 mutation', async () => {
-            // Kills mutation on line 155: if(options.noCoverage) → if(true)
+        it('should skip --config when bunfigPath not provided', async () => {
+            // Kills mutation on if(options.bunfigPath) → if(true)
             const resultPromise = runBunTests({
-                bunPath:    'bun',
-                timeout:    5000,
-                noCoverage: false, // Explicitly false
+                bunPath: 'bun',
+                timeout: 5000,
+                // bunfigPath intentionally omitted
             });
 
             mockChildProcess.closeHandler?.(0);
@@ -713,8 +818,8 @@ describe('runBunTests', () => {
 
             const args = spawnCall[1];
 
-            // Should not include --no-coverage flag
-            expect(args).not.toContain('--no-coverage');
+            // Should not include any --config flag (neither `--config=<path>` nor `--config` on its own)
+            expect((args as readonly string[]).some(a => a.startsWith('--config'))).toBe(false);
         });
 
         it('should skip onInspectorReady callback when not provided - line 179 mutation', async () => {

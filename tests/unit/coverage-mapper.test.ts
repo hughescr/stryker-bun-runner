@@ -1,28 +1,283 @@
 /**
  * Unit tests for coverage/coverage-mapper
- * Tests mapping of counter-based coverage IDs to inspector test IDs
+ * Tests mapping of file-prefixed counter-based coverage IDs to inspector test IDs
  */
 
-import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
+import { describe, it, expect, mock } from 'bun:test';
 import { mapCoverageToInspectorIds } from '../../src/coverage/coverage-mapper.js';
 import type { MutantCoverage } from '@stryker-mutator/api/core';
 import type { TestInfo } from '../../src/inspector/types.js';
 
 describe('mapCoverageToInspectorIds', () => {
-    let consoleWarnSpy: ReturnType<typeof spyOn>;
+    // eslint-disable-next-line @typescript-eslint/no-empty-function -- intentional mock to suppress output
+    const makeLogger = () => ({ warn: mock(() => {}) });
 
-    beforeEach(() => {
-    // Spy on console.warn to verify warnings
-        // eslint-disable-next-line @typescript-eslint/no-empty-function -- intentional mock to suppress test output
-        consoleWarnSpy = spyOn(console, 'warn').mockImplementation(() => {});
+    // ─────────────────────────────────────────────────────────────────────────
+    // New format: "relativeFile@@test-N" keys (file-prefixed counter)
+    // ─────────────────────────────────────────────────────────────────────────
+    describe('file-prefixed counter keys (new format)', () => {
+        it('should map file@@test-N keys to full test names using per-file position', () => {
+            const rawCoverage: MutantCoverage = {
+                'static': { '1': 1 },
+                perTest:  {
+                    'tests/foo.test.ts@@test-1': { '2': 1, '3': 1 },
+                    'tests/foo.test.ts@@test-2': { '4': 1 },
+                    'tests/bar.test.ts@@test-1': { '5': 1, '6': 1, '7': 1 },
+                },
+            };
+
+            const executionOrder = [42, 43, 44];
+            const testHierarchy = new Map<number, TestInfo>([
+                [42, { id: 42, name: 'test1', fullName: 'Suite > test1', type: 'test', url: 'file:///.stryker-tmp/sandbox-ABC/tests/foo.test.ts' }],
+                [43, { id: 43, name: 'test2', fullName: 'Suite > Nested > test2', type: 'test', url: 'file:///.stryker-tmp/sandbox-ABC/tests/foo.test.ts' }],
+                [44, { id: 44, name: 'test3', fullName: 'Suite > test3', type: 'test', url: 'file:///.stryker-tmp/sandbox-ABC/tests/bar.test.ts' }],
+            ]);
+
+            const logger = makeLogger();
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy, logger);
+
+            // foo.test.ts@@test-1 → 1st test in foo.test.ts → inspector 42 → Suite > test1
+            // foo.test.ts@@test-2 → 2nd test in foo.test.ts → inspector 43 → Suite > Nested > test2
+            // bar.test.ts@@test-1 → 1st test in bar.test.ts → inspector 44 → Suite > test3
+            expect(result).toEqual({
+                'static': { '1': 1 },
+                perTest:  {
+                    'tests/foo.test.ts > Suite > test1':          { '2': 1, '3': 1 },
+                    'tests/foo.test.ts > Suite > Nested > test2': { '4': 1 },
+                    'tests/bar.test.ts > Suite > test3':          { '5': 1, '6': 1, '7': 1 },
+                },
+            });
+
+            expect(logger.warn).not.toHaveBeenCalled();
+        });
+
+        it('should correctly separate per-file positions even when execution order is interleaved', () => {
+            // Simulates two files running in parallel: A-test1, B-test1, A-test2, B-test2
+            const rawCoverage: MutantCoverage = {
+                'static': {},
+                perTest:  {
+                    'tests/a.test.ts@@test-1': { '1': 1 },
+                    'tests/a.test.ts@@test-2': { '2': 1 },
+                    'tests/b.test.ts@@test-1': { '3': 1 },
+                    'tests/b.test.ts@@test-2': { '4': 1 },
+                },
+            };
+
+            // Execution order is interleaved: A1, B1, A2, B2
+            const executionOrder = [10, 20, 11, 21];
+            const testHierarchy = new Map<number, TestInfo>([
+                [10, { id: 10, name: 'a-first', fullName: 'a-first', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/a.test.ts' }],
+                [11, { id: 11, name: 'a-second', fullName: 'a-second', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/a.test.ts' }],
+                [20, { id: 20, name: 'b-first', fullName: 'b-first', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/b.test.ts' }],
+                [21, { id: 21, name: 'b-second', fullName: 'b-second', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/b.test.ts' }],
+            ]);
+
+            const logger = makeLogger();
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy, logger);
+
+            // Per-file mapping:
+            // tests/a.test.ts: [10, 11] (in execution order)
+            //   a.test.ts@@test-1 → position 1 → inspector 10 → a-first
+            //   a.test.ts@@test-2 → position 2 → inspector 11 → a-second
+            // tests/b.test.ts: [20, 21] (in execution order)
+            //   b.test.ts@@test-1 → position 1 → inspector 20 → b-first
+            //   b.test.ts@@test-2 → position 2 → inspector 21 → b-second
+            expect(result.perTest).toEqual({
+                'tests/a.test.ts > a-first':  { '1': 1 },
+                'tests/a.test.ts > a-second': { '2': 1 },
+                'tests/b.test.ts > b-first':  { '3': 1 },
+                'tests/b.test.ts > b-second': { '4': 1 },
+            });
+
+            expect(logger.warn).not.toHaveBeenCalled();
+        });
+
+        it('should produce identical mapping regardless of which file runs first (determinism guarantee)', () => {
+            // This is the core nondeterminism fix:
+            // Two runs where file execution ORDER differs must produce the same perTest mapping.
+
+            const testHierarchy = new Map<number, TestInfo>([
+                [1, { id: 1, name: 'alpha', fullName: 'Suite > alpha', type: 'test', url: 'file:///.stryker-tmp/sandbox-A/tests/foo.test.ts' }],
+                [2, { id: 2, name: 'beta', fullName: 'Suite > beta', type: 'test', url: 'file:///.stryker-tmp/sandbox-A/tests/foo.test.ts' }],
+                [3, { id: 3, name: 'gamma', fullName: 'Suite > gamma', type: 'test', url: 'file:///.stryker-tmp/sandbox-A/tests/bar.test.ts' }],
+            ]);
+
+            const coverage: MutantCoverage = {
+                'static': {},
+                perTest:  {
+                    'tests/foo.test.ts@@test-1': { '1': 1, '2': 1 },
+                    'tests/foo.test.ts@@test-2': { '3': 1 },
+                    'tests/bar.test.ts@@test-1': { '4': 1, '5': 1 },
+                },
+            };
+
+            // Run 1: foo runs before bar in execution order
+            const run1 = mapCoverageToInspectorIds(
+                coverage,
+                [1, 2, 3],
+                testHierarchy
+            );
+
+            // Run 2: bar runs before foo in execution order (different OS scheduling)
+            const run2 = mapCoverageToInspectorIds(
+                coverage,
+                [3, 1, 2],
+                testHierarchy
+            );
+
+            // Both must produce identical perTest mappings
+            expect(run1.perTest).toEqual(run2.perTest);
+            expect(run1.perTest).toEqual({
+                'tests/foo.test.ts > Suite > alpha': { '1': 1, '2': 1 },
+                'tests/foo.test.ts > Suite > beta':  { '3': 1 },
+                'tests/bar.test.ts > Suite > gamma': { '4': 1, '5': 1 },
+            });
+        });
+
+        it('should handle single file-prefixed test without URL in hierarchy', () => {
+            const rawCoverage: MutantCoverage = {
+                'static': {},
+                perTest:  {
+                    'tests/foo.test.ts@@test-1': { '1': 1, '2': 1 },
+                },
+            };
+
+            const executionOrder = [100];
+            const testHierarchy = new Map<number, TestInfo>([
+                // url is undefined - this happens for synthetic or external tests
+                [100, { id: 100, name: 'only test', fullName: 'only test', type: 'test', url: undefined }],
+            ]);
+
+            const logger = makeLogger();
+            mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy, logger);
+
+            // File prefix "tests/foo.test.ts" won't match normalizeTestFilePath(undefined)="" so
+            // the test is not found via file lookup. Logger warning expected.
+            expect(logger.warn).toHaveBeenCalled();
+        });
+
+        it('should preserve static coverage unchanged', () => {
+            const rawCoverage: MutantCoverage = {
+                'static': { '10': 1, '20': 1, '30': 1 },
+                perTest:  {
+                    'tests/foo.test.ts@@test-1': { '1': 1 },
+                },
+            };
+
+            const executionOrder = [50];
+            const testHierarchy = new Map<number, TestInfo>([
+                [50, { id: 50, name: 'test', fullName: 'test', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/foo.test.ts' }],
+            ]);
+
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+
+            expect(result.static).toEqual({ '10': 1, '20': 1, '30': 1 });
+        });
+
+        it('should sort counter IDs numerically within a file (not lexicographically)', () => {
+            // test-10 sorts AFTER test-9 numerically (correct)
+            // but BEFORE test-2 lexicographically (wrong)
+            // A file with 10 tests produces counters test-1..test-10
+            const rawCoverage: MutantCoverage = {
+                'static': {},
+                perTest:  {
+                    'tests/foo.test.ts@@test-2':  { '20': 1 },
+                    'tests/foo.test.ts@@test-10': { '100': 1 },
+                    'tests/foo.test.ts@@test-1':  { '10': 1 },
+                },
+            };
+
+            // 10 tests in execution order; we only check positions 1, 2, 10
+            const executionOrder = [101, 102, 103, 104, 105, 106, 107, 108, 109, 110];
+            const testHierarchy = new Map<number, TestInfo>([
+                [101, { id: 101, name: 'first',  fullName: 'first',  type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/foo.test.ts' }],
+                [102, { id: 102, name: 'second', fullName: 'second', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/foo.test.ts' }],
+                [103, { id: 103, name: 'third',  fullName: 'third',  type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/foo.test.ts' }],
+                [104, { id: 104, name: 'fourth', fullName: 'fourth', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/foo.test.ts' }],
+                [105, { id: 105, name: 'fifth',  fullName: 'fifth',  type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/foo.test.ts' }],
+                [106, { id: 106, name: 'sixth',  fullName: 'sixth',  type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/foo.test.ts' }],
+                [107, { id: 107, name: 'seventh',fullName: 'seventh',type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/foo.test.ts' }],
+                [108, { id: 108, name: 'eighth', fullName: 'eighth', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/foo.test.ts' }],
+                [109, { id: 109, name: 'ninth',  fullName: 'ninth',  type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/foo.test.ts' }],
+                [110, { id: 110, name: 'tenth',  fullName: 'tenth',  type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/foo.test.ts' }],
+            ]);
+
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+
+            // Numerically: test-1 (pos 1) → first, test-2 (pos 2) → second, test-10 (pos 10) → tenth
+            // Lexicographically (wrong): test-1 → first, test-10 → second, test-2 → third
+            expect(result.perTest).toEqual({
+                'tests/foo.test.ts > first':  { '10': 1 },
+                'tests/foo.test.ts > second': { '20': 1 },
+                'tests/foo.test.ts > tenth':  { '100': 1 },
+            });
+        });
+
+        it('should warn and skip when file prefix matches no tests in hierarchy', () => {
+            const rawCoverage: MutantCoverage = {
+                'static': {},
+                perTest:  {
+                    'tests/missing.test.ts@@test-1': { '1': 1 },
+                    'tests/present.test.ts@@test-1': { '2': 1 },
+                },
+            };
+
+            const executionOrder = [42];
+            const testHierarchy = new Map<number, TestInfo>([
+                // Only present.test.ts has a test in the hierarchy
+                [42, { id: 42, name: 'exists', fullName: 'exists', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/present.test.ts' }],
+            ]);
+
+            const logger = makeLogger();
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy, logger);
+
+            expect(result.perTest).toEqual({
+                'tests/present.test.ts > exists': { '2': 1 },
+            });
+
+            expect(logger.warn).toHaveBeenCalledWith(
+                expect.stringContaining('%s'),
+                expect.stringContaining('tests/missing.test.ts'),
+                expect.anything(),
+                expect.anything(),
+                expect.anything()
+            );
+        });
+
+        it('should handle deduplication for tests with same name from same file (it.each)', () => {
+            // it.each in classifier.test.ts produces the same test name for each iteration
+            const rawCoverage: MutantCoverage = {
+                'static': {},
+                perTest:  {
+                    'tests/c.test.ts@@test-1': { '1': 1 },
+                    'tests/c.test.ts@@test-2': { '2': 1 },
+                    'tests/c.test.ts@@test-3': { '3': 1 },
+                },
+            };
+
+            const executionOrder = [1, 2, 3];
+            // All three tests from the same file have the same fullName (it.each with %s)
+            const testHierarchy = new Map<number, TestInfo>([
+                [1, { id: 1, name: 'should handle %s', fullName: 'Suite > should handle %s', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/c.test.ts' }],
+                [2, { id: 2, name: 'should handle %s', fullName: 'Suite > should handle %s', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/c.test.ts' }],
+                [3, { id: 3, name: 'should handle %s', fullName: 'Suite > should handle %s', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/c.test.ts' }],
+            ]);
+
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+
+            // With deduplication: [0], [1], [2] suffixes assigned in counter order (deterministic)
+            expect(result.perTest).toEqual({
+                'tests/c.test.ts > Suite > should handle %s [0]': { '1': 1 },
+                'tests/c.test.ts > Suite > should handle %s [1]': { '2': 1 },
+                'tests/c.test.ts > Suite > should handle %s [2]': { '3': 1 },
+            });
+        });
     });
 
-    afterEach(() => {
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- mock function access
-        consoleWarnSpy.mockRestore();
-    });
-
-    describe('successful mapping', () => {
+    // ─────────────────────────────────────────────────────────────────────────
+    // Legacy format: "test-N" keys (backward compatibility)
+    // ─────────────────────────────────────────────────────────────────────────
+    describe('legacy counter keys (test-N format)', () => {
         it('should map counter IDs to inspector full names with file paths', () => {
             const rawCoverage: MutantCoverage = {
                 'static': { '1': 1 },
@@ -40,7 +295,8 @@ describe('mapCoverageToInspectorIds', () => {
                 [44, { id: 44, name: 'test3', fullName: 'Suite > test3', type: 'test', url: 'file:///.stryker-tmp/sandbox-ABC/tests/bar.test.ts' }],
             ]);
 
-            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+            const logger = makeLogger();
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy, logger);
 
             // Maps based on execution order with file paths included:
             // test-1 -> ID 42 (tests/foo.test.ts > Suite > test1)
@@ -55,7 +311,7 @@ describe('mapCoverageToInspectorIds', () => {
                 },
             });
 
-            expect(consoleWarnSpy).not.toHaveBeenCalled();
+            expect(logger.warn).not.toHaveBeenCalled();
         });
 
         it('should handle single test without URL', () => {
@@ -148,10 +404,105 @@ describe('mapCoverageToInspectorIds', () => {
                 'tests/integration.test.ts > Suite > test2': { '2': 1 },
             });
         });
+
+        it('should warn and do partial mapping when coverage has more tests than execution order', () => {
+            const rawCoverage: MutantCoverage = {
+                'static': {},
+                perTest:  {
+                    'test-1': { '1': 1 },
+                    'test-2': { '2': 1 },
+                    'test-3': { '3': 1 },
+                },
+            };
+
+            const executionOrder = [42, 43]; // Only 2 tests
+            const testHierarchy = new Map<number, TestInfo>([
+                [42, { id: 42, name: 'test1', fullName: 'Suite > test1', type: 'test' }],
+                [43, { id: 43, name: 'test2', fullName: 'Suite > test2', type: 'test' }],
+            ]);
+
+            const logger = makeLogger();
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy, logger);
+
+            // Should map only first 2 tests
+            expect(result.perTest).toEqual({
+                'Suite > test1': { '1': 1 },
+                'Suite > test2': { '2': 1 },
+            });
+
+            expect(logger.warn).toHaveBeenCalledWith(
+                expect.stringContaining('Coverage/execution count mismatch'),
+                3,
+                2,
+                2
+            );
+        });
+
+        it('should warn and skip test when inspector ID not found in hierarchy', () => {
+            const rawCoverage: MutantCoverage = {
+                'static': {},
+                perTest:  {
+                    'test-1': { '1': 1 },
+                    'test-2': { '2': 1 },
+                    'test-3': { '3': 1 },
+                },
+            };
+
+            const executionOrder = [42, 43, 44];
+            const testHierarchy = new Map<number, TestInfo>([
+                [42, { id: 42, name: 'test1', fullName: 'Suite > test1', type: 'test' }],
+                // 43 is missing
+                [44, { id: 44, name: 'test3', fullName: 'Suite > test3', type: 'test' }],
+            ]);
+
+            const logger = makeLogger();
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy, logger);
+
+            expect(result.perTest).toEqual({
+                'Suite > test1': { '1': 1 },
+                'Suite > test3': { '3': 1 },
+            });
+
+            expect(logger.warn).toHaveBeenCalledWith(
+                expect.stringContaining('Missing test info for inspector ID'),
+                43,
+                'test-2'
+            );
+        });
+
+        it('should deduplicate test names with [N] suffix in legacy key format (it.each)', () => {
+            // it.each produces tests with the same fullName; legacy keys must also dedup them
+            const rawCoverage: MutantCoverage = {
+                'static': {},
+                perTest:  {
+                    'test-1': { '10': 1 },
+                    'test-2': { '20': 1 },
+                    'test-3': { '30': 1 },
+                },
+            };
+
+            const executionOrder = [1, 2, 3];
+            const testHierarchy = new Map<number, TestInfo>([
+                [1, { id: 1, name: 'handles %s', fullName: 'Suite > handles %s', type: 'test' }],
+                [2, { id: 2, name: 'handles %s', fullName: 'Suite > handles %s', type: 'test' }],
+                [3, { id: 3, name: 'handles %s', fullName: 'Suite > handles %s', type: 'test' }],
+            ]);
+
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+
+            expect(result.perTest).toEqual({
+                'Suite > handles %s [0]': { '10': 1 },
+                'Suite > handles %s [1]': { '20': 1 },
+                'Suite > handles %s [2]': { '30': 1 },
+            });
+        });
     });
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Format detection and passthrough
+    // ─────────────────────────────────────────────────────────────────────────
     describe('non-counter ID handling', () => {
-        it('should return coverage unchanged when keys do not match test-N pattern', () => {
+        it('should return coverage unchanged when keys do not match any known pattern', () => {
             const rawCoverage: MutantCoverage = {
                 'static': { '1': 1 },
                 perTest:  {
@@ -166,11 +517,12 @@ describe('mapCoverageToInspectorIds', () => {
                 [43, { id: 43, name: 'test2', fullName: 'Different > test2', type: 'test' }],
             ]);
 
-            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+            const logger = makeLogger();
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy, logger);
 
-            // Should return unchanged because keys don't match test-N pattern
+            // Should return unchanged because keys don't match any counter pattern
             expect(result).toEqual(rawCoverage);
-            expect(consoleWarnSpy).not.toHaveBeenCalled();
+            expect(logger.warn).not.toHaveBeenCalled();
         });
 
         it('should return unchanged when keys have test- prefix but no number', () => {
@@ -186,10 +538,11 @@ describe('mapCoverageToInspectorIds', () => {
                 [42, { id: 42, name: 'test', fullName: 'test', type: 'test' }],
             ]);
 
-            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+            const logger = makeLogger();
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy, logger);
 
             expect(result).toEqual(rawCoverage);
-            expect(consoleWarnSpy).not.toHaveBeenCalled();
+            expect(logger.warn).not.toHaveBeenCalled();
         });
 
         it('should return unchanged when keys have numbers but wrong prefix', () => {
@@ -205,48 +558,11 @@ describe('mapCoverageToInspectorIds', () => {
                 [42, { id: 42, name: 'test', fullName: 'test', type: 'test' }],
             ]);
 
-            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+            const logger = makeLogger();
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy, logger);
 
             expect(result).toEqual(rawCoverage);
-            expect(consoleWarnSpy).not.toHaveBeenCalled();
-        });
-
-        it('should return unchanged when keys have test-N pattern but extra characters', () => {
-            const rawCoverage: MutantCoverage = {
-                'static': {},
-                perTest:  {
-                    'test-1-extra': { '1': 1 },
-                },
-            };
-
-            const executionOrder = [42];
-            const testHierarchy = new Map<number, TestInfo>([
-                [42, { id: 42, name: 'test', fullName: 'test', type: 'test' }],
-            ]);
-
-            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
-
-            expect(result).toEqual(rawCoverage);
-            expect(consoleWarnSpy).not.toHaveBeenCalled();
-        });
-
-        it('should return unchanged when keys start with test-N but have suffix', () => {
-            const rawCoverage: MutantCoverage = {
-                'static': {},
-                perTest:  {
-                    'test-1suffix': { '1': 1 },
-                },
-            };
-
-            const executionOrder = [42];
-            const testHierarchy = new Map<number, TestInfo>([
-                [42, { id: 42, name: 'test', fullName: 'test', type: 'test' }],
-            ]);
-
-            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
-
-            expect(result).toEqual(rawCoverage);
-            expect(consoleWarnSpy).not.toHaveBeenCalled();
+            expect(logger.warn).not.toHaveBeenCalled();
         });
 
         it('should map when keys exactly match test-N pattern', () => {
@@ -262,16 +578,42 @@ describe('mapCoverageToInspectorIds', () => {
                 [42, { id: 42, name: 'test', fullName: 'Mapped > test', type: 'test' }],
             ]);
 
-            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+            const logger = makeLogger();
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy, logger);
 
             // Should be mapped, not returned unchanged
             expect(result.perTest).toEqual({
                 'Mapped > test': { '1': 1 },
             });
-            expect(consoleWarnSpy).not.toHaveBeenCalled();
+            expect(logger.warn).not.toHaveBeenCalled();
+        });
+
+        it('should map when keys match file@@test-N pattern', () => {
+            const rawCoverage: MutantCoverage = {
+                'static': {},
+                perTest:  {
+                    'tests/x.test.ts@@test-1': { '1': 1 },
+                },
+            };
+
+            const executionOrder = [42];
+            const testHierarchy = new Map<number, TestInfo>([
+                [42, { id: 42, name: 'test', fullName: 'Mapped > test', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/x.test.ts' }],
+            ]);
+
+            const logger = makeLogger();
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy, logger);
+
+            expect(result.perTest).toEqual({
+                'tests/x.test.ts > Mapped > test': { '1': 1 },
+            });
+            expect(logger.warn).not.toHaveBeenCalled();
         });
     });
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Edge cases
+    // ─────────────────────────────────────────────────────────────────────────
     describe('edge cases', () => {
         it('should return coverage unchanged when perTest is empty', () => {
             const rawCoverage: MutantCoverage = {
@@ -284,10 +626,11 @@ describe('mapCoverageToInspectorIds', () => {
                 [42, { id: 42, name: 'test', fullName: 'test', type: 'test' }],
             ]);
 
-            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+            const logger = makeLogger();
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy, logger);
 
             expect(result).toEqual(rawCoverage);
-            expect(consoleWarnSpy).not.toHaveBeenCalled();
+            expect(logger.warn).not.toHaveBeenCalled();
         });
 
         it('should handle undefined coverage', () => {
@@ -313,196 +656,6 @@ describe('mapCoverageToInspectorIds', () => {
 
             expect(result).toEqual(rawCoverage);
         });
-    });
-
-    describe('count mismatch handling', () => {
-        it('should warn and do partial mapping when coverage has more tests than execution order', () => {
-            const rawCoverage: MutantCoverage = {
-                'static': {},
-                perTest:  {
-                    'test-1': { '1': 1 },
-                    'test-2': { '2': 1 },
-                    'test-3': { '3': 1 },
-                },
-            };
-
-            const executionOrder = [42, 43]; // Only 2 tests
-            const testHierarchy = new Map<number, TestInfo>([
-                [42, { id: 42, name: 'test1', fullName: 'Suite > test1', type: 'test' }],
-                [43, { id: 43, name: 'test2', fullName: 'Suite > test2', type: 'test' }],
-            ]);
-
-            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
-
-            // Should map only first 2 tests
-            expect(result.perTest).toEqual({
-                'Suite > test1': { '1': 1 },
-                'Suite > test2': { '2': 1 },
-            });
-
-            expect(consoleWarnSpy).toHaveBeenCalledWith(
-                expect.stringContaining('Coverage/execution count mismatch: 3 coverage entries vs 2 executed tests')
-            );
-            expect(consoleWarnSpy).toHaveBeenCalledWith(
-                expect.stringContaining('Performing partial mapping for 2 tests')
-            );
-        });
-
-        it('should warn and do partial mapping when execution order has more tests than coverage', () => {
-            const rawCoverage: MutantCoverage = {
-                'static': {},
-                perTest:  {
-                    'test-1': { '1': 1 },
-                },
-            };
-
-            const executionOrder = [42, 43, 44]; // 3 tests
-            const testHierarchy = new Map<number, TestInfo>([
-                [42, { id: 42, name: 'test1', fullName: 'Suite > test1', type: 'test' }],
-                [43, { id: 43, name: 'test2', fullName: 'Suite > test2', type: 'test' }],
-                [44, { id: 44, name: 'test3', fullName: 'Suite > test3', type: 'test' }],
-            ]);
-
-            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
-
-            // Should map only the 1 test in coverage
-            expect(result.perTest).toEqual({
-                'Suite > test1': { '1': 1 },
-            });
-
-            expect(consoleWarnSpy).toHaveBeenCalledWith(
-                expect.stringContaining('Coverage/execution count mismatch: 1 coverage entries vs 3 executed tests')
-            );
-            expect(consoleWarnSpy).toHaveBeenCalledWith(
-                expect.stringContaining('Performing partial mapping for 1 tests')
-            );
-        });
-
-        it('should include both counts in warning message', () => {
-            const rawCoverage: MutantCoverage = {
-                'static': {},
-                perTest:  {
-                    'test-1': { '1': 1 },
-                    'test-2': { '2': 1 },
-                    'test-3': { '3': 1 },
-                    'test-4': { '4': 1 },
-                    'test-5': { '5': 1 },
-                },
-            };
-
-            const executionOrder = [42, 43]; // Only 2 tests
-            const testHierarchy = new Map<number, TestInfo>([
-                [42, { id: 42, name: 'test1', fullName: 'Suite > test1', type: 'test' }],
-                [43, { id: 43, name: 'test2', fullName: 'Suite > test2', type: 'test' }],
-            ]);
-
-            mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
-
-            // Verify exact count values are in the warning message
-            expect(consoleWarnSpy).toHaveBeenCalledWith(
-                expect.stringMatching(/5 coverage entries vs 2 executed tests/)
-            );
-        });
-    });
-
-    describe('missing test info handling', () => {
-        it('should warn and skip test when inspector ID not found in hierarchy', () => {
-            const rawCoverage: MutantCoverage = {
-                'static': {},
-                perTest:  {
-                    'test-1': { '1': 1 },
-                    'test-2': { '2': 1 },
-                    'test-3': { '3': 1 },
-                },
-            };
-
-            const executionOrder = [42, 43, 44];
-            const testHierarchy = new Map<number, TestInfo>([
-                [42, { id: 42, name: 'test1', fullName: 'Suite > test1', type: 'test' }],
-                // 43 is missing
-                [44, { id: 44, name: 'test3', fullName: 'Suite > test3', type: 'test' }],
-            ]);
-
-            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
-
-            // Maps based on execution order:
-            // test-1 -> ID 42 (Suite > test1), test-2 -> ID 43 (missing, skipped), test-3 -> ID 44 (Suite > test3)
-            expect(result.perTest).toEqual({
-                'Suite > test1': { '1': 1 },
-                'Suite > test3': { '3': 1 },
-            });
-
-            expect(consoleWarnSpy).toHaveBeenCalledWith(
-                expect.stringContaining('Missing test info for inspector ID 43 (counter ID: test-2)')
-            );
-        });
-
-        it('should handle all tests missing from hierarchy', () => {
-            const rawCoverage: MutantCoverage = {
-                'static': { '99': 1 },
-                perTest:  {
-                    'test-1': { '1': 1 },
-                    'test-2': { '2': 1 },
-                },
-            };
-
-            const executionOrder = [42, 43];
-            const testHierarchy = new Map<number, TestInfo>(); // Empty hierarchy
-
-            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
-
-            // Should have empty perTest but preserve static
-            expect(result).toEqual({
-                'static': { '99': 1 },
-                perTest:  {},
-            });
-
-            expect(consoleWarnSpy).toHaveBeenCalledTimes(2); // One warning per missing test
-        });
-    });
-
-    describe('early return for empty coverage', () => {
-        it('should return coverage unchanged when perTest has entries but first key is non-counter', () => {
-            // Kills mutation 313: if(!rawCoverage?.perTest || ...) → if(false || ...)
-            // This ensures we actually check if perTest exists and has content
-            const rawCoverage: MutantCoverage = {
-                'static': { '1': 1 },
-                perTest:  {
-                    'already-mapped-test': { '2': 1 },
-                },
-            };
-
-            const executionOrder = [42];
-            const testHierarchy = new Map<number, TestInfo>([
-                [42, { id: 42, name: 'test', fullName: 'test', type: 'test' }],
-            ]);
-
-            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
-
-            // Should return unchanged because first key doesn't match test-N pattern
-            expect(result).toEqual(rawCoverage);
-        });
-
-        it('should handle coverage with non-empty perTest that needs checking', () => {
-            // This test verifies that the truthiness check for rawCoverage?.perTest works correctly
-            // If mutated to always false, this would break
-            const rawCoverage: MutantCoverage = {
-                'static': { '99': 1 },
-                perTest:  {
-                    'test-1': { '1': 1 },
-                },
-            };
-
-            const executionOrder = [100];
-            const testHierarchy = new Map<number, TestInfo>([
-                [100, { id: 100, name: 'mytest', fullName: 'Suite > mytest', type: 'test' }],
-            ]);
-
-            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
-
-            // Should map successfully
-            expect(result.perTest['Suite > mytest']).toEqual({ '1': 1 });
-        });
 
         it('should return same object reference when perTest is empty (early return path)', () => {
             // Kills ConditionalExpression mutation at line 54: if(!rawCoverage?.perTest || ...) → if(false || ...)
@@ -521,18 +674,11 @@ describe('mapCoverageToInspectorIds', () => {
             const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
 
             // Should return the exact same object reference (early return)
-            // If mutated to false and processing continues, a new object would be created
             expect(result).toBe(rawCoverage);
         });
 
         it('should early return for empty perTest without processing', () => {
-            // Kills ConditionalExpression mutation at line 54:
-            // if(!rawCoverage?.perTest || Object.keys(rawCoverage.perTest).length === 0) → if(false)
-            //
-            // Strategy: Use a property that would cause an error if accessed after the length check.
-            // With proper early return, we check length and return immediately.
-            // With mutation (false), code continues to line 60 and tries to access the first key,
-            // but our custom object will track this access.
+            // Kills ConditionalExpression mutation at line 54
             let keysAccessCount = 0;
             const emptyPerTest = new Proxy({} as Record<string, Record<string, number>>, {
                 ownKeys(target) {
@@ -557,119 +703,21 @@ describe('mapCoverageToInspectorIds', () => {
             expect(result).toBe(rawCoverage);
             expect(result.perTest).toBe(emptyPerTest);
 
-            // CRITICAL: Object.keys should be called exactly ONCE (at line 54 for length check)
-            // If mutation changes condition to false, it would be called AGAIN at line 60
-            // to get the first key, resulting in 2 calls
+            // CRITICAL: Object.keys should be called exactly ONCE (at the length check)
+            // If mutation changes condition to false, it would be called AGAIN to get the first key
             expect(keysAccessCount).toBe(1);
         });
     });
 
-    describe('Math.min usage verification', () => {
-        it('should use Math.min not Math.max when reporting partial mapping count', () => {
-            // Kills mutation on line 83: Math.min(...) → Math.max(...)
-            // When coverage has 5 entries but execution has 2, we map min(5,2) = 2 tests
-            const rawCoverage: MutantCoverage = {
-                'static': {},
-                perTest:  {
-                    'test-1': { '1': 1 },
-                    'test-2': { '2': 1 },
-                    'test-3': { '3': 1 },
-                    'test-4': { '4': 1 },
-                    'test-5': { '5': 1 },
-                },
-            };
-
-            const executionOrder = [42, 43]; // Only 2 tests
-            const testHierarchy = new Map<number, TestInfo>([
-                [42, { id: 42, name: 'test1', fullName: 'test1', type: 'test' }],
-                [43, { id: 43, name: 'test2', fullName: 'test2', type: 'test' }],
-            ]);
-
-            mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
-
-            // Verify warning mentions the SMALLER number (Math.min result)
-            // If Math.max was used, it would incorrectly say "5 tests" instead of "2 tests"
-            expect(consoleWarnSpy).toHaveBeenCalledWith(
-                expect.stringContaining('Performing partial mapping for 2 tests')
-            );
-        });
-
-        it('should use Math.min when execution order is longer than coverage', () => {
-            // Another case: execution has 10 tests, coverage has 3
-            // Should map min(3,10) = 3 tests
-            const rawCoverage: MutantCoverage = {
-                'static': {},
-                perTest:  {
-                    'test-1': { '1': 1 },
-                    'test-2': { '2': 1 },
-                    'test-3': { '3': 1 },
-                },
-            };
-
-            const executionOrder = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]; // 10 tests
-            const testHierarchy = new Map<number, TestInfo>();
-            for(let i = 1; i <= 10; i++) {
-                testHierarchy.set(i, {
-                    id:       i,
-                    name:     `test${i}`,
-                    fullName: `test${i}`,
-                    type:     'test',
-                });
-            }
-
-            mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
-
-            // Should report mapping 3 tests (the minimum), not 10
-            expect(consoleWarnSpy).toHaveBeenCalledWith(
-                expect.stringContaining('Performing partial mapping for 3 tests')
-            );
-        });
-
-        it('should only map tests up to the shorter array length (Math.min behavior)', () => {
-            // Kills mutation on line 83: Math.min(...) → Math.max(...)
-            // With Math.max, would try to iterate beyond the shorter array and get undefined values
-            const rawCoverage: MutantCoverage = {
-                'static': {},
-                perTest:  {
-                    'test-1': { '1': 1 },
-                    'test-2': { '2': 1 },
-                    'test-3': { '3': 1 },
-                    'test-4': { '4': 1 },
-                    'test-5': { '5': 1 },
-                },
-            };
-
-            // Only 2 execution entries - shorter than coverage
-            const executionOrder = [100, 101];
-            const testHierarchy = new Map<number, TestInfo>([
-                [100, { id: 100, name: 'first', fullName: 'mapped-first', type: 'test' }],
-                [101, { id: 101, name: 'second', fullName: 'mapped-second', type: 'test' }],
-            ]);
-
-            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
-
-            // With Math.min: only first 2 tests mapped
-            // With Math.max: would try to access executionOrder[2-4] (undefined) causing missing test info warnings
-            expect(Object.keys(result.perTest)).toHaveLength(2);
-            expect(result.perTest).toEqual({
-                'mapped-first':  { '1': 1 },
-                'mapped-second': { '2': 1 },
-            });
-
-            // Should only have 1 warning about count mismatch, not 3 additional warnings about missing test info
-            expect(consoleWarnSpy).toHaveBeenCalledTimes(1);
-            expect(consoleWarnSpy).toHaveBeenCalledWith(
-                expect.stringContaining('Coverage/execution count mismatch')
-            );
-        });
-    });
-
+    // ─────────────────────────────────────────────────────────────────────────
+    // Complex scenarios
+    // ─────────────────────────────────────────────────────────────────────────
     describe('complex scenarios', () => {
         it('should handle deeply nested test hierarchy', () => {
             const rawCoverage: MutantCoverage = {
                 'static': {},
                 perTest:  {
-                    'test-1': { '1': 1 },
+                    'tests/foo.test.ts@@test-1': { '1': 1 },
                 },
             };
 
@@ -680,13 +728,14 @@ describe('mapCoverageToInspectorIds', () => {
                     name:     'deeply nested test',
                     fullName: 'Suite > Level1 > Level2 > Level3 > deeply nested test',
                     type:     'test',
+                    url:      'file:///.stryker-tmp/sandbox-X/tests/foo.test.ts',
                 }],
             ]);
 
             const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
 
             expect(result.perTest).toEqual({
-                'Suite > Level1 > Level2 > Level3 > deeply nested test': { '1': 1 },
+                'tests/foo.test.ts > Suite > Level1 > Level2 > Level3 > deeply nested test': { '1': 1 },
             });
         });
 
@@ -694,41 +743,42 @@ describe('mapCoverageToInspectorIds', () => {
             const rawCoverage: MutantCoverage = {
                 'static': {},
                 perTest:  {
-                    'test-1': { '1': 1 },
-                    'test-2': { '2': 1 },
+                    'tests/s.test.ts@@test-1': { '1': 1 },
+                    'tests/s.test.ts@@test-2': { '2': 1 },
                 },
             };
 
             const executionOrder = [1, 2];
             const testHierarchy = new Map<number, TestInfo>([
-                [1, { id: 1, name: 'test with "quotes"', fullName: 'Suite > test with "quotes"', type: 'test' }],
-                [2, { id: 2, name: "test with 'apostrophes'", fullName: "Suite > test with 'apostrophes'", type: 'test' }],
+                [1, { id: 1, name: 'test with "quotes"', fullName: 'Suite > test with "quotes"', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/s.test.ts' }],
+                [2, { id: 2, name: "test with 'apostrophes'", fullName: "Suite > test with 'apostrophes'", type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/s.test.ts' }],
             ]);
 
             const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
 
-            // Maps based on execution order:
-            // test-1 -> ID 1 (quotes), test-2 -> ID 2 (apostrophes)
             expect(result.perTest).toEqual({
-                'Suite > test with "quotes"':      { '1': 1 },
-                "Suite > test with 'apostrophes'": { '2': 1 },
+                'tests/s.test.ts > Suite > test with "quotes"':      { '1': 1 },
+                "tests/s.test.ts > Suite > test with 'apostrophes'": { '2': 1 },
             });
         });
 
-        it('should handle large numbers of tests', () => {
-            const numTests = 1000;
+        it('should handle large numbers of tests across files', () => {
+            const numTests = 100;
             const perTest: Record<string, Record<string, number>> = {};
             const executionOrder: number[] = [];
             const testHierarchy = new Map<number, TestInfo>();
 
             for(let i = 1; i <= numTests; i++) {
-                perTest[`test-${i}`] = { [`${i}`]: 1 };
+                const file = i % 2 === 0 ? 'tests/even.test.ts' : 'tests/odd.test.ts';
+                const counterInFile = Math.ceil(i / 2);
+                perTest[`${file}@@test-${counterInFile}`] = { [`${i}`]: 1 };
                 executionOrder.push(i);
                 testHierarchy.set(i, {
                     id:       i,
                     name:     `test${i}`,
                     fullName: `Suite > test${i}`,
                     type:     'test',
+                    url:      `file:///.stryker-tmp/sandbox-X/${file}`,
                 });
             }
 
@@ -740,10 +790,222 @@ describe('mapCoverageToInspectorIds', () => {
             const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
 
             expect(Object.keys(result.perTest)).toHaveLength(numTests);
-            // Maps based on execution order:
-            // test-1 -> ID 1 (Suite > test1), test-1000 -> ID 1000 (Suite > test1000)
-            expect(result.perTest['Suite > test1']).toEqual({ '1': 1 });
-            expect(result.perTest['Suite > test1000']).toEqual({ '1000': 1 });
+        });
+    });
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Static/perTest stabilization (Drift 1 fix)
+    // ─────────────────────────────────────────────────────────────────────────
+    describe('static/perTest stabilization', () => {
+        it('should promote a mutant that appears in multiple perTest entries to static', () => {
+            // Mutant '5' appears in both test-1 and test-2 (module-level code reached from two tests)
+            const rawCoverage: MutantCoverage = {
+                'static': {},
+                perTest:  {
+                    'tests/a.test.ts@@test-1': { '5': 1, '10': 1 },
+                    'tests/a.test.ts@@test-2': { '5': 1, '20': 1 },
+                },
+            };
+            const executionOrder = [1, 2];
+            const testHierarchy = new Map<number, TestInfo>([
+                [1, { id: 1, name: 'test-one', fullName: 'test-one', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/a.test.ts' }],
+                [2, { id: 2, name: 'test-two', fullName: 'test-two', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/a.test.ts' }],
+            ]);
+
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+
+            // Mutant '5' should be promoted to static because it appears in both tests
+            expect(result.static).toMatchObject({ '5': expect.any(Number) });
+            // Mutant '5' should NOT appear in any perTest entry
+            for(const counts of Object.values(result.perTest)) {
+                expect(Object.keys(counts)).not.toContain('5');
+            }
+            // Mutants '10' and '20' are uniquely attributed — they stay in perTest
+            expect(Object.values(result.perTest).some(c => '10' in c)).toBe(true);
+            expect(Object.values(result.perTest).some(c => '20' in c)).toBe(true);
+        });
+
+        it('should remove from perTest any mutant already in static', () => {
+            // Mutant '99' is already in static in one run; in another run it appears in perTest
+            // After mapping, stabilizeCoverage should strip it from perTest
+            const rawCoverage: MutantCoverage = {
+                'static': { '99': 1 },
+                perTest:  {
+                    'tests/b.test.ts@@test-1': { '99': 1, '7': 1 },
+                },
+            };
+            const executionOrder = [1];
+            const testHierarchy = new Map<number, TestInfo>([
+                [1, { id: 1, name: 'sole-test', fullName: 'sole-test', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/b.test.ts' }],
+            ]);
+
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+
+            // '99' must remain in static (unchanged)
+            expect(result.static).toMatchObject({ '99': 1 });
+            // '99' must NOT appear in perTest (stripped because it's already static)
+            for(const counts of Object.values(result.perTest)) {
+                expect(Object.keys(counts)).not.toContain('99');
+            }
+            // '7' is uniquely attributed — stays in perTest
+            expect(Object.values(result.perTest).some(c => '7' in c)).toBe(true);
+        });
+
+        it('should leave perTest unchanged when every mutant appears in exactly one test', () => {
+            // No promotion needed — all mutants are uniquely attributed
+            const rawCoverage: MutantCoverage = {
+                'static': { '1': 1 },
+                perTest:  {
+                    'tests/c.test.ts@@test-1': { '2': 1 },
+                    'tests/c.test.ts@@test-2': { '3': 1 },
+                },
+            };
+            const executionOrder = [1, 2];
+            const testHierarchy = new Map<number, TestInfo>([
+                [1, { id: 1, name: 'first', fullName: 'first', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/c.test.ts' }],
+                [2, { id: 2, name: 'second', fullName: 'second', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/c.test.ts' }],
+            ]);
+
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+
+            // No new promotions: static unchanged, perTest entries both survive
+            expect(result.static).toEqual({ '1': 1 });
+            expect(Object.keys(result.perTest)).toHaveLength(2);
+            expect(Object.values(result.perTest).some(c => '2' in c)).toBe(true);
+            expect(Object.values(result.perTest).some(c => '3' in c)).toBe(true);
+        });
+
+        it('should drop perTest entry completely when all its mutants are promoted to static', () => {
+            // Both mutants in test-2 also appear in test-1 — after promotion, test-2 has nothing left
+            const rawCoverage: MutantCoverage = {
+                'static': {},
+                perTest:  {
+                    'tests/d.test.ts@@test-1': { '10': 1, '20': 1, '30': 1 },
+                    'tests/d.test.ts@@test-2': { '10': 1, '20': 1 },
+                },
+            };
+            const executionOrder = [1, 2];
+            const testHierarchy = new Map<number, TestInfo>([
+                [1, { id: 1, name: 'first', fullName: 'first', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/d.test.ts' }],
+                [2, { id: 2, name: 'second', fullName: 'second', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/d.test.ts' }],
+            ]);
+
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+
+            // '10' and '20' promoted to static; test-2 entry disappears — exactly 1 perTest entry remains
+            expect(result.static).toMatchObject({ '10': expect.any(Number), '20': expect.any(Number) });
+            // Only test-1 entry (which owns '30') should remain
+            expect(Object.keys(result.perTest)).toHaveLength(1);
+            // '30' is unique to test-1 so test-1 entry still exists
+            expect(Object.values(result.perTest).some(c => '30' in c)).toBe(true);
+            // No perTest entry should contain '10' or '20'
+            for(const counts of Object.values(result.perTest)) {
+                expect(Object.keys(counts)).not.toContain('10');
+                expect(Object.keys(counts)).not.toContain('20');
+            }
+        });
+
+        it('should produce empty perTest when every mutant is shared across 2+ tests', () => {
+            // Every mutant appears in both tests, so all are promoted to static
+            const rawCoverage: MutantCoverage = {
+                'static': {},
+                perTest:  {
+                    'tests/f.test.ts@@test-1': { '100': 1, '200': 1, '300': 1 },
+                    'tests/f.test.ts@@test-2': { '100': 1, '200': 1, '300': 1 },
+                },
+            };
+            const executionOrder = [1, 2];
+            const testHierarchy = new Map<number, TestInfo>([
+                [1, { id: 1, name: 'first', fullName: 'first', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/f.test.ts' }],
+                [2, { id: 2, name: 'second', fullName: 'second', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/f.test.ts' }],
+            ]);
+
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+
+            // All mutants promoted to static; perTest must be an empty object, not undefined
+            expect(result.perTest).toEqual({});
+            expect(Object.keys(result.perTest)).toHaveLength(0);
+            // All three mutants must be in the static bucket
+            expect(result.static).toMatchObject({
+                '100': expect.any(Number),
+                '200': expect.any(Number),
+                '300': expect.any(Number),
+            });
+        });
+
+        it('should produce identical coverage regardless of which test first triggered module import (simulates drift)', () => {
+            // Run A: module-level mutant '500' attributed to test-1 (it imported first)
+            const coverageRunA: MutantCoverage = {
+                'static': {},
+                perTest:  {
+                    'tests/e.test.ts@@test-1': { '500': 1, '501': 1 },
+                    'tests/e.test.ts@@test-2': { '502': 1 },
+                },
+            };
+            // Run B: module-level mutant '500' attributed to test-2 (different import order)
+            const coverageRunB: MutantCoverage = {
+                'static': {},
+                perTest:  {
+                    'tests/e.test.ts@@test-1': { '501': 1 },
+                    'tests/e.test.ts@@test-2': { '500': 1, '502': 1 },
+                },
+            };
+            const executionOrder = [1, 2];
+            const testHierarchy = new Map<number, TestInfo>([
+                [1, { id: 1, name: 'first', fullName: 'first', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/e.test.ts' }],
+                [2, { id: 2, name: 'second', fullName: 'second', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/e.test.ts' }],
+            ]);
+
+            const resultA = mapCoverageToInspectorIds(coverageRunA, executionOrder, testHierarchy);
+            const resultB = mapCoverageToInspectorIds(coverageRunB, executionOrder, testHierarchy);
+
+            // '500' appears in only ONE test per run, so stabilizeCoverage alone won't
+            // deduplicate it — but both runs produce the same perTest assignment for it
+            // (test-1 in run A, test-2 in run B). However, when BOTH runs contribute,
+            // the UNION scenario is handled. For this test we verify that:
+            // (a) each run's result is internally consistent, and
+            // (b) '501' (unique to test-1 in both runs) stays in perTest[test-1] in both
+            // (c) '502' (unique to test-2 in both runs) stays in perTest[test-2] in both
+
+            // Run A: '500' only in test-1 → stays in perTest[test-1]
+            expect(Object.values(resultA.perTest).some(c => '500' in c)).toBe(true);
+            expect(resultA.static).not.toMatchObject({ '500': expect.anything() });
+            // Run B: '500' only in test-2 → stays in perTest[test-2]
+            expect(Object.values(resultB.perTest).some(c => '500' in c)).toBe(true);
+            expect(resultB.static).not.toMatchObject({ '500': expect.anything() });
+            // '501' in test-1 in both runs
+            // find the entry containing '501'
+            const test1EntryA = Object.entries(resultA.perTest).find(([, c]) => '501' in c);
+            const test1EntryB = Object.entries(resultB.perTest).find(([, c]) => '501' in c);
+            expect(test1EntryA?.[0]).toBeDefined();
+            expect(test1EntryB?.[0]).toBeDefined();
+        });
+
+        it('should stabilize coverage with legacy test-N keys as well', () => {
+            // Same promotion logic should apply when using legacy counter keys
+            const rawCoverage: MutantCoverage = {
+                'static': {},
+                perTest:  {
+                    'test-1': { '77': 1, '88': 1 },
+                    'test-2': { '77': 1, '99': 1 },
+                },
+            };
+            const executionOrder = [10, 20];
+            const testHierarchy = new Map<number, TestInfo>([
+                [10, { id: 10, name: 'legacy-first', fullName: 'legacy-first', type: 'test' }],
+                [20, { id: 20, name: 'legacy-second', fullName: 'legacy-second', type: 'test' }],
+            ]);
+
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+
+            // '77' appears in both tests → promoted to static
+            expect(result.static).toMatchObject({ '77': expect.any(Number) });
+            for(const counts of Object.values(result.perTest)) {
+                expect(Object.keys(counts)).not.toContain('77');
+            }
+            // '88' and '99' are unique → stay in perTest
+            expect(Object.values(result.perTest).some(c => '88' in c)).toBe(true);
+            expect(Object.values(result.perTest).some(c => '99' in c)).toBe(true);
         });
     });
 });

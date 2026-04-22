@@ -16,6 +16,7 @@ const originalReadFile = actualFs.readFile;
 const originalWriteFile = actualFs.writeFile;
 const originalMkdir = actualFs.mkdir;
 const originalUnlink = actualFs.unlink;
+const originalReaddir = actualFs.readdir;
 const originalCreateServer = actualNet.createServer;
 const originalSpawn = actualChildProcess.spawn;
 const originalGetAvailablePort = actualPortUtils.getAvailablePort;
@@ -31,6 +32,8 @@ export const mockMkdir = mock((...args: Parameters<typeof actualFs.mkdir>) =>
     originalMkdir(...args));
 export const mockUnlink = mock((...args: Parameters<typeof actualFs.unlink>) =>
     originalUnlink(...args));
+export const mockReaddir = mock((...args: Parameters<typeof actualFs.readdir>) =>
+    originalReaddir(...args));
 
 // Create controllable mock function for net.createServer
 // Used by getAvailablePort() to find free ports

@@ -8,6 +8,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 /** @type {import('@stryker-mutator/api/core').PartialStrykerOptions} */
 export default {
     testRunner:  'bun',
+    bun:         { timeout: 60000 },
     checkers:    ['typescript'],
     incremental: !isCI,
     plugins:     [
@@ -18,7 +19,7 @@ export default {
     ignorePatterns:   ['**', '!src/**/*.ts', '!tests/**/*.ts', '!bunfig.toml', '!tsconfig.json', '!*.mjs'], // Only include source and test files in the mutation testing process
     thresholds:       { high: 100, low: 100, 'break': 100 },
     coverageAnalysis: 'perTest',
-    concurrency:      isCI ? 4 : 24,
+    concurrency:      isCI ? 4 : 12,
     disableBail:      true,
     reporters:        isCI ? ['clear-text', 'progress', 'dashboard'] : ['progress', 'json', 'html'],
     tempDirName:      '.stryker-tmp',

@@ -96,9 +96,23 @@ bun: {
 bunx stryker run
 ```
 
+## How the sandboxed config works
+
+When the plugin initialises it reads your project's `bunfig.toml` (if present) and writes a sanitized copy that is passed to every `bun test` invocation via `--config`. The sanitizer forwards only an explicit allowlist of `[test]` keys; everything else is stripped. The forwarded keys are: `preload`, `root`, `pathIgnorePatterns`, `timeout`, `smol`, `rerunEach`, `retry`, `randomize`, `seed`. The `[install]` table is copied verbatim. Two keys are always forced: `coverage = false` and `onlyFailures = false`. This prevents `coverageThreshold` misses (which cause Bun to exit 1 even when no test actually fails) from being mistaken for mutant kills. If you need additional `[test]` settings forwarded, add their key names to the `SAFE_TEST_KEYS` set in `src/utils/bunfig-sanitizer.ts`.
+
 ## Known Limitations
 
 - **Sequential execution required** - Tests run with `--concurrency=1` to ensure accurate coverage tracking. This is slower than parallel execution but necessary for correct test-to-mutant correlation.
+
+**Eager-import and `mock.module()` compatibility**
+
+During `dryRun`, the plugin eager-imports every mutated source module at preload time in order to produce deterministic per-test coverage. Each mutated module is imported once, before any test file executes.
+
+Because of this, any `mock.module()` call that runs after a module has already been imported has no effect on the already-resolved module binding. In practice, this means that if a test file calls `mock.module('./some-source-file')` at the top level (or inside a `beforeAll`), and that file is among the mutated modules, the test will see the real module rather than the mock.
+
+Suggested workarounds: use dependency injection so the real module reference is replaceable at test time; wrap the mocked surface in a test-local helper that the test can control without replacing the module; or use `mock.fn()` on method instances rather than replacing the entire module with `mock.module()`.
+
+This limitation applies only to mutated source files — the ones listed under `mutate:` in your Stryker config. Pre-import `mock.module()` of non-mutated modules (for example `node:fs`, third-party libraries, or utility files outside the mutation scope) is unaffected.
 
 ## Concurrent Tests
 

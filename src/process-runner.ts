@@ -52,9 +52,10 @@ export interface BunTestRunOptions {
     coverageFile?: string
 
     /**
-   * Whether to disable coverage collection (overrides bunfig.toml)
+   * Path to sanitized bunfig.toml (passed as --config to bun test)
+   * Overrides the project's bunfig.toml for the child process.
    */
-    noCoverage?: boolean
+    bunfigPath?: string
 
     /**
    * Port for --inspect flag
@@ -79,6 +80,14 @@ export interface BunTestRunOptions {
    * When provided, sets __STRYKER_SYNC_PORT__ env var for preload script
    */
     syncPort?: number
+
+    /**
+   * Explicit list of test file paths to pass as positional arguments to bun test.
+   * When provided, Bun runs only these files in the given order, eliminating
+   * readdir-based non-determinism.  Paths must be relative to process.cwd().
+   * When omitted, Bun performs its normal file discovery.
+   */
+    testFiles?: string[]
 }
 
 export interface BunProcessResult {
@@ -102,6 +111,14 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
         args.push(`--inspect=${options.inspectWaitPort}`);
     }
 
+    // Override the project bunfig with a sanitized copy to prevent coverage
+    // thresholds and onlyFailures from interfering with mutation testing.
+    // NOTE: bun requires the equals form here; `--config PATH` is silently
+    // ignored and PATH is then consumed as a positional test-file filter.
+    if(options.bunfigPath) {
+        args.push(`--config=${options.bunfigPath}`);
+    }
+
     // Add preload script if specified
     if(options.preloadScript) {
         args.push('--preload', options.preloadScript);
@@ -117,11 +134,6 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
         args.push('--bail');
     }
 
-    // Disable coverage if requested (overrides bunfig.toml)
-    if(options.noCoverage) {
-        args.push('--no-coverage');
-    }
-
     // Force sequential execution if requested
     if(options.sequentialMode) {
         args.push('--concurrency=1');
@@ -131,6 +143,15 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
     // Stryker disable next-line EqualityOperator,ConditionalExpression: length >= 0 is equivalent to length > 0 for empty arrays (spreading [] is a no-op); ConditionalExpression would cause spread of undefined
     if(options.bunArgs && options.bunArgs.length > 0) {
         args.push(...options.bunArgs);
+    }
+
+    // Append explicit test file paths as positional arguments.
+    // Positional args to `bun test` tell it exactly which files to load and in
+    // which order, removing reliance on readdir ordering (non-deterministic on
+    // macOS APFS) so mutantCoverage.perTest is stable across runs.
+    // Stryker disable next-line EqualityOperator,ConditionalExpression: length >= 0 equivalent to > 0 for empty arrays; spread of [] is a no-op
+    if(options.testFiles && options.testFiles.length > 0) {
+        args.push(...options.testFiles);
     }
 
     // Prepare environment variables

@@ -11,22 +11,16 @@ import { join } from 'node:path';
 
 describe('collectCoverage', () => {
     let tempCoverageFile: string;
-    let mockConsoleWarn: ReturnType<typeof mock>;
-    const originalConsoleWarn = console.warn;
+    // eslint-disable-next-line @typescript-eslint/no-empty-function -- intentional mock to suppress output
+    const makeLogger = () => ({ warn: mock(() => {}) });
 
     beforeEach(() => {
         tempCoverageFile = join(tmpdir(), `test-coverage-${Date.now()}.json`);
         // Clear the mock state before each test
         mockReadFile.mockClear();
-        // Suppress expected console.warn messages from error handling tests
-        // eslint-disable-next-line @typescript-eslint/no-empty-function -- intentional mock to suppress test output
-        mockConsoleWarn = mock(() => {});
-        console.warn = mockConsoleWarn as unknown as typeof console.warn;
     });
 
     afterEach(() => {
-        // Restore console.warn to prevent leakage to other tests
-        console.warn = originalConsoleWarn;
         // Reset fs mocks to prevent leakage to other tests
         resetFsMocks();
     });
@@ -305,8 +299,7 @@ describe('collectCoverage', () => {
         it('should kill mutation 260: catch block must log warning for parse errors', async () => {
             // Mutation 260: removes the catch block body (lines 90-96)
             // The catch block should log a warning when JSON parsing fails
-            // Reset the console.warn mock to verify it's called
-            mockConsoleWarn.mockClear();
+            const logger = makeLogger();
 
             const jsonLines
                 = JSON.stringify({ perTest: { 'test-1': ['1'] }, 'static': [] }) + '\n'
@@ -315,17 +308,18 @@ describe('collectCoverage', () => {
 
             mockReadFile.mockResolvedValue(jsonLines);
 
-            const result = await collectCoverage(tempCoverageFile);
+            const result = await collectCoverage(tempCoverageFile, logger);
 
             // Should still process valid lines
             expect(result).toBeDefined();
             expect(Object.keys(result!.perTest)).toHaveLength(2);
 
             // CRITICAL: The catch block must execute and log the warning
-            // If mutation 260 removes the catch block body, console.warn won't be called
-            expect(mockConsoleWarn).toHaveBeenCalled();
-            expect(mockConsoleWarn).toHaveBeenCalledWith(
-                expect.stringContaining('[Stryker Coverage] Failed to parse coverage line:')
+            // If mutation 260 removes the catch block body, logger.warn won't be called
+            expect(logger.warn).toHaveBeenCalled();
+            expect(logger.warn).toHaveBeenCalledWith(
+                expect.stringContaining('[Stryker Coverage] Failed to parse coverage line:'),
+                expect.any(String)
             );
         });
     });

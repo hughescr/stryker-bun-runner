@@ -7,20 +7,8 @@
  */
 
 import { appendFileSync } from 'node:fs';
-
-// ============================================================================
-// Types
-// ============================================================================
-
-export interface CoverageFileData {
-    perTest:  Record<string, string[]>
-    'static': string[]
-}
-
-export interface MutantCoverage {
-    'static': Record<string, number>
-    perTest:  Record<string, Record<string, number>>
-}
+import type { MutantCoverage } from '@stryker-mutator/api/core';
+import type { CoverageFileData } from './types.js';
 
 export interface StrykerNamespace {
     mutantCoverage?: MutantCoverage
@@ -103,58 +91,3 @@ export function writeCoverageToFile(coverageFile: string, data: CoverageFileData
     appendFileSync(coverageFile, JSON.stringify(data) + '\n', 'utf-8');
 }
 
-// ============================================================================
-// WebSocket Message Parsing
-// ============================================================================
-
-export interface TestStartMessage {
-    type: 'testStart'
-    name: string
-}
-
-export function parseWebSocketMessage(data: string): TestStartMessage | 'ready' | null {
-    if(data === 'ready') {
-        return 'ready';
-    }
-    try {
-        const msg = JSON.parse(data) as { type?: string, name?: string };
-        if(msg.type === 'testStart' && msg.name) {
-            return { type: 'testStart', name: msg.name };
-        }
-    } catch{
-        // Ignore parse errors
-    }
-    return null;
-}
-
-// ============================================================================
-// Test Counter Management
-// ============================================================================
-
-export interface TestCounter {
-    increment(): string
-    setName(counterId: string, name: string): void
-    getName(counterId: string): string | undefined
-    getCounterToNameMap(): Map<string, string>
-}
-
-export function createTestCounter(): TestCounter {
-    let counter = 0;
-    const counterToName = new Map<string, string>();
-
-    return {
-        increment(): string {
-            counter++;
-            return `test-${counter}`;
-        },
-        setName(counterId: string, name: string): void {
-            counterToName.set(counterId, name);
-        },
-        getName(counterId: string): string | undefined {
-            return counterToName.get(counterId);
-        },
-        getCounterToNameMap(): Map<string, string> {
-            return counterToName;
-        },
-    };
-}
