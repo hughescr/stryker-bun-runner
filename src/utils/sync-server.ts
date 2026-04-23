@@ -3,8 +3,7 @@
  * Used to coordinate inspector connection with test execution
  */
 
-import { createServer } from 'node:http';
-import type { Server as HTTPServer } from 'node:http';
+import { createServer, type Server as HTTPServer } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
 
 export interface SyncServerOptions {
@@ -46,6 +45,7 @@ export class SyncServer {
     private httpServer:                    HTTPServer | null = null;
     private wss:                           WebSocketServer | null = null;
     private clients = new Set<WebSocket>();
+    private readyLatched =                 false;
     private readonly port:                 number;
     private readonly createHttpServer:     typeof createServer;
     private readonly WebSocketServerClass: typeof WebSocketServer;
@@ -62,18 +62,20 @@ export class SyncServer {
    * Start the WebSocket server
    */
     async start(): Promise<void> {
+        // Stryker disable next-line BlockStatement: removing Promise body means resolve() never called → start() never resolves → Timeout
         return new Promise((resolve, reject) => {
+            // Stryker disable next-line BlockStatement: removing try body means httpServer/wss never created and resolve() never called → start() never resolves → Timeout
             try {
                 // Create HTTP server to handle WebSocket upgrades and 404s
                 this.httpServer = this.createHttpServer((req, res) => {
-                    // Non-WebSocket requests get 404
-                    if(req.url !== '/sync') {
-                        res.writeHead(404);
-                        res.end('Not found');
-                    } else {
+                    if(req.url === '/sync') {
                         // WebSocket upgrade requests should be handled by ws
                         res.writeHead(400);
                         res.end('WebSocket upgrade failed');
+                    } else {
+                        // Non-WebSocket requests get 404
+                        res.writeHead(404);
+                        res.end('Not found');
                     }
                 });
 
@@ -86,6 +88,16 @@ export class SyncServer {
                 // Track client connections
                 this.wss.on('connection', (ws) => {
                     this.clients.add(ws);
+
+                    // If ready was already signalled before this client connected,
+                    // deliver the latch immediately so the preload doesn't stall.
+                    if(this.readyLatched && ws.readyState === this.webSocketOpenState) {
+                        try {
+                            ws.send('ready');
+                        } catch{
+                            // Ignore send errors - client may have disconnected
+                        }
+                    }
 
                     ws.on('close', () => {
                         this.clients.delete(ws);
@@ -101,6 +113,7 @@ export class SyncServer {
                 this.httpServer.on('error', reject);
 
                 // Start listening
+                // Stryker disable next-line BlockStatement: removing listen callback body means resolve() never called → start() never resolves → Timeout
                 this.httpServer.listen(this.port, () => {
                     resolve();
                 });
@@ -115,9 +128,12 @@ export class SyncServer {
     }
 
     /**
-   * Signal all connected clients that they can proceed
+   * Signal all connected clients that they can proceed.
+   * After this call the ready state is latched: any client that connects
+   * later will receive the 'ready' message immediately upon connection.
    */
     signalReady(): void {
+        this.readyLatched = true;
         for(const client of this.clients) {
             try {
                 if(client.readyState === this.webSocketOpenState) {
@@ -133,7 +149,10 @@ export class SyncServer {
    * Close the server and all client connections
    */
     async close(): Promise<void> {
-    // Close all client connections
+        // Reset the ready latch so the instance can be reused across runs
+        this.readyLatched = false;
+
+        // Close all client connections
         for(const client of this.clients) {
             try {
                 client.close();
@@ -145,7 +164,9 @@ export class SyncServer {
 
         // Close WebSocket server
         if(this.wss) {
-            this.wss.close();
+            await new Promise<void>((resolve) => {
+                this.wss!.close(() => resolve());
+            });
             this.wss = null;
         }
 

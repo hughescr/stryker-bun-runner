@@ -107,7 +107,7 @@ describe('buildTestNamePattern', () => {
     it('escapes regex metacharacters so new RegExp(result) matches the literal name', () => {
         // Build an ID containing every metacharacter that must be escaped.
         // The post-prefix name is: a . * + ? ^ $ { } ( ) | [ ] \ / b
-        const specialCharsName = 'a . * + ? ^ $ { } ( ) | [ ] \\ / b';
+        const specialCharsName = String.raw`a . * + ? ^ $ { } ( ) | [ ] \ / b`;
         const id = `tests/meta.test.ts > ${specialCharsName}`;
         const pattern = buildTestNamePattern([id]);
 
@@ -115,12 +115,23 @@ describe('buildTestNamePattern', () => {
 
         // The regex constructed from the pattern must match the original unescaped name
         // when applied via new RegExp — proving the escaping is correct.
-        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- asserted defined above
+
         const re = new RegExp(pattern!);
         expect(re.test(specialCharsName)).toBe(true);
 
         // And must NOT match a different string
         expect(re.test('a X b')).toBe(false);
+    });
+
+    it('strips exactly the " > " separator (3 chars) — not 1 or 2 chars', () => {
+        // Kills UnaryOperator mutant that changes +3 to +1 in id.slice(firstSepIdx + 3).
+        // With +1, the result would start with "> Suite" (includes the " > " chars).
+        // With +3, it correctly starts with "Suite".
+        const result = buildTestNamePattern(['tests/foo.test.ts > Suite > leaf']);
+        // Correct: "Suite leaf" (prefix stripped, " > " collapsed to " ")
+        expect(result).toBe('^(?:Suite leaf)$');
+        // Sanity: must NOT contain the separator chars from the prefix boundary
+        expect(result).not.toContain('> Suite');
     });
 
     it('returns undefined when all alternatives are empty after stripping', () => {

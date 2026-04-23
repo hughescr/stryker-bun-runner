@@ -76,6 +76,7 @@ export async function generateSanitizedBunfig(projectCwd: string, tmpDir: string
     } catch (err: unknown) {
         // ENOENT → no bunfig present, use empty config
         if((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+            // Stryker disable next-line ObjectLiteral: equivalent mutant — { cause: err } vs {} is only observable via error.cause, not the error message tested here
             throw new Error(`Failed to read bunfig.toml at ${bunfigPath}: ${String(err)}`, { cause: err });
         }
     }
@@ -84,17 +85,20 @@ export async function generateSanitizedBunfig(projectCwd: string, tmpDir: string
     const sanitized: Record<string, unknown> = {};
 
     // Copy [install] table verbatim (registries, caches, etc.)
+    // Stryker disable next-line ConditionalExpression,LogicalOperator: equivalent mutants — null/non-object install values are silently dropped by TOML serializer either way
     if(typeof rawConfig.install === 'object' && rawConfig.install !== null) {
         sanitized.install = rawConfig.install;
     }
 
     // Build sanitized [test] section
+    // Stryker disable next-line ConditionalExpression,LogicalOperator: equivalent mutant — non-object test values produce empty {} either way, causing no key matches
     const sourceTest = (typeof rawConfig.test === 'object' && rawConfig.test !== null)
         ? rawConfig.test as Record<string, unknown>
         : {};
 
     const sanitizedTest: Record<string, unknown> = {};
     for(const key of SAFE_TEST_KEYS) {
+        // Stryker disable next-line ConditionalExpression: equivalent mutant — absent keys return undefined, which smol-toml serializes to nothing; output is identical
         // eslint-disable-next-line prefer-object-has-own -- Object.hasOwn not available until Node 16.9; using hasOwnProperty for compatibility
         if(Object.prototype.hasOwnProperty.call(sourceTest, key)) {
             // Path-valued keys must be made absolute because bun resolves them

@@ -934,7 +934,8 @@ tests/example.test.ts:
 
             // Error message should be trimmed (no trailing spaces)
             expect(result.tests[0].failureMessage).toBe('error: Test failed');
-            expect(result.tests[0].failureMessage).not.toMatch(/\s+$/);
+            // Check no trailing whitespace by verifying trim() is idempotent
+            expect(result.tests[0].failureMessage?.trimEnd()).toBe(result.tests[0].failureMessage);
         });
 
         it('should handle error messages with leading and trailing whitespace', () => {
@@ -1002,7 +1003,7 @@ tests/example.test.ts:
             const result = parseBunTestOutput(output, '');
 
             expect(result.tests).toHaveLength(1);
-            expect(result.tests[0].duration).toBe(0.00);
+            expect(result.tests[0].duration).toBe(0);
             expect(result.tests[0].status).toBe('passed');
         });
 
@@ -1021,7 +1022,7 @@ tests/example.test.ts:
             const result = parseBunTestOutput(output, '');
 
             expect(result.tests).toHaveLength(1);
-            expect(result.tests[0].duration).toBe(0.00);
+            expect(result.tests[0].duration).toBe(0);
             expect(result.tests[0].status).toBe('failed');
         });
 
@@ -1039,7 +1040,7 @@ Bailed out after 1 failure
             const result = parseBunTestOutput(output, '');
 
             expect(result.tests).toHaveLength(1);
-            expect(result.tests[0].duration).toBe(0.00);
+            expect(result.tests[0].duration).toBe(0);
             expect(result.tests[0].status).toBe('failed');
         });
     });
@@ -2102,7 +2103,8 @@ tests/example.test.ts:
 
             // Without .trim() mutation, names would have trailing/leading spaces
             expect(result.tests[0].name).not.toMatch(/>\s{2,}/);
-            expect(result.tests[0].name).not.toMatch(/\s{2,}$/);
+            // Check no double trailing whitespace by verifying trimEnd() removes nothing
+            expect(result.tests[0].name.trimEnd()).toBe(result.tests[0].name);
             expect(result.tests[1].name).not.toMatch(/>\s{2,}/);
         });
 

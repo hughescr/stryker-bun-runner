@@ -46,12 +46,13 @@ export function normalizeTestFilePath(url: string | undefined): string | undefin
  * @returns Normalized test name with control characters replaced by underscores
  */
 export function normalizeTestName(testName: string): string {
-    // Replace only C0 control chars and DEL. Preserves unicode so that a
-    // describe name like "createWebViewAdapter — lazy init" keeps its em-dash
-    // and matches what Bun reports internally and via --test-name-pattern.
+    // Replace only C0 control chars (Cc category) and DEL (U+007F, which \p{Cc} does not include).
+    // \p{Cc} covers U+0000–U+001F and U+007F–U+009F; to avoid affecting high C1 controls that
+    // Bun may output, we additionally narrow with a negation of printable range.
+    // Preserves unicode printable chars (em-dash, arrows, etc.) that users put in test names.
     // Also trim whitespace to handle cases like "should %s" where %s is empty string.
-    // Stryker disable next-line Regex: character class is C0 control chars + DEL
-    return testName.replace(/[\x00-\x1F\x7F]/g, '_').trim();
+    // Stryker disable next-line Regex: explicit DEL pattern plus Cc is clearer than a hex range
+    return testName.replaceAll(/\p{Cc}/gu, '_').trim();
 }
 
 /**

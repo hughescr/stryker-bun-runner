@@ -3,20 +3,20 @@
  * Tests preload script generation and cleanup
  */
 
+import { mkdir, writeFile as fsWriteFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { generatePreloadScript, cleanupPreloadScript, resolveEagerModulesFromGlobs } from '../../src/coverage/preload-generator.js';
 import { mockMkdir, mockReadFile, mockWriteFile, mockUnlink, resetFsMocks } from '../test-preload.js';
-import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { mkdir, writeFile as fsWriteFile, rm } from 'node:fs/promises';
 
 describe('generatePreloadScript', () => {
     let tempDir: string;
     let coverageFile: string;
 
     beforeEach(() => {
-        tempDir = join(tmpdir(), `stryker-test-${Date.now()}`);
-        coverageFile = join(tempDir, 'coverage.json');
+        tempDir = path.join(tmpdir(), `stryker-test-${Date.now()}`);
+        coverageFile = path.join(tempDir, 'coverage.json');
 
         // Clear the mock state before each test
         mockMkdir.mockClear();
@@ -42,7 +42,7 @@ describe('generatePreloadScript', () => {
         });
 
         it('should handle nested directory creation', async () => {
-            const nestedTempDir = join(tmpdir(), 'a', 'b', 'c', 'stryker');
+            const nestedTempDir = path.join(tmpdir(), 'a', 'b', 'c', 'stryker');
 
             await generatePreloadScript({ tempDir: nestedTempDir, coverageFile });
 
@@ -84,7 +84,7 @@ describe('generatePreloadScript', () => {
             const [templatePath, encoding] = mockReadFile.mock.calls[0];
             expect(templatePath).toContain('templates');
             expect(templatePath).toContain('coverage-preload.ts');
-            expect(encoding).toBe('utf-8');
+            expect(encoding).toBe('utf8');
         });
 
         it('should write template content to temp location', async () => {
@@ -96,15 +96,15 @@ describe('generatePreloadScript', () => {
             expect(mockWriteFile).toHaveBeenCalled();
 
             const [targetPath, content, encoding] = mockWriteFile.mock.calls[0];
-            expect(targetPath).toBe(join(tempDir, `stryker-coverage-preload-${process.pid}.ts`));
+            expect(targetPath).toBe(path.join(tempDir, `stryker-coverage-preload-${process.pid}.ts`));
             expect(content).toBe(templateContent);
-            expect(encoding).toBe('utf-8');
+            expect(encoding).toBe('utf8');
         });
 
         it('should return path to generated preload script', async () => {
             const result = await generatePreloadScript({ tempDir, coverageFile });
 
-            expect(result).toBe(join(tempDir, `stryker-coverage-preload-${process.pid}.ts`));
+            expect(result).toBe(path.join(tempDir, `stryker-coverage-preload-${process.pid}.ts`));
         });
     });
 
@@ -128,26 +128,23 @@ describe('generatePreloadScript', () => {
         it('should propagate error if directory creation fails', async () => {
             mockMkdir.mockRejectedValue(new Error('Permission denied'));
 
-            await expect(
-                generatePreloadScript({ tempDir, coverageFile })
-            ).rejects.toThrow('Permission denied');
+            const err = await generatePreloadScript({ tempDir, coverageFile }).catch((e: unknown) => e);
+            expect((err as Error).message).toContain('Permission denied');
         });
 
         it('should propagate error if template reading fails', async () => {
             mockReadFile.mockRejectedValue(new Error('Template not found'));
 
-            await expect(
-                generatePreloadScript({ tempDir, coverageFile })
-            ).rejects.toThrow('Template not found');
+            const err = await generatePreloadScript({ tempDir, coverageFile }).catch((e: unknown) => e);
+            expect((err as Error).message).toContain('Template not found');
         });
 
         it('should propagate error if writing fails', async () => {
             mockReadFile.mockResolvedValue('// content');
             mockWriteFile.mockRejectedValue(new Error('Disk full'));
 
-            await expect(
-                generatePreloadScript({ tempDir, coverageFile })
-            ).rejects.toThrow('Disk full');
+            const err = await generatePreloadScript({ tempDir, coverageFile }).catch((e: unknown) => e);
+            expect((err as Error).message).toContain('Disk full');
         });
     });
 
@@ -166,7 +163,7 @@ describe('generatePreloadScript', () => {
             expect(mockWriteFile).toHaveBeenCalled();
 
             const [targetPath, content] = mockWriteFile.mock.calls[0];
-            expect(targetPath).toBe(join(customTempDir, `stryker-coverage-preload-${process.pid}.ts`));
+            expect(targetPath).toBe(path.join(customTempDir, `stryker-coverage-preload-${process.pid}.ts`));
             expect(content).toBe(templateContent);
         });
 
@@ -207,7 +204,7 @@ describe('generatePreloadScript', () => {
 
     describe('__EAGER_MODULES__ substitution', () => {
         it('should replace __EAGER_MODULES__ placeholder with empty array when no eagerModules provided', async () => {
-            const templateContent = 'const EAGER_MODULES: string[] = __EAGER_MODULES__;\n// rest';
+            const templateContent = 'const EAGER_MODULES = __EAGER_MODULES__;\n// rest';
             mockReadFile.mockResolvedValue(templateContent);
 
             await generatePreloadScript({ tempDir, coverageFile });
@@ -215,7 +212,8 @@ describe('generatePreloadScript', () => {
             expect(mockWriteFile).toHaveBeenCalled();
             const [, writtenContent] = mockWriteFile.mock.calls[0] as [string, string];
             expect(writtenContent).not.toContain('__EAGER_MODULES__');
-            expect(writtenContent).toContain('[]');
+            // Must be exactly the empty JSON array, not ['Stryker was here'] or similar
+            expect(writtenContent).toContain('= []');
         });
 
         it('should replace __EAGER_MODULES__ placeholder with JSON array of provided paths', async () => {
@@ -235,7 +233,7 @@ describe('generatePreloadScript', () => {
             const templateContent = '__EAGER_MODULES__';
             mockReadFile.mockResolvedValue(templateContent);
             // Windows-style paths with backslashes need JSON escaping
-            const paths = ['C:\\src\\foo.ts'];
+            const paths = [String.raw`C:\src\foo.ts`];
 
             await generatePreloadScript({ tempDir, coverageFile, eagerModules: paths });
 
@@ -270,25 +268,19 @@ describe('cleanupPreloadScript', () => {
     it('should not throw error if file does not exist', async () => {
         mockUnlink.mockRejectedValue(new Error('ENOENT: no such file or directory'));
 
-        await expect(
-            cleanupPreloadScript('/nonexistent/preload.ts')
-        ).resolves.toBeUndefined();
+        await cleanupPreloadScript('/nonexistent/preload.ts');
     });
 
     it('should not throw error on permission errors', async () => {
         mockUnlink.mockRejectedValue(new Error('EACCES: permission denied'));
 
-        await expect(
-            cleanupPreloadScript('/tmp/preload.ts')
-        ).resolves.toBeUndefined();
+        await cleanupPreloadScript('/tmp/preload.ts');
     });
 
     it('should silently ignore any deletion errors', async () => {
         mockUnlink.mockRejectedValue(new Error('Some random error'));
 
-        await expect(
-            cleanupPreloadScript('/tmp/preload.ts')
-        ).resolves.toBeUndefined();
+        await cleanupPreloadScript('/tmp/preload.ts');
     });
 
     it('should handle multiple cleanup calls', async () => {
@@ -319,15 +311,15 @@ describe('resolveEagerModulesFromGlobs', () => {
 
     // Helper: create a file (and its parent dirs) inside fixtureDir
     const mkfile = async (rel: string): Promise<string> => {
-        const abs = join(fixtureDir, rel);
-        await mkdir(join(abs, '..'), { recursive: true });
-        await fsWriteFile(abs, '// fixture', 'utf-8');
+        const abs = path.join(fixtureDir, rel);
+        await mkdir(path.join(abs, '..'), { recursive: true });
+        await fsWriteFile(abs, '// fixture', 'utf8');
         return abs;
     };
 
     beforeEach(async () => {
         // Each test gets its own isolated temp directory so tests don't interfere.
-        fixtureDir = join(tmpdir(), `stryker-eager-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+        fixtureDir = path.join(tmpdir(), `stryker-eager-test-${Date.now()}-${process.pid}`);
         await mkdir(fixtureDir, { recursive: true });
     });
 
@@ -354,7 +346,7 @@ describe('resolveEagerModulesFromGlobs', () => {
 
         const result = await resolveEagerModulesFromGlobs(['src/**/*.ts'], fixtureDir);
 
-        expect(result).toEqual([resolve(absA), resolve(absB)]);
+        expect(result).toEqual([path.resolve(absA), path.resolve(absB)]);
     });
 
     it('should sort results ascending by absolute path', async () => {
@@ -365,7 +357,7 @@ describe('resolveEagerModulesFromGlobs', () => {
 
         const result = await resolveEagerModulesFromGlobs(['src/**/*.ts'], fixtureDir);
 
-        const sorted = [...result].sort();
+        const sorted = result.toSorted((a, b) => a.localeCompare(b));
         expect(result).toEqual(sorted);
     });
 
@@ -378,7 +370,7 @@ describe('resolveEagerModulesFromGlobs', () => {
             fixtureDir
         );
 
-        expect(result).toEqual([resolve(absA)]);
+        expect(result).toEqual([path.resolve(absA)]);
     });
 
     it('should filter out .d.ts declaration files', async () => {
@@ -389,7 +381,7 @@ describe('resolveEagerModulesFromGlobs', () => {
         const result = await resolveEagerModulesFromGlobs(['src/**/*.ts'], fixtureDir);
 
         // Only a.ts should be included, not declaration files
-        expect(result).toEqual([resolve(absA)]);
+        expect(result).toEqual([path.resolve(absA)]);
     });
 
     it('should filter out .json files', async () => {
@@ -399,7 +391,7 @@ describe('resolveEagerModulesFromGlobs', () => {
         const result = await resolveEagerModulesFromGlobs(['src/**/*'], fixtureDir);
 
         // JSON files should be excluded even if glob matches them
-        expect(result).toEqual([resolve(absA)]);
+        expect(result).toEqual([path.resolve(absA)]);
     });
 
     it('should include .tsx files', async () => {
@@ -407,7 +399,7 @@ describe('resolveEagerModulesFromGlobs', () => {
 
         const result = await resolveEagerModulesFromGlobs(['src/**/*.tsx'], fixtureDir);
 
-        expect(result).toEqual([resolve(absA)]);
+        expect(result).toEqual([path.resolve(absA)]);
     });
 
     it('should include .js and .mjs files', async () => {
@@ -417,16 +409,16 @@ describe('resolveEagerModulesFromGlobs', () => {
         const result = await resolveEagerModulesFromGlobs(['src/**/*.{js,mjs}'], fixtureDir);
 
         // Both should be included, sorted
-        expect(result.map(p => resolve(p))).toEqual([resolve(absA), resolve(absB)].sort());
+        expect(result.map(p => path.resolve(p))).toEqual([path.resolve(absA), path.resolve(absB)].toSorted((a, b) => a.localeCompare(b)));
     });
 
     it('should strip Stryker mutation-range suffix from glob patterns', async () => {
         const absA = await mkfile('src/a.ts');
 
         // Stryker mutation-range syntax: src/a.ts:1:3-2:5
-        const result = await resolveEagerModulesFromGlobs([`src/a.ts:1:3-2:5`], fixtureDir);
+        const result = await resolveEagerModulesFromGlobs(['src/a.ts:1:3-2:5'], fixtureDir);
 
-        expect(result).toEqual([resolve(absA)]);
+        expect(result).toEqual([path.resolve(absA)]);
     });
 
     it('should return empty array when no files match', async () => {
@@ -445,6 +437,6 @@ describe('resolveEagerModulesFromGlobs', () => {
         );
 
         // tinyglobby deduplicates, so absA should appear only once
-        expect(result).toEqual([resolve(absA)]);
+        expect(result).toEqual([path.resolve(absA)]);
     });
 });

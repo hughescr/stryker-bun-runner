@@ -1,12 +1,11 @@
+import * as fsPromises from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import type { StrykerOptions } from '@stryker-mutator/api/core';
+import { DryRunStatus } from '@stryker-mutator/api/test-runner';
 import { describe, test, expect, beforeAll, afterAll, afterEach, jest } from 'bun:test';
 import { BunTestRunner } from '../../src/bun-test-runner.js';
-import { DryRunStatus } from '@stryker-mutator/api/test-runner';
-import { writeFile, mkdir, rm } from 'node:fs/promises';
 import { resetAllMocks } from '../test-preload.js';
-import { join } from 'node:path';
-import { tmpdir } from 'node:os';
-import type { Logger } from '@stryker-mutator/api/logging';
-import type { StrykerOptions } from '@stryker-mutator/api/core';
 
 describe('Inspector Integration', () => {
     let tempDir: string;
@@ -17,11 +16,11 @@ describe('Inspector Integration', () => {
         resetAllMocks();
 
         // Create temp directory with a simple test file
-        tempDir = join(tmpdir(), 'inspector-test-' + Date.now());
-        await mkdir(tempDir, { recursive: true });
+        tempDir = path.join(tmpdir(), `inspector-test-${Date.now()}`);
+        await fsPromises.mkdir(tempDir, { recursive: true });
 
-        testFilePath = join(tempDir, 'example.test.ts');
-        await writeFile(testFilePath, `
+        testFilePath = path.join(tempDir, 'example.test.ts');
+        await fsPromises.writeFile(testFilePath, `
       import { describe, test, expect } from 'bun:test';
 
       describe('Math operations', () => {
@@ -47,14 +46,20 @@ describe('Inspector Integration', () => {
     });
 
     afterAll(async () => {
-        await rm(tempDir, { recursive: true, force: true });
+        await fsPromises.rm(tempDir, { recursive: true, force: true });
+        // Clean up the dryRun registry file that BunTestRunner writes to process.cwd().
+        // This prevents leaving .stryker-bun-runner-registry.json as an untracked file
+        // after the integration test run.
+        const registryPath = path.join(process.cwd(), '.stryker-bun-runner-registry.json');
+        await fsPromises.rm(registryPath, { force: true });
+        await fsPromises.rm(`${registryPath}.tmp`, { force: true });
     });
 
     test('collects test names via inspector', async () => {
     // Create a mock logger
         const logs: string[] = [];
         const formatArg = (arg: unknown): string => {
-            if(arg == null) {
+            if(arg === null || arg === undefined) {
                 return '';
             }
             if(typeof arg === 'object') {
@@ -67,34 +72,34 @@ describe('Inspector Integration', () => {
                 return '[Function]';
             }
             // After all checks, arg is string, number, boolean, or bigint
-            // Type assertion is safe here as we've exhausted all object-like types
-            return String(arg as string | number | boolean | bigint);
+            // eslint-disable-next-line @typescript-eslint/no-base-to-string, @typescript-eslint/restrict-template-expressions -- exhaustive type guards above eliminate all non-primitive cases; TypeScript cannot narrow unknown past typeof guards
+            return `${arg}`;
         };
 
         const mockLogger = {
             debug: (msg: string, ...args: unknown[]) => {
-                const formatted = msg.replace(/%[sdjoO]/g, () => formatArg(args.shift()));
-                logs.push('DEBUG: ' + formatted);
+                const formatted = msg.replaceAll(/%[sdjoO]/g, () => formatArg(args.shift()));
+                logs.push(`DEBUG: ${formatted}`);
             },
             info: (msg: string, ...args: unknown[]) => {
-                const formatted = msg.replace(/%[sdjoO]/g, () => formatArg(args.shift()));
-                logs.push('INFO: ' + formatted);
+                const formatted = msg.replaceAll(/%[sdjoO]/g, () => formatArg(args.shift()));
+                logs.push(`INFO: ${formatted}`);
             },
             warn: (msg: string, ...args: unknown[]) => {
-                const formatted = msg.replace(/%[sdjoO]/g, () => formatArg(args.shift()));
-                logs.push('WARN: ' + formatted);
+                const formatted = msg.replaceAll(/%[sdjoO]/g, () => formatArg(args.shift()));
+                logs.push(`WARN: ${formatted}`);
             },
             error: (msg: string, ...args: unknown[]) => {
-                const formatted = msg.replace(/%[sdjoO]/g, () => formatArg(args.shift()));
-                logs.push('ERROR: ' + formatted);
+                const formatted = msg.replaceAll(/%[sdjoO]/g, () => formatArg(args.shift()));
+                logs.push(`ERROR: ${formatted}`);
             },
             trace: (msg: string, ...args: unknown[]) => {
-                const formatted = msg.replace(/%[sdjoO]/g, () => formatArg(args.shift()));
-                logs.push('TRACE: ' + formatted);
+                const formatted = msg.replaceAll(/%[sdjoO]/g, () => formatArg(args.shift()));
+                logs.push(`TRACE: ${formatted}`);
             },
             fatal: (msg: string, ...args: unknown[]) => {
-                const formatted = msg.replace(/%[sdjoO]/g, () => formatArg(args.shift()));
-                logs.push('FATAL: ' + formatted);
+                const formatted = msg.replaceAll(/%[sdjoO]/g, () => formatArg(args.shift()));
+                logs.push(`FATAL: ${formatted}`);
             },
             isDebugEnabled: () => true,
             isInfoEnabled:  () => true,
@@ -104,12 +109,12 @@ describe('Inspector Integration', () => {
             isFatalEnabled: () => true,
         };
 
-        const runner = new BunTestRunner(mockLogger as unknown as Logger, {
+        const runner = new BunTestRunner(mockLogger, {
             bun: {
                 bunPath:          'bun',  // Use the default bun
-                timeout:          60000,
-                inspectorTimeout: 30000,  // Increased for resource contention during full test suite
-                bunArgs:          [testFilePath],  // Point to our test file
+                timeout:          60_000,
+                inspectorTimeout: 30_000,  // Increased for resource contention during full test suite
+                testFiles:        [testFilePath],  // Point to our test file; bypasses auto-discovery
             },
             testRunner: { name: 'bun' },
         } as unknown as StrykerOptions);
@@ -145,5 +150,5 @@ describe('Inspector Integration', () => {
             name.includes('>') || name.includes('addition') || name.includes('standalone')
         );
         expect(hasProperNames).toBe(true);
-    }, 60000); // 60 second timeout
+    }, 60_000); // 60 second timeout
 });

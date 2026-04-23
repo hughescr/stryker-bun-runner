@@ -3,10 +3,7 @@ import {
     isTestReporterFoundEvent,
     isTestReporterStartEvent,
     isTestReporterEndEvent,
-    type InspectorMessage,
-    type TestReporterFoundEvent,
-    type TestReporterStartEvent,
-    type TestReporterEndEvent
+    type InspectorMessage
 } from '../../src/inspector/types.js';
 
 describe('Inspector Type Guards', () => {
@@ -18,7 +15,7 @@ describe('Inspector Type Guards', () => {
                     id:   1,
                     name: 'test name',
                     type: 'test'
-                } as TestReporterFoundEvent
+                }
             };
             expect(isTestReporterFoundEvent(message)).toBe(true);
         });
@@ -33,7 +30,7 @@ describe('Inspector Type Guards', () => {
                     parentId: 0,
                     url:      'file:///test.ts',
                     line:     42
-                } as TestReporterFoundEvent
+                }
             };
             expect(isTestReporterFoundEvent(message)).toBe(true);
         });
@@ -103,7 +100,7 @@ describe('Inspector Type Guards', () => {
                 method: 'TestReporter.start',
                 params: {
                     id: 1
-                } as TestReporterStartEvent
+                }
             };
             expect(isTestReporterStartEvent(message)).toBe(true);
         });
@@ -167,7 +164,7 @@ describe('Inspector Type Guards', () => {
                     id:      1,
                     status:  'pass',
                     elapsed: 100
-                } as TestReporterEndEvent
+                }
             };
             expect(isTestReporterEndEvent(message)).toBe(true);
         });
@@ -183,24 +180,24 @@ describe('Inspector Type Guards', () => {
                         message: 'Test failed',
                         stack:   'Error: Test failed\n  at ...'
                     }
-                } as TestReporterEndEvent
+                }
             };
             expect(isTestReporterEndEvent(message)).toBe(true);
         });
 
         it('should return true for different test statuses', () => {
             const statuses: ('pass' | 'fail' | 'skip' | 'todo')[] = ['pass', 'fail', 'skip', 'todo'];
-            statuses.forEach((status) => {
+            for(const status of statuses) {
                 const message: InspectorMessage = {
                     method: 'TestReporter.end',
                     params: {
                         id:      1,
                         status,
                         elapsed: 100
-                    } as TestReporterEndEvent
+                    }
                 };
                 expect(isTestReporterEndEvent(message)).toBe(true);
-            });
+            }
         });
 
         it('should return false when method is wrong', () => {
@@ -340,13 +337,13 @@ describe('Inspector Type Guards', () => {
                 'TestReporter.found ', // Trailing space
             ];
 
-            similarMethods.forEach((method) => {
+            for(const method of similarMethods) {
                 const message: InspectorMessage = {
                     method,
                     params: { id: 1 }
                 };
                 expect(isTestReporterFoundEvent(message)).toBe(false);
-            });
+            }
         });
     });
 });

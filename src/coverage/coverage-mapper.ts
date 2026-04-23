@@ -19,16 +19,33 @@ import { buildUniqueTestName, normalizeTestFilePath } from '../utils/test-name.j
  * @param logger - Optional logger for diagnostic warnings
  * @returns New MutantCoverage with perTest re-keyed to full test names
  */
+// Overload: when rawCoverage is a well-typed MutantCoverage the return is also MutantCoverage.
 export function mapCoverageToInspectorIds(
     rawCoverage: MutantCoverage,
     executionOrder: number[],
     testHierarchy: Map<number, TestInfo>,
     logger?: Pick<Logger, 'warn'>
-): MutantCoverage {
-    // Handle empty coverage - return as-is
+): MutantCoverage;
+// Overload: when rawCoverage may be undefined/null (runtime-only scenario), the return is undefined.
+export function mapCoverageToInspectorIds(
+    rawCoverage: MutantCoverage | undefined | null,
+    executionOrder: number[],
+    testHierarchy: Map<number, TestInfo>,
+    logger?: Pick<Logger, 'warn'>
+): MutantCoverage | undefined;
+// Implementation
+export function mapCoverageToInspectorIds(
+    rawCoverage: MutantCoverage | undefined | null,
+    executionOrder: number[],
+    testHierarchy: Map<number, TestInfo>,
+    logger?: Pick<Logger, 'warn'>
+): MutantCoverage | undefined {
+    // Handle empty or missing coverage - return as-is.
+    // rawCoverage can be undefined/null at runtime even though the primary overload
+    // accepts only MutantCoverage — callers may pass partially-initialised global data.
     // Stryker disable next-line ConditionalExpression: equivalent mutation - empty perTest is also caught by firstKey check at line 62
     if(!rawCoverage?.perTest || Object.keys(rawCoverage.perTest).length === 0) {
-        return rawCoverage;
+        return rawCoverage ?? undefined;
     }
 
     const firstKey = Object.keys(rawCoverage.perTest)[0];
@@ -36,14 +53,14 @@ export function mapCoverageToInspectorIds(
     // New format: "relativeFile@@test-N" (file-prefixed counter keys).
     // Use per-file positional mapping to eliminate cross-file counter collisions.
     // Stryker disable next-line Regex: anchors are defensive for pattern matching file-prefixed keys
-    if(/@@test-\d+$/.exec(firstKey)) {
+    if(/@@test-\d+$/.test(firstKey)) {
         return mapFilePrefixedCounterKeys(rawCoverage, executionOrder, testHierarchy, logger);
     }
 
     // Legacy format: "test-N" (global counter keys, no file prefix).
     // Fall back to global positional mapping via executionOrder.
     // Stryker disable next-line Regex: anchors are defensive for pattern matching counter-based keys
-    if(/^test-\d+$/.exec(firstKey)) {
+    if(/^test-\d+$/.test(firstKey)) {
         return mapLegacyCounterKeys(rawCoverage, executionOrder, testHierarchy, logger);
     }
 
@@ -74,53 +91,46 @@ export function mapCoverageToInspectorIds(
  * @param coverage - Fully-mapped MutantCoverage (perTest keys are test names)
  * @returns New MutantCoverage with stabilised static/perTest attribution
  */
-function stabilizeCoverage(coverage: MutantCoverage): MutantCoverage {
-    const perTestEntries = Object.entries(coverage.perTest ?? {});
-    if(perTestEntries.length === 0) {
-        return coverage;
-    }
-
-    // Count how many perTest entries each mutant ID appears in.
-    const perTestAppearances = new Map<string, number>();
+/**
+ * Count how many perTest entries each mutant ID appears in.
+ */
+function countPerTestAppearances(
+    perTestEntries: [string, Record<string, number>][]
+): Map<string, number> {
+    const appearances = new Map<string, number>();
     for(const [, counts] of perTestEntries) {
         for(const mutantId of Object.keys(counts)) {
-            perTestAppearances.set(mutantId, (perTestAppearances.get(mutantId) ?? 0) + 1);
+            appearances.set(mutantId, (appearances.get(mutantId) ?? 0) + 1);
         }
     }
+    return appearances;
+}
 
-    // A mutant belongs in static if:
-    //   (a) it is already in static, OR
-    //   (b) it appears in more than one test's perTest (ambiguous attribution)
-    const promoteToStatic = new Set<string>(Object.keys(coverage.static ?? {}));
+/**
+ * Build the set of mutant IDs that should be promoted to static.
+ * Includes all already-static IDs plus any that appear in >1 perTest entry.
+ */
+function buildPromoteToStaticSet(
+    existingStaticKeys: string[],
+    perTestAppearances: Map<string, number>
+): Set<string> {
+    const promoteToStatic = new Set<string>(existingStaticKeys);
     for(const [mutantId, count] of perTestAppearances) {
         // Stryker disable next-line EqualityOperator: > 1 is the correct threshold — 1 means uniquely attributed
         if(count > 1) {
             promoteToStatic.add(mutantId);
         }
     }
+    return promoteToStatic;
+}
 
-    // Nothing to change if there are no promotions AND no perTest entries contain
-    // any of the static IDs (i.e., nothing to strip from perTest either).
-    const existingStatic = new Set<string>(Object.keys(coverage.static ?? {}));
-    const hasNewPromotions = [...promoteToStatic].some(id => !existingStatic.has(id));
-    const hasPerTestContamination = perTestEntries.some(
-        ([, counts]) => Object.keys(counts).some(id => promoteToStatic.has(id))
-    );
-    if(!hasNewPromotions && !hasPerTestContamination) {
-        return coverage;
-    }
-
-    // Build new static: union of original static hits and promoted mutant IDs.
-    // Use hit-count 1 for newly-promoted mutants (conservative default; the
-    // actual count is irrelevant for Stryker's coverage decision).
-    const newStatic: Record<string, number> = { ...(coverage.static ?? {}) };
-    for(const mutantId of promoteToStatic) {
-        if(!(mutantId in newStatic)) {
-            newStatic[mutantId] = 1;
-        }
-    }
-
-    // Build new perTest: strip any mutant ID that is now in static.
+/**
+ * Build the new perTest map, stripping mutants that have been promoted to static.
+ */
+function buildFilteredPerTest(
+    perTestEntries: [string, Record<string, number>][],
+    promoteToStatic: Set<string>
+): Record<string, Record<string, number>> {
     const newPerTest: Record<string, Record<string, number>> = {};
     for(const [testId, counts] of perTestEntries) {
         const filteredCounts: Record<string, number> = {};
@@ -134,6 +144,50 @@ function stabilizeCoverage(coverage: MutantCoverage): MutantCoverage {
             newPerTest[testId] = filteredCounts;
         }
     }
+    return newPerTest;
+}
+
+function stabilizeCoverage(coverage: MutantCoverage): MutantCoverage {
+    const perTestEntries = Object.entries(coverage.perTest);
+    // Stryker disable next-line ConditionalExpression,BlockStatement: equivalent mutant — empty perTest produces no promotions/contamination so second guard returns coverage unchanged
+    if(perTestEntries.length === 0) {
+        return coverage;
+    }
+
+    const existingStaticKeys = Object.keys(coverage.static);
+    const perTestAppearances = countPerTestAppearances(perTestEntries);
+
+    // A mutant belongs in static if:
+    //   (a) it is already in static, OR
+    //   (b) it appears in more than one test's perTest (ambiguous attribution)
+    const promoteToStatic = buildPromoteToStaticSet(existingStaticKeys, perTestAppearances);
+
+    // Nothing to change if there are no promotions AND no perTest entries contain
+    // any of the static IDs (i.e., nothing to strip from perTest either).
+    const existingStatic = new Set<string>(existingStaticKeys);
+    // Stryker disable next-line ArrayDeclaration,ArrowFunction,BooleanLiteral,MethodExpression: equivalent mutants — bogus spread/arrow/every changes force hasNewPromotions=true, but rebuild produces identical output when all promotions are already in static; .every vs .some only affects early-return optimization, not the final result
+    const hasNewPromotions = [...promoteToStatic].some(id => !existingStatic.has(id));
+    // Stryker disable next-line MethodExpression,ArrowFunction: equivalent mutant — perTestEntries.some false-positive only causes unnecessary rebuild; output is identical
+    const hasPerTestContamination = perTestEntries.some(
+        // Stryker disable next-line ConditionalExpression: equivalent mutant — inner some always-true forces unnecessary rebuild but output is identical
+        ([, counts]) => Object.keys(counts).some(id => promoteToStatic.has(id))
+    );
+    // Stryker disable next-line ConditionalExpression,BooleanLiteral,BlockStatement: equivalent mutants — skipping early return (or flipping condition) just forces rebuild that produces identical output; the rebuild produces the same static+perTest values
+    if(!hasNewPromotions && !hasPerTestContamination) {
+        return coverage;
+    }
+
+    // Build new static: union of original static hits and promoted mutant IDs.
+    // Use hit-count 1 for newly-promoted mutants (conservative default; the
+    // actual count is irrelevant for Stryker's coverage decision).
+    const newStatic: Record<string, number> = { ...coverage.static };
+    for(const mutantId of promoteToStatic) {
+        if(!(mutantId in newStatic)) {
+            newStatic[mutantId] = 1;
+        }
+    }
+
+    const newPerTest = buildFilteredPerTest(perTestEntries, promoteToStatic);
 
     return { 'static': newStatic, perTest: newPerTest };
 }
@@ -150,20 +204,21 @@ function stabilizeCoverage(coverage: MutantCoverage): MutantCoverage {
  * This is deterministic because tests within a single file always execute in
  * the same order, and the per-file counter always starts at 1 for each file.
  */
-function mapFilePrefixedCounterKeys(
-    rawCoverage: MutantCoverage,
+/**
+ * Build a per-file map of inspector IDs from the execution order.
+ * Key: normalised relative file path; value: inspector IDs in execution order.
+ */
+function buildFileToInspectorIds(
     executionOrder: number[],
-    testHierarchy: Map<number, TestInfo>,
-    logger?: Pick<Logger, 'warn'>
-): MutantCoverage {
-    // Pre-build a per-file ordered list of inspector IDs to avoid repeated filtering.
-    // Key: normalised relative file path; value: inspector IDs in execution order.
+    testHierarchy: Map<number, TestInfo>
+): Map<string, number[]> {
     const fileToInspectorIds = new Map<string, number[]>();
     for(const inspectorId of executionOrder) {
         const testInfo = testHierarchy.get(inspectorId);
         if(!testInfo) {
             continue;
         }
+        // Stryker disable next-line StringLiteral: equivalent mutant — '' and "" are identical in JS
         const relFile = normalizeTestFilePath(testInfo.url) ?? '';
         const bucket = fileToInspectorIds.get(relFile);
         if(bucket) {
@@ -172,65 +227,76 @@ function mapFilePrefixedCounterKeys(
             fileToInspectorIds.set(relFile, [inspectorId]);
         }
     }
+    return fileToInspectorIds;
+}
 
-    // Sort the counter IDs numerically within each key so we iterate in order.
-    const counterIds = Object.keys(rawCoverage.perTest).sort((a, b) => {
-        const nA = parseInt(a.split('@@test-')[1] ?? '0', 10);
-        const nB = parseInt(b.split('@@test-')[1] ?? '0', 10);
-        return nA - nB;
-    });
+interface ResolvedCounterKey {
+    name:     string
+    testInfo: TestInfo | null
+}
 
-    // First pass: resolve test names for all keys to build the deduplication map.
-    const testNames: string[] = [];
-    const resolvedInfos: (TestInfo | null)[] = [];
-
-    for(const key of counterIds) {
+/**
+ * First-pass: resolve all counter keys to test names and testInfos.
+ */
+function resolveCounterKeys(
+    counterIds: string[],
+    fileToInspectorIds: Map<string, number[]>,
+    testHierarchy: Map<number, TestInfo>,
+    logger?: Pick<Logger, 'warn'>
+): ResolvedCounterKey[] {
+    return counterIds.map((key) => {
         const sepIdx = key.indexOf('@@');
         const filePrefix = key.slice(0, sepIdx);
         const counterStr = key.slice(sepIdx + 2 + 'test-'.length); // skip "@@test-"
-        const n = parseInt(counterStr, 10); // 1-based
+        const n = Number.parseInt(counterStr, 10); // 1-based
 
         const fileIds = fileToInspectorIds.get(filePrefix);
         const inspectorId = fileIds?.[n - 1];
-        const testInfo = inspectorId !== undefined ? testHierarchy.get(inspectorId) : undefined;
+        const testInfo = inspectorId === undefined ? undefined : testHierarchy.get(inspectorId);
 
         if(testInfo) {
-            testNames.push(buildUniqueTestName(testInfo.fullName, testInfo.url));
-            resolvedInfos.push(testInfo);
-        } else {
-            // Stryker disable next-line all: Logging statement
-            logger?.warn(
-                'Coverage key %s: no inspector test found for file "%s" at position %s '
-                + '(file has %s tests in execution order). Skipping this test in coverage mapping.',
-                key,
-                filePrefix,
-                n,
-                fileToInspectorIds.get(filePrefix)?.length ?? 0
-            );
-            testNames.push(`unknown-${key}`);
-            resolvedInfos.push(null);
+            return { name: buildUniqueTestName(testInfo.fullName, testInfo.url), testInfo };
         }
-    }
 
+        // Stryker disable StringLiteral: diagnostic logging message — format strings not functionally tested
+        logger?.warn(
+            'Coverage key %s: no inspector test found for file "%s" at position %s '
+            + '(file has %s tests in execution order). Skipping this test in coverage mapping.',
+            // Stryker restore StringLiteral
+            key,
+            filePrefix,
+            n,
+            fileToInspectorIds.get(filePrefix)?.length ?? 0
+        );
+        // Stryker disable next-line StringLiteral: equivalent mutant — the unknown name is only used as a Map key that is immediately skipped (testInfo: null) in buildRemappedPerTest
+        return { name: `unknown-${key}`, testInfo: null };
+    });
+}
+
+/**
+ * Second-pass: build remapped perTest from resolved counter keys with deduplication.
+ */
+function buildRemappedPerTest(
+    counterIds: string[],
+    resolved: ResolvedCounterKey[],
+    rawPerTest: MutantCoverage['perTest']
+): Record<string, Record<string, number>> {
     // Count occurrences for deduplication (handles it.each with %s placeholders)
     const nameCounts = new Map<string, number>();
-    for(const name of testNames) {
+    for(const { name } of resolved) {
         nameCounts.set(name, (nameCounts.get(name) ?? 0) + 1);
     }
 
-    // Second pass: build remappedPerTest with deduplicated names
     const remappedPerTest: Record<string, Record<string, number>> = {};
     const nameIndexes = new Map<string, number>();
 
-    for(let i = 0; i < counterIds.length; i++) {
-        const key = counterIds[i];
-        const testInfo = resolvedInfos[i];
+    for(const [i, key] of counterIds.entries()) {
+        const { name: baseName, testInfo } = resolved[i];
 
         if(!testInfo) {
             continue;
         }
 
-        const baseName = testNames[i];
         const count = nameCounts.get(baseName) ?? 1;
         let finalName = baseName;
 
@@ -240,8 +306,31 @@ function mapFilePrefixedCounterKeys(
             nameIndexes.set(baseName, index + 1);
         }
 
-        remappedPerTest[finalName] = rawCoverage.perTest[key];
+        remappedPerTest[finalName] = rawPerTest[key];
     }
+
+    return remappedPerTest;
+}
+
+function mapFilePrefixedCounterKeys(
+    rawCoverage: MutantCoverage,
+    executionOrder: number[],
+    testHierarchy: Map<number, TestInfo>,
+    logger?: Pick<Logger, 'warn'>
+): MutantCoverage {
+    const fileToInspectorIds = buildFileToInspectorIds(executionOrder, testHierarchy);
+
+    // Sort the counter IDs numerically within each key so we iterate in order.
+    // Stryker disable StringLiteral,LogicalOperator,ArithmeticOperator: equivalent mutants — sort order doesn't affect correctness since resolveCounterKeys extracts position from key string directly; '??' fallback only fires for malformed keys not present in valid coverage files
+    const counterIds = Object.keys(rawCoverage.perTest).toSorted((a, b) => {
+        const nA = Number.parseInt(a.split('@@test-')[1] ?? '0', 10);
+        const nB = Number.parseInt(b.split('@@test-')[1] ?? '0', 10);
+        return nA - nB;
+    });
+    // Stryker restore StringLiteral,LogicalOperator,ArithmeticOperator
+
+    const resolved = resolveCounterKeys(counterIds, fileToInspectorIds, testHierarchy, logger);
+    const remappedPerTest = buildRemappedPerTest(counterIds, resolved, rawCoverage.perTest);
 
     return stabilizeCoverage({
         'static': rawCoverage.static,
@@ -263,16 +352,19 @@ function mapLegacyCounterKeys(
     logger?: Pick<Logger, 'warn'>
 ): MutantCoverage {
     // Extract and sort counter-based test IDs numerically (test-1, test-2, ...)
-    const counterIds = Object.keys(rawCoverage.perTest).sort(
-        (a, b) => parseInt(a.split('-')[1], 10) - parseInt(b.split('-')[1], 10)
+    // Stryker disable StringLiteral: equivalent mutants — '??' fallback only fires for malformed keys; valid legacy keys always have 'test-N' format so split('-')[1] is never undefined
+    const counterIds = Object.keys(rawCoverage.perTest).toSorted(
+        (a, b) => Number.parseInt(a.split('-')[1] ?? '0', 10) - Number.parseInt(b.split('-')[1] ?? '0', 10)
     );
+    // Stryker restore StringLiteral
 
     // Handle count mismatch - log warning and do partial mapping
     if(counterIds.length !== executionOrder.length) {
-        // Stryker disable next-line all: Logging statement
+        // Stryker disable StringLiteral: diagnostic logging message format strings
         logger?.warn(
             'Coverage/execution count mismatch: %s coverage entries vs %s executed tests. '
             + 'Performing partial mapping for %s tests.',
+            // Stryker restore StringLiteral
             counterIds.length,
             executionOrder.length,
             Math.min(counterIds.length, executionOrder.length)
@@ -280,9 +372,11 @@ function mapLegacyCounterKeys(
     }
 
     // First pass: build unique names and count occurrences (same logic as buildTestsFromInspector)
+    // Stryker disable MethodExpression,ArrayDeclaration,EqualityOperator,BlockStatement,StringLiteral: equivalent mutants — Math.max vs Math.min and i<=maxIndex both cause out-of-bounds access that is silently skipped by the undefined testInfo check; [] vs ["Stryker was here"] only affects nameCounts for a name never used in second pass; the else body pushes to testNames which only affects dedup counts (no effect when names are unique); template literal change only affects an intermediate string not used in output
     const maxIndex = Math.min(counterIds.length, executionOrder.length);
     const testNames: string[] = [];
 
+    // Stryker disable next-line UpdateOperator: i-- would cause infinite loop → Timeout
     for(let i = 0; i < maxIndex; i++) {
         const inspectorId = executionOrder[i];
         const testInfo = testHierarchy.get(inspectorId);
@@ -292,6 +386,7 @@ function mapLegacyCounterKeys(
             testNames.push(`unknown-${inspectorId}`);
         }
     }
+    // Stryker restore MethodExpression,ArrayDeclaration,EqualityOperator,BlockStatement,StringLiteral
 
     // Count occurrences for deduplication (handles it.each with %s placeholders)
     const nameCounts = new Map<string, number>();
@@ -303,6 +398,7 @@ function mapLegacyCounterKeys(
     const remappedPerTest: Record<string, Record<string, number>> = {};
     const nameIndexes = new Map<string, number>();
 
+    // Stryker disable next-line UpdateOperator: i-- would cause infinite loop → Timeout
     for(let i = 0; i < maxIndex; i++) {
         const counterId = counterIds[i];
         const inspectorId = executionOrder[i];

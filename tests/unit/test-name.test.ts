@@ -53,8 +53,8 @@ describe('normalizeTestName', () => {
     });
 
     it('replaces control characters with underscores', () => {
-        expect(normalizeTestName('before\x00after')).toBe('before_after');
-        expect(normalizeTestName('before\x1Fafter')).toBe('before_after');
+        expect(normalizeTestName('before\u0000after')).toBe('before_after');
+        expect(normalizeTestName('before\u001Fafter')).toBe('before_after');
     });
 
     it('preserves unicode characters verbatim', () => {

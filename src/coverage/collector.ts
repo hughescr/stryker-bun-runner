@@ -3,9 +3,9 @@
  * Collects and processes coverage data from test runs
  */
 
+import { readFile, unlink } from 'node:fs/promises';
 import type { MutantCoverage } from '@stryker-mutator/api/core';
 import type { Logger } from '@stryker-mutator/api/logging';
-import { readFile, unlink } from 'node:fs/promises';
 import type { CoverageFileData } from './types.js';
 
 /**
@@ -41,16 +41,16 @@ function mergeCoverageData(dataList: CoverageFileData[]): CoverageFileData {
     for(const data of dataList) {
     // Merge perTest data
         for(const [testId, mutantIds] of Object.entries(data.perTest)) {
-            // Stryker disable next-line ConditionalExpression: new Set(undefined) works, mutation is equivalent
-            if(!merged.perTest[testId]) {
-                merged.perTest[testId] = mutantIds;
-            } else {
+            // Stryker disable next-line ConditionalExpression: equivalent mutant — mutating to true makes the first occurrence union an empty set then add all mutantIds, yielding the same result as direct assignment
+            if(testId in merged.perTest) {
                 // Union mutant IDs if duplicate test ID (shouldn't happen, but be safe)
                 const existingSet = new Set(merged.perTest[testId]);
                 for(const mutantId of mutantIds) {
                     existingSet.add(mutantId);
                 }
-                merged.perTest[testId] = Array.from(existingSet);
+                merged.perTest[testId] = [...existingSet];
+            } else {
+                merged.perTest[testId] = mutantIds;
             }
         }
 
@@ -60,7 +60,7 @@ function mergeCoverageData(dataList: CoverageFileData[]): CoverageFileData {
         }
     }
 
-    merged.static = Array.from(staticSet);
+    merged.static = [...staticSet];
     return merged;
 }
 
@@ -82,11 +82,12 @@ export async function collectCoverage(
     logger?: Pick<Logger, 'warn'>
 ): Promise<MutantCoverage | undefined> {
     try {
-        const content = await readFile(coverageFile, 'utf-8');
+        const content = await readFile(coverageFile, 'utf8');
 
         // Parse JSON lines format (one JSON object per line)
         // Stryker disable next-line MethodExpression: Removing .trim() is equivalent because .filter() removes empty lines anyway
         const trimmed = content.trim();
+        // Stryker disable next-line MethodExpression,ConditionalExpression,EqualityOperator: equivalent mutants — removing .filter() or always-true/>=0 condition passes empty lines to JSON.parse which throws and skips them; result is identical
         const lines = trimmed.split('\n').filter(line => line.length > 0);
         const dataList: CoverageFileData[] = [];
 

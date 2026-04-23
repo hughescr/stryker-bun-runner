@@ -27,6 +27,7 @@
  *          when the filter is empty or yields no usable alternatives
  */
 export function buildTestNamePattern(testFilter: readonly string[]): string | undefined {
+    // Stryker disable next-line ConditionalExpression,BlockStatement: equivalent mutant — empty filter also returns undefined via the alternatives.size === 0 check below
     if(testFilter.length === 0) {
         return undefined;
     }
@@ -38,27 +39,19 @@ export function buildTestNamePattern(testFilter: readonly string[]): string | un
     // Stryker disable next-line Regex: suffix regex is anchored and defensive
     const dedupSuffixRe = / \[\d+\]$/;
 
-    // Collapse hierarchy separators " > " to single space (Bun's internal format).
-    // Global, non-anchored; runs before regex-metachar escaping so the ">" char
-    // itself never needs escaping in the output.
-    // Stryker disable next-line Regex: hierarchy separator collapse is deliberate
-    const hierarchySepRe = / > /g;
-
     // Characters that carry special meaning inside a regex literal.
     // Stryker disable next-line Regex: character class enumerates metacharacters to escape
-    const metaRe = /[.*+?^${}()|[\]\\\/]/g;
+    const metaRe = /[.*+?^${}()|[\]\\/]/g;
 
     const alternatives = new Set<string>();
     for(const id of testFilter) {
         // Strip the leading file-path prefix when the first component ends in a
         // recognised test-file extension.  The separator is " > ".
         const firstSepIdx = id.indexOf(' > ');
-        let name: string;
-        if(firstSepIdx !== -1 && fileExtRe.test(id.slice(0, firstSepIdx))) {
-            name = id.slice(firstSepIdx + 3);
-        } else {
-            name = id;
-        }
+        // Stryker disable next-line ConditionalExpression,UnaryOperator: equivalent mutants — when firstSepIdx===-1 or ===1, id.slice(0,N) won't match fileExtRe for realistic test IDs (path prefix is >1 char), so behavior is unchanged
+        let name: string = (firstSepIdx !== -1 && fileExtRe.test(id.slice(0, firstSepIdx)))
+            ? id.slice(firstSepIdx + 3)
+            : id;
 
         // Strip trailing " [N]" dedup suffix so both "foo [0]" and "foo [1]"
         // collapse to a single "foo" alternative.
@@ -66,10 +59,11 @@ export function buildTestNamePattern(testFilter: readonly string[]): string | un
 
         // Collapse " > " hierarchy separators to single spaces to match Bun's
         // internal test-name format.
-        name = name.replace(hierarchySepRe, ' ');
+        name = name.replaceAll(' > ', ' ');
 
         // Escape regex metacharacters so the string is matched literally.
-        name = name.replace(metaRe, '\\$&');
+        // Stryker disable next-line Regex: character class enumerates metacharacters to escape
+        name = name.replaceAll(metaRe, String.raw`\$&`);
 
         if(name.length > 0) {
             alternatives.add(name);
@@ -80,5 +74,5 @@ export function buildTestNamePattern(testFilter: readonly string[]): string | un
         return undefined;
     }
 
-    return `^(?:${Array.from(alternatives).join('|')})$`;
+    return `^(?:${[...alternatives].join('|')})$`;
 }

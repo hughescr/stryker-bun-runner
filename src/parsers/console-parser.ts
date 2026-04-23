@@ -36,6 +36,13 @@ interface TestLineParseResult {
 }
 
 /**
+ * Build a full test name by prefixing with the current file if available
+ */
+function buildTestName(testName: string, currentFile: string | undefined): string {
+    return currentFile ? `${currentFile} > ${testName}` : testName;
+}
+
+/**
  * Parse individual test result line
  */
 function parseTestLine(line: string, currentFile: string | undefined): TestLineParseResult {
@@ -44,14 +51,12 @@ function parseTestLine(line: string, currentFile: string | undefined): TestLineP
     // Stryker disable next-line Regex: anchors and character classes are defensive; input is line-by-line parsed
     const passMatch = /^✓ +(\S.*?) \[([0-9.]+)ms\]$/.exec(line);
     if(passMatch) {
-        const testName = passMatch[1].trim();
-        const fullName = currentFile ? `${currentFile} > ${testName}` : testName;
         return {
             test: {
-                name:     fullName,
+                name:     buildTestName(passMatch[1].trim(), currentFile),
                 file:     currentFile,
                 status:   'passed',
-                duration: parseFloat(passMatch[2])
+                duration: Number.parseFloat(passMatch[2])
             }
         };
     }
@@ -61,14 +66,12 @@ function parseTestLine(line: string, currentFile: string | undefined): TestLineP
     // Stryker disable next-line Regex: anchors and character classes are defensive; input is line-by-line parsed
     const failMatch = /^✗ +(\S.*?)(?: \[([0-9.]+)ms\])?$/.exec(line);
     if(failMatch) {
-        const testName = failMatch[1].trim();
-        const fullName = currentFile ? `${currentFile} > ${testName}` : testName;
         return {
             test: {
-                name:     fullName,
+                name:     buildTestName(failMatch[1].trim(), currentFile),
                 file:     currentFile,
                 status:   'failed',
-                duration: failMatch[2] ? parseFloat(failMatch[2]) : undefined
+                duration: failMatch[2] ? Number.parseFloat(failMatch[2]) : undefined
             },
             startedCollectingError: true
         };
@@ -79,14 +82,12 @@ function parseTestLine(line: string, currentFile: string | undefined): TestLineP
     // Stryker disable next-line Regex: anchors and character classes are defensive; input is line-by-line parsed
     const bailFailMatch = /^\(fail\) +(\S.*?)(?: \[([0-9.]+)ms\])?$/.exec(line);
     if(bailFailMatch) {
-        const testName = bailFailMatch[1].trim();
-        const fullName = currentFile ? `${currentFile} > ${testName}` : testName;
         return {
             test: {
-                name:     fullName,
+                name:     buildTestName(bailFailMatch[1].trim(), currentFile),
                 file:     currentFile,
                 status:   'failed',
-                duration: bailFailMatch[2] ? parseFloat(bailFailMatch[2]) : undefined
+                duration: bailFailMatch[2] ? Number.parseFloat(bailFailMatch[2]) : undefined
             },
             startedCollectingError: true
         };
@@ -97,11 +98,9 @@ function parseTestLine(line: string, currentFile: string | undefined): TestLineP
     // Stryker disable next-line Regex: anchors are defensive; input is line-by-line parsed
     const skipMatch = /^⏭ +(\S.*)$/.exec(line);
     if(skipMatch) {
-        const testName = skipMatch[1].trim();
-        const fullName = currentFile ? `${currentFile} > ${testName}` : testName;
         return {
             test: {
-                name:   fullName,
+                name:   buildTestName(skipMatch[1].trim(), currentFile),
                 file:   currentFile,
                 status: 'skipped'
             }
@@ -129,7 +128,7 @@ function shouldCollectErrorLine(line: string): boolean {
     }
     // Skip summary lines
     // Stryker disable next-line Regex: anchors and character classes are defensive; line detection pattern
-    return !(/^\s*\d+\s+(?:pass|fail|skip)/.exec(line));
+    return !(/^\s*\d+\s+(?:pass|fail|skip)/.test(line));
 }
 
 interface TestCounters {
@@ -181,26 +180,26 @@ function parseSummaryLines(output: string): SummaryCounts {
     const bailSummary = /Bailed out after (\d+) failures?/.exec(output);
 
     if(passSummary) {
-        counts.passed = parseInt(passSummary[1], 10);
+        counts.passed = Number.parseInt(passSummary[1], 10);
     }
 
     if(failSummary) {
-        counts.failed = parseInt(failSummary[1], 10);
+        counts.failed = Number.parseInt(failSummary[1], 10);
     }
 
     if(skipSummary) {
-        counts.skipped = parseInt(skipSummary[1], 10);
+        counts.skipped = Number.parseInt(skipSummary[1], 10);
     }
 
     if(bailSummary) {
-        counts.failed = Math.max(counts.failed, parseInt(bailSummary[1], 10));
+        counts.failed = Math.max(counts.failed, Number.parseInt(bailSummary[1], 10));
     }
 
     // Also try to parse from "Ran N tests" line as ultimate fallback
     // Stryker disable next-line Regex: character classes are defensive for optional plural
     const ranTestsSummary = /Ran\s+(\d+)\s+tests?/.exec(output);
     if(ranTestsSummary) {
-        const totalFromRan = parseInt(ranTestsSummary[1], 10);
+        const totalFromRan = Number.parseInt(ranTestsSummary[1], 10);
         // Use this as source of truth for total, and derive passed if needed
         // Stryker disable next-line ArithmeticOperator: condition requires passed=0 and failed=0, making arithmetic mutations equivalent
         const totalParsed = counts.passed + counts.failed + counts.skipped;
@@ -237,7 +236,7 @@ export function parseBunTestOutput(stdout: string, stderr: string): ParsedTestRe
     const counters: TestCounters = { passed: 0, failed: 0, skipped: 0 };
 
     // Combine stdout and stderr for parsing
-    const output = stdout + '\n' + stderr;
+    const output = `${stdout}\n${stderr}`;
     const lines = output.split('\n');
 
     let currentTest: TestResult | null = null;

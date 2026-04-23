@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, mock } from 'bun:test';
+import { describe, it, expect, beforeEach, mock, jest } from 'bun:test';
 import {
     InspectorClient,
     InspectorTimeoutError,
@@ -34,8 +34,9 @@ class MockWebSocketServer {
     emit(event: string, data: any): void {
         const handlers = this.handlers.get(event);
         if(handlers) {
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- mock event data passed through
-            handlers.forEach(handler => handler(data));
+            for(const handler of handlers) {
+                handler(data);
+            }
         }
     }
 
@@ -65,7 +66,7 @@ describe('InspectorClient', () => {
         // Create mock WebSocket constructor
 
         MockWebSocketConstructor = function(_url: string) {
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-return, @typescript-eslint/no-explicit-any -- returning mock as WebSocket
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- returning mock as WebSocket
             return mockWs as any;
         };
     });
@@ -73,8 +74,8 @@ describe('InspectorClient', () => {
     describe('constructor', () => {
         it('should create client with default options', () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
             expect(client).toBeDefined();
@@ -82,20 +83,20 @@ describe('InspectorClient', () => {
 
         it('should create client with custom handlers', () => {
             const handlers: InspectorEventHandlers = {
-                // eslint-disable-next-line @typescript-eslint/no-empty-function -- intentional mock stub
+
                 onTestFound: mock(() => {}),
-                // eslint-disable-next-line @typescript-eslint/no-empty-function -- intentional mock stub
+
                 onTestStart: mock(() => {}),
-                // eslint-disable-next-line @typescript-eslint/no-empty-function -- intentional mock stub
-                onTestEnd:   mock(() => {}),
-                // eslint-disable-next-line @typescript-eslint/no-empty-function -- intentional mock stub
-                onError:     mock(() => {}),
+
+                onTestEnd: mock(() => {}),
+
+                onError: mock(() => {}),
             };
 
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
+                url: 'ws://localhost:6499',
                 handlers,
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -106,49 +107,59 @@ describe('InspectorClient', () => {
     describe('connect', () => {
         it('should connect successfully', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
             const connectPromise = client.connect();
             mockWs.simulateOpen();
 
-            await expect(connectPromise).resolves.toBeUndefined();
+            await connectPromise;
         });
 
         it('should reject on connection timeout', async () => {
-            const client = new InspectorClient({
-                url:               'ws://localhost:6499',
-                connectionTimeout: 100,
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
-                WebSocketClass:    MockWebSocketConstructor,
-            });
+            jest.useFakeTimers();
+            try {
+                const client = new InspectorClient({
+                    url:               'ws://localhost:6499',
+                    connectionTimeout: 100,
 
-            const connectPromise = client.connect();
+                    WebSocketClass: MockWebSocketConstructor,
+                });
 
-            await expect(connectPromise).rejects.toThrow(InspectorTimeoutError);
-            await expect(connectPromise).rejects.toThrow('Connection timeout after 100ms');
+                const connectPromise = client.connect();
+
+                jest.advanceTimersByTime(150);
+                await Promise.resolve();
+
+                const connectError = await connectPromise.catch((e: unknown) => e);
+                expect(connectError).toBeInstanceOf(InspectorTimeoutError);
+                expect((connectError as InspectorTimeoutError).message).toContain('Connection timeout after 100ms');
+            } finally {
+                jest.useRealTimers();
+            }
         });
 
         it('should reject on connection error', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
             const connectPromise = client.connect();
             mockWs.simulateError();
 
-            await expect(connectPromise).rejects.toThrow(InspectorConnectionError);
-            await expect(connectPromise).rejects.toThrow('WebSocket connection failed');
+            const connectError = await connectPromise.catch((e: unknown) => e);
+            expect(connectError).toBeInstanceOf(InspectorConnectionError);
+            expect((connectError as InspectorConnectionError).message).toContain('WebSocket connection failed');
         });
 
         it('should throw if already connected', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -156,15 +167,16 @@ describe('InspectorClient', () => {
             mockWs.simulateOpen();
             await connectPromise;
 
-            await expect(client.connect()).rejects.toThrow('Already connected');
+            const connectAgainError = await client.connect().catch((e: unknown) => e);
+            expect((connectAgainError as Error).message).toContain('Already connected');
         });
     });
 
     describe('send', () => {
         it('should send request and receive response', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -175,11 +187,11 @@ describe('InspectorClient', () => {
             const sendPromise = client.send('TestReporter.enable', {});
 
             // Simulate response
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- parsing mock message data
+
             const sentMessage = JSON.parse(mockWs.sentMessages[0]);
             mockWs.simulateMessage(
                 JSON.stringify({
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access -- accessing mock message ID
+
                     id:     sentMessage.id,
                     result: { enabled: true },
                 })
@@ -190,27 +202,36 @@ describe('InspectorClient', () => {
         });
 
         it('should reject on request timeout', async () => {
-            const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                requestTimeout: 100,
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
-                WebSocketClass: MockWebSocketConstructor,
-            });
+            jest.useFakeTimers();
+            try {
+                const client = new InspectorClient({
+                    url:            'ws://localhost:6499',
+                    requestTimeout: 100,
 
-            const connectPromise = client.connect();
-            mockWs.simulateOpen();
-            await connectPromise;
+                    WebSocketClass: MockWebSocketConstructor,
+                });
 
-            const sendPromise = client.send('TestReporter.enable', {});
+                const connectPromise = client.connect();
+                mockWs.simulateOpen();
+                await connectPromise;
 
-            await expect(sendPromise).rejects.toThrow(InspectorTimeoutError);
-            await expect(sendPromise).rejects.toThrow('Request timeout after 100ms: TestReporter.enable');
+                const sendPromise = client.send('TestReporter.enable', {});
+
+                jest.advanceTimersByTime(150);
+                await Promise.resolve();
+
+                const sendError = await sendPromise.catch((e: unknown) => e);
+                expect(sendError).toBeInstanceOf(InspectorTimeoutError);
+                expect((sendError as InspectorTimeoutError).message).toContain('Request timeout after 100ms: TestReporter.enable');
+            } finally {
+                jest.useRealTimers();
+            }
         });
 
         it('should reject with error from server', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -221,40 +242,40 @@ describe('InspectorClient', () => {
             const sendPromise = client.send('InvalidMethod', {});
 
             // Simulate error response
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- parsing mock message data
+
             const sentMessage = JSON.parse(mockWs.sentMessages[0]);
             mockWs.simulateMessage(
                 JSON.stringify({
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access -- accessing mock message ID
+
                     id:    sentMessage.id,
                     error: {
-                        code:    -32601,
+                        code:    -32_601,
                         message: 'Method not found',
                     },
                 })
             );
 
-            await expect(sendPromise).rejects.toThrow('Inspector error: Method not found');
+            const sendError = await sendPromise.catch((e: unknown) => e);
+            expect((sendError as Error).message).toContain('Inspector error: Method not found');
         });
 
         it('should throw if not connected', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
-            await expect(client.send('TestReporter.enable', {})).rejects.toThrow(
-                'WebSocket not connected'
-            );
+            const sendError = await client.send('TestReporter.enable', {}).catch((e: unknown) => e);
+            expect((sendError as Error).message).toContain('WebSocket not connected');
         });
     });
 
     describe('close', () => {
         it('should close connection', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -268,8 +289,8 @@ describe('InspectorClient', () => {
 
         it('should reject pending requests on close', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -280,14 +301,15 @@ describe('InspectorClient', () => {
             const sendPromise = client.send('TestReporter.enable', {});
             await client.close();
 
-            await expect(sendPromise).rejects.toThrow(InspectorConnectionError);
-            await expect(sendPromise).rejects.toThrow('Connection closed');
+            const sendError = await sendPromise.catch((e: unknown) => e);
+            expect(sendError).toBeInstanceOf(InspectorConnectionError);
+            expect((sendError as InspectorConnectionError).message).toContain('Connection closed');
         });
 
         it('should be idempotent', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -301,8 +323,8 @@ describe('InspectorClient', () => {
 
         it('should handle close on unconnected client', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
             await client.close(); // Should not throw
@@ -311,13 +333,12 @@ describe('InspectorClient', () => {
 
     describe('event handling', () => {
         it('should handle TestReporter.found event', async () => {
-            // eslint-disable-next-line @typescript-eslint/no-empty-function -- intentional mock stub
             const onTestFound = mock((_test: TestInfo) => {});
 
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                handlers:       { onTestFound },
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url:      'ws://localhost:6499',
+                handlers: { onTestFound },
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -351,13 +372,12 @@ describe('InspectorClient', () => {
         });
 
         it('should handle TestReporter.start event', async () => {
-            // eslint-disable-next-line @typescript-eslint/no-empty-function -- intentional mock stub
             const onTestStart = mock((_test: TestInfo) => {});
 
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                handlers:       { onTestStart },
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url:      'ws://localhost:6499',
+                handlers: { onTestStart },
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -395,13 +415,12 @@ describe('InspectorClient', () => {
         });
 
         it('should handle TestReporter.end event', async () => {
-            // eslint-disable-next-line @typescript-eslint/no-empty-function -- intentional mock stub
             const onTestEnd = mock((_test: TestInfo) => {});
 
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                handlers:       { onTestEnd },
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url:      'ws://localhost:6499',
+                handlers: { onTestEnd },
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -441,13 +460,12 @@ describe('InspectorClient', () => {
         });
 
         it('should call onError for unknown test in start event', async () => {
-            // eslint-disable-next-line @typescript-eslint/no-empty-function -- intentional mock stub
             const onError = mock((_error: Error) => {});
 
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                handlers:       { onError },
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url:      'ws://localhost:6499',
+                handlers: { onError },
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -468,13 +486,12 @@ describe('InspectorClient', () => {
         });
 
         it('should call onError for unknown test in end event', async () => {
-            // eslint-disable-next-line @typescript-eslint/no-empty-function -- intentional mock stub
             const onError = mock((_error: Error) => {});
 
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                handlers:       { onError },
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url:      'ws://localhost:6499',
+                handlers: { onError },
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -499,13 +516,12 @@ describe('InspectorClient', () => {
         });
 
         it('should verify exact error message for start event', async () => {
-            // eslint-disable-next-line @typescript-eslint/no-empty-function -- intentional mock stub
             const onError = mock((_error: Error) => {});
 
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                handlers:       { onError },
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url:      'ws://localhost:6499',
+                handlers: { onError },
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -529,8 +545,8 @@ describe('InspectorClient', () => {
     describe('test hierarchy', () => {
         it('should build full name with parent chain', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -581,13 +597,12 @@ describe('InspectorClient', () => {
         });
 
         it('should detect circular references', async () => {
-            // eslint-disable-next-line @typescript-eslint/no-empty-function -- intentional mock stub
             const onError = mock((_error: Error) => {});
 
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                handlers:       { onError },
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url:      'ws://localhost:6499',
+                handlers: { onError },
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -625,13 +640,12 @@ describe('InspectorClient', () => {
         });
 
         it('should detect circular references in parent chains', async () => {
-            // eslint-disable-next-line @typescript-eslint/no-empty-function -- intentional mock stub
             const onError = mock((_error: Error) => {});
 
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                handlers:       { onError },
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url:      'ws://localhost:6499',
+                handlers: { onError },
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -684,8 +698,8 @@ describe('InspectorClient', () => {
 
         it('should build name when parent is undefined', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -712,8 +726,8 @@ describe('InspectorClient', () => {
 
         it('should stop building name when parent not found', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -741,8 +755,8 @@ describe('InspectorClient', () => {
 
         it('should continue building name until parent is undefined', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -793,8 +807,8 @@ describe('InspectorClient', () => {
 
         it('should track execution order for tests only', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -870,8 +884,8 @@ describe('InspectorClient', () => {
     describe('getters', () => {
         it('should return all tests', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -909,8 +923,8 @@ describe('InspectorClient', () => {
 
         it('should return specific test by ID', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -936,8 +950,8 @@ describe('InspectorClient', () => {
 
         it('should return undefined for unknown test ID', () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
             const test = client.getTest(999);
@@ -948,8 +962,8 @@ describe('InspectorClient', () => {
     describe('connection close handling', () => {
         it('should reject pending requests on unexpected close', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -962,14 +976,15 @@ describe('InspectorClient', () => {
             // Simulate unexpected close
             mockWs.close();
 
-            await expect(sendPromise).rejects.toThrow(InspectorConnectionError);
-            await expect(sendPromise).rejects.toThrow('Connection closed unexpectedly');
+            const sendError = await sendPromise.catch((e: unknown) => e);
+            expect(sendError).toBeInstanceOf(InspectorConnectionError);
+            expect((sendError as InspectorConnectionError).message).toContain('Connection closed unexpectedly');
         });
 
         it('should handle close event while isClosing is true', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -991,8 +1006,8 @@ describe('InspectorClient', () => {
 
         it('should not process close if already closing', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -1011,16 +1026,17 @@ describe('InspectorClient', () => {
             await closePromise;
 
             // Request should be rejected with "Connection closed" not "Connection closed unexpectedly"
-            await expect(sendPromise).rejects.toThrow(InspectorConnectionError);
-            await expect(sendPromise).rejects.toThrow('Connection closed');
+            const sendError = await sendPromise.catch((e: unknown) => e);
+            expect(sendError).toBeInstanceOf(InspectorConnectionError);
+            expect((sendError as InspectorConnectionError).message).toContain('Connection closed');
         });
     });
 
     describe('method return values', () => {
         it('should return copy of execution order', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -1063,8 +1079,8 @@ describe('InspectorClient', () => {
 
         it('should return copy of tests array', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -1095,72 +1111,84 @@ describe('InspectorClient', () => {
 
     describe('error class names', () => {
         it('should have InspectorTimeoutError as error name', async () => {
-            const client = new InspectorClient({
-                url:               'ws://localhost:6499',
-                connectionTimeout: 10,
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
-                WebSocketClass:    MockWebSocketConstructor,
-            });
-
+            jest.useFakeTimers();
             try {
-                await client.connect();
-            } catch (error) {
-                expect(error).toBeInstanceOf(InspectorTimeoutError);
-                expect((error as Error).name).toBe('InspectorTimeoutError');
+                const client = new InspectorClient({
+                    url:               'ws://localhost:6499',
+                    connectionTimeout: 100,
+
+                    WebSocketClass: MockWebSocketConstructor,
+                });
+
+                const connectPromise = client.connect();
+
+                jest.advanceTimersByTime(150);
+                await Promise.resolve();
+
+                const result = await connectPromise.catch((e: unknown) => e);
+                expect(result).toBeInstanceOf(InspectorTimeoutError);
+                expect((result as Error).name).toBe('InspectorTimeoutError');
+            } finally {
+                jest.useRealTimers();
             }
         });
 
         it('should have InspectorConnectionError as error name', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
             const connectPromise = client.connect();
             mockWs.simulateError();
 
-            try {
-                await connectPromise;
-            } catch (error) {
-                expect(error).toBeInstanceOf(InspectorConnectionError);
-                expect((error as Error).name).toBe('InspectorConnectionError');
-            }
+            const result = await connectPromise.catch((e: unknown) => e);
+            expect(result).toBeInstanceOf(InspectorConnectionError);
+            expect((result as Error).name).toBe('InspectorConnectionError');
         });
     });
 
     describe('connection timeout cleanup', () => {
         it('should close WebSocket and set to null on timeout', async () => {
-            const client = new InspectorClient({
-                url:               'ws://localhost:6499',
-                connectionTimeout: 10,
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
-                WebSocketClass:    MockWebSocketConstructor,
-            });
+            jest.useFakeTimers();
+            try {
+                const client = new InspectorClient({
+                    url:               'ws://localhost:6499',
+                    connectionTimeout: 10,
 
-            const connectPromise = client.connect();
+                    WebSocketClass: MockWebSocketConstructor,
+                });
 
-            // Save reference to the mockWs before it might get replaced
-            const wsInstance = mockWs;
+                const connectPromise = client.connect();
 
-            // Catch the rejection immediately to prevent unhandled error
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-return -- test error handling
-            const result = await connectPromise.catch(e => e);
+                // Save reference to the mockWs before it might get replaced
+                const wsInstance = mockWs;
 
-            expect(result).toBeInstanceOf(InspectorTimeoutError);
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- test error validation
-            expect(result.message).toContain('Connection timeout after 10ms');
+                jest.advanceTimersByTime(20);
+                await Promise.resolve();
 
-            // Verify WebSocket was closed and nulled
-            expect(wsInstance.readyState).toBe(WebSocket.CLOSED);
+                // Catch the rejection immediately to prevent unhandled error
+
+                const result = await connectPromise.catch(e => e);
+
+                expect(result).toBeInstanceOf(InspectorTimeoutError);
+
+                expect(result.message).toContain('Connection timeout after 10ms');
+
+                // Verify WebSocket was closed and nulled
+                expect(wsInstance.readyState).toBe(WebSocket.CLOSED);
+            } finally {
+                jest.useRealTimers();
+            }
         });
     });
 
     describe('WebSocket readyState checks', () => {
         it('should throw when WebSocket is CONNECTING', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -1169,7 +1197,8 @@ describe('InspectorClient', () => {
 
             // Try to send while still connecting
 
-            await expect(client.send('TestReporter.enable', {})).rejects.toThrow('WebSocket not connected');
+            const sendError1 = await client.send('TestReporter.enable', {}).catch((e: unknown) => e);
+            expect((sendError1 as Error).message).toContain('WebSocket not connected');
 
             // Clean up
             mockWs.simulateOpen();
@@ -1179,8 +1208,8 @@ describe('InspectorClient', () => {
 
         it('should throw when WebSocket is CLOSED', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -1191,15 +1220,16 @@ describe('InspectorClient', () => {
             // Close and try to send
             await client.close();
 
-            await expect(client.send('TestReporter.enable', {})).rejects.toThrow('WebSocket not connected');
+            const sendError2 = await client.send('TestReporter.enable', {}).catch((e: unknown) => e);
+            expect((sendError2 as Error).message).toContain('WebSocket not connected');
         });
     });
 
     describe('message ID increment', () => {
         it('should increment messageId for each request', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -1208,25 +1238,24 @@ describe('InspectorClient', () => {
             await connectPromise;
 
             // Send multiple requests (catching to prevent unhandled rejections)
-            // eslint-disable-next-line @typescript-eslint/no-empty-function -- intentional empty catch for test
+
             const p1 = client.send('Method1', {}).catch(() => {});
-            // eslint-disable-next-line @typescript-eslint/no-empty-function -- intentional empty catch for test
+
             const p2 = client.send('Method2', {}).catch(() => {});
-            // eslint-disable-next-line @typescript-eslint/no-empty-function -- intentional empty catch for test
+
             const p3 = client.send('Method3', {}).catch(() => {});
 
             // Verify message IDs are incrementing
             expect(mockWs.sentMessages.length).toBe(3);
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- parsing mock message
+
             const msg1 = JSON.parse(mockWs.sentMessages[0]);
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- parsing mock message
+
             const msg2 = JSON.parse(mockWs.sentMessages[1]);
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- parsing mock message
+
             const msg3 = JSON.parse(mockWs.sentMessages[2]);
 
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- checking message IDs
             expect(msg2.id).toBe(msg1.id + 1);
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- checking message IDs
+
             expect(msg3.id).toBe(msg2.id + 1);
 
             // Close the client (which will reject the pending requests)
@@ -1240,8 +1269,8 @@ describe('InspectorClient', () => {
     describe('close method edge cases', () => {
         it('should only close WebSocket when in OPEN or CONNECTING state', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -1250,6 +1279,7 @@ describe('InspectorClient', () => {
             await connectPromise;
 
             // Manually set to a closed state before calling close
+            // eslint-disable-next-line require-atomic-updates -- mockWs is a test mock; no concurrent access
             mockWs.readyState = WebSocket.CLOSED;
             await client.close();
 
@@ -1258,8 +1288,8 @@ describe('InspectorClient', () => {
 
         it('should return early when ws is null', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -1271,8 +1301,8 @@ describe('InspectorClient', () => {
 
         it('should set isClosing flag to prevent duplicate close handling', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -1293,8 +1323,8 @@ describe('InspectorClient', () => {
     describe('error handling edge cases', () => {
         it('should update testInfo when error is present in end event', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -1337,8 +1367,8 @@ describe('InspectorClient', () => {
 
         it('should update testInfo without error when not present', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -1378,8 +1408,8 @@ describe('InspectorClient', () => {
     describe('buildFullName edge cases', () => {
         it('should return just name when parentId is undefined', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -1405,13 +1435,12 @@ describe('InspectorClient', () => {
         });
 
         it('should include specific circular reference IDs in error message', async () => {
-            // eslint-disable-next-line @typescript-eslint/no-empty-function -- intentional mock stub
             const onError = mock((_error: Error) => {});
 
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                handlers:       { onError },
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url:      'ws://localhost:6499',
+                handlers: { onError },
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -1442,8 +1471,8 @@ describe('InspectorClient', () => {
     describe('handleClose edge cases', () => {
         it('should return early when isClosing is true', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -1466,8 +1495,8 @@ describe('InspectorClient', () => {
     describe('send error handling', () => {
         it('should handle non-Error exceptions during send', async () => {
             const client = new InspectorClient({
-                url:            'ws://localhost:6499',
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                url: 'ws://localhost:6499',
+
                 WebSocketClass: MockWebSocketConstructor,
             });
 
@@ -1477,11 +1506,11 @@ describe('InspectorClient', () => {
 
             // Mock send to throw a non-Error
             mockWs.send = () => {
-                // eslint-disable-next-line @typescript-eslint/only-throw-error -- testing non-Error exception handling
                 throw 'string error';
             };
 
-            await expect(client.send('TestReporter.enable', {})).rejects.toThrow('string error');
+            const sendError = await client.send('TestReporter.enable', {}).catch((e: unknown) => e);
+            expect(String(sendError)).toContain('string error');
         });
     });
 
@@ -1489,8 +1518,8 @@ describe('InspectorClient', () => {
         describe('line 222: isClosing BooleanLiteral mutation', () => {
             it('should prevent handleClose from running when close() is called explicitly', async () => {
                 const client = new InspectorClient({
-                    url:            'ws://localhost:6499',
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                    url: 'ws://localhost:6499',
+
                     WebSocketClass: MockWebSocketConstructor,
                 });
 
@@ -1529,8 +1558,8 @@ describe('InspectorClient', () => {
 
             it('should set isClosing to true when close() is called', async () => {
                 const client = new InspectorClient({
-                    url:            'ws://localhost:6499',
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                    url: 'ws://localhost:6499',
+
                     WebSocketClass: MockWebSocketConstructor,
                 });
 
@@ -1545,8 +1574,9 @@ describe('InspectorClient', () => {
                 await client.close();
 
                 // Verify the request was rejected with "Connection closed" not "Connection closed unexpectedly"
-                await expect(sendPromise).rejects.toThrow(InspectorConnectionError);
-                await expect(sendPromise).rejects.toThrow('Connection closed');
+                const sendError = await sendPromise.catch((e: unknown) => e);
+                expect(sendError).toBeInstanceOf(InspectorConnectionError);
+                expect((sendError as InspectorConnectionError).message).toContain('Connection closed');
                 // If isClosing was false instead of true, handleClose would trigger and reject with "Connection closed unexpectedly"
             });
         });
@@ -1554,8 +1584,8 @@ describe('InspectorClient', () => {
         describe('line 233: ConditionalExpression readyState check mutation', () => {
             it('MUST call ws.close() when readyState is OPEN or CONNECTING', async () => {
                 const client = new InspectorClient({
-                    url:            'ws://localhost:6499',
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                    url: 'ws://localhost:6499',
+
                     WebSocketClass: MockWebSocketConstructor,
                 });
 
@@ -1584,8 +1614,8 @@ describe('InspectorClient', () => {
 
             it('should close WebSocket when readyState is OPEN', async () => {
                 const client = new InspectorClient({
-                    url:            'ws://localhost:6499',
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                    url: 'ws://localhost:6499',
+
                     WebSocketClass: MockWebSocketConstructor,
                 });
 
@@ -1603,8 +1633,8 @@ describe('InspectorClient', () => {
 
             it('should close WebSocket when readyState is CONNECTING', async () => {
                 const client = new InspectorClient({
-                    url:            'ws://localhost:6499',
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                    url: 'ws://localhost:6499',
+
                     WebSocketClass: MockWebSocketConstructor,
                 });
 
@@ -1626,14 +1656,14 @@ describe('InspectorClient', () => {
 
                 // Clean up connection attempt
                 mockWs.simulateOpen();
-                // eslint-disable-next-line @typescript-eslint/no-empty-function -- intentional empty catch for test cleanup
+
                 await connectPromise.catch(() => {});
             });
 
             it('should NOT close WebSocket when readyState is CLOSED', async () => {
                 const client = new InspectorClient({
-                    url:            'ws://localhost:6499',
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                    url: 'ws://localhost:6499',
+
                     WebSocketClass: MockWebSocketConstructor,
                 });
 
@@ -1642,6 +1672,7 @@ describe('InspectorClient', () => {
                 await connectPromise;
 
                 // Manually set WebSocket to CLOSED before calling close
+                // eslint-disable-next-line require-atomic-updates -- mockWs is a test mock; no concurrent access
                 mockWs.readyState = WebSocket.CLOSED;
 
                 // Track if close was called
@@ -1660,8 +1691,8 @@ describe('InspectorClient', () => {
 
             it('should NOT close WebSocket when readyState is CLOSING', async () => {
                 const client = new InspectorClient({
-                    url:            'ws://localhost:6499',
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                    url: 'ws://localhost:6499',
+
                     WebSocketClass: MockWebSocketConstructor,
                 });
 
@@ -1670,6 +1701,7 @@ describe('InspectorClient', () => {
                 await connectPromise;
 
                 // Manually set WebSocket to CLOSING
+                // eslint-disable-next-line require-atomic-updates -- mockWs is a test mock; no concurrent access
                 mockWs.readyState = WebSocket.CLOSING;
 
                 // Track if close was called
@@ -1690,8 +1722,8 @@ describe('InspectorClient', () => {
         describe('line 353: error assignment check', () => {
             it('should NOT assign error when params.error is undefined', async () => {
                 const client = new InspectorClient({
-                    url:            'ws://localhost:6499',
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                    url: 'ws://localhost:6499',
+
                     WebSocketClass: MockWebSocketConstructor,
                 });
 
@@ -1732,8 +1764,8 @@ describe('InspectorClient', () => {
 
             it('should assign error when params.error is present', async () => {
                 const client = new InspectorClient({
-                    url:            'ws://localhost:6499',
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                    url: 'ws://localhost:6499',
+
                     WebSocketClass: MockWebSocketConstructor,
                 });
 
@@ -1777,8 +1809,8 @@ describe('InspectorClient', () => {
         describe('line 367: BlockStatement and ConditionalExpression parentId mutations', () => {
             it('MUST return early when parentId is undefined without building hierarchy', async () => {
                 const client = new InspectorClient({
-                    url:            'ws://localhost:6499',
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                    url: 'ws://localhost:6499',
+
                     WebSocketClass: MockWebSocketConstructor,
                 });
 
@@ -1809,8 +1841,8 @@ describe('InspectorClient', () => {
 
             it('should return just name when parentId is undefined', async () => {
                 const client = new InspectorClient({
-                    url:            'ws://localhost:6499',
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                    url: 'ws://localhost:6499',
+
                     WebSocketClass: MockWebSocketConstructor,
                 });
 
@@ -1839,8 +1871,8 @@ describe('InspectorClient', () => {
 
             it('should build hierarchy when parentId is defined (even if 0)', async () => {
                 const client = new InspectorClient({
-                    url:            'ws://localhost:6499',
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                    url: 'ws://localhost:6499',
+
                     WebSocketClass: MockWebSocketConstructor,
                 });
 
@@ -1881,13 +1913,12 @@ describe('InspectorClient', () => {
 
         describe('line 379: StringLiteral error message mutation', () => {
             it('MUST include non-empty descriptive error message for circular reference', async () => {
-                // eslint-disable-next-line @typescript-eslint/no-empty-function -- intentional mock stub
                 const onError = mock((_error: Error) => {});
 
                 const client = new InspectorClient({
-                    url:            'ws://localhost:6499',
-                    handlers:       { onError },
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                    url:      'ws://localhost:6499',
+                    handlers: { onError },
+
                     WebSocketClass: MockWebSocketConstructor,
                 });
 
@@ -1924,13 +1955,12 @@ describe('InspectorClient', () => {
             });
 
             it('should include exact circular reference error message', async () => {
-                // eslint-disable-next-line @typescript-eslint/no-empty-function -- intentional mock stub
                 const onError = mock((_error: Error) => {});
 
                 const client = new InspectorClient({
-                    url:            'ws://localhost:6499',
-                    handlers:       { onError },
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                    url:      'ws://localhost:6499',
+                    handlers: { onError },
+
                     WebSocketClass: MockWebSocketConstructor,
                 });
 
@@ -1962,8 +1992,8 @@ describe('InspectorClient', () => {
         describe('line 402: BlockStatement and ConditionalExpression handleClose mutations', () => {
             it('MUST distinguish between expected and unexpected close via isClosing flag', async () => {
                 const client = new InspectorClient({
-                    url:            'ws://localhost:6499',
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                    url: 'ws://localhost:6499',
+
                     WebSocketClass: MockWebSocketConstructor,
                 });
 
@@ -1979,20 +2009,17 @@ describe('InspectorClient', () => {
                 // CRITICAL: Must reject with "unexpectedly" because isClosing is false
                 // If the condition were false or block removed, it would not return early
                 // and would always process the close (even when expected)
-                await expect(sendPromise).rejects.toThrow('Connection closed unexpectedly');
+                const sendError = await sendPromise.catch((e: unknown) => e);
+                expect((sendError as Error).message).toContain('Connection closed unexpectedly');
 
                 // The error message MUST contain "unexpectedly" to prove handleClose ran
-                try {
-                    await sendPromise;
-                } catch (error) {
-                    expect((error as Error).message).toContain('unexpectedly');
-                }
+                expect((sendError as Error).message).toContain('unexpectedly');
             });
 
             it('should handle unexpected close when isClosing is false', async () => {
                 const client = new InspectorClient({
-                    url:            'ws://localhost:6499',
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                    url: 'ws://localhost:6499',
+
                     WebSocketClass: MockWebSocketConstructor,
                 });
 
@@ -2006,13 +2033,14 @@ describe('InspectorClient', () => {
                 mockWs.close();
 
                 // Should reject with "Connection closed unexpectedly"
-                await expect(sendPromise).rejects.toThrow('Connection closed unexpectedly');
+                const sendError = await sendPromise.catch((e: unknown) => e);
+                expect((sendError as Error).message).toContain('Connection closed unexpectedly');
             });
 
             it('should NOT process close handler when isClosing is true', async () => {
                 const client = new InspectorClient({
-                    url:            'ws://localhost:6499',
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock WebSocket constructor
+                    url: 'ws://localhost:6499',
+
                     WebSocketClass: MockWebSocketConstructor,
                 });
 
@@ -2032,8 +2060,9 @@ describe('InspectorClient', () => {
 
                 // Should reject with "Connection closed" not "Connection closed unexpectedly"
                 // This verifies that handleClose returned early when isClosing was true
-                await expect(sendPromise).rejects.toThrow('Connection closed');
-                await expect(sendPromise).rejects.not.toThrow('Connection closed unexpectedly');
+                const sendError = await sendPromise.catch((e: unknown) => e);
+                expect((sendError as Error).message).toContain('Connection closed');
+                expect((sendError as Error).message).not.toContain('Connection closed unexpectedly');
             });
         });
     });

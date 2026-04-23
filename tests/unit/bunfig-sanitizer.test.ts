@@ -258,6 +258,65 @@ describe('generateSanitizedBunfig', () => {
             const test = parsed.test as Record<string, unknown>;
             expect(test.randomize).toBe(true);
         });
+
+        it('forwards smol', async () => {
+            // Kills StringLiteral mutant 1353: 'smol' → "" in SAFE_TEST_KEYS
+            mockReadFile.mockResolvedValue('[test]\nsmol = true\n');
+
+            await generateSanitizedBunfig(projectCwd, tmpDir);
+
+            const [, written] = mockWriteFile.mock.calls[0] as [string, string, string];
+            const parsed = parse(written) as Record<string, unknown>;
+            const test = parsed.test as Record<string, unknown>;
+            expect(test.smol).toBe(true);
+        });
+
+        it('forwards rerunEach', async () => {
+            // Kills StringLiteral mutant 1354: 'rerunEach' → "" in SAFE_TEST_KEYS
+            mockReadFile.mockResolvedValue('[test]\nrerunEach = 3\n');
+
+            await generateSanitizedBunfig(projectCwd, tmpDir);
+
+            const [, written] = mockWriteFile.mock.calls[0] as [string, string, string];
+            const parsed = parse(written) as Record<string, unknown>;
+            const test = parsed.test as Record<string, unknown>;
+            expect(test.rerunEach).toBe(3);
+        });
+
+        it('forwards retry', async () => {
+            // Kills StringLiteral mutant 1355: 'retry' → "" in SAFE_TEST_KEYS
+            mockReadFile.mockResolvedValue('[test]\nretry = 2\n');
+
+            await generateSanitizedBunfig(projectCwd, tmpDir);
+
+            const [, written] = mockWriteFile.mock.calls[0] as [string, string, string];
+            const parsed = parse(written) as Record<string, unknown>;
+            const test = parsed.test as Record<string, unknown>;
+            expect(test.retry).toBe(2);
+        });
+
+        it('forwards pathIgnorePatterns', async () => {
+            // Kills StringLiteral mutant 1351: 'pathIgnorePatterns' → "" in SAFE_TEST_KEYS
+            mockReadFile.mockResolvedValue('[test]\npathIgnorePatterns = [\'dist\', \'node_modules\']\n');
+
+            await generateSanitizedBunfig(projectCwd, tmpDir);
+
+            const [, written] = mockWriteFile.mock.calls[0] as [string, string, string];
+            const parsed = parse(written) as Record<string, unknown>;
+            const test = parsed.test as Record<string, unknown>;
+            expect(test.pathIgnorePatterns).toEqual(['dist', 'node_modules']);
+        });
+
+        it('forwards seed', async () => {
+            mockReadFile.mockResolvedValue('[test]\nseed = 42\n');
+
+            await generateSanitizedBunfig(projectCwd, tmpDir);
+
+            const [, written] = mockWriteFile.mock.calls[0] as [string, string, string];
+            const parsed = parse(written) as Record<string, unknown>;
+            const test = parsed.test as Record<string, unknown>;
+            expect(test.seed).toBe(42);
+        });
     });
 
     describe('read errors', () => {
@@ -265,9 +324,8 @@ describe('generateSanitizedBunfig', () => {
             const err = Object.assign(new Error('Permission denied'), { code: 'EACCES' });
             mockReadFile.mockRejectedValue(err);
 
-            await expect(generateSanitizedBunfig(projectCwd, tmpDir)).rejects.toThrow(
-                /Failed to read bunfig\.toml/
-            );
+            const err2 = await generateSanitizedBunfig(projectCwd, tmpDir).catch((e: unknown) => e);
+            expect((err2 as Error).message).toMatch(/Failed to read bunfig\.toml/);
         });
 
         it('does not throw for ENOENT (no bunfig)', async () => {
@@ -324,13 +382,13 @@ describe('cleanupSanitizedBunfig', () => {
     it('does not throw when file does not exist (ENOENT)', async () => {
         mockUnlink.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
 
-        const result = cleanupSanitizedBunfig('/tmp/nonexistent.toml');
-        await expect(result).resolves.toBeUndefined();
+        await cleanupSanitizedBunfig('/tmp/nonexistent.toml');
     });
 
     it('rethrows non-ENOENT errors', async () => {
         mockUnlink.mockRejectedValue(Object.assign(new Error('Permission denied'), { code: 'EACCES' }));
 
-        await expect(cleanupSanitizedBunfig('/tmp/protected.toml')).rejects.toThrow('Permission denied');
+        const err = await cleanupSanitizedBunfig('/tmp/protected.toml').catch((e: unknown) => e);
+        expect((err as Error).message).toContain('Permission denied');
     });
 });

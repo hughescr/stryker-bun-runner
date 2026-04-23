@@ -3,19 +3,19 @@
  * Tests coverage data collection and conversion
  */
 
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
 import { collectCoverage, cleanupCoverageFile } from '../../src/coverage/collector.js';
 import { mockReadFile, mockUnlink, resetFsMocks } from '../test-preload.js';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 
 describe('collectCoverage', () => {
     let tempCoverageFile: string;
-    // eslint-disable-next-line @typescript-eslint/no-empty-function -- intentional mock to suppress output
+
     const makeLogger = () => ({ warn: mock(() => {}) });
 
     beforeEach(() => {
-        tempCoverageFile = join(tmpdir(), `test-coverage-${Date.now()}.json`);
+        tempCoverageFile = path.join(tmpdir(), `test-coverage-${Date.now()}.json`);
         // Clear the mock state before each test
         mockReadFile.mockClear();
     });
@@ -28,13 +28,13 @@ describe('collectCoverage', () => {
     describe('successful collection', () => {
         it('should convert array format to Record<string, number> format', async () => {
             // JSON lines format: one JSON object per line
-            const jsonLines = JSON.stringify({
+            const jsonLines = `${JSON.stringify({
                 perTest: {
                     'test-1': ['1', '2', '3'],
                     'test-2': ['4', '5'],
                 },
                 'static': ['6', '7'],
-            }) + '\n';
+            })}\n`;
 
             mockReadFile.mockResolvedValue(jsonLines);
 
@@ -53,10 +53,10 @@ describe('collectCoverage', () => {
 
         it('should handle empty coverage data', async () => {
             // JSON lines format: one JSON object per line
-            const jsonLines = JSON.stringify({
+            const jsonLines = `${JSON.stringify({
                 perTest:  {},
                 'static': [],
-            }) + '\n';
+            })}\n`;
 
             mockReadFile.mockResolvedValue(jsonLines);
 
@@ -69,12 +69,12 @@ describe('collectCoverage', () => {
 
         it('should handle coverage with only perTest data', async () => {
             // JSON lines format: one JSON object per line
-            const jsonLines = JSON.stringify({
+            const jsonLines = `${JSON.stringify({
                 perTest: {
                     'test-1': ['1', '2'],
                 },
                 'static': [],
-            }) + '\n';
+            })}\n`;
 
             mockReadFile.mockResolvedValue(jsonLines);
 
@@ -88,10 +88,10 @@ describe('collectCoverage', () => {
 
         it('should handle coverage with only static data', async () => {
             // JSON lines format: one JSON object per line
-            const jsonLines = JSON.stringify({
+            const jsonLines = `${JSON.stringify({
                 perTest:  {},
                 'static': ['1', '2', '3'],
-            }) + '\n';
+            })}\n`;
 
             mockReadFile.mockResolvedValue(jsonLines);
 
@@ -107,14 +107,14 @@ describe('collectCoverage', () => {
 
         it('should handle multiple tests with overlapping mutant coverage', async () => {
             // JSON lines format: one JSON object per line
-            const jsonLines = JSON.stringify({
+            const jsonLines = `${JSON.stringify({
                 perTest: {
                     'test-1': ['1', '2', '3'],
                     'test-2': ['2', '3', '4'],
                     'test-3': ['1', '4', '5'],
                 },
                 'static': ['6'],
-            }) + '\n';
+            })}\n`;
 
             mockReadFile.mockResolvedValue(jsonLines);
 
@@ -129,12 +129,12 @@ describe('collectCoverage', () => {
 
         it('should set all hit counts to 1', async () => {
             // JSON lines format: one JSON object per line
-            const jsonLines = JSON.stringify({
+            const jsonLines = `${JSON.stringify({
                 perTest: {
                     'test-1': ['1', '2', '3', '4', '5'],
                 },
                 'static': ['10', '20'],
-            }) + '\n';
+            })}\n`;
 
             mockReadFile.mockResolvedValue(jsonLines);
 
@@ -151,8 +151,8 @@ describe('collectCoverage', () => {
         it('should merge coverage from multiple JSON lines', async () => {
             // Multiple test files writing to the same coverage file
             const jsonLines
-                = JSON.stringify({ perTest: { 'test-1': ['1', '2'] }, 'static': ['6', '7'] }) + '\n'
-                  + JSON.stringify({ perTest: { 'test-2': ['3', '4'] }, 'static': ['8', '9'] }) + '\n';
+                = `${JSON.stringify({ perTest: { 'test-1': ['1', '2'] }, 'static': ['6', '7'] })}\n${
+                    JSON.stringify({ perTest: { 'test-2': ['3', '4'] }, 'static': ['8', '9'] })}\n`;
 
             mockReadFile.mockResolvedValue(jsonLines);
 
@@ -174,9 +174,9 @@ describe('collectCoverage', () => {
         it('should deduplicate static coverage across JSON lines', async () => {
             // Multiple test files may cover the same static mutants
             const jsonLines
-                = JSON.stringify({ perTest: { 'test-1': ['1'] }, 'static': ['6', '7', '8'] }) + '\n'
-                  + JSON.stringify({ perTest: { 'test-2': ['2'] }, 'static': ['7', '8', '9'] }) + '\n'
-                  + JSON.stringify({ perTest: { 'test-3': ['3'] }, 'static': ['8', '9', '10'] }) + '\n';
+                = `${JSON.stringify({ perTest: { 'test-1': ['1'] }, 'static': ['6', '7', '8'] })}\n${
+                    JSON.stringify({ perTest: { 'test-2': ['2'] }, 'static': ['7', '8', '9'] })}\n${
+                    JSON.stringify({ perTest: { 'test-3': ['3'] }, 'static': ['8', '9', '10'] })}\n`;
 
             mockReadFile.mockResolvedValue(jsonLines);
 
@@ -198,8 +198,8 @@ describe('collectCoverage', () => {
             // This shouldn't happen in normal operation, but we handle it safely
             // Kills mutation 241: tests the else branch on line 42 where !merged.perTest[testId] is false
             const jsonLines
-                = JSON.stringify({ perTest: { 'test-1': ['1', '2'] }, 'static': [] }) + '\n'
-                  + JSON.stringify({ perTest: { 'test-1': ['3', '4'] }, 'static': [] }) + '\n';
+                = `${JSON.stringify({ perTest: { 'test-1': ['1', '2'] }, 'static': [] })}\n${
+                    JSON.stringify({ perTest: { 'test-1': ['3', '4'] }, 'static': [] })}\n`;
 
             mockReadFile.mockResolvedValue(jsonLines);
 
@@ -221,9 +221,9 @@ describe('collectCoverage', () => {
             // The condition !merged.perTest[testId] must be true for first occurrence
             // and false for subsequent occurrences
             const jsonLines
-                = JSON.stringify({ perTest: { 'test-1': ['1', '2', '3'] }, 'static': [] }) + '\n'
-                  + JSON.stringify({ perTest: { 'test-1': ['2', '3', '4'] }, 'static': [] }) + '\n'
-                  + JSON.stringify({ perTest: { 'test-1': ['3', '4', '5'] }, 'static': [] }) + '\n';
+                = `${JSON.stringify({ perTest: { 'test-1': ['1', '2', '3'] }, 'static': [] })}\n${
+                    JSON.stringify({ perTest: { 'test-1': ['2', '3', '4'] }, 'static': [] })}\n${
+                    JSON.stringify({ perTest: { 'test-1': ['3', '4', '5'] }, 'static': [] })}\n`;
 
             mockReadFile.mockResolvedValue(jsonLines);
 
@@ -249,7 +249,7 @@ describe('collectCoverage', () => {
                     'static': [`${i + 100}`],
                 }));
             }
-            const jsonLines = lines.join('\n') + '\n';
+            const jsonLines = `${lines.join('\n')}\n`;
 
             mockReadFile.mockResolvedValue(jsonLines);
 
@@ -272,11 +272,11 @@ describe('collectCoverage', () => {
         it('should skip invalid JSON lines but process valid ones', async () => {
             // Mix of valid and invalid lines
             const jsonLines
-                = JSON.stringify({ perTest: { 'test-1': ['1'] }, 'static': ['6'] }) + '\n'
-                  + '{ invalid json here }\n'
-                  + JSON.stringify({ perTest: { 'test-2': ['2'] }, 'static': ['7'] }) + '\n'
-                  + 'also not valid\n'
-                  + JSON.stringify({ perTest: { 'test-3': ['3'] }, 'static': ['8'] }) + '\n';
+                = `${JSON.stringify({ perTest: { 'test-1': ['1'] }, 'static': ['6'] })}\n`
+                  + `{ invalid json here }\n${
+                      JSON.stringify({ perTest: { 'test-2': ['2'] }, 'static': ['7'] })}\n`
+                      + `also not valid\n${
+                          JSON.stringify({ perTest: { 'test-3': ['3'] }, 'static': ['8'] })}\n`;
 
             mockReadFile.mockResolvedValue(jsonLines);
 
@@ -302,9 +302,9 @@ describe('collectCoverage', () => {
             const logger = makeLogger();
 
             const jsonLines
-                = JSON.stringify({ perTest: { 'test-1': ['1'] }, 'static': [] }) + '\n'
-                  + '{ this is invalid json and will throw }\n'
-                  + JSON.stringify({ perTest: { 'test-2': ['2'] }, 'static': [] }) + '\n';
+                = `${JSON.stringify({ perTest: { 'test-1': ['1'] }, 'static': [] })}\n`
+                  + `{ this is invalid json and will throw }\n${
+                      JSON.stringify({ perTest: { 'test-2': ['2'] }, 'static': [] })}\n`;
 
             mockReadFile.mockResolvedValue(jsonLines);
 
@@ -352,7 +352,7 @@ describe('collectCoverage', () => {
 
         it('should return undefined when coverage data has wrong structure', async () => {
             // Data with missing required fields will cause errors during merge
-            const jsonLines = JSON.stringify({ wrong: 'structure' }) + '\n';
+            const jsonLines = `${JSON.stringify({ wrong: 'structure' })}\n`;
 
             mockReadFile.mockResolvedValue(jsonLines);
 
@@ -376,11 +376,11 @@ describe('collectCoverage', () => {
             // This test kills mutations on line 83: .filter(line => line.length > 0)
             // If the filter is removed or mutated, empty lines would cause JSON.parse errors
             const jsonLines
-                = JSON.stringify({ perTest: { 'test-1': ['1'] }, 'static': ['6'] }) + '\n'
+                = `${JSON.stringify({ perTest: { 'test-1': ['1'] }, 'static': ['6'] })}\n`
                   + '\n'  // Empty line that should be filtered out
-                  + '\n'  // Another empty line
-                  + JSON.stringify({ perTest: { 'test-2': ['2'] }, 'static': ['7'] }) + '\n'
-                  + '\n';  // Trailing empty line
+                  + `\n${// Another empty line
+                      JSON.stringify({ perTest: { 'test-2': ['2'] }, 'static': ['7'] })}\n`
+                      + '\n';  // Trailing empty line
 
             mockReadFile.mockResolvedValue(jsonLines);
 
@@ -427,12 +427,12 @@ describe('collectCoverage', () => {
             // Tests the full chain: trim().split('\n').filter(line => line.length > 0)
             // Ensures whitespace-only lines are trimmed to empty strings and then filtered out
             const jsonLines
-                = '  \n'  // Leading whitespace line
-                  + JSON.stringify({ perTest: { 'test-1': ['1'] }, 'static': [] }) + '\n'
-                  + '\t\t\n'  // Tab-only line
-                  + '\n'  // Empty line
-                  + '   \t  \n'  // Mixed whitespace
-                  + JSON.stringify({ perTest: { 'test-2': ['2'] }, 'static': [] }) + '\n';
+                = `  \n${// Leading whitespace line
+                    JSON.stringify({ perTest: { 'test-1': ['1'] }, 'static': [] })}\n`
+                    + '\t\t\n'  // Tab-only line
+                    + '\n'  // Empty line
+                    + `   \t  \n${// Mixed whitespace
+                        JSON.stringify({ perTest: { 'test-2': ['2'] }, 'static': [] })}\n`;
 
             mockReadFile.mockResolvedValue(jsonLines);
 
@@ -463,7 +463,7 @@ describe('collectCoverage', () => {
 
         it('should handle single valid line with trailing whitespace', async () => {
             // Tests trim() effectiveness on lines with trailing spaces
-            const jsonLines = JSON.stringify({ perTest: { 'test-1': ['1'] }, 'static': [] }) + '   \n';
+            const jsonLines = `${JSON.stringify({ perTest: { 'test-1': ['1'] }, 'static': [] })}   \n`;
 
             mockReadFile.mockResolvedValue(jsonLines);
 
@@ -477,7 +477,7 @@ describe('collectCoverage', () => {
             // Specifically tests filter(line => line.length > 0)
             // After trim and split, ensure empty strings are removed
             const jsonLines
-                = JSON.stringify({ perTest: { 'test-1': ['1'] }, 'static': [] }) + '\n'
+                = `${JSON.stringify({ perTest: { 'test-1': ['1'] }, 'static': [] })}\n`
                   + ''  // Empty string after split
                   + '\n'
                   + '';  // Another empty string
@@ -495,9 +495,9 @@ describe('collectCoverage', () => {
             // Mutation 249: content.trim().split('\\n').filter(line => line.length > 0) → content.trim().split('\\n')
             // If filter is removed, empty lines would cause JSON.parse to fail
             const jsonLines
-                = JSON.stringify({ perTest: { 'test-1': ['1'] }, 'static': [] }) + '\n'
-                  + '\n'  // This empty line MUST be filtered out
-                  + JSON.stringify({ perTest: { 'test-2': ['2'] }, 'static': [] }) + '\n';
+                = `${JSON.stringify({ perTest: { 'test-1': ['1'] }, 'static': [] })}\n`
+                  + `\n${// This empty line MUST be filtered out
+                      JSON.stringify({ perTest: { 'test-2': ['2'] }, 'static': [] })}\n`;
 
             mockReadFile.mockResolvedValue(jsonLines);
 
@@ -511,7 +511,7 @@ describe('collectCoverage', () => {
         it('should kill mutation 250: trim method must exist', async () => {
             // Mutation 250: content.trim().split('\\n') → content.split('\\n')
             // If trim is removed, leading/trailing whitespace would remain
-            const jsonLines = '  \n' + JSON.stringify({ perTest: { 'test-1': ['1'] }, 'static': [] }) + '\n  ';
+            const jsonLines = `  \n${JSON.stringify({ perTest: { 'test-1': ['1'] }, 'static': [] })}\n  `;
 
             mockReadFile.mockResolvedValue(jsonLines);
 
@@ -526,9 +526,9 @@ describe('collectCoverage', () => {
             // Mutation 255: line.length > 0 → line.length >= 0
             // Zero-length lines should be filtered out, not kept
             const jsonLines
-                = JSON.stringify({ perTest: { 'test-1': ['1'] }, 'static': [] }) + '\n'
-                  + '\n'  // Zero-length line after trim
-                  + JSON.stringify({ perTest: { 'test-2': ['2'] }, 'static': [] }) + '\n';
+                = `${JSON.stringify({ perTest: { 'test-1': ['1'] }, 'static': [] })}\n`
+                  + `\n${// Zero-length line after trim
+                      JSON.stringify({ perTest: { 'test-2': ['2'] }, 'static': [] })}\n`;
 
             mockReadFile.mockResolvedValue(jsonLines);
 
@@ -544,10 +544,10 @@ describe('collectCoverage', () => {
             // Mutation 253: filter(line => line.length > 0) → filter(line => true)
             // If condition is always true, empty lines would not be filtered
             const jsonLines
-                = JSON.stringify({ perTest: { 'test-1': ['1'] }, 'static': [] }) + '\n'
+                = `${JSON.stringify({ perTest: { 'test-1': ['1'] }, 'static': [] })}\n`
                   + '\n'
-                  + '\n'
-                  + JSON.stringify({ perTest: { 'test-2': ['2'] }, 'static': [] }) + '\n';
+                  + `\n${
+                      JSON.stringify({ perTest: { 'test-2': ['2'] }, 'static': [] })}\n`;
 
             mockReadFile.mockResolvedValue(jsonLines);
 
@@ -564,10 +564,10 @@ describe('collectCoverage', () => {
             // This test kills mutations on line 34: static: [] → ["Stryker was here"]
             // If static is pre-populated, the first coverage data would incorrectly
             // include mutants that weren't actually covered
-            const jsonLines = JSON.stringify({
+            const jsonLines = `${JSON.stringify({
                 perTest:  { 'test-1': ['1'] },
                 'static': [],  // Explicitly empty - no static coverage
-            }) + '\n';
+            })}\n`;
 
             mockReadFile.mockResolvedValue(jsonLines);
 
@@ -582,8 +582,8 @@ describe('collectCoverage', () => {
             // Kills mutation 236: Verifies that merged.static starts as [] on line 34
             // If it started with ["Stryker was here"], the result would include that mutant
             const jsonLines
-                = JSON.stringify({ perTest: {}, 'static': [] }) + '\n'
-                  + JSON.stringify({ perTest: {}, 'static': [] }) + '\n';
+                = `${JSON.stringify({ perTest: {}, 'static': [] })}\n${
+                    JSON.stringify({ perTest: {}, 'static': [] })}\n`;
 
             mockReadFile.mockResolvedValue(jsonLines);
 
@@ -596,9 +596,9 @@ describe('collectCoverage', () => {
         it('should handle multiple coverage entries with initially empty static', async () => {
             // Verify that static array merging works correctly when starting empty
             const jsonLines
-                = JSON.stringify({ perTest: { 'test-1': ['1'] }, 'static': [] }) + '\n'
-                  + JSON.stringify({ perTest: { 'test-2': ['2'] }, 'static': ['10'] }) + '\n'
-                  + JSON.stringify({ perTest: { 'test-3': ['3'] }, 'static': ['20', '30'] }) + '\n';
+                = `${JSON.stringify({ perTest: { 'test-1': ['1'] }, 'static': [] })}\n${
+                    JSON.stringify({ perTest: { 'test-2': ['2'] }, 'static': ['10'] })}\n${
+                    JSON.stringify({ perTest: { 'test-3': ['3'] }, 'static': ['20', '30'] })}\n`;
 
             mockReadFile.mockResolvedValue(jsonLines);
 
@@ -616,12 +616,12 @@ describe('collectCoverage', () => {
     describe('data format conversion', () => {
         it('should handle numeric mutant IDs as strings', async () => {
             // JSON lines format: one JSON object per line
-            const jsonLines = JSON.stringify({
+            const jsonLines = `${JSON.stringify({
                 perTest: {
                     'test-1': ['1', '2', '3'],
                 },
                 'static': ['10', '20', '30'],
-            }) + '\n';
+            })}\n`;
 
             mockReadFile.mockResolvedValue(jsonLines);
 
@@ -635,12 +635,12 @@ describe('collectCoverage', () => {
         it('should handle large numbers of mutants', async () => {
             const mutants = Array.from({ length: 1000 }, (_, i) => String(i));
             // JSON lines format: one JSON object per line
-            const jsonLines = JSON.stringify({
+            const jsonLines = `${JSON.stringify({
                 perTest: {
                     'test-1': mutants,
                 },
                 'static': [],
-            }) + '\n';
+            })}\n`;
 
             mockReadFile.mockResolvedValue(jsonLines);
 
@@ -651,14 +651,14 @@ describe('collectCoverage', () => {
 
         it('should handle test IDs with special characters', async () => {
             // JSON lines format: one JSON object per line
-            const jsonLines = JSON.stringify({
+            const jsonLines = `${JSON.stringify({
                 perTest: {
                     'should handle "quotes"': ['1'],
                     'should handle spaces':   ['2'],
                     'should-handle-dashes':   ['3'],
                 },
                 'static': [],
-            }) + '\n';
+            })}\n`;
 
             mockReadFile.mockResolvedValue(jsonLines);
 

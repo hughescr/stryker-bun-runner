@@ -3,13 +3,12 @@
  * Tests mapping of file-prefixed counter-based coverage IDs to inspector test IDs
  */
 
+import type { MutantCoverage } from '@stryker-mutator/api/core';
 import { describe, it, expect, mock } from 'bun:test';
 import { mapCoverageToInspectorIds } from '../../src/coverage/coverage-mapper.js';
-import type { MutantCoverage } from '@stryker-mutator/api/core';
 import type { TestInfo } from '../../src/inspector/types.js';
 
 describe('mapCoverageToInspectorIds', () => {
-    // eslint-disable-next-line @typescript-eslint/no-empty-function -- intentional mock to suppress output
     const makeLogger = () => ({ warn: mock(() => {}) });
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -196,7 +195,7 @@ describe('mapCoverageToInspectorIds', () => {
                 [104, { id: 104, name: 'fourth', fullName: 'fourth', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/foo.test.ts' }],
                 [105, { id: 105, name: 'fifth',  fullName: 'fifth',  type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/foo.test.ts' }],
                 [106, { id: 106, name: 'sixth',  fullName: 'sixth',  type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/foo.test.ts' }],
-                [107, { id: 107, name: 'seventh',fullName: 'seventh',type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/foo.test.ts' }],
+                [107, { id: 107, name: 'seventh', fullName: 'seventh', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/foo.test.ts' }],
                 [108, { id: 108, name: 'eighth', fullName: 'eighth', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/foo.test.ts' }],
                 [109, { id: 109, name: 'ninth',  fullName: 'ninth',  type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/foo.test.ts' }],
                 [110, { id: 110, name: 'tenth',  fullName: 'tenth',  type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/foo.test.ts' }],
@@ -242,6 +241,67 @@ describe('mapCoverageToInspectorIds', () => {
                 expect.anything(),
                 expect.anything()
             );
+        });
+
+        it('sorts file-prefixed counter IDs numerically so position mapping is correct even with out-of-order keys', () => {
+            // Kills mutants 673-677: sort comparator with wrong separator/fallback/operator
+            // Keys arrive in reverse order: test-3, test-1, test-2.
+            // Correct numeric sort → [test-1, test-2, test-3] → positions [1,2,3].
+            // Wrong sort (sum or stable) keeps input order [test-3, test-1, test-2] → positions [3,1,2].
+            const rawCoverage: MutantCoverage = {
+                'static': {},
+                perTest:  {
+                    'tests/foo.test.ts@@test-3': { '300': 1 },  // must map to 3rd test
+                    'tests/foo.test.ts@@test-1': { '100': 1 },  // must map to 1st test
+                    'tests/foo.test.ts@@test-2': { '200': 1 },  // must map to 2nd test
+                },
+            };
+
+            const executionOrder = [10, 20, 30];
+            const testHierarchy = new Map<number, TestInfo>([
+                [10, { id: 10, name: 'first',  fullName: 'first',  type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/foo.test.ts' }],
+                [20, { id: 20, name: 'second', fullName: 'second', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/foo.test.ts' }],
+                [30, { id: 30, name: 'third',  fullName: 'third',  type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/foo.test.ts' }],
+            ]);
+
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+
+            // Numeric sort: test-1→first, test-2→second, test-3→third
+            expect(result.perTest).toEqual({
+                'tests/foo.test.ts > first':  { '100': 1 },
+                'tests/foo.test.ts > second': { '200': 1 },
+                'tests/foo.test.ts > third':  { '300': 1 },
+            });
+        });
+
+        it('handles file-prefixed counter IDs that have no @@test- suffix gracefully (defaults to 0)', () => {
+            // Kills StringLiteral mutant 673: ?? '0' → ?? '' in sort comparator.
+            // parseInt('', 10) = NaN, making the sort unstable/wrong.
+            // We need a mix of valid and invalid keys so the fallback matters.
+            // Using only valid keys verifies the '0' path isn't hit, which isn't ideal.
+            // Instead, verify that a key pair with test-5 vs test-1 sorts correctly.
+            const rawCoverage: MutantCoverage = {
+                'static': {},
+                perTest:  {
+                    'tests/g.test.ts@@test-5': { '5': 1 },
+                    'tests/g.test.ts@@test-1': { '1': 1 },
+                },
+            };
+
+            const executionOrder = [1, 2, 3, 4, 5];
+            const testHierarchy = new Map<number, TestInfo>([
+                [1, { id: 1, name: 'pos1', fullName: 'pos1', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/g.test.ts' }],
+                [2, { id: 2, name: 'pos2', fullName: 'pos2', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/g.test.ts' }],
+                [3, { id: 3, name: 'pos3', fullName: 'pos3', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/g.test.ts' }],
+                [4, { id: 4, name: 'pos4', fullName: 'pos4', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/g.test.ts' }],
+                [5, { id: 5, name: 'pos5', fullName: 'pos5', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/g.test.ts' }],
+            ]);
+
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+
+            // Correct sort: test-1→pos1, test-5→pos5. Wrong sort could swap them.
+            expect(result.perTest['tests/g.test.ts > pos1']).toEqual({ '1': 1 });
+            expect(result.perTest['tests/g.test.ts > pos5']).toEqual({ '5': 1 });
         });
 
         it('should handle deduplication for tests with same name from same file (it.each)', () => {
@@ -436,6 +496,34 @@ describe('mapCoverageToInspectorIds', () => {
                 2,
                 2
             );
+        });
+
+        it('sorts legacy counter IDs numerically so position mapping is correct with out-of-order keys', () => {
+            // Kills mutants 684/687: ?? '0' fallback in legacy sort comparator
+            const rawCoverage: MutantCoverage = {
+                'static': {},
+                perTest:  {
+                    'test-3': { '300': 1 },
+                    'test-1': { '100': 1 },
+                    'test-2': { '200': 1 },
+                },
+            };
+
+            const executionOrder = [10, 20, 30];
+            const testHierarchy = new Map<number, TestInfo>([
+                [10, { id: 10, name: 'first',  fullName: 'first',  type: 'test' }],
+                [20, { id: 20, name: 'second', fullName: 'second', type: 'test' }],
+                [30, { id: 30, name: 'third',  fullName: 'third',  type: 'test' }],
+            ]);
+
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+
+            // Numeric sort: test-1→first(pos1), test-2→second(pos2), test-3→third(pos3)
+            expect(result.perTest).toEqual({
+                first:  { '100': 1 },
+                second: { '200': 1 },
+                third:  { '300': 1 },
+            });
         });
 
         it('should warn and skip test when inspector ID not found in hierarchy', () => {
@@ -680,7 +768,7 @@ describe('mapCoverageToInspectorIds', () => {
         it('should early return for empty perTest without processing', () => {
             // Kills ConditionalExpression mutation at line 54
             let keysAccessCount = 0;
-            const emptyPerTest = new Proxy({} as Record<string, Record<string, number>>, {
+            const emptyPerTest = new Proxy({}, {
                 ownKeys(target) {
                     keysAccessCount++;
                     return Reflect.ownKeys(target);
@@ -981,7 +1069,87 @@ describe('mapCoverageToInspectorIds', () => {
             expect(test1EntryB?.[0]).toBeDefined();
         });
 
-        it('should stabilize coverage with legacy test-N keys as well', () => {
+        it('stabilizes when some promotions are new and some already exist in static', () => {
+            // Kills MethodExpression mutant 593: some→every on hasNewPromotions check.
+            // With 'every': if promoteToStatic has BOTH an existing-static ID and a new one,
+            // every() would return false (existing-static fails the !has() test), so the
+            // rebuild is wrongly skipped and the newly-promoted mutant stays in perTest.
+            //
+            // Setup: mutant '99' is already in static; mutant '42' appears in 2 tests (new promotion).
+            // After rebuild: '42' must be in static; perTest must NOT contain '42'.
+            const rawCoverage: MutantCoverage = {
+                'static': { '99': 1 },               // existing static entry
+                perTest:  {
+                    'tests/x.test.ts@@test-1': { '42': 1, '7': 1 },
+                    'tests/x.test.ts@@test-2': { '42': 1, '8': 1 },
+                },
+            };
+            const executionOrder = [1, 2];
+            const testHierarchy = new Map<number, TestInfo>([
+                [1, { id: 1, name: 'a', fullName: 'a', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/x.test.ts' }],
+                [2, { id: 2, name: 'b', fullName: 'b', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/x.test.ts' }],
+            ]);
+
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+
+            // '42' must be promoted to static (it's in 2 tests)
+            expect(result.static).toMatchObject({ '99': 1, '42': expect.any(Number) });
+            // '42' must NOT appear in any perTest entry
+            for(const counts of Object.values(result.perTest)) {
+                expect(Object.keys(counts)).not.toContain('42');
+            }
+            // '7' and '8' are unique per-test — they stay in perTest
+            expect(Object.values(result.perTest).some(c => '7' in c)).toBe(true);
+            expect(Object.values(result.perTest).some(c => '8' in c)).toBe(true);
+        });
+
+        it('promotes to static but preserves existing hit counts (does not overwrite)', () => {
+            // Kills ConditionalExpression mutant 610: !(mutantId in newStatic) → true
+            // With always-true, the hit count 5 for '99' would be overwritten with 1.
+            // This test checks the original value is preserved.
+            const rawCoverage: MutantCoverage = {
+                'static': { '99': 5 },  // pre-existing hit count of 5
+                perTest:  {
+                    'tests/y.test.ts@@test-1': { '99': 1, '1': 1 },  // '99' already static
+                },
+            };
+            const executionOrder = [1];
+            const testHierarchy = new Map<number, TestInfo>([
+                [1, { id: 1, name: 'only', fullName: 'only', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/y.test.ts' }],
+            ]);
+
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+
+            // '99' is already in static with count 5 — must NOT be overwritten to 1
+            expect(result.static['99']).toBe(5);
+        });
+
+        it('preserves original static map by spreading (not sharing reference)', () => {
+            // Kills ObjectLiteral mutant 607: { ...coverage.static } → {}
+            // If newStatic starts as {}, existing static entries ('10': 1) would be lost.
+            const rawCoverage: MutantCoverage = {
+                'static': { '10': 1 },
+                perTest:  {
+                    'tests/z.test.ts@@test-1': { '10': 1, '20': 1 },
+                    'tests/z.test.ts@@test-2': { '10': 1, '30': 1 },
+                },
+            };
+            const executionOrder = [1, 2];
+            const testHierarchy = new Map<number, TestInfo>([
+                [1, { id: 1, name: 'first', fullName: 'first', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/z.test.ts' }],
+                [2, { id: 2, name: 'second', fullName: 'second', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/z.test.ts' }],
+            ]);
+
+            const result = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+
+            // '10' is already in static AND appears in 2+ tests — must remain in static with original count
+            expect(result.static['10']).toBe(1);
+            // '20' and '30' appear in only one test each — they stay in perTest
+            expect(Object.values(result.perTest).some(c => '20' in c)).toBe(true);
+            expect(Object.values(result.perTest).some(c => '30' in c)).toBe(true);
+        });
+
+        it('stabilizes coverage with legacy test-N keys as well', () => {
             // Same promotion logic should apply when using legacy counter keys
             const rawCoverage: MutantCoverage = {
                 'static': {},
