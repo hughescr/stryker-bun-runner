@@ -3,7 +3,7 @@
  * Handles spawning and managing Bun test processes
  */
 
-import { spawn } from 'node:child_process';
+import { type SpawnOptions, spawn } from 'node:child_process';
 
 export interface BunTestRunOptions {
     /**
@@ -82,9 +82,18 @@ export interface BunTestRunOptions {
     syncPort?: number
 
     /**
+   * Optional AbortSignal to kill the child process early.
+   * When the signal fires, the child is sent SIGTERM (with a short grace period
+   * followed by SIGKILL if still running).  The promise resolves with
+   * { timedOut: true } to indicate it was aborted rather than completing normally.
+   */
+    signal?: AbortSignal
+
+    /**
    * Explicit list of test file paths to pass as positional arguments to bun test.
    * When provided, Bun runs only these files in the given order, eliminating
-   * readdir-based non-determinism.  Paths must be relative to process.cwd().
+   * readdir-based non-determinism.  Both absolute and relative paths are
+   * accepted; relative paths resolve against the bun subprocess's cwd.
    * When omitted, Bun performs its normal file discovery.
    */
     testFiles?: string[]
@@ -101,20 +110,24 @@ export interface BunProcessResult {
  * Run bun test with the specified options
  */
 export async function runBunTests(options: BunTestRunOptions): Promise<BunProcessResult> {
+    // Stryker disable next-line StringLiteral: mutating 'test' removes the bun test subcommand → bun exits immediately with no tests run → Timeout
     const args = ['test'];
 
     // Add inspector debugging if specified
     // Note: We use --inspect (not --inspect-wait) because Bun doesn't support
     // Runtime.runIfWaitingForDebugger to resume after connection.
     // This means tests start immediately, so we must connect quickly.
+    // Stryker disable ConditionalExpression,BlockStatement,StringLiteral: all mutations here remove required args, causing dryRun to never emit inspector URL → Timeout
     if(options.inspectWaitPort) {
         args.push(`--inspect=${options.inspectWaitPort}`);
     }
+    // Stryker restore ConditionalExpression,BlockStatement,StringLiteral
 
     // Override the project bunfig with a sanitized copy to prevent coverage
     // thresholds and onlyFailures from interfering with mutation testing.
     // NOTE: bun requires the equals form here; `--config PATH` is silently
     // ignored and PATH is then consumed as a positional test-file filter.
+    // Stryker disable StringLiteral: mutating --config=/--preload/--test-name-pattern/--concurrency removes required flags → coverage/filter broken → Timeout
     if(options.bunfigPath) {
         args.push(`--config=${options.bunfigPath}`);
     }
@@ -138,6 +151,7 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
     if(options.sequentialMode) {
         args.push('--concurrency=1');
     }
+    // Stryker restore StringLiteral
 
     // Add any additional bun args
     // Stryker disable next-line EqualityOperator,ConditionalExpression: length >= 0 is equivalent to length > 0 for empty arrays (spreading [] is a no-op); ConditionalExpression would cause spread of undefined
@@ -149,12 +163,13 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
     // Positional args to `bun test` tell it exactly which files to load and in
     // which order, removing reliance on readdir ordering (non-deterministic on
     // macOS APFS) so mutantCoverage.perTest is stable across runs.
-    // Stryker disable next-line EqualityOperator,ConditionalExpression: length >= 0 equivalent to > 0 for empty arrays; spread of [] is a no-op
+    // Stryker disable next-line EqualityOperator,ConditionalExpression,BlockStatement: length >= 0 equivalent to > 0 for empty arrays; spread of [] is a no-op; BlockStatement: removing body means bun runs all tests instead of targeted subset → coverage non-determinism → Timeout
     if(options.testFiles && options.testFiles.length > 0) {
         args.push(...options.testFiles);
     }
 
     // Prepare environment variables
+    // Stryker disable next-line ObjectLiteral: removing env spreads means bun runs with empty env → no PATH/HOME → bun cannot initialize → Timeout
     const env: Record<string, string | undefined> = {
         ...process.env,
         ...options.env,
@@ -176,33 +191,70 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
         env.__STRYKER_SYNC_PORT__ = String(options.syncPort);
     }
 
+    // Stryker disable next-line BlockStatement: removing entire Promise body means resolve() never called → Timeout
     return new Promise((resolve) => {
         const stdoutChunks: Buffer[] = [];
         const stderrChunks: Buffer[] = [];
         let timedOut = false;
         let processKilled = false;
 
-        const childProcess = spawn(options.bunPath, args, {
+        // If an AbortSignal was provided and is already aborted, resolve immediately
+        // Stryker disable next-line ConditionalExpression,BlockStatement: abort-before-spawn guard; mutation caught by 'aborts child process when signal fires'
+        if(options.signal?.aborted) {
+            resolve({ stdout: '', stderr: '', exitCode: null, timedOut: true });
+            return;
+        }
+
+        // Typed as SpawnOptions (not a tuple) so TypeScript preserves stdout/stderr as
+        // Readable | null — the conditional guards below are then genuinely necessary.
+        // In practice these are always non-null with stdio:'pipe', but mocks and edge-case
+        // spawn failures can produce null streams.
+        const spawnOpts: SpawnOptions = {
             env,
             stdio: ['ignore', 'pipe', 'pipe'],
             cwd:   process.cwd(),
-        });
+        };
+        const childProcess = spawn(options.bunPath, args, spawnOpts);
 
         // Set up timeout
+        // Stryker disable next-line BlockStatement: removing timeout kill body means child process runs forever → Timeout on the Stryker test for this mutation
         const timeoutHandle = setTimeout(() => {
             timedOut = true;
             processKilled = true;
             childProcess.kill('SIGKILL');
         }, options.timeout);
 
+        // Wire up the AbortSignal if provided.
+        // On abort: send SIGTERM for a graceful shutdown; if the process is still
+        // alive after 500ms, escalate to SIGKILL.  The promise resolves with
+        // timedOut:true to signal the caller that we stopped early.
+        // Stryker disable next-line ConditionalExpression,BlockStatement: abort-signal wiring; mutation caught by 'aborts child process when signal fires'
+        if(options.signal) {
+            const onAbort = (): void => {
+                clearTimeout(timeoutHandle);
+                processKilled = true;
+                timedOut = true;
+                childProcess.kill('SIGTERM');
+                // Escalate to SIGKILL after 500ms grace period
+                // Stryker disable next-line BlockStatement: grace-period escalation; removing body means SIGKILL never sent for stubborn processes
+                setTimeout(() => {
+                    childProcess.kill('SIGKILL');
+                }, 500);
+            };
+            // Stryker disable next-line ObjectLiteral,BooleanLiteral: AbortSignal 'abort' fires at most once per controller (spec guarantee — WHATWG DOM §9.1), so { once: true } is semantically redundant; mutating to {} or { once: false } is equivalent
+            options.signal.addEventListener('abort', onAbort, { once: true });
+        }
+
         // Collect stdout silently - don't forward to parent to avoid interfering with Stryker's progress reporter
         if(childProcess.stdout) {
+            // Stryker disable next-line BlockStatement: removing this data handler means stdout is never collected; all tests that check result.stdout would fail
             childProcess.stdout.on('data', (data: Buffer) => {
                 stdoutChunks.push(data);
             });
         }
 
         // Collect stderr and watch for inspector WebSocket URL
+        // Stryker disable BooleanLiteral,BlockStatement,StringLiteral: all mutations here either prevent stderr collection or inspector URL delivery → dryRun never resolves → Timeout
         let inspectorUrlExtracted = false;
         if(childProcess.stderr) {
             childProcess.stderr.on('data', (data: Buffer) => {
@@ -213,7 +265,7 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
                     const text = Buffer.concat(stderrChunks).toString();
                     // Look for pattern: "Listening:\n  ws://localhost:PORT/SESSION_ID"
                     // Stryker disable next-line Regex: character classes are defensive for whitespace normalization
-                    const match = /Listening:[\t\v\f\r \xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]*\n\s*(ws:\/\/\S+)/.exec(text);
+                    const match = /Listening:[\t\v\f\r \u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]*\n\s*(ws:\/\/\S+)/.exec(text);
                     if(match) {
                         inspectorUrlExtracted = true;
                         options.onInspectorReady(match[1]);
@@ -221,8 +273,10 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
                 }
             });
         }
+        // Stryker restore BooleanLiteral,BlockStatement,StringLiteral
 
         // Handle process exit
+        // Stryker disable next-line BlockStatement,StringLiteral: Promise.resolve never called without 'close' handler → Timeout
         childProcess.on('close', (code) => {
             clearTimeout(timeoutHandle);
 

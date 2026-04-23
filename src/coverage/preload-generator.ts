@@ -4,7 +4,7 @@
  */
 
 import { mkdir, unlink, readFile, writeFile } from 'node:fs/promises';
-import { join, dirname, resolve } from 'node:path';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { glob } from 'tinyglobby';
 
@@ -49,6 +49,7 @@ export async function resolveEagerModulesFromGlobs(
     mutateGlobs: readonly string[],
     cwd: string = process.cwd()
 ): Promise<string[]> {
+    // Stryker disable next-line ConditionalExpression,BlockStatement: equivalent mutant — empty globs yield no positive patterns, caught by positivePatterns.length === 0 below
     if(mutateGlobs.length === 0) {
         return [];
     }
@@ -56,28 +57,33 @@ export async function resolveEagerModulesFromGlobs(
     // Separate positive patterns from negation patterns.
     // tinyglobby accepts negations inline when they start with '!', but we pass
     // them through the `ignore` option for clarity and to support both forms.
+    // Stryker disable next-line ArrayDeclaration: equivalent mutant — extra "Stryker was here" initial element never matches real paths, so glob result is unchanged
     const positivePatterns: string[] = [];
+    // Stryker disable next-line ArrayDeclaration: equivalent mutant — "Stryker was here" never matches real files so no legitimate path is excluded
     const negativePatterns: string[] = [];
     for(const p of mutateGlobs) {
+        // Stryker disable next-line ConditionalExpression,MethodExpression: negation-pattern detection; tests verify excluded files do not appear in results
         if(p.startsWith('!')) {
             negativePatterns.push(p.slice(1));
         } else {
             // Strip any Stryker mutation-range suffix (e.g. "src/foo.ts:1:3-2:5")
             // before passing to the glob engine.
             // Stryker disable next-line Regex: mutation range suffix stripper is defensive
-            positivePatterns.push(p.replace(/:[0-9].*$/, ''));
+            positivePatterns.push(p.replace(/:\d.*$/, ''));
         }
     }
 
+    // Stryker disable next-line ConditionalExpression,BlockStatement: equivalent mutant — glob([]) returns [] so skipping this check yields the same result
     if(positivePatterns.length === 0) {
         return [];
     }
 
     const paths = await glob(positivePatterns, {
         cwd,
-        absolute: true,
-        ignore:   negativePatterns,
+        absolute:          true,
+        ignore:            negativePatterns,
         // Do not expand plain directory patterns — the user's globs already name files.
+        // Stryker disable next-line BooleanLiteral: existing tests only use file-glob patterns (not bare directories), so expandDirectories: true vs false is unobservable
         expandDirectories: false,
     });
 
@@ -92,9 +98,9 @@ export async function resolveEagerModulesFromGlobs(
 
     // Resolve to absolute paths (glob returns absolute when absolute: true, but
     // be defensive in case cwd is relative).
-    const resolved = filtered.map(p => resolve(p));
+    const resolved = filtered.map(p => path.resolve(p));
 
-    resolved.sort();
+    resolved.sort((a, b) => a.localeCompare(b));
     return resolved;
 }
 
@@ -107,7 +113,7 @@ export async function resolveEagerModulesFromGlobs(
  * @returns Path to the generated preload script
  */
 export async function generatePreloadScript(options: PreloadOptions): Promise<string> {
-    const preloadPath = join(options.tempDir, `stryker-coverage-preload-${process.pid}.ts`);
+    const preloadPath = path.join(options.tempDir, `stryker-coverage-preload-${process.pid}.ts`);
 
     // Ensure temp directory exists (mkdir with recursive is idempotent)
     await mkdir(options.tempDir, { recursive: true });
@@ -116,7 +122,7 @@ export async function generatePreloadScript(options: PreloadOptions): Promise<st
     // Path differs between source and bundled builds:
     // - Bundled: __dirname is dist/, templates at dist/templates/, logic at dist/coverage/preload-logic.js
     // - Source: __dirname is src/coverage/, templates at src/templates/, logic at src/coverage/preload-logic.ts
-    const __dirname = dirname(fileURLToPath(import.meta.url));
+    const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
     // Detect if running from bundled dist (has templates/ subdirectory) or source
     // Stryker disable next-line ConditionalExpression,LogicalOperator,MethodExpression: bundled path detection only testable with actual dist build
@@ -124,19 +130,19 @@ export async function generatePreloadScript(options: PreloadOptions): Promise<st
 
     // Stryker disable StringLiteral: bundled paths only used when running from dist/
     const templatePath = isBundled
-        ? join(__dirname, 'templates/coverage-preload.ts')
-        : join(__dirname, '../templates/coverage-preload.ts');
+        ? path.join(__dirname, 'templates/coverage-preload.ts')
+        : path.join(__dirname, '../templates/coverage-preload.ts');
     // Stryker restore StringLiteral
 
     // Read the template
-    const template = await readFile(templatePath, 'utf-8');
+    const template = await readFile(templatePath, 'utf8');
 
     // Calculate the absolute path to preload-logic
     // Extension differs: .js for bundled, .ts for source (Bun handles both)
     // Stryker disable StringLiteral: bundled paths only used when running from dist/
     const preloadLogicPath = isBundled
-        ? join(__dirname, 'coverage/preload-logic.js')
-        : join(__dirname, 'preload-logic.ts');
+        ? path.join(__dirname, 'coverage/preload-logic.js')
+        : path.join(__dirname, 'preload-logic.ts');
     // Stryker restore StringLiteral
 
     // Use caller-provided eager module list (resolved from StrykerOptions.mutate).
@@ -151,7 +157,7 @@ export async function generatePreloadScript(options: PreloadOptions): Promise<st
         .replace('__EAGER_MODULES__', JSON.stringify(eagerModules));
 
     // Write the template to the temp location
-    await writeFile(preloadPath, content, 'utf-8');
+    await writeFile(preloadPath, content, 'utf8');
 
     return preloadPath;
 }

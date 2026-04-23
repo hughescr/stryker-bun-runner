@@ -3,22 +3,23 @@
  * Integration-level tests for the main TestRunner implementation
  */
 
+import * as fsPromises from 'node:fs/promises';
+import path from 'node:path';
+import type { StrykerOptions } from '@stryker-mutator/api/core';
+import type { Logger } from '@stryker-mutator/api/logging';
+import { DryRunStatus, MutantRunStatus, TestStatus } from '@stryker-mutator/api/test-runner';
 import { describe, it, expect, beforeEach, afterEach, mock, spyOn, jest } from 'bun:test';
 import { BunTestRunner } from '../../src/bun-test-runner.js';
-import * as testFileDiscovery from '../../src/utils/test-file-discovery.js';
-import { DryRunStatus, MutantRunStatus, TestStatus } from '@stryker-mutator/api/test-runner';
-import type { Logger } from '@stryker-mutator/api/logging';
-import type { StrykerOptions } from '@stryker-mutator/api/core';
-import * as processRunner from '../../src/process-runner.js';
 import * as coverageCollector from '../../src/coverage/collector.js';
-import * as preloadGenerator from '../../src/coverage/preload-generator.js';
-import * as bunfigSanitizer from '../../src/utils/bunfig-sanitizer.js';
-import { mockGetAvailablePort, resetAllMocks } from '../test-preload.js';
-import * as syncServerModule from '../../src/utils/sync-server.js';
-import * as inspectorModule from '../../src/inspector/inspector-client.js';
 import * as coverageMapper from '../../src/coverage/coverage-mapper.js';
+import * as preloadGenerator from '../../src/coverage/preload-generator.js';
+import * as inspectorModule from '../../src/inspector/inspector-client.js';
 import type { TestInfo } from '../../src/inspector/types.js';
-import * as fsPromises from 'node:fs/promises';
+import * as processRunner from '../../src/process-runner.js';
+import * as bunfigSanitizer from '../../src/utils/bunfig-sanitizer.js';
+import * as syncServerModule from '../../src/utils/sync-server.js';
+import * as testFileDiscovery from '../../src/utils/test-file-discovery.js';
+import { mockGetAvailablePort, mockRename, mockWriteFile, resetAllMocks } from '../test-preload.js';
 
 describe('BunTestRunner', () => {
     let mockLogger: Logger;
@@ -30,11 +31,10 @@ describe('BunTestRunner', () => {
     let mockGenerateSanitizedBunfig: ReturnType<typeof mock>;
     let mockCleanupSanitizedBunfig: ReturnType<typeof mock>;
     let mockSyncServer: {
-        start:         ReturnType<typeof mock>
-        signalReady:   ReturnType<typeof mock>
-        close:         ReturnType<typeof mock>
-        sendTestStart: ReturnType<typeof mock>
-        clientCount:   number
+        start:       ReturnType<typeof mock>
+        signalReady: ReturnType<typeof mock>
+        close:       ReturnType<typeof mock>
+        clientCount: number
     };
     let mockInspectorClient: {
         connect:           ReturnType<typeof mock>
@@ -106,11 +106,10 @@ describe('BunTestRunner', () => {
 
         // Mock sync server
         mockSyncServer = {
-            start:         mock(),
-            signalReady:   mock(),
-            close:         mock(),
-            sendTestStart: mock(),
-            clientCount:   0,
+            start:       mock(),
+            signalReady: mock(),
+            close:       mock(),
+            clientCount: 0,
         };
         // @ts-expect-error - Mocking constructor, type system doesn't understand this pattern
         syncServerSpy = spyOn(syncServerModule, 'SyncServer').mockImplementation(() => mockSyncServer);
@@ -130,7 +129,7 @@ describe('BunTestRunner', () => {
         mockMapCoverageToInspectorIds = mock();
         mapCoverageToInspectorIdsSpy = spyOn(coverageMapper, 'mapCoverageToInspectorIds').mockImplementation(mockMapCoverageToInspectorIds);
         // Default: pass through coverage unchanged (tests can override if needed)
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-return -- intentional pass-through mock
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- intentional pass-through mock
         mockMapCoverageToInspectorIds.mockImplementation((coverage: any) => coverage);
 
         // Default mock implementations
@@ -143,12 +142,19 @@ describe('BunTestRunner', () => {
         mockSyncServer.start.mockResolvedValue(undefined);
         mockSyncServer.signalReady.mockReturnValue(undefined);
         mockSyncServer.close.mockResolvedValue(undefined);
-        mockSyncServer.sendTestStart.mockReturnValue(undefined);
         mockInspectorClient.connect.mockResolvedValue(undefined);
         mockInspectorClient.send.mockResolvedValue(undefined);
         mockInspectorClient.getTests.mockReturnValue([]);
         mockInspectorClient.getExecutionOrder.mockReturnValue([]);
         mockInspectorClient.close.mockResolvedValue(undefined);
+
+        // Suppress real filesystem writes from dryRun's registry persistence.
+        // Without this, fake-timer tests that call dryRun() hang because Bun's
+        // fake-timer implementation starves the libuv I/O callbacks needed to
+        // resolve real fsPromises.writeFile / fsPromises.rename awaits.
+        // resetAllMocks() in afterEach restores pass-through behaviour.
+        mockWriteFile.mockResolvedValue(undefined);
+        mockRename.mockResolvedValue(undefined);
 
         // Mock discoverTestFiles so dryRun/mutantRun resolve synchronously without
         // real filesystem I/O.  Returns a stable sorted list of two fictitious test
@@ -163,35 +169,42 @@ describe('BunTestRunner', () => {
         resolveEagerModulesFromGlobsSpy = spyOn(preloadGenerator, 'resolveEagerModulesFromGlobs').mockResolvedValue([]);
     });
 
-    afterEach(() => {
+    afterEach(async () => {
         // Restore all spies to prevent test pollution
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+
         runBunTestsSpy.mockRestore();
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+
         collectCoverageSpy.mockRestore();
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+
         cleanupCoverageFileSpy.mockRestore();
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+
         generatePreloadScriptSpy.mockRestore();
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+
         cleanupPreloadScriptSpy.mockRestore();
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+
         generateSanitizedBunfigSpy.mockRestore();
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+
         cleanupSanitizedBunfigSpy.mockRestore();
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+
         syncServerSpy.mockRestore();
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+
         inspectorClientSpy.mockRestore();
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+
         mapCoverageToInspectorIdsSpy.mockRestore();
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+
         discoverTestFilesSpy.mockRestore();
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+
         resolveEagerModulesFromGlobsSpy.mockRestore();
+
         // Reset preload mocks and timers
         resetAllMocks();
         jest.useRealTimers();
+
+        // Clean up the registry file that dryRun writes to the project root.
+        // This is scoped to this file's afterEach so it doesn't pollute other test files.
+        const registryPath = path.join(process.cwd(), '.stryker-bun-runner-registry.json');
+        await fsPromises.rm(registryPath, { force: true });
+        await fsPromises.rm(`${registryPath}.tmp`, { force: true });
     });
 
     describe('constructor', () => {
@@ -199,12 +212,12 @@ describe('BunTestRunner', () => {
             const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
 
             expect(runner).toBeDefined();
-            // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
+
             expect(mockLogger.debug).toHaveBeenCalledWith(
                 expect.stringContaining('BunTestRunner initialized'),
                 expect.objectContaining({
                     bunPath: 'bun',
-                    timeout: 10000,
+                    timeout: 10_000,
                 })
             );
         });
@@ -213,12 +226,12 @@ describe('BunTestRunner', () => {
             const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
 
             expect(runner).toBeDefined();
-            // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
+
             expect(mockLogger.debug).toHaveBeenCalledWith(
                 'BunTestRunner initialized with options: %o',
                 expect.objectContaining({
                     bunPath:          'bun',
-                    timeout:          10000,
+                    timeout:          10_000,
                     inspectorTimeout: 5000,
                 })
             );
@@ -229,9 +242,8 @@ describe('BunTestRunner', () => {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -249,7 +261,6 @@ describe('BunTestRunner', () => {
                 },
             } as unknown as StrykerOptions);
 
-            // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
             expect(mockLogger.debug).toHaveBeenCalledWith(
                 expect.any(String),
                 expect.objectContaining({
@@ -273,9 +284,8 @@ describe('BunTestRunner', () => {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -289,15 +299,14 @@ describe('BunTestRunner', () => {
 
             const runner = new BunTestRunner(mockLogger, {
                 bun: {
-                    timeout: 20000,
+                    timeout: 20_000,
                 },
             } as unknown as StrykerOptions);
 
-            // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
             expect(mockLogger.debug).toHaveBeenCalledWith(
                 expect.any(String),
                 expect.objectContaining({
-                    timeout: 20000,
+                    timeout: 20_000,
                 })
             );
 
@@ -307,7 +316,7 @@ describe('BunTestRunner', () => {
 
             expect(mockRunBunTests).toHaveBeenCalledWith(
                 expect.objectContaining({
-                    timeout: 20000,
+                    timeout: 20_000,
                 })
             );
         });
@@ -317,9 +326,8 @@ describe('BunTestRunner', () => {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -339,7 +347,6 @@ describe('BunTestRunner', () => {
                 },
             } as unknown as StrykerOptions);
 
-            // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
             expect(mockLogger.debug).toHaveBeenCalledWith(
                 expect.any(String),
                 expect.objectContaining({
@@ -363,9 +370,8 @@ describe('BunTestRunner', () => {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -383,7 +389,6 @@ describe('BunTestRunner', () => {
                 },
             } as unknown as StrykerOptions);
 
-            // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
             expect(mockLogger.debug).toHaveBeenCalledWith(
                 expect.any(String),
                 expect.objectContaining({
@@ -398,6 +403,174 @@ describe('BunTestRunner', () => {
             expect(mockRunBunTests).toHaveBeenCalledWith(
                 expect.objectContaining({
                     bunArgs: ['--only', '--verbose'],
+                })
+            );
+        });
+
+        it('treats empty testFiles array as undefined and emits a warning', async () => {
+            // Fix 3 (runtime guard): an empty array should be treated as "no override"
+            // and auto-discovery should be used instead.
+            mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+            mockRunBunTests.mockImplementation((options: any) => {
+                if(options.onInspectorReady) {
+                    options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                }
+                return Promise.resolve({ exitCode: 0, stdout: '1 pass', stderr: '', timedOut: false });
+            });
+            mockCollectCoverage.mockResolvedValue(undefined);
+
+            const runner = new BunTestRunner(mockLogger, {
+                bun: {
+                    testFiles: [],
+                },
+            } as unknown as StrykerOptions);
+
+            // The constructor-time warning must be emitted for the empty array
+            expect(mockLogger.warn).toHaveBeenCalledWith(
+                expect.stringContaining('empty array')
+            );
+
+            await runner.init();
+            await runner.dryRun();
+
+            // Auto-discovery must run (discoverTestFiles is called during init)
+            expect(discoverTestFilesSpy).toHaveBeenCalled();
+
+            // testFilesOverride is undefined → runBunTests receives the discovered list, not []
+            expect(mockRunBunTests).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    testFiles: ['tests/alpha.test.ts', 'tests/beta.test.ts'],
+                })
+            );
+        });
+
+        it('warns when absolute testFiles paths are used inside a Stryker sandbox', () => {
+            // Fix 1: absolute-path testFiles bypass the sandbox copy — warn the user.
+            const cwdSpy = spyOn(process, 'cwd').mockReturnValue('/project/.stryker-tmp/sandbox-ABC');
+
+            try {
+                new BunTestRunner(mockLogger, {
+                    bun: {
+                        testFiles: ['/absolute/path/to/my.test.ts'],
+                    },
+                } as unknown as StrykerOptions);
+
+                // Assert on substrings from each of the three concatenated string
+                // chunks so that mutating any individual chunk to "" is detected.
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect.stringContaining('absolute path'),
+                    expect.stringContaining('.stryker-tmp/sandbox-')
+                );
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect.stringContaining('ORIGINAL'),
+                    expect.any(String)
+                );
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect.stringContaining('sandbox copy'),
+                    expect.any(String)
+                );
+            } finally {
+                cwdSpy.mockRestore();
+            }
+        });
+
+        it('warns when at least one testFiles path is absolute (mixed array) inside a Stryker sandbox', () => {
+            // Kills the MethodExpression mutant that replaces `some` with `every`.
+            // With `every`, a mixed array (one absolute, one relative) would return false,
+            // suppressing the warning; `some` correctly fires it on any absolute entry.
+            const cwdSpy = spyOn(process, 'cwd').mockReturnValue('/project/.stryker-tmp/sandbox-ABC');
+
+            try {
+                new BunTestRunner(mockLogger, {
+                    bun: {
+                        testFiles: ['/absolute/path/to/my.test.ts', 'tests/relative.test.ts'],
+                    },
+                } as unknown as StrykerOptions);
+
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect.stringContaining('absolute path'),
+                    expect.stringContaining('.stryker-tmp/sandbox-')
+                );
+            } finally {
+                cwdSpy.mockRestore();
+            }
+        });
+
+        it('does not warn about absolute testFiles paths when outside a Stryker sandbox', () => {
+            // Fix 1: the warning must only fire inside a sandbox — not for normal direct use
+            // (e.g. the integration test which uses absolute paths without a Stryker sandbox)
+            const cwdSpy = spyOn(process, 'cwd').mockReturnValue('/project/not-a-sandbox');
+
+            try {
+                new BunTestRunner(mockLogger, {
+                    bun: {
+                        testFiles: ['/absolute/path/to/my.test.ts'],
+                    },
+                } as unknown as StrykerOptions);
+
+                expect(mockLogger.warn).not.toHaveBeenCalledWith(
+                    expect.stringContaining('absolute path'),
+                    expect.any(String)
+                );
+            } finally {
+                cwdSpy.mockRestore();
+            }
+        });
+
+        it('does not warn when testFiles contains only relative paths inside a sandbox', () => {
+            // Fix 1: relative paths are fine in sandbox — no warning needed
+            const cwdSpy = spyOn(process, 'cwd').mockReturnValue('/project/.stryker-tmp/sandbox-XYZ');
+
+            try {
+                new BunTestRunner(mockLogger, {
+                    bun: {
+                        testFiles: ['tests/my.test.ts'],
+                    },
+                } as unknown as StrykerOptions);
+
+                expect(mockLogger.warn).not.toHaveBeenCalledWith(
+                    expect.stringContaining('absolute path'),
+                    expect.any(String)
+                );
+            } finally {
+                cwdSpy.mockRestore();
+            }
+        });
+
+        it('should use testFiles override and skip discoverTestFiles when bun.testFiles is provided', async () => {
+            mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+            mockRunBunTests.mockImplementation((options: any) => {
+                if(options.onInspectorReady) {
+                    options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                }
+                return Promise.resolve({
+                    exitCode: 0,
+                    stdout:   '✓ test [0.12ms]\n 1 pass',
+                    stderr:   '',
+                    timedOut: false,
+                });
+            });
+            mockCollectCoverage.mockResolvedValue(undefined);
+
+            const explicitFiles = ['/absolute/path/to/my.test.ts'];
+            const runner = new BunTestRunner(mockLogger, {
+                bun: {
+                    testFiles: explicitFiles,
+                },
+            } as unknown as StrykerOptions);
+
+            await runner.init();
+            await runner.dryRun();
+
+            // discoverTestFiles must NOT have been called — the override bypasses it
+            expect(discoverTestFilesSpy).not.toHaveBeenCalled();
+
+            // The explicit file list must be forwarded verbatim to runBunTests
+            expect(mockRunBunTests).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    testFiles: explicitFiles,
                 })
             );
         });
@@ -425,7 +598,7 @@ describe('BunTestRunner', () => {
 
             expect(mockGeneratePreloadScript).toHaveBeenCalledWith(
                 expect.objectContaining({
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- expect.stringContaining returns any
+
                     tempDir: expect.stringContaining('stryker-bun-runner'),
                 })
             );
@@ -439,11 +612,11 @@ describe('BunTestRunner', () => {
             await runner.init();
 
             // Verify exact debug message strings (kills StringLiteral mutations on lines 127, 133, 138)
-            // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
+
             expect(mockLogger.debug).toHaveBeenCalledWith('BunTestRunner init starting...');
-            // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
+
             expect(mockLogger.debug).toHaveBeenCalledWith('Generating coverage preload script...');
-            // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
+
             expect(mockLogger.debug).toHaveBeenCalledWith('Preload script generated at: %s', '/tmp/preload-test.ts');
         });
 
@@ -463,7 +636,7 @@ describe('BunTestRunner', () => {
         it('should pass eagerModules to generatePreloadScript', async () => {
             mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
             const eagerModules = ['/abs/src/a.ts', '/abs/src/b.ts'];
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- mock returns resolved value
+
             resolveEagerModulesFromGlobsSpy.mockResolvedValue(eagerModules);
 
             const runner = new BunTestRunner(mockLogger, {
@@ -508,6 +681,113 @@ describe('BunTestRunner', () => {
             // resolveEagerModulesFromGlobs should only be called once (cached)
             expect(resolveEagerModulesFromGlobsSpy).toHaveBeenCalledTimes(1);
         });
+
+        it('re-resolves eager modules when cwd changes between init() calls', async () => {
+            // Simulates Stryker sandbox rotation: init() runs in cwd A, then again in cwd B.
+            // The cachedEagerModulesCwd key must detect the change and re-resolve.
+            mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+
+            // Use a flag to switch cwd after the first init() completes so the spy
+            // does not interfere with unrelated process.cwd() calls in test infrastructure.
+            let useNewCwd = false;
+            const originalCwd = process.cwd();
+            const cwdSpy = spyOn(process, 'cwd').mockImplementation(() => (useNewCwd ? '/new/sandbox/cwd' : originalCwd));
+
+            try {
+                const runner = new BunTestRunner(mockLogger, {
+                    mutate: ['src/**/*.ts'],
+                } as unknown as StrykerOptions);
+
+                await runner.init();  // cwd = originalCwd
+
+                // Switch to new cwd before second init so the cache key mismatches
+                useNewCwd = true;
+                await runner.init();  // cwd = /new/sandbox/cwd (different)
+
+                // resolveEagerModulesFromGlobs must be called twice — once per distinct cwd
+                expect(resolveEagerModulesFromGlobsSpy).toHaveBeenCalledTimes(2);
+            } finally {
+                cwdSpy.mockRestore();
+            }
+        });
+
+        it('cleans up previous preload script when init() is called again (Fix 6: no preload leak on re-init)', async () => {
+            // Stryker sandbox rotation calls init() multiple times on the same runner instance.
+            // The old preload script must be cleaned up before generating the new one.
+            mockGeneratePreloadScript
+                .mockResolvedValueOnce('/tmp/preload-first.ts')
+                .mockResolvedValueOnce('/tmp/preload-second.ts');
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+
+            await runner.init();   // generates /tmp/preload-first.ts
+
+            // cleanupPreloadScript must NOT have been called yet (first init)
+            expect(cleanupPreloadScriptSpy).not.toHaveBeenCalled();
+
+            await runner.init();   // generates /tmp/preload-second.ts, must clean up first
+
+            // cleanupPreloadScript must have been called with the first path
+            expect(cleanupPreloadScriptSpy).toHaveBeenCalledWith('/tmp/preload-first.ts');
+        });
+
+        it('logs debug message when cleanupPreloadScript throws on re-init', async () => {
+            // The catch block in init() must log a debug message when cleanup fails.
+            // Mutating the catch body to {} silences the log — this test catches that.
+            const fsError = new Error('ENOENT: no such file or directory');
+            mockCleanupPreloadScript.mockRejectedValueOnce(fsError);
+            mockGeneratePreloadScript
+                .mockResolvedValueOnce('/tmp/preload-first.ts')
+                .mockResolvedValueOnce('/tmp/preload-second.ts');
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();   // sets preloadScriptPath = /tmp/preload-first.ts
+
+            // Second init: cleanupPreloadScript throws — catch block must log debug
+            await runner.init();
+
+            expect(mockLogger.debug).toHaveBeenCalledWith(
+                expect.stringContaining('Failed to clean up previous preload script'),
+                expect.any(String)
+            );
+        });
+
+        it('cleans up previous coverage file when init() is called again (Fix 6: no coverage file leak on re-init)', async () => {
+            // Each init() generates a new coverage-<timestamp>.json path.
+            // The previous path must be cleaned up if it still exists.
+            mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+
+            await runner.init();   // sets coverageFilePath = .../coverage-<ts>.json
+
+            // cleanupCoverageFile must NOT have been called yet (first init)
+            expect(cleanupCoverageFileSpy).not.toHaveBeenCalled();
+
+            await runner.init();   // must call cleanupCoverageFile for the previous path
+
+            // cleanupCoverageFile must have been called exactly once (cleaning up previous path)
+            expect(cleanupCoverageFileSpy).toHaveBeenCalledTimes(1);
+        });
+
+        it('logs debug message when cleanupCoverageFile throws on re-init', async () => {
+            // The catch block in init() must log a debug message when coverage cleanup fails.
+            // Mutating the catch body to {} silences the log — this test catches that.
+            const fsError = new Error('ENOENT: no such file or directory');
+            mockCleanupCoverageFile.mockRejectedValueOnce(fsError);
+            mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();   // sets coverageFilePath
+
+            // Second init: cleanupCoverageFile throws — catch block must log debug
+            await runner.init();
+
+            expect(mockLogger.debug).toHaveBeenCalledWith(
+                expect.stringContaining('Failed to clean up previous coverage file'),
+                expect.any(String)
+            );
+        });
     });
 
     describe('dryRun', () => {
@@ -520,9 +800,8 @@ describe('BunTestRunner', () => {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -571,9 +850,8 @@ tests/example.test.ts:
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -596,9 +874,8 @@ tests/example.test.ts:
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -622,9 +899,8 @@ tests/example.test.ts:
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -690,30 +966,44 @@ tests/example.test.ts:
         });
 
         it('should return specific error message on inspector timeout', async () => {
-            // Mock runBunTests to never call onInspectorReady (simulates inspector timeout).
-            // After the timeout, the runner awaits the child process to drain its
-            // stdout/stderr for diagnostics — resolve with a plausible crashed result.
-            mockRunBunTests.mockImplementation(() => {
-                return Promise.resolve({
-                    exitCode: 1,
-                    stdout:   '',
-                    stderr:   'preload crashed before inspector came up',
-                    timedOut: false,
+            jest.useFakeTimers();
+            try {
+                // Mock runBunTests to never call onInspectorReady (simulates inspector timeout).
+                // After the timeout, the runner awaits the child process to drain its
+                // stdout/stderr for diagnostics — resolve with a plausible crashed result.
+                mockRunBunTests.mockImplementation(() => {
+                    return Promise.resolve({
+                        exitCode: 1,
+                        stdout:   '',
+                        stderr:   'preload crashed before inspector came up',
+                        timedOut: false,
+                    });
                 });
-            });
 
-            const runner = new BunTestRunner(mockLogger, {
-                bun: {
-                    inspectorTimeout: 100, // Very short timeout to speed up test
-                },
-            } as unknown as StrykerOptions);
-            await runner.init();
+                const runner = new BunTestRunner(mockLogger, {
+                    bun: {
+                        inspectorTimeout: 100,
+                    },
+                } as unknown as StrykerOptions);
+                await runner.init();
 
-            const result = await runner.dryRun();
+                const resultPromise = runner.dryRun();
 
-            expect(result.status).toBe(DryRunStatus.Error);
-            if(result.status === DryRunStatus.Error) {
-                expect(result.errorMessage).toBe('Timeout waiting for inspector URL');
+                // Advance past the inspectorTimeout threshold in polling increments
+                for(let i = 0; i < 5; i++) {
+                    jest.advanceTimersByTime(50);
+                    // eslint-disable-next-line no-await-in-loop -- deliberate sequential microtask flush for fake-timer test
+                    await Promise.resolve();
+                }
+
+                const result = await resultPromise;
+
+                expect(result.status).toBe(DryRunStatus.Error);
+                if(result.status === DryRunStatus.Error) {
+                    expect(result.errorMessage).toBe('Timeout waiting for inspector URL');
+                }
+            } finally {
+                jest.useRealTimers();
             }
         });
 
@@ -728,9 +1018,7 @@ tests/example.test.ts:
                 mockRunBunTests.mockImplementation((options: any) => {
                     // Schedule callback after 160ms (3+ polling cycles)
                     setTimeout(() => {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- invoking mock callback
                         if(options.onInspectorReady) {
-                            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                             options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                         }
                     }, 160);
@@ -760,6 +1048,7 @@ tests/example.test.ts:
                 // Each iteration: advance time, then let microtasks/promises settle
                 for(let i = 0; i < 10; i++) {
                     jest.advanceTimersByTime(50);
+                    // eslint-disable-next-line no-await-in-loop -- deliberate sequential microtask flush for fake-timer test
                     await Promise.resolve();
                 }
 
@@ -795,9 +1084,7 @@ tests/example.test.ts:
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
                     setTimeout(() => {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- invoking mock callback
                         if(options.onInspectorReady) {
-                            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                             options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                         }
                     }, 60);
@@ -826,6 +1113,7 @@ tests/example.test.ts:
                 // Advance fake timers - only need a few iterations since URL arrives at 60ms
                 for(let i = 0; i < 5; i++) {
                     jest.advanceTimersByTime(50);
+                    // eslint-disable-next-line no-await-in-loop -- deliberate sequential microtask flush for fake-timer test
                     await Promise.resolve();
                 }
 
@@ -852,9 +1140,8 @@ tests/example.test.ts:
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -877,13 +1164,37 @@ tests/example.test.ts:
             }
         });
 
+        it('closes sync server via finally even when inspector.close() throws', async () => {
+            // Kills the BlockStatement mutant at the finally block in dryRun():
+            // mutating `{ await syncServer.close(); }` to `{}` would leave the server
+            // open when an unexpected exception occurs between signalReady and return.
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+            mockRunBunTests.mockImplementation((options: any) => {
+                if(options.onInspectorReady) {
+                    options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                }
+                return Promise.resolve({ exitCode: 0, stdout: '1 pass', stderr: '', timedOut: false });
+            });
+            // Make inspector.close() throw to exercise the finally path
+            mockInspectorClient.close.mockRejectedValue(new Error('inspector close failed'));
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+            await runner.init();
+
+            // dryRun should throw (because inspector.close() throws inside the try block)
+            await expect(runner.dryRun()).rejects.toThrow('inspector close failed');
+
+            // syncServer.close() must have been called despite the throw
+            expect(mockSyncServer.close).toHaveBeenCalledTimes(1);
+        });
+
         it('should use fallback when executionOrder is empty', async () => {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -921,9 +1232,8 @@ tests/example.test.ts:
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -959,9 +1269,8 @@ tests/example.test.ts:
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
                     // Call onInspectorReady immediately if provided
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                     if(options.onInspectorReady) {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                         options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                     }
                     // Simulate a small delay that will result in timePerTest calculation
@@ -1031,9 +1340,8 @@ tests/example.test.ts:
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 // Return immediately (very small elapsed time)
@@ -1077,9 +1385,8 @@ tests/example.test.ts:
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -1129,9 +1436,8 @@ tests/example.test.ts:
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -1188,9 +1494,8 @@ tests/example.test.ts:
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -1214,9 +1519,8 @@ tests/example.test.ts:
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -1273,9 +1577,8 @@ tests/example.test.ts:
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -1300,9 +1603,8 @@ tests/example.test.ts:
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -1331,9 +1633,8 @@ tests/example.test.ts:
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -1359,17 +1660,17 @@ tests/example.test.ts:
             await runner.dryRun();
 
             // Verify exact debug message strings (kills StringLiteral mutations)
-            // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
+
             expect(mockLogger.debug).toHaveBeenCalledWith('Running dry run with inspector-based coverage collection...');
-            // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
+
             expect(mockLogger.debug).toHaveBeenCalledWith('Sync server started on port %d', expect.any(Number));
-            // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
+
             expect(mockLogger.debug).toHaveBeenCalledWith('Inspector URL: %s', expect.any(String));
-            // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
+
             expect(mockLogger.debug).toHaveBeenCalledWith('Inspector connected and TestReporter enabled');
-            // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
+
             expect(mockLogger.debug).toHaveBeenCalledWith('Signaled preload script to proceed');
-            // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
+
             expect(mockLogger.debug).toHaveBeenCalledWith('Inspector collected %d tests in hierarchy, %d in execution order',
                 1, 1);
         });
@@ -1378,9 +1679,8 @@ tests/example.test.ts:
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -1446,9 +1746,7 @@ tests/example.test.ts:
             // start before the first — without line-based ordering this produces [0]/[1] swaps.
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -1526,8 +1824,9 @@ tests/example.test.ts:
 
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking callback
-                    if(options.onInspectorReady) options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
                     return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
                 });
                 mockCollectCoverage.mockResolvedValue(undefined);
@@ -1546,13 +1845,14 @@ tests/example.test.ts:
 
             it('passes undefined testFiles when discoverTestFiles returns undefined (no test files found)', async () => {
                 // Override the global spy: no test files found → fallback to Bun discovery
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+
                 discoverTestFilesSpy.mockResolvedValue(undefined);
 
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking callback
-                    if(options.onInspectorReady) options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
                     return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
                 });
                 mockCollectCoverage.mockResolvedValue(undefined);
@@ -1572,8 +1872,9 @@ tests/example.test.ts:
             it('discoverTestFiles is called once during init; dryRun reuses cached result without re-discovering', async () => {
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking callback
-                    if(options.onInspectorReady) options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
                     return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
                 });
                 mockCollectCoverage.mockResolvedValue(undefined);
@@ -1585,6 +1886,51 @@ tests/example.test.ts:
 
                 // discoverTestFiles should have been called exactly once (during init)
                 expect(discoverTestFilesSpy).toHaveBeenCalledTimes(1);
+            });
+
+            it('rediscovers test files when cwd changes between init() and dryRun()', async () => {
+                // Simulates Stryker sandbox rotation: init() runs in one cwd, dryRun() runs in another.
+                // The cachedTestFilesCwd key must detect the change and re-discover from the new cwd.
+                discoverTestFilesSpy
+                    .mockResolvedValueOnce(['tests/original.test.ts'])
+                    .mockResolvedValueOnce(['tests/sandbox.test.ts']);
+
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
+                });
+                mockCollectCoverage.mockResolvedValue(undefined);
+
+                // Use a flag to switch cwd after init() completes so the spy does not
+                // interfere with unrelated process.cwd() calls during init or test infra.
+                let useNewCwd = false;
+                const originalCwd = process.cwd();
+                const cwdSpy = spyOn(process, 'cwd').mockImplementation(() => (useNewCwd ? '/new/sandbox/cwd' : originalCwd));
+
+                try {
+                    const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                    mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+                    await runner.init();    // cwd = originalCwd → discovers ['tests/original.test.ts']
+
+                    // Switch to new cwd before dryRun so the cachedTestFilesCwd key mismatches
+                    useNewCwd = true;
+                    await runner.dryRun(); // cwd = /new/sandbox/cwd → must re-discover
+
+                    // discoverTestFiles must be called twice (once per distinct cwd)
+                    expect(discoverTestFilesSpy).toHaveBeenCalledTimes(2);
+
+                    // dryRun must use the re-discovered file list from the new cwd
+                    expect(mockRunBunTests).toHaveBeenCalledWith(
+                        expect.objectContaining({
+                            testFiles: ['tests/sandbox.test.ts'],
+                        })
+                    );
+                } finally {
+                    cwdSpy.mockRestore();
+                }
             });
         });
     });
@@ -1601,9 +1947,7 @@ tests/example.test.ts:
             // kill rather than Survived.  killedBy: ['unknown'] is the fallback.
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -1617,9 +1961,8 @@ tests/example.test.ts:
             const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
             await runner.init();
 
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test uses simplified mock data
             const result = await runner.mutantRun({
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                 activeMutant:    { id: '1' } as any,
                 testFilter:      [],
                 sandboxFileName: 'sandbox',
@@ -1632,13 +1975,83 @@ tests/example.test.ts:
             }
         });
 
+        it('returns MutantRunStatus.Error when stderr indicates a syntax error and no tests ran', async () => {
+            // Kills ConditionalExpression/LogicalOperator/EqualityOperator mutants at L803-814:
+            //   - ConditionalExpression→true (always fires) would return Error even when tests DID run
+            //   - LogicalOperator→|| would return Error when rawFailedNames>0 but tests=0
+            //   - EqualityOperator inversions change when the runtime-error path fires
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+            mockRunBunTests.mockImplementation((options: any) => {
+                if(options.onInspectorReady) {
+                    options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                }
+                return Promise.resolve({
+                    exitCode: 1,
+                    stdout:   '',   // no test output at all (parsed.tests will be empty)
+                    stderr:   'SyntaxError: Unexpected token \'export\'',
+                    timedOut: false,
+                });
+            });
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+
+            const result = await runner.mutantRun({
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                activeMutant:    { id: '77' } as any,
+                testFilter:      [],
+                sandboxFileName: 'sandbox',
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+            } as any);
+
+            // rawFailedNames=0 and parsed.tests=0 → checkRuntimeError fires → SyntaxError in stderr → Error
+            expect(result.status).toBe(MutantRunStatus.Error);
+            if(result.status === MutantRunStatus.Error) {
+                expect(result.errorMessage).toContain('SyntaxError');
+            }
+        });
+
+        it('returns MutantRunStatus.Killed (not Error) when tests fail even with runtime-error keywords in stderr', async () => {
+            // Kills LogicalOperator mutant 328: && → || would make runtime-error check fire when
+            // rawFailedNames is non-empty, returning Error instead of Killed.
+            // Also kills ConditionalExpression→true mutant 326 in the same way.
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+            mockRunBunTests.mockImplementation((options: any) => {
+                if(options.onInspectorReady) {
+                    options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                }
+                return Promise.resolve({
+                    exitCode: 1,
+                    stdout:   'tests/foo.test.ts:\n✗ my test [1ms]\n  error: fail\n\n 0 pass\n 1 fail\n',
+                    stderr:   'SyntaxError: some unrelated log line',  // error keyword in stderr but tests DID run
+                    timedOut: false,
+                });
+            });
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+
+            const result = await runner.mutantRun({
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                activeMutant:    { id: '77' } as any,
+                testFilter:      [],
+                sandboxFileName: 'sandbox',
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+            } as any);
+
+            // rawFailedNames.length > 0 → runtime-error check MUST NOT fire → Killed
+            expect(result.status).toBe(MutantRunStatus.Killed);
+            if(result.status === MutantRunStatus.Killed) {
+                expect(result.killedBy).toContain('tests/foo.test.ts > my test');
+            }
+        });
+
         it('should filter out null failure messages', async () => {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -1662,9 +2075,8 @@ tests/example.test.ts:
             const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
             await runner.init();
 
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test uses simplified mock data
             const result = await runner.mutantRun({
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                 activeMutant:    { id: '1' } as any,
                 testFilter:      [],
                 sandboxFileName: 'sandbox',
@@ -1683,9 +2095,8 @@ tests/example.test.ts:
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -1712,9 +2123,8 @@ tests/example.test.ts:
             const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
             await runner.init();
 
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test uses simplified mock data
             const result = await runner.mutantRun({
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                 activeMutant:    { id: '1' } as any,
                 testFilter:      [],
                 sandboxFileName: 'sandbox',
@@ -1732,9 +2142,8 @@ tests/example.test.ts:
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -1757,9 +2166,8 @@ tests/example.test.ts:
             const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
             await runner.init();
 
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test uses simplified mock data
             const result = await runner.mutantRun({
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                 activeMutant:    { id: '1' } as any,
                 testFilter:      ['should catch mutant'],
                 sandboxFileName: 'sandbox',
@@ -1778,9 +2186,8 @@ tests/example.test.ts:
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -1801,9 +2208,8 @@ tests/example.test.ts:
             const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
             await runner.init();
 
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test uses simplified mock data
             const result = await runner.mutantRun({
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                 activeMutant:    { id: '1' } as any,
                 testFilter:      [],
                 sandboxFileName: 'sandbox',
@@ -1820,9 +2226,8 @@ tests/example.test.ts:
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -1836,9 +2241,8 @@ tests/example.test.ts:
             const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
             await runner.init();
 
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test uses simplified mock data
             const result = await runner.mutantRun({
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                 activeMutant:    { id: '1' } as any,
                 testFilter:      [],
                 sandboxFileName: 'sandbox',
@@ -1853,9 +2257,7 @@ tests/example.test.ts:
             // a genuine (unknown) kill.  killedBy: ['unknown'] is the expected fallback.
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -1869,9 +2271,8 @@ tests/example.test.ts:
             const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
             await runner.init();
 
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test uses simplified mock data
             const result = await runner.mutantRun({
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                 activeMutant:    { id: '1' } as any,
                 testFilter:      [],
                 sandboxFileName: 'sandbox',
@@ -1888,9 +2289,8 @@ tests/example.test.ts:
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -1904,9 +2304,8 @@ tests/example.test.ts:
             const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
             await runner.init();
 
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test uses simplified mock data
             await runner.mutantRun({
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                 activeMutant:    { id: '42' } as any,
                 testFilter:      [],
                 sandboxFileName: 'sandbox',
@@ -1924,9 +2323,8 @@ tests/example.test.ts:
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -1940,9 +2338,8 @@ tests/example.test.ts:
             const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
             await runner.init();
 
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test uses simplified mock data
             await runner.mutantRun({
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                 activeMutant:    { id: '1' } as any,
                 testFilter:      [],
                 sandboxFileName: 'sandbox',
@@ -1960,9 +2357,8 @@ tests/example.test.ts:
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -1976,9 +2372,8 @@ tests/example.test.ts:
             const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
             await runner.init();
 
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test uses simplified mock data
             await runner.mutantRun({
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                 activeMutant:    { id: '1' } as any,
                 testFilter:      [],
                 sandboxFileName: 'sandbox',
@@ -2003,9 +2398,9 @@ tests/example.test.ts:
             expect(discoverTestFilesSpy).toHaveBeenCalledTimes(1);
 
             // Act: mutantRun should reuse the cached list (no additional call to discoverTestFiles)
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test uses simplified mock data
+
             await runner.mutantRun({
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                 activeMutant:    { id: '1' } as any,
                 testFilter:      [],
                 sandboxFileName: 'sandbox',
@@ -2027,9 +2422,8 @@ tests/example.test.ts:
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -2055,9 +2449,8 @@ tests/example.test.ts:
             const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
             await runner.init();
 
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test uses simplified mock data
             const result = await runner.mutantRun({
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                 activeMutant:    { id: '1' } as any,
                 testFilter:      [],
                 sandboxFileName: 'sandbox',
@@ -2079,9 +2472,8 @@ tests/example.test.ts:
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -2106,9 +2498,8 @@ tests/example.test.ts:
             const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
             await runner.init();
 
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test uses simplified mock data
             const result = await runner.mutantRun({
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                 activeMutant:    { id: '1' } as any,
                 testFilter:      [],
                 sandboxFileName: 'sandbox',
@@ -2128,9 +2519,7 @@ tests/example.test.ts:
             // no parseable failure output is treated as a genuine kill with killedBy: ['unknown'].
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -2144,9 +2533,8 @@ tests/example.test.ts:
             const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
             await runner.init();
 
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test uses simplified mock data
             const result = await runner.mutantRun({
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                 activeMutant:    { id: '1' } as any,
                 testFilter:      [],
                 sandboxFileName: 'sandbox',
@@ -2163,9 +2551,8 @@ tests/example.test.ts:
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                 if(options.onInspectorReady) {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                 }
                 return Promise.resolve({
@@ -2179,9 +2566,8 @@ tests/example.test.ts:
             const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
             await runner.init();
 
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test uses simplified mock data
             await runner.mutantRun({
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                 activeMutant:    { id: '42' } as any,
                 testFilter:      [],
                 sandboxFileName: 'sandbox',
@@ -2189,9 +2575,9 @@ tests/example.test.ts:
             } as any);
 
             // Verify exact debug message strings
-            // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
+
             expect(mockLogger.debug).toHaveBeenCalledWith('Running mutant run for mutant %s', '42');
-            // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
+
             expect(mockLogger.debug).toHaveBeenCalledWith('Mutant run completed: %o', expect.any(Object));
         });
 
@@ -2216,10 +2602,9 @@ tests/example.test.ts:
 
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- checking for dryRun callback
                 if(options.onInspectorReady) {
                     // dryRun: fire the inspector-ready callback and return exit-0
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking callback
+
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                     return Promise.resolve({
                         exitCode: 0,
@@ -2243,15 +2628,20 @@ tests/example.test.ts:
             setupDryRunThenMutantRun(
                 [{ id: 1, name: 'my test', fullName: 'my test', type: 'test' as const, url: 'file:///proj/.stryker-tmp/sandbox-ABC/tests/foo.test.ts', status: 'pass' }],
                 [1],
-                `tests/foo.test.ts:\n✗ my test [1ms]\n  error: boom\n\n 0 pass\n 1 fail\n`
+                'tests/foo.test.ts:\n✗ my test [1ms]\n  error: boom\n\n 0 pass\n 1 fail\n'
             );
 
             const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
             await runner.init();
             await runner.dryRun();
 
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test mock
-            const result = await runner.mutantRun({ activeMutant: { id: '1' } as any, testFilter: [], sandboxFileName: 'sandbox' } as any);
+            const result = await runner.mutantRun({
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                activeMutant:    { id: '1' } as any,
+                testFilter:      [],
+                sandboxFileName: 'sandbox',
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+            } as any);
 
             expect(result.status).toBe(MutantRunStatus.Killed);
             if(result.status === MutantRunStatus.Killed) {
@@ -2268,15 +2658,20 @@ tests/example.test.ts:
                     { id: 2, name: 'bar', fullName: 'bar', type: 'test' as const, url: 'file:///proj/.stryker-tmp/sandbox-ABC/tests/b.test.ts', status: 'pass' },
                 ],
                 [1, 2],
-                `tests/b.test.ts:\n✗ bar [1ms]\n  error: oops\n\n 0 pass\n 1 fail\n`
+                'tests/b.test.ts:\n✗ bar [1ms]\n  error: oops\n\n 0 pass\n 1 fail\n'
             );
 
             const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
             await runner.init();
             await runner.dryRun();
 
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test mock
-            const result = await runner.mutantRun({ activeMutant: { id: '2' } as any, testFilter: [], sandboxFileName: 'sandbox' } as any);
+            const result = await runner.mutantRun({
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                activeMutant:    { id: '2' } as any,
+                testFilter:      [],
+                sandboxFileName: 'sandbox',
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+            } as any);
 
             expect(result.status).toBe(MutantRunStatus.Killed);
             if(result.status === MutantRunStatus.Killed) {
@@ -2298,15 +2693,20 @@ tests/example.test.ts:
                 ],
                 [1, 2],
                 // Console output emits the already-suffixed form (hypothetical, but covers identity entry)
-                `tests/c.test.ts:\n✗ baz [0] [1ms]\n  error: err\n\n 0 pass\n 1 fail\n`
+                'tests/c.test.ts:\n✗ baz [0] [1ms]\n  error: err\n\n 0 pass\n 1 fail\n'
             );
 
             const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
             await runner.init();
             await runner.dryRun();
 
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test mock
-            const result = await runner.mutantRun({ activeMutant: { id: '3' } as any, testFilter: [], sandboxFileName: 'sandbox' } as any);
+            const result = await runner.mutantRun({
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                activeMutant:    { id: '3' } as any,
+                testFilter:      [],
+                sandboxFileName: 'sandbox',
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+            } as any);
 
             expect(result.status).toBe(MutantRunStatus.Killed);
             if(result.status === MutantRunStatus.Killed) {
@@ -2327,15 +2727,20 @@ tests/example.test.ts:
                 ],
                 [1, 2, 3],
                 // Both "unique test" and "dup" fail (same dup base name listed twice to exercise dedup)
-                `tests/d.test.ts:\n✗ unique test [1ms]\n  error: a\n✗ dup [1ms]\n  error: b\n✗ dup [1ms]\n  error: c\n\n 0 pass\n 3 fail\n`
+                'tests/d.test.ts:\n✗ unique test [1ms]\n  error: a\n✗ dup [1ms]\n  error: b\n✗ dup [1ms]\n  error: c\n\n 0 pass\n 3 fail\n'
             );
 
             const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
             await runner.init();
             await runner.dryRun();
 
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test mock
-            const result = await runner.mutantRun({ activeMutant: { id: '4' } as any, testFilter: [], sandboxFileName: 'sandbox' } as any);
+            const result = await runner.mutantRun({
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                activeMutant:    { id: '4' } as any,
+                testFilter:      [],
+                sandboxFileName: 'sandbox',
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+            } as any);
 
             expect(result.status).toBe(MutantRunStatus.Killed);
             if(result.status === MutantRunStatus.Killed) {
@@ -2354,27 +2759,38 @@ tests/example.test.ts:
                 [{ id: 1, name: 'known test', fullName: 'known test', type: 'test' as const, url: 'file:///proj/.stryker-tmp/sandbox-ABC/tests/e.test.ts', status: 'pass' }],
                 [1],
                 // mutantRun output reports a completely different test name
-                `tests/e.test.ts:\n✗ totally unknown test name [1ms]\n  error: err\n\n 0 pass\n 1 fail\n`
+                'tests/e.test.ts:\n✗ totally unknown test name [1ms]\n  error: err\n\n 0 pass\n 1 fail\n'
             );
 
             const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
             await runner.init();
             await runner.dryRun();
 
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test mock
-            const result = await runner.mutantRun({ activeMutant: { id: '5' } as any, testFilter: [], sandboxFileName: 'sandbox' } as any);
+            const result = await runner.mutantRun({
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                activeMutant:    { id: '5' } as any,
+                testFilter:      [],
+                sandboxFileName: 'sandbox',
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+            } as any);
 
             expect(result.status).toBe(MutantRunStatus.Killed);
             if(result.status === MutantRunStatus.Killed) {
                 // The unrecognised name is included as-is (not dropped)
                 expect(result.killedBy).toEqual(['tests/e.test.ts > totally unknown test name']);
             }
-            // Should emit a logger.warn for the unrecognised name
-            // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
-            expect(mockLogger.warn).toHaveBeenCalledWith(
+            // Should emit a logger.debug (not warn) for the unrecognised name —
+            // the fallback is correct behavior, not a recoverable problem.
+
+            expect(mockLogger.debug).toHaveBeenCalledWith(
                 expect.stringContaining('not found in test registry'),
                 expect.stringContaining('totally unknown test name'),
                 '5'
+            );
+            expect(mockLogger.warn).not.toHaveBeenCalledWith(
+                expect.stringContaining('not found in test registry'),
+                expect.anything(),
+                expect.anything()
             );
         });
 
@@ -2387,10 +2803,9 @@ tests/example.test.ts:
             // testFilter carries the suffixed registry ID Stryker recorded from dryRun.
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- checking for dryRun callback
                 if(options.onInspectorReady) {
                     // dryRun path — should not be reached in this test
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking callback
+
                     options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                     return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
                 }
@@ -2408,9 +2823,9 @@ tests/example.test.ts:
             await runner.init();
 
             // testFilter includes the suffixed ID (as Stryker would pass it)
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test mock
+
             const result = await runner.mutantRun({
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                 activeMutant:    { id: '99' } as any,
                 testFilter:      ['tests/foo.test.ts > should do X [0]'],
                 sandboxFileName: 'sandbox',
@@ -2444,9 +2859,8 @@ tests/example.test.ts:
             await runner.init();
             await runner.dryRun();  // populates cachedTestNames and baseNameIndex
 
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test mock
             const result = await runner.mutantRun({
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                 activeMutant:    { id: '100' } as any,
                 testFilter:      [],   // empty → must fall back to instance fields
                 sandboxFileName: 'sandbox',
@@ -2478,9 +2892,9 @@ tests/example.test.ts:
             await runner.dryRun();  // populates cachedTestNames with "tests/leak.test.ts > leak test"
 
             // mutantRun with testFilter that does NOT include "leak test"
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test mock
+
             const result = await runner.mutantRun({
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                 activeMutant:    { id: '101' } as any,
                 testFilter:      ['tests/other.test.ts > other test'],   // unrelated test in testFilter
                 sandboxFileName: 'sandbox',
@@ -2492,7 +2906,7 @@ tests/example.test.ts:
                 // "leak test" not in localRegistry, but exact match in cachedTestNames (step 3)
                 expect(result.killedBy).toEqual(['tests/leak.test.ts > leak test']);
                 // Must NOT warn about unrecognised name
-                // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
+
                 expect(mockLogger.warn).not.toHaveBeenCalledWith(
                     expect.stringContaining('not found in test registry'),
                     expect.anything(),
@@ -2519,9 +2933,9 @@ tests/example.test.ts:
             await runner.dryRun();  // registers "shared name [0]" and "shared name [1]"
 
             // mutantRun with testFilter that does NOT mention "shared name"
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test mock
+
             const result = await runner.mutantRun({
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                 activeMutant:    { id: '102' } as any,
                 testFilter:      ['tests/other.test.ts > unrelated'],   // unrelated
                 sandboxFileName: 'sandbox',
@@ -2536,7 +2950,7 @@ tests/example.test.ts:
                 expect(result.killedBy).toContain('tests/shared.test.ts > shared name [0]');
                 expect(result.killedBy).toContain('tests/shared.test.ts > shared name [1]');
                 // Must NOT warn about unrecognised name
-                // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
+
                 expect(mockLogger.warn).not.toHaveBeenCalledWith(
                     expect.stringContaining('not found in test registry'),
                     expect.anything(),
@@ -2562,11 +2976,11 @@ tests/example.test.ts:
             await runner.dryRun();
 
             // testFilter includes the suffixed IDs for "covering test"
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test mock
+
             const result = await runner.mutantRun({
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
-                activeMutant:    { id: '103' } as any,
-                testFilter:      [
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                activeMutant: { id: '103' } as any,
+                testFilter:   [
                     'tests/cover.test.ts > covering test [0]',
                     'tests/cover.test.ts > covering test [1]',
                 ],
@@ -2596,9 +3010,8 @@ tests/example.test.ts:
             await runner.init();
             await runner.dryRun();
 
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test mock
             const result = await runner.mutantRun({
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                 activeMutant:    { id: '104' } as any,
                 testFilter:      ['tests/k.test.ts > known test'],  // known test in filter, unknown one leaks
                 sandboxFileName: 'sandbox',
@@ -2610,11 +3023,16 @@ tests/example.test.ts:
                 // Raw name stored as-is
                 expect(result.killedBy).toContain('tests/k.test.ts > completely unknown test');
             }
-            // Warning emitted for unresolved name
-            // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
-            expect(mockLogger.warn).toHaveBeenCalledWith(
+            // Debug (not warn) emitted for unresolved name
+
+            expect(mockLogger.debug).toHaveBeenCalledWith(
                 expect.stringContaining('not found in test registry'),
                 expect.stringContaining('completely unknown test'),
+                expect.anything()
+            );
+            expect(mockLogger.warn).not.toHaveBeenCalledWith(
+                expect.stringContaining('not found in test registry'),
+                expect.anything(),
                 expect.anything()
             );
         });
@@ -2634,11 +3052,10 @@ tests/example.test.ts:
             });
 
             afterEach(() => {
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
                 writeFileSpy.mockRestore();
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+
                 renameSpy.mockRestore();
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+
                 mkdirSpy.mockRestore();
             });
 
@@ -2654,8 +3071,9 @@ tests/example.test.ts:
 
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking callback
-                    if(options.onInspectorReady) options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
                     return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
                 });
 
@@ -2666,30 +3084,41 @@ tests/example.test.ts:
                 // writeFile should have been called with the .tmp path
                 expect(writeFileSpy).toHaveBeenCalled();
                 const writeCall = writeFileSpy.mock.calls.find(
-                    // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- dynamic arg
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dynamic arg
                     (args: any) => String(args[0]).endsWith('.stryker-bun-runner-registry.json.tmp')
                 );
                 expect(writeCall).toBeDefined();
 
                 // Parse the written JSON and verify shape
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access -- dynamic JSON
-                const written = JSON.parse(writeCall![1] as string) as any;
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- verifying shape
+
+                const written = JSON.parse(writeCall![1] as string);
+
                 expect(written.version).toBe(1);
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- verifying shape
+
                 expect(written.writtenAt).toBeNumber();
                 // cachedTestNames: unique test + dup test [0] + dup test [1]
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- verifying shape
+
                 expect(written.cachedTestNames).toBeArray();
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- verifying shape
+
                 expect(written.cachedTestNames).toContain('tests/reg.test.ts > unique test');
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- verifying shape
+
                 expect(written.cachedTestNames).toContain('tests/reg.test.ts > dup test [0]');
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- verifying shape
+
                 expect(written.cachedTestNames).toContain('tests/reg.test.ts > dup test [1]');
-                // baseNameIndex is serialised as entries array
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- verifying shape
+                // baseNameIndex is serialised as entries array — every element must be a [string, string[]] pair
+                // (Kills ArrayDeclaration mutant 293: prepending "Stryker was here" would break this structure)
                 expect(written.baseNameIndex).toBeArray();
+                for(const entry of written.baseNameIndex) {
+                    expect(Array.isArray(entry)).toBe(true);
+                    expect(typeof entry[0]).toBe('string');
+                    expect(Array.isArray(entry[1])).toBe(true);
+                    for(const name of entry[1]) {
+                        expect(typeof name).toBe('string');
+                    }
+                }
+                // Verify the structure can be reconstructed as a Map (as loadRegistryFile does)
+                const reconstructed = new Map<string, string[]>(written.baseNameIndex);
+                expect(reconstructed.size).toBeGreaterThan(0);
             });
 
             it('uses atomic write-to-tmp-then-rename pattern for the registry file', async () => {
@@ -2701,15 +3130,20 @@ tests/example.test.ts:
 
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking callback
-                    if(options.onInspectorReady) options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
                     return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
                 });
 
                 // Track call order to ensure writeFile precedes rename
                 const callOrder: string[] = [];
-                writeFileSpy.mockImplementation(async () => { callOrder.push('writeFile'); });
-                renameSpy.mockImplementation(async () => { callOrder.push('rename'); });
+                writeFileSpy.mockImplementation(async () => {
+                    callOrder.push('writeFile');
+                });
+                renameSpy.mockImplementation(async () => {
+                    callOrder.push('rename');
+                });
 
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
                 await runner.init();
@@ -2717,7 +3151,7 @@ tests/example.test.ts:
 
                 // writeFile must have been called with the .tmp path
                 const tmpWriteCall = writeFileSpy.mock.calls.find(
-                    // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- dynamic arg
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dynamic arg
                     (args: any) => String(args[0]).endsWith('.stryker-bun-runner-registry.json.tmp')
                 );
                 expect(tmpWriteCall).toBeDefined();
@@ -2741,8 +3175,9 @@ tests/example.test.ts:
 
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking callback
-                    if(options.onInspectorReady) options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
                     return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
                 });
 
@@ -2755,7 +3190,7 @@ tests/example.test.ts:
                 const result = await runner.dryRun();
 
                 expect(result.status).toBe(DryRunStatus.Complete);
-                // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
+
                 expect(mockLogger.warn).toHaveBeenCalledWith(
                     expect.stringContaining('Failed to write dryRun registry file'),
                     expect.stringContaining('ENOSPC')
@@ -2779,13 +3214,12 @@ tests/example.test.ts:
             });
 
             afterEach(() => {
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
                 readFileSpy.mockRestore();
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+
                 writeFileSpy.mockRestore();
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+
                 renameSpy.mockRestore();
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+
                 mkdirSpy.mockRestore();
             });
 
@@ -2793,8 +3227,8 @@ tests/example.test.ts:
                 // Simulate a non-dryRun worker: no cachedTestNames, testFilter is empty.
                 // The registry file contains a test that has a " [N]" suffix.
                 const registryJson = JSON.stringify({
-                    version:        1,
-                    writtenAt:      Date.now(),
+                    version:         1,
+                    writtenAt:       Date.now(),
                     cachedTestNames: [
                         'tests/static.test.ts > static test [0]',
                         'tests/static.test.ts > static test [1]',
@@ -2811,9 +3245,7 @@ tests/example.test.ts:
                 // mutantRun output: Bun console parser emits the base name (no [N] suffix)
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- checking callback
                     if(options.onInspectorReady) {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking callback
                         options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                         return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
                     }
@@ -2830,7 +3262,6 @@ tests/example.test.ts:
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
                 await runner.init();
 
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test mock
                 const result = await runner.mutantRun({
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                     activeMutant:    { id: '200' } as any,
@@ -2858,8 +3289,8 @@ tests/example.test.ts:
                 // This ensures leaked tests (tests NOT in testFilter that Bun's hierarchy
                 // regex may still run) can be resolved via the instance registry.
                 const registryJson = JSON.stringify({
-                    version:        1,
-                    writtenAt:      Date.now(),
+                    version:         1,
+                    writtenAt:       Date.now(),
                     cachedTestNames: ['tests/foo.test.ts > should work [0]'],
                     baseNameIndex:   [
                         ['tests/foo.test.ts > should work', ['tests/foo.test.ts > should work [0]']],
@@ -2871,9 +3302,7 @@ tests/example.test.ts:
 
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- checking callback
                     if(options.onInspectorReady) {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking callback
                         options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                         return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
                     }
@@ -2888,7 +3317,6 @@ tests/example.test.ts:
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
                 await runner.init();
 
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test mock
                 const result = await runner.mutantRun({
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                     activeMutant:    { id: '201' } as any,
@@ -2913,9 +3341,7 @@ tests/example.test.ts:
 
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- checking callback
                     if(options.onInspectorReady) {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking callback
                         options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                         return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
                     }
@@ -2930,7 +3356,6 @@ tests/example.test.ts:
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
                 await runner.init();
 
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test mock
                 const result = await runner.mutantRun({
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                     activeMutant:    { id: '202' } as any,
@@ -2946,18 +3371,62 @@ tests/example.test.ts:
                     expect(result.killedBy).toContain('tests/foo.test.ts > raw name test');
                 }
 
-                // Should have warned about the missing file
-                // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
-                expect(mockLogger.warn).toHaveBeenCalledWith(
+                // ENOENT is expected on non-dryRun workers; the log is debug not warn
+                expect(mockLogger.debug).toHaveBeenCalledWith(
                     expect.stringContaining('dryRun registry file not found'),
                     expect.stringContaining('.stryker-bun-runner-registry.json')
                 );
             });
 
+            it('logs warning when registry file load fails with non-ENOENT error', async () => {
+                // Non-ENOENT errors (e.g. EACCES, parse failure) should log a warn, not a debug
+                const permError = Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock returns error
+                readFileSpy.mockRejectedValue(permError as any);
+
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                        return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
+                    }
+                    return Promise.resolve({
+                        exitCode: 1,
+                        stdout:   'tests/foo.test.ts:\n✗ test name [1ms]\n  error: killed\n\n 0 pass\n 1 fail\n',
+                        stderr:   '',
+                        timedOut: false,
+                    });
+                });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+
+                await runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '202' } as any,
+                    testFilter:      [],  // empty → tries to load registry
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+
+                // Non-ENOENT error must log a warn with the exact format string (kills StringLiteral mutant 79)
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    'Failed to load dryRun registry from %s: %s',
+                    expect.stringContaining('.stryker-bun-runner-registry.json'),
+                    'EACCES: permission denied'
+                );
+
+                // Must NOT have logged the debug message used for ENOENT
+                expect(mockLogger.debug).not.toHaveBeenCalledWith(
+                    expect.stringContaining('dryRun registry file not found'),
+                    expect.any(String)
+                );
+            });
+
             it('caches registry after first load (does not re-read file on second mutantRun)', async () => {
                 const registryJson = JSON.stringify({
-                    version:        1,
-                    writtenAt:      Date.now(),
+                    version:         1,
+                    writtenAt:       Date.now(),
                     cachedTestNames: ['tests/cache.test.ts > cached test'],
                     baseNameIndex:   [
                         ['tests/cache.test.ts > cached test', ['tests/cache.test.ts > cached test']],
@@ -2968,9 +3437,7 @@ tests/example.test.ts:
 
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- checking callback
                     if(options.onInspectorReady) {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking callback
                         options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                         return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
                     }
@@ -2986,7 +3453,7 @@ tests/example.test.ts:
                 await runner.init();
 
                 // First call: triggers registry load
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test mock
+
                 await runner.mutantRun({
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                     activeMutant:    { id: '203' } as any,
@@ -2996,7 +3463,7 @@ tests/example.test.ts:
                 } as any);
 
                 // Second call: registry already in memory; should NOT read file again
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test mock
+
                 await runner.mutantRun({
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                     activeMutant:    { id: '204' } as any,
@@ -3022,9 +3489,7 @@ tests/example.test.ts:
 
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- checking callback
                     if(options.onInspectorReady) {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking callback
                         options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                         return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
                     }
@@ -3035,7 +3500,7 @@ tests/example.test.ts:
                 await runner.init();
 
                 // First call: triggers registry load, shape-check fails
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test mock
+
                 await runner.mutantRun({
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                     activeMutant:    { id: '205' } as any,
@@ -3045,7 +3510,7 @@ tests/example.test.ts:
                 } as any);
 
                 // Should have warned about the malformed file
-                // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
+
                 expect(mockLogger.warn).toHaveBeenCalledWith(
                     expect.stringContaining('malformed')
                 );
@@ -3054,7 +3519,7 @@ tests/example.test.ts:
                 // guard `if (!this.cachedTestNames) await this.loadRegistryFile()` fires again
                 // on the second call.  readFile being invoked twice proves no half-init occurred.
                 const callsAfterFirst = readFileSpy.mock.calls.length;
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test mock
+
                 await runner.mutantRun({
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                     activeMutant:    { id: '206' } as any,
@@ -3073,9 +3538,7 @@ tests/example.test.ts:
 
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- checking callback
                     if(options.onInspectorReady) {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking callback
                         options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                         return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
                     }
@@ -3086,7 +3549,7 @@ tests/example.test.ts:
                 await runner.init();
 
                 // First call: triggers registry load, shape-check fails
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test mock
+
                 await runner.mutantRun({
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                     activeMutant:    { id: '205' } as any,
@@ -3096,7 +3559,7 @@ tests/example.test.ts:
                 } as any);
 
                 // Should have warned about the malformed file (cachedTestNames missing)
-                // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
+
                 expect(mockLogger.warn).toHaveBeenCalledWith(
                     expect.stringContaining('malformed')
                 );
@@ -3105,7 +3568,7 @@ tests/example.test.ts:
                 // guard `if (!this.cachedTestNames) await this.loadRegistryFile()` fires again
                 // on the second call.  readFile being invoked twice proves no half-init occurred.
                 const callsAfterFirst = readFileSpy.mock.calls.length;
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test mock
+
                 await runner.mutantRun({
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                     activeMutant:    { id: '207' } as any,
@@ -3156,11 +3619,11 @@ tests/example.test.ts:
             await runner.dispose();
 
             // Verify exact debug message strings (kills StringLiteral mutations on lines 469, 473, 479)
-            // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
+
             expect(mockLogger.debug).toHaveBeenCalledWith('Disposing BunTestRunner');
-            // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
+
             expect(mockLogger.debug).toHaveBeenCalledWith('Cleaning up preload script: %s', expect.any(String));
-            // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
+
             expect(mockLogger.debug).toHaveBeenCalledWith('Cleaning up coverage file: %s', expect.any(String));
         });
 
@@ -3178,7 +3641,6 @@ tests/example.test.ts:
             );
             expect(tmpCall).toBeUndefined();
 
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
             unlinkSpy.mockRestore();
         });
 
@@ -3196,20 +3658,24 @@ tests/example.test.ts:
 
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock
                 mockRunBunTests.mockImplementation((options: any) => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking callback
-                    if(options.onInspectorReady) options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
                     return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
                 });
             });
 
             afterEach(() => {
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
                 writeFileSpy.mockRestore();
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+
                 renameSpy.mockRestore();
             });
 
-            it('calls unlink on the cached registry tmp path during dispose after dryRun', async () => {
+            it('does NOT attempt unlink on the registry tmp path when dryRun succeeds (tmp was renamed away)', async () => {
+                // Fix 7: after a successful rename(), lastRegistryTmpPath is cleared so that
+                // dispose() does not try to unlink a path that no longer exists.
+                // This test verifies the new correct semantics: no unlink for the .tmp file
+                // when dryRun() completed normally (rename succeeded).
                 const unlinkSpy = spyOn(fsPromises, 'unlink').mockResolvedValue(undefined);
 
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
@@ -3217,62 +3683,80 @@ tests/example.test.ts:
                 await runner.dryRun();
                 await runner.dispose();
 
-                // unlink must be called with the exact path written during dryRun
-                const unlinkCalls = unlinkSpy.mock.calls;
-                const tmpCall = unlinkCalls.find(
+                // After successful rename, lastRegistryTmpPath is cleared → no unlink for .tmp
+                const tmpCall = unlinkSpy.mock.calls.find(
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dynamic arg check
+                    (args: any) => String(args[0]).endsWith('.stryker-bun-runner-registry.json.tmp')
+                );
+                expect(tmpCall).toBeUndefined();
+
+                unlinkSpy.mockRestore();
+            });
+
+            it('calls unlink on the registry tmp path when rename fails (crash between writeFile and rename)', async () => {
+                // When rename() fails (e.g. OS error), lastRegistryTmpPath remains set so
+                // dispose() can clean up the orphaned .tmp file.
+                renameSpy.mockRejectedValue(Object.assign(new Error('ENOENT: rename failed'), { code: 'ENOENT' }));
+
+                const unlinkSpy = spyOn(fsPromises, 'unlink').mockResolvedValue(undefined);
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                // dryRun will log a warning about the rename failure but still complete
+                await runner.dryRun();
+                await runner.dispose();
+
+                // lastRegistryTmpPath was NOT cleared (rename failed) → dispose() should unlink
+                const tmpCall = unlinkSpy.mock.calls.find(
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dynamic arg check
                     (args: any) => String(args[0]).endsWith('.stryker-bun-runner-registry.json.tmp')
                 );
                 expect(tmpCall).toBeDefined();
 
-                // Also verify the written path matches what writeFile was called with
-                const writeCall = writeFileSpy.mock.calls.find(
-                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dynamic arg check
-                    (args: any) => String(args[0]).endsWith('.stryker-bun-runner-registry.json.tmp')
-                );
-                expect(writeCall).toBeDefined();
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access -- dynamic arg
-                expect((tmpCall as any)[0]).toBe((writeCall as any)[0]);
-
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
                 unlinkSpy.mockRestore();
             });
 
             it('swallows ENOENT silently when registry tmp file does not exist during dispose', async () => {
+                // Simulate: rename() failed so lastRegistryTmpPath is still set, but the tmp file
+                // is gone by the time dispose() runs → ENOENT from unlink should be silent.
+                renameSpy.mockRejectedValue(Object.assign(new Error('ENOENT: rename failed'), { code: 'ENOENT' }));
+
                 const enoentErr = Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' });
                 const unlinkSpy = spyOn(fsPromises, 'unlink').mockRejectedValue(enoentErr);
 
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
                 await runner.init();
                 await runner.dryRun();
-                await expect(runner.dispose()).resolves.toBeUndefined();
+                await runner.dispose();
                 // ENOENT is normal — must NOT be debug-logged
-                // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
+
                 expect(mockLogger.debug).not.toHaveBeenCalledWith(
                     expect.stringContaining('Failed to clean registry tmp file'),
                     expect.any(String)
                 );
 
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
                 unlinkSpy.mockRestore();
             });
 
             it('debug-logs unexpected unlink errors during dispose without rethrowing', async () => {
+                // Simulate: rename() failed so lastRegistryTmpPath is still set, and unlink
+                // fails with an unexpected error — it should be debug-logged but not thrown.
+                renameSpy.mockRejectedValue(Object.assign(new Error('ENOENT: rename failed'), { code: 'ENOENT' }));
+
                 const permErr = Object.assign(new Error('EPERM: permission denied'), { code: 'EPERM' });
                 const unlinkSpy = spyOn(fsPromises, 'unlink').mockRejectedValue(permErr);
 
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
                 await runner.init();
                 await runner.dryRun();
-                await expect(runner.dispose()).resolves.toBeUndefined();
+                await runner.dispose();
                 // Non-ENOENT error must be debug-logged
-                // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
+
                 expect(mockLogger.debug).toHaveBeenCalledWith(
                     expect.stringContaining('Failed to clean registry tmp file'),
                     expect.stringContaining('EPERM')
                 );
 
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
                 unlinkSpy.mockRestore();
             });
         });
@@ -3291,7 +3775,7 @@ tests/example.test.ts:
                 // Verify generatePreloadScript was called with coverageFile containing "coverage-"
                 expect(mockGeneratePreloadScript).toHaveBeenCalledWith(
                     expect.objectContaining({
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- test mock
+
                         coverageFile: expect.stringContaining('coverage-'),
                     })
                 );
@@ -3304,7 +3788,7 @@ tests/example.test.ts:
                 // Verify the coverage file path is not empty or just a timestamp
                 expect(mockGeneratePreloadScript).toHaveBeenCalledWith(
                     expect.objectContaining({
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- test mock
+
                         coverageFile: expect.stringMatching(/coverage-\d+\.json$/),
                     })
                 );
@@ -3317,9 +3801,7 @@ tests/example.test.ts:
                 try {
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                     mockRunBunTests.mockImplementation((options: any) => {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- test mock
                         if(options.onInspectorReady) {
-                            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                             options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                         }
                         // Return after small delay with 2 tests
@@ -3362,9 +3844,7 @@ tests/example.test.ts:
             it('should use > 0 not >= 0 for executionOrder length check', async () => {
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- test mock
                     if(options.onInspectorReady) {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                         options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                     }
                     return Promise.resolve({
@@ -3395,9 +3875,7 @@ tests/example.test.ts:
                 // This tests that the condition isn't replaced with true/false
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- test mock
                     if(options.onInspectorReady) {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                         options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                     }
                     return Promise.resolve({
@@ -3437,9 +3915,7 @@ tests/example.test.ts:
             it('should use exact "unknown-" prefix for missing tests', async () => {
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- test mock
                     if(options.onInspectorReady) {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                         options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                     }
                     return Promise.resolve({
@@ -3470,9 +3946,7 @@ tests/example.test.ts:
             it('should not use empty string for unknown test prefix', async () => {
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- test mock
                     if(options.onInspectorReady) {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                         options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                     }
                     return Promise.resolve({
@@ -3508,9 +3982,7 @@ tests/example.test.ts:
                     mockRunBunTests.mockImplementation((options: any) => {
                         // Call onInspectorReady after 110ms (slightly past the 100ms timeout boundary)
                         setTimeout(() => {
-                            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- test mock
                             if(options.onInspectorReady) {
-                                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                                 options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                             }
                         }, 110);
@@ -3539,6 +4011,7 @@ tests/example.test.ts:
                     // Advance fake timers past the timeout (100ms) but before callback (110ms)
                     for(let i = 0; i < 5; i++) {
                         jest.advanceTimersByTime(50);
+                        // eslint-disable-next-line no-await-in-loop -- deliberate sequential microtask flush for fake-timer test
                         await Promise.resolve();
                     }
 
@@ -3561,9 +4034,7 @@ tests/example.test.ts:
             it('should pass empty handlers object to InspectorClient (no per-test relay needed)', async () => {
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- test mock
                     if(options.onInspectorReady) {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                         options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                     }
                     return Promise.resolve({
@@ -3580,7 +4051,6 @@ tests/example.test.ts:
                 // @ts-expect-error - Mocking constructor with implementation
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 spyOn(inspectorModule, 'InspectorClient').mockImplementation((options: any) => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access -- test spy
                     capturedHandlers = options.handlers;
                     return mockInspectorClient;
                 });
@@ -3603,9 +4073,7 @@ tests/example.test.ts:
             it('should log exact debug message after enabling TestReporter (line 332)', async () => {
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- test mock
                     if(options.onInspectorReady) {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                         options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                     }
                     return Promise.resolve({
@@ -3625,16 +4093,14 @@ tests/example.test.ts:
                 await runner.dryRun();
 
                 // Verify exact string "Inspector connected and TestReporter enabled"
-                // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
+
                 expect(mockLogger.debug).toHaveBeenCalledWith('Inspector connected and TestReporter enabled');
             });
 
             it('should log exact debug message with exit code format (line 383)', async () => {
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- test mock
                     if(options.onInspectorReady) {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                         options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                     }
                     return Promise.resolve({
@@ -3672,9 +4138,8 @@ tests/example.test.ts:
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
                 await runner.init();
 
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test uses simplified mock data
                 await runner.mutantRun({
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                     activeMutant:    { id: '123' } as any,
                     testFilter:      [],
                     sandboxFileName: 'sandbox',
@@ -3682,18 +4147,18 @@ tests/example.test.ts:
                 } as any);
 
                 // Verify exact log format with %o
-                // eslint-disable-next-line @typescript-eslint/unbound-method -- accessing method for mock verification
+
                 expect(mockLogger.debug).toHaveBeenCalledWith(
                     'Mutant run completed: %o',
                     expect.objectContaining({
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- test mock
+
                         totalTests: expect.any(Number),
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- test mock
-                        passed:     expect.any(Number),
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- test mock
-                        failed:     expect.any(Number),
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- test mock
-                        exitCode:   expect.any(Number),
+
+                        passed: expect.any(Number),
+
+                        failed: expect.any(Number),
+
+                        exitCode: expect.any(Number),
                     })
                 );
             });
@@ -3721,9 +4186,8 @@ error: Expected 1 but got 2
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
                 await runner.init();
 
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test uses simplified mock data
                 const result = await runner.mutantRun({
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                     activeMutant:    { id: '1' } as any,
                     testFilter:      [],
                     sandboxFileName: 'sandbox',
@@ -3759,9 +4223,8 @@ error: Failed B
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
                 await runner.init();
 
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test uses simplified mock data
                 const result = await runner.mutantRun({
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                     activeMutant:    { id: '1' } as any,
                     testFilter:      [],
                     sandboxFileName: 'sandbox',
@@ -3798,9 +4261,8 @@ error: Message 2
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
                 await runner.init();
 
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test uses simplified mock data
                 const result = await runner.mutantRun({
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                     activeMutant:    { id: '1' } as any,
                     testFilter:      [],
                     sandboxFileName: 'sandbox',
@@ -3825,9 +4287,7 @@ error: Message 2
                 mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
                     if(options.onInspectorReady) {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                         options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                     }
                     return Promise.resolve({
@@ -3859,9 +4319,7 @@ error: Message 2
                     const totalTime = 20;
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                     mockRunBunTests.mockImplementation((options: any) => {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
                         if(options.onInspectorReady) {
-                            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                             options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                         }
 
@@ -3920,9 +4378,7 @@ error: Message 2
                 mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
                     if(options.onInspectorReady) {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                         options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                     }
                     return Promise.resolve({
@@ -3967,9 +4423,7 @@ error: Message 2
                     const totalTime = 100; // Use larger time to make difference obvious
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                     mockRunBunTests.mockImplementation((options: any) => {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
                         if(options.onInspectorReady) {
-                            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                             options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                         }
 
@@ -4029,9 +4483,7 @@ error: Message 2
                 mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
                     if(options.onInspectorReady) {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                         options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                     }
                     return Promise.resolve({
@@ -4083,31 +4535,45 @@ error: Message 2
 
         describe('inspector timeout loop (line 299)', () => {
             it('should timeout when inspector URL not provided within timeout', async () => {
-                mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+                jest.useFakeTimers();
+                try {
+                    mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
 
-                // Mock runBunTests to never call onInspectorReady but resolve the
-                // child promise so the runner can drain stdout/stderr for diagnostics.
-                mockRunBunTests.mockImplementation(() => {
-                    return Promise.resolve({
-                        exitCode: 1,
-                        stdout:   '',
-                        stderr:   'simulated early exit',
-                        timedOut: false,
+                    // Mock runBunTests to never call onInspectorReady but resolve the
+                    // child promise so the runner can drain stdout/stderr for diagnostics.
+                    mockRunBunTests.mockImplementation(() => {
+                        return Promise.resolve({
+                            exitCode: 1,
+                            stdout:   '',
+                            stderr:   'simulated early exit',
+                            timedOut: false,
+                        });
                     });
-                });
 
-                const runner = new BunTestRunner(mockLogger, {
-                    bun: {
-                        inspectorTimeout: 100, // Short timeout for test
-                    },
-                } as unknown as StrykerOptions);
-                await runner.init();
+                    const runner = new BunTestRunner(mockLogger, {
+                        bun: {
+                            inspectorTimeout: 100,
+                        },
+                    } as unknown as StrykerOptions);
+                    await runner.init();
 
-                const result = await runner.dryRun();
+                    const resultPromise = runner.dryRun();
 
-                expect(result.status).toBe(DryRunStatus.Error);
-                if(result.status === DryRunStatus.Error) {
-                    expect(result.errorMessage).toContain('Timeout waiting for inspector URL');
+                    // Advance past the inspectorTimeout threshold in polling increments
+                    for(let i = 0; i < 5; i++) {
+                        jest.advanceTimersByTime(50);
+                        // eslint-disable-next-line no-await-in-loop -- deliberate sequential microtask flush for fake-timer test
+                        await Promise.resolve();
+                    }
+
+                    const result = await resultPromise;
+
+                    expect(result.status).toBe(DryRunStatus.Error);
+                    if(result.status === DryRunStatus.Error) {
+                        expect(result.errorMessage).toContain('Timeout waiting for inspector URL');
+                    }
+                } finally {
+                    jest.useRealTimers();
                 }
             });
 
@@ -4119,9 +4585,8 @@ error: Message 2
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
                     // Call onInspectorReady immediately - simulates URL arriving quickly
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
+
                     if(options.onInspectorReady) {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                         options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                     }
 
@@ -4159,9 +4624,7 @@ error: Message 2
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                     mockRunBunTests.mockImplementation((options: any) => {
                         setTimeout(() => {
-                            // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
                             if(options.onInspectorReady) {
-                                // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                                 options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                             }
                         }, 110);
@@ -4190,6 +4653,7 @@ error: Message 2
                     // Advance fake timers past the timeout (100ms) but before callback (110ms)
                     for(let i = 0; i < 5; i++) {
                         jest.advanceTimersByTime(50);
+                        // eslint-disable-next-line no-await-in-loop -- deliberate sequential microtask flush for fake-timer test
                         await Promise.resolve();
                     }
 
@@ -4213,9 +4677,7 @@ error: Message 2
                 mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- accessing mock callback
                     if(options.onInspectorReady) {
-                        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call -- invoking mock callback
                         options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                     }
                     return Promise.resolve({
@@ -4252,9 +4714,8 @@ error: Message 2
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
                 await runner.init();
 
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test uses simplified mock data
                 await runner.mutantRun({
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                     activeMutant:    { id: '1' } as any,
                     testFilter:      [],
                     sandboxFileName: 'sandbox',
@@ -4290,9 +4751,8 @@ error: Test failure
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
                 await runner.init();
 
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test uses simplified mock data
                 const result = await runner.mutantRun({
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                     activeMutant:    { id: '1' } as any,
                     testFilter:      [],
                     sandboxFileName: 'sandbox',
@@ -4322,9 +4782,8 @@ error: Test failure
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
                 await runner.init();
 
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test uses simplified mock data
                 const result = await runner.mutantRun({
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                     activeMutant:    { id: '1' } as any,
                     testFilter:      [],
                     sandboxFileName: 'sandbox',
@@ -4360,9 +4819,8 @@ error: Error message 2
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
                 await runner.init();
 
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test uses simplified mock data
                 const result = await runner.mutantRun({
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                     activeMutant:    { id: '1' } as any,
                     testFilter:      [],
                     sandboxFileName: 'sandbox',
@@ -4397,9 +4855,8 @@ error: Actual error message
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
                 await runner.init();
 
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test uses simplified mock data
                 const result = await runner.mutantRun({
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                     activeMutant:    { id: '1' } as any,
                     testFilter:      [],
                     sandboxFileName: 'sandbox',
@@ -4436,9 +4893,8 @@ error: Expected error
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
                 await runner.init();
 
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test uses simplified mock data
                 const result = await runner.mutantRun({
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                     activeMutant:    { id: '1' } as any,
                     testFilter:      [],
                     sandboxFileName: 'sandbox',
@@ -4477,9 +4933,8 @@ error: Only this message
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
                 await runner.init();
 
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test uses simplified mock data
                 const result = await runner.mutantRun({
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                     activeMutant:    { id: '1' } as any,
                     testFilter:      [],
                     sandboxFileName: 'sandbox',
@@ -4519,9 +4974,8 @@ error: Third failure message
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
                 await runner.init();
 
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test uses simplified mock data
                 const result = await runner.mutantRun({
-                    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- test mock object
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                     activeMutant:    { id: '1' } as any,
                     testFilter:      [],
                     sandboxFileName: 'sandbox',
@@ -4562,11 +5016,10 @@ describe('mutantRun testFilter integration', () => {
     let mockCollectCoverage: ReturnType<typeof mock>;
     let mockCleanupCoverageFile: ReturnType<typeof mock>;
     let mockSyncServer: {
-        start:         ReturnType<typeof mock>
-        signalReady:   ReturnType<typeof mock>
-        close:         ReturnType<typeof mock>
-        sendTestStart: ReturnType<typeof mock>
-        clientCount:   number
+        start:       ReturnType<typeof mock>
+        signalReady: ReturnType<typeof mock>
+        close:       ReturnType<typeof mock>
+        clientCount: number
     };
     let mockInspectorClient: {
         connect:           ReturnType<typeof mock>
@@ -4623,11 +5076,10 @@ describe('mutantRun testFilter integration', () => {
         mockGetAvailablePort.mockImplementation(() => Promise.resolve(7000));
 
         mockSyncServer = {
-            start:         mock().mockResolvedValue(undefined),
-            signalReady:   mock().mockReturnValue(undefined),
-            close:         mock().mockResolvedValue(undefined),
-            sendTestStart: mock().mockReturnValue(undefined),
-            clientCount:   0,
+            start:       mock().mockResolvedValue(undefined),
+            signalReady: mock().mockReturnValue(undefined),
+            close:       mock().mockResolvedValue(undefined),
+            clientCount: 0,
         };
         // @ts-expect-error - Mocking constructor
         syncServerSpy = spyOn(syncServerModule, 'SyncServer').mockImplementation(() => mockSyncServer);
@@ -4644,23 +5096,22 @@ describe('mutantRun testFilter integration', () => {
     });
 
     afterEach(() => {
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
         runBunTestsSpy.mockRestore();
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+
         generatePreloadScriptSpy.mockRestore();
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+
         cleanupPreloadScriptSpy.mockRestore();
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+
         generateSanitizedBunfigSpy2.mockRestore();
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+
         cleanupSanitizedBunfigSpy2.mockRestore();
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+
         collectCoverageSpy.mockRestore();
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+
         cleanupCoverageFileSpy.mockRestore();
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+
         syncServerSpy.mockRestore();
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Bun spyOn returns any type
+
         inspectorClientSpy.mockRestore();
         resetAllMocks();
         jest.useRealTimers();
@@ -4677,8 +5128,8 @@ describe('mutantRun testFilter integration', () => {
         const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
         await runner.init();
 
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test mock
         await runner.mutantRun({
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
             activeMutant:    { id: '1' } as any,
             testFilter:      ['tests/foo.test.ts > Suite > my test'],
             sandboxFileName: 'sandbox',
@@ -4706,8 +5157,8 @@ describe('mutantRun testFilter integration', () => {
         const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
         await runner.init();
 
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test mock
         await runner.mutantRun({
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
             activeMutant:    { id: '1' } as any,
             testFilter:      [],
             sandboxFileName: 'sandbox',
@@ -4735,8 +5186,8 @@ describe('mutantRun testFilter integration', () => {
         const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
         await runner.init();
 
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test mock
         await runner.mutantRun({
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
             activeMutant:    { id: '1' } as any,
             sandboxFileName: 'sandbox',
         // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock
@@ -4762,10 +5213,10 @@ describe('mutantRun testFilter integration', () => {
         const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
         await runner.init();
 
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-argument -- test mock
         await runner.mutantRun({
-            activeMutant:    { id: '1' } as any,
-            testFilter:      [
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+            activeMutant: { id: '1' } as any,
+            testFilter:   [
                 'tests/foo.test.ts > Suite > dup test [0]',
                 'tests/foo.test.ts > Suite > dup test [1]',
             ],

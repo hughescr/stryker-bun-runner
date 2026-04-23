@@ -1,5 +1,5 @@
+import type * as net from 'node:net';
 import { describe, it, expect, mock, beforeEach, afterEach } from 'bun:test';
-import type * as net from 'net';
 import { getAvailablePort } from '../../src/utils/port';
 import { mockCreateServer, resetNetMocks } from '../test-preload.js';
 
@@ -21,7 +21,7 @@ describe('getAvailablePort', () => {
                 callback();
                 return mockServer;
             }),
-            address: mock(() => ({ port: 12345, family: 'IPv4', address: '127.0.0.1' })),
+            address: mock(() => ({ port: 12_345, family: 'IPv4', address: '127.0.0.1' })),
             close:   mock((callback: (err?: Error) => void) => {
                 callback();
             }),
@@ -31,7 +31,7 @@ describe('getAvailablePort', () => {
 
         const port = await getAvailablePort();
 
-        expect(port).toBe(12345);
+        expect(port).toBe(12_345);
         expect(port).toBeGreaterThan(0);
         expect(typeof port).toBe('number');
         expect(mockServer.listen).toHaveBeenCalledWith(0, '127.0.0.1', expect.any(Function));
@@ -40,7 +40,7 @@ describe('getAvailablePort', () => {
     });
 
     it('returns different valid port numbers', async () => {
-        const testPort = 54321;
+        const testPort = 54_321;
         const mockServer = {
             on:     mock(() => mockServer),
             listen: mock((_port: number, _host: string, callback: () => void) => {
@@ -72,16 +72,18 @@ describe('getAvailablePort', () => {
                 return mockServer;
             }),
             listen:  mock(() => mockServer),
-            address: mock(() => ({ port: 12345, family: 'IPv4', address: '127.0.0.1' })),
-            // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
-            close:   mock(() => {}),
+            address: mock(() => ({ port: 12_345, family: 'IPv4', address: '127.0.0.1' })),
+
+            close: mock(() => {}),
         };
 
         mockCreateServer.mockReturnValue(mockServer as unknown as net.Server);
 
-        await expect(getAvailablePort()).rejects.toThrow('Failed to get available port');
-        await expect(getAvailablePort()).rejects.toThrow('EADDRINUSE');
-        await expect(getAvailablePort()).rejects.toThrow(testError.message);
+        const caughtError = await getAvailablePort().catch((e: unknown) => e);
+        expect(caughtError).toBeInstanceOf(Error);
+        expect((caughtError as Error).message).toContain('Failed to get available port');
+        expect((caughtError as Error).message).toContain('EADDRINUSE');
+        expect((caughtError as Error).message).toContain(testError.message);
     });
 
     it('rejects with specific error message format when server errors', async () => {
@@ -95,14 +97,16 @@ describe('getAvailablePort', () => {
                 return mockServer;
             }),
             listen:  mock(() => mockServer),
-            address: mock(() => ({ port: 12345, family: 'IPv4', address: '127.0.0.1' })),
-            // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
-            close:   mock(() => {}),
+            address: mock(() => ({ port: 12_345, family: 'IPv4', address: '127.0.0.1' })),
+
+            close: mock(() => {}),
         };
 
         mockCreateServer.mockReturnValue(mockServer as unknown as net.Server);
 
-        await expect(getAvailablePort()).rejects.toThrow(`Failed to get available port: ${errorMessage}`);
+        const caughtError = await getAvailablePort().catch((e: unknown) => e);
+        expect(caughtError).toBeInstanceOf(Error);
+        expect((caughtError as Error).message).toContain(`Failed to get available port: ${errorMessage}`);
     });
 
     it('rejects when server address returns null', async () => {
@@ -113,14 +117,16 @@ describe('getAvailablePort', () => {
                 return mockServer;
             }),
             address: mock(() => null),
-            // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
-            close:   mock(() => {}),
+
+            close: mock(() => {}),
         };
 
         mockCreateServer.mockReturnValue(mockServer as unknown as net.Server);
 
-        await expect(getAvailablePort()).rejects.toThrow('Failed to get port: server address is invalid');
-        await expect(getAvailablePort()).rejects.toThrow('server address is invalid');
+        const caughtError1 = await getAvailablePort().catch((e: unknown) => e);
+        expect(caughtError1).toBeInstanceOf(Error);
+        expect((caughtError1 as Error).message).toContain('Failed to get port: server address is invalid');
+        expect((caughtError1 as Error).message).toContain('server address is invalid');
         expect(mockServer.close).toHaveBeenCalled();
     });
 
@@ -132,14 +138,16 @@ describe('getAvailablePort', () => {
                 return mockServer;
             }),
             address: mock(() => '/tmp/socket.sock'),
-            // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
-            close:   mock(() => {}),
+
+            close: mock(() => {}),
         };
 
         mockCreateServer.mockReturnValue(mockServer as unknown as net.Server);
 
-        await expect(getAvailablePort()).rejects.toThrow('Failed to get port: server address is invalid');
-        await expect(getAvailablePort()).rejects.toThrow('invalid');
+        const caughtError2 = await getAvailablePort().catch((e: unknown) => e);
+        expect(caughtError2).toBeInstanceOf(Error);
+        expect((caughtError2 as Error).message).toContain('Failed to get port: server address is invalid');
+        expect((caughtError2 as Error).message).toContain('invalid');
         expect(mockServer.close).toHaveBeenCalled();
     });
 
@@ -151,7 +159,7 @@ describe('getAvailablePort', () => {
                 callback();
                 return mockServer;
             }),
-            address: mock(() => ({ port: 12345, family: 'IPv4', address: '127.0.0.1' })),
+            address: mock(() => ({ port: 12_345, family: 'IPv4', address: '127.0.0.1' })),
             close:   mock((callback: (err?: Error) => void) => {
                 callback(closeError);
             }),
@@ -159,9 +167,11 @@ describe('getAvailablePort', () => {
 
         mockCreateServer.mockReturnValue(mockServer as unknown as net.Server);
 
-        await expect(getAvailablePort()).rejects.toThrow('Failed to close server');
-        await expect(getAvailablePort()).rejects.toThrow('Failed to release socket');
-        await expect(getAvailablePort()).rejects.toThrow(closeError.message);
+        const caughtError3 = await getAvailablePort().catch((e: unknown) => e);
+        expect(caughtError3).toBeInstanceOf(Error);
+        expect((caughtError3 as Error).message).toContain('Failed to close server');
+        expect((caughtError3 as Error).message).toContain('Failed to release socket');
+        expect((caughtError3 as Error).message).toContain(closeError.message);
     });
 
     it('rejects with specific error message format when close fails', async () => {
@@ -173,7 +183,7 @@ describe('getAvailablePort', () => {
                 callback();
                 return mockServer;
             }),
-            address: mock(() => ({ port: 12345, family: 'IPv4', address: '127.0.0.1' })),
+            address: mock(() => ({ port: 12_345, family: 'IPv4', address: '127.0.0.1' })),
             close:   mock((callback: (err?: Error) => void) => {
                 callback(closeError);
             }),
@@ -181,7 +191,9 @@ describe('getAvailablePort', () => {
 
         mockCreateServer.mockReturnValue(mockServer as unknown as net.Server);
 
-        await expect(getAvailablePort()).rejects.toThrow(`Failed to close server: ${errorMessage}`);
+        const caughtError4 = await getAvailablePort().catch((e: unknown) => e);
+        expect(caughtError4).toBeInstanceOf(Error);
+        expect((caughtError4 as Error).message).toContain(`Failed to close server: ${errorMessage}`);
     });
 
     it('binds to 127.0.0.1 specifically', async () => {
@@ -191,7 +203,7 @@ describe('getAvailablePort', () => {
                 callback();
                 return mockServer;
             }),
-            address: mock(() => ({ port: 12345, family: 'IPv4', address: '127.0.0.1' })),
+            address: mock(() => ({ port: 12_345, family: 'IPv4', address: '127.0.0.1' })),
             close:   mock((callback: (err?: Error) => void) => {
                 callback();
             }),
@@ -215,7 +227,7 @@ describe('getAvailablePort', () => {
                 callback();
                 return mockServer;
             }),
-            address: mock(() => ({ port: 12345, family: 'IPv4', address: '127.0.0.1' })),
+            address: mock(() => ({ port: 12_345, family: 'IPv4', address: '127.0.0.1' })),
             close:   mock((callback: (err?: Error) => void) => {
                 callback();
             }),
@@ -247,7 +259,7 @@ describe('getAvailablePort', () => {
             }),
             address: mock(() => {
                 callOrder.push('address');
-                return { port: 12345, family: 'IPv4', address: '127.0.0.1' };
+                return { port: 12_345, family: 'IPv4', address: '127.0.0.1' };
             }),
             close: mock((callback: (err?: Error) => void) => {
                 callOrder.push('close');
@@ -276,13 +288,14 @@ describe('getAvailablePort', () => {
                 return mockServer;
             }),
             address: mock(() => null),
-            // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
-            close:   mock(() => {}),
+
+            close: mock(() => {}),
         };
 
         mockCreateServer.mockReturnValue(mockServer as unknown as net.Server);
 
-        await expect(getAvailablePort()).rejects.toThrow();
+        const caughtError5 = await getAvailablePort().catch((e: unknown) => e);
+        expect(caughtError5).toBeInstanceOf(Error);
 
         // Verify close was called before rejection
         expect(mockServer.close).toHaveBeenCalled();

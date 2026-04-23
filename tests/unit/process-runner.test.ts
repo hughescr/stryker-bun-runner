@@ -3,9 +3,9 @@
  * Tests the Bun process spawning and management utilities
  */
 
+import type { ChildProcess } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach, mock, jest } from 'bun:test';
 import { runBunTests } from '../../src/process-runner.js';
-import type { ChildProcess } from 'node:child_process';
 import { mockSpawn, resetChildProcessMocks } from '../test-preload.js';
 
 /**
@@ -24,7 +24,7 @@ describe('runBunTests', () => {
 
     beforeEach(() => {
     // Create a mock child process
-        /* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- mock child process with any-typed properties */
+        /* eslint-disable @typescript-eslint/no-explicit-any -- mock child process with any-typed properties */
         mockChildProcess = {
             stdout: {
                 on: mock((event: string, handler: (data: Buffer) => void) => {
@@ -53,7 +53,7 @@ describe('runBunTests', () => {
             }) as any,
             kill: mock(() => true),
         };
-        /* eslint-enable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- re-enable after mock setup */
+        /* eslint-enable @typescript-eslint/no-explicit-any -- re-enable after mock setup */
 
         // Configure preload mock spawn to return our mock child process
         mockSpawn.mockClear();
@@ -636,7 +636,6 @@ describe('runBunTests', () => {
         });
 
         it('should call onInspectorReady when inspector URL is found in stderr', async () => {
-            // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
             const onInspectorReady = mock(() => {});
 
             const resultPromise = runBunTests({
@@ -656,7 +655,6 @@ describe('runBunTests', () => {
         });
 
         it('should only extract inspector URL once even with multiple stderr chunks', async () => {
-            // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
             const onInspectorReady = mock(() => {});
 
             const resultPromise = runBunTests({
@@ -819,7 +817,7 @@ describe('runBunTests', () => {
             const args = spawnCall[1];
 
             // Should not include any --config flag (neither `--config=<path>` nor `--config` on its own)
-            expect((args as readonly string[]).some(a => a.startsWith('--config'))).toBe(false);
+            expect((args).some(a => a.startsWith('--config'))).toBe(false);
         });
 
         it('should skip onInspectorReady callback when not provided - line 179 mutation', async () => {
@@ -837,12 +835,12 @@ describe('runBunTests', () => {
             mockChildProcess.closeHandler?.(0);
 
             // Should not crash despite onInspectorReady being undefined
-            await expect(resultPromise).resolves.toBeDefined();
+            expect(await resultPromise).toBeDefined();
         });
 
         it('should only extract inspector URL when stderr contains expected pattern - line 187 mutation', async () => {
             // Kills mutation on line 187: if(match) → if(true)
-            // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
+
             const onInspectorReady = mock(() => {});
 
             const resultPromise = runBunTests({
@@ -957,7 +955,7 @@ describe('runBunTests', () => {
             // Create a child process with null stdout
             const mockChildProcessNullStdout: MockChildProcess = {
                 stdout: null, // Explicitly null
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock child process with any-typed properties
+
                 stderr: {
                     on: mock((event: string, handler: (data: Buffer) => void) => {
                         if(event === 'data') {
@@ -966,7 +964,7 @@ describe('runBunTests', () => {
                     }),
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock child process with any-typed properties
                 } as any,
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- mock requires any-typed handler
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock requires any-typed handler
                 on: mock((event: string, handler: (...args: any[]) => void) => {
                     if(event === 'close') {
                         mockChildProcessNullStdout.closeHandler = handler;
@@ -981,7 +979,7 @@ describe('runBunTests', () => {
             };
 
             // Override preload mock to return our custom child process
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-return -- mock implementation needs any type
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock implementation needs any type
             mockSpawn.mockImplementation(() => mockChildProcessNullStdout as any);
 
             const resultPromise = runBunTests({
@@ -1006,7 +1004,7 @@ describe('runBunTests', () => {
             // If mutated to always true, would crash trying to call .on() on null stderr
             // Create a child process with null stderr
             const mockChildProcessNullStderr: MockChildProcess = {
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- mock child process with any-typed properties
+
                 stdout: {
                     on: mock((event: string, handler: (data: Buffer) => void) => {
                         if(event === 'data') {
@@ -1016,7 +1014,7 @@ describe('runBunTests', () => {
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock child process with any-typed properties
                 } as any,
                 stderr: null, // Explicitly null
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- mock requires any-typed handler
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock requires any-typed handler
                 on:     mock((event: string, handler: (...args: any[]) => void) => {
                     if(event === 'close') {
                         mockChildProcessNullStderr.closeHandler = handler;
@@ -1031,7 +1029,7 @@ describe('runBunTests', () => {
             };
 
             // Override preload mock to return our custom child process
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-return -- mock implementation needs any type
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock implementation needs any type
             mockSpawn.mockImplementation(() => mockChildProcessNullStderr as any);
 
             const resultPromise = runBunTests({
@@ -1056,7 +1054,7 @@ describe('runBunTests', () => {
             const mockChildProcessBothNull: MockChildProcess = {
                 stdout: null, // Explicitly null
                 stderr: null, // Explicitly null
-                // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-explicit-any -- mock requires any-typed handler
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock requires any-typed handler
                 on:     mock((event: string, handler: (...args: any[]) => void) => {
                     if(event === 'close') {
                         mockChildProcessBothNull.closeHandler = handler;
@@ -1071,7 +1069,7 @@ describe('runBunTests', () => {
             };
 
             // Override preload mock to return our custom child process
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-return -- mock implementation needs any type
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock implementation needs any type
             mockSpawn.mockImplementation(() => mockChildProcessBothNull as any);
 
             const resultPromise = runBunTests({
@@ -1162,6 +1160,81 @@ describe('runBunTests', () => {
             expect(result.timedOut).toBe(true);
 
             jest.useRealTimers();
+        });
+    });
+
+    describe('AbortSignal support', () => {
+        it('aborts child process when signal fires after spawn', async () => {
+            jest.useFakeTimers();
+            try {
+                const controller = new AbortController();
+
+                const resultPromise = runBunTests({
+                    bunPath: 'bun',
+                    timeout: 10_000,
+                    signal:  controller.signal,
+                });
+
+                // Let spawn happen
+                await Promise.resolve();
+
+                // Fire abort signal — should SIGTERM the child and resolve with timedOut:true
+                controller.abort();
+
+                // Simulate process closing after SIGTERM with a non-null exit code (e.g. 143
+                // for SIGTERM on Linux).  processKilled=true must override the code to null;
+                // mutating processKilled=false would leave exitCode=143 instead.
+                mockChildProcess.closeHandler?.(143);
+
+                const result = await resultPromise;
+
+                expect(result.timedOut).toBe(true);
+                expect(result.exitCode).toBeNull();
+                expect(mockChildProcess.kill).toHaveBeenCalledWith('SIGTERM');
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('resolves immediately with timedOut:true when signal is already aborted before spawn', async () => {
+            const controller = new AbortController();
+            controller.abort();  // Already aborted before calling runBunTests
+
+            const result = await runBunTests({
+                bunPath: 'bun',
+                timeout: 10_000,
+                signal:  controller.signal,
+            });
+
+            // Must resolve immediately without spawning a child process
+            expect(result.timedOut).toBe(true);
+            expect(result.exitCode).toBeNull();
+            expect(result.stdout).toBe('');
+            expect(result.stderr).toBe('');
+        });
+
+        it('does not kill process when signal fires after process already closed normally', async () => {
+            jest.useFakeTimers();
+            try {
+                const controller = new AbortController();
+
+                const resultPromise = runBunTests({
+                    bunPath: 'bun',
+                    timeout: 10_000,
+                    signal:  controller.signal,
+                });
+
+                // Process exits normally before abort fires
+                mockChildProcess.closeHandler?.(0);
+
+                const result = await resultPromise;
+
+                // Normal exit — no abort involvement
+                expect(result.exitCode).toBe(0);
+                expect(result.timedOut).toBe(false);
+            } finally {
+                jest.useRealTimers();
+            }
         });
     });
 });

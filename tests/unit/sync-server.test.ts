@@ -16,12 +16,12 @@ interface MockClient {
 
 const createMockClient = (readyState = 1): MockClient => ({
     readyState,
-    // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
-    send:  mock(() => {}),
-    // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
+
+    send: mock(() => {}),
+
     close: mock(() => {}),
-    // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
-    on:    mock(() => {}),
+
+    on: mock(() => {}),
 });
 
 // Mock WebSocketServer
@@ -37,8 +37,13 @@ const createMockWss = (): MockWss => {
         on: mock((event: string, handler: (arg: unknown) => void) => {
             handlers.set(event, handler);
         }),
-        // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
-        close: mock(() => {}),
+
+        close: mock((callback?: () => void) => {
+            if(!callback) {
+                return;
+            }
+            callback();
+        }),
         triggerConnection(client: MockClient) {
             const handler = handlers.get('connection');
             if(handler) {
@@ -69,9 +74,10 @@ const createMockHttpServer = (): MockHttpServer => {
             setImmediate(callback);
         }),
         close: mock((callback?: () => void) => {
-            if(callback) {
-                return callback();
+            if(!callback) {
+                return;
             }
+            callback();
         }),
         triggerError(err: Error) {
             const handler = handlers.get('error');
@@ -85,9 +91,9 @@ const createMockHttpServer = (): MockHttpServer => {
     };
 
     // Store the setter function on the mockServer object for factory to call
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access -- mock object extension
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock object extension
     (mockServer as any)._setRequestHandler = (handler: unknown) => {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-assignment -- type cast for mock
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- type cast for mock
         requestHandler = handler as any;
     };
 
@@ -139,13 +145,13 @@ describe('SyncServer', () => {
             expect(requestHandler).toBeDefined();
 
             const mockRes = {
-                // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
+
                 writeHead: mock(() => {}),
-                // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
-                end:       mock(() => {}),
+
+                end: mock(() => {}),
             };
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-argument -- mock response object
-            requestHandler!({ url: '/other-path' }, mockRes as any);
+
+            requestHandler!({ url: '/other-path' }, mockRes);
 
             expect(mockRes.writeHead).toHaveBeenCalledWith(404);
             expect(mockRes.end).toHaveBeenCalledWith('Not found');
@@ -159,13 +165,13 @@ describe('SyncServer', () => {
             expect(requestHandler).toBeDefined();
 
             const mockRes = {
-                // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
+
                 writeHead: mock(() => {}),
-                // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
-                end:       mock(() => {}),
+
+                end: mock(() => {}),
             };
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-argument -- mock response object
-            requestHandler!({ url: '/sync' }, mockRes as any);
+
+            requestHandler!({ url: '/sync' }, mockRes);
 
             expect(mockRes.writeHead).toHaveBeenCalledWith(400);
             expect(mockRes.end).toHaveBeenCalledWith('WebSocket upgrade failed');
@@ -179,13 +185,13 @@ describe('SyncServer', () => {
             expect(requestHandler).toBeDefined();
 
             const mockRes = {
-                // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
+
                 writeHead: mock(() => {}),
-                // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
-                end:       mock(() => {}),
+
+                end: mock(() => {}),
             };
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-argument -- mock response object
-            requestHandler!({}, mockRes as any);
+
+            requestHandler!({}, mockRes);
 
             expect(mockRes.writeHead).toHaveBeenCalledWith(404);
             expect(mockRes.end).toHaveBeenCalledWith('Not found');
@@ -228,7 +234,7 @@ describe('SyncServer', () => {
 
         it('resolves when listen completes', async () => {
             const server = createServer();
-            await expect(server.start()).resolves.toBeUndefined();
+            await server.start();
         });
 
         it('rejects when server emits error', async () => {
@@ -248,7 +254,9 @@ describe('SyncServer', () => {
             const startPromise = server.start();
             errorServer.triggerError(new Error('EADDRINUSE'));
 
-            await expect(startPromise).rejects.toThrow('EADDRINUSE');
+            const startError = await startPromise.catch((e: unknown) => e);
+            expect(startError).toBeInstanceOf(Error);
+            expect((startError as Error).message).toContain('EADDRINUSE');
         });
     });
 
@@ -263,6 +271,19 @@ describe('SyncServer', () => {
             mockWss.triggerConnection(client);
 
             expect(server.clientCount).toBe(1);
+        });
+
+        it('does not send ready to a client that connects before signalReady is called', async () => {
+            // Verifies that readyLatched starts as false: a client connecting while the
+            // latch is unset must not receive 'ready' until signalReady() is called.
+            const server = createServer();
+            await server.start();
+
+            const earlyClient = createMockClient(1);
+            mockWss.triggerConnection(earlyClient);
+
+            // signalReady has NOT been called — latch is false — no 'ready' yet
+            expect(earlyClient.send).not.toHaveBeenCalled();
         });
 
         it('registers close handler on client', async () => {
@@ -290,7 +311,7 @@ describe('SyncServer', () => {
             await server.start();
 
             const client = createMockClient();
-            // eslint-disable-next-line @typescript-eslint/no-empty-function -- default handler
+
             let closeHandler: () => void = () => {};
             client.on = mock((event: string, handler: () => void) => {
                 if(event === 'close') {
@@ -379,6 +400,84 @@ describe('SyncServer', () => {
 
             expect(() => server.signalReady()).not.toThrow();
         });
+
+        it('delivers ready to a client that connects after signalReady (late-connection latch)', async () => {
+            // This is the race scenario: runner calls signalReady() before the preload's
+            // WebSocket handshake completes and lands in this.clients. Without the latch
+            // the 'ready' message is sent to zero clients and the preload stalls for 500ms.
+            const server = createServer();
+            await server.start();
+
+            // Signal ready before any client is connected
+            server.signalReady();
+
+            // Now a client connects late (after signalReady)
+            const lateClient = createMockClient(1); // readyState OPEN
+            mockWss.triggerConnection(lateClient);
+
+            // The connection handler must immediately send 'ready' to the late client
+            expect(lateClient.send).toHaveBeenCalledWith('ready');
+        });
+
+        it('does not send ready to a late-connecting client in non-OPEN state', async () => {
+            const server = createServer();
+            await server.start();
+
+            server.signalReady();
+
+            // Client that connects but is not yet in OPEN state (edge case)
+            const connectingClient = createMockClient(0); // readyState CONNECTING
+            mockWss.triggerConnection(connectingClient);
+
+            expect(connectingClient.send).not.toHaveBeenCalled();
+        });
+
+        it('ignores send errors for late-connecting clients', async () => {
+            const server = createServer();
+            await server.start();
+
+            server.signalReady();
+
+            const lateClient = createMockClient(1);
+            lateClient.send = mock(() => {
+                throw new Error('Send failed');
+            });
+
+            expect(() => mockWss.triggerConnection(lateClient)).not.toThrow();
+        });
+
+        it('is idempotent: multiple signalReady calls do not error', async () => {
+            const server = createServer();
+            await server.start();
+
+            const client = createMockClient(1);
+            mockWss.triggerConnection(client);
+
+            expect(() => {
+                server.signalReady();
+                server.signalReady();
+            }).not.toThrow();
+        });
+    });
+
+    describe('readyLatched reset on close', () => {
+        it('resets the latch so a reused server does not send ready on first connection', async () => {
+            const server = createServer();
+            await server.start();
+
+            // Signal ready and then close — this should reset the latch
+            server.signalReady();
+            await server.close();
+
+            // Restart the server
+            await server.start();
+
+            // A client connecting after restart must NOT get a spurious 'ready'
+            const freshClient = createMockClient(1);
+            mockWss.triggerConnection(freshClient);
+
+            expect(freshClient.send).not.toHaveBeenCalled();
+        });
     });
 
     describe('close', () => {
@@ -407,7 +506,7 @@ describe('SyncServer', () => {
             });
             mockWss.triggerConnection(client);
 
-            await expect(server.close()).resolves.toBeUndefined();
+            await server.close();
         });
 
         it('clears client count', async () => {
@@ -444,12 +543,12 @@ describe('SyncServer', () => {
             await server.start();
 
             await server.close();
-            await expect(server.close()).resolves.toBeUndefined();
+            await server.close();
         });
 
         it('is safe to call before start', async () => {
             const server = createServer();
-            await expect(server.close()).resolves.toBeUndefined();
+            await server.close();
         });
     });
 

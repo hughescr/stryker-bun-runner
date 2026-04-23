@@ -60,8 +60,17 @@ export function setActiveMutant(strykerNamespace: StrykerNamespace, activeMutant
 // Coverage Data Formatting
 // ============================================================================
 
+// Runtime coverage objects come from globalThis.__stryker__ and may have
+// partially-initialised fields (perTest/static may be missing even though
+// the MutantCoverage type declares them as required).  Widen the parameter
+// type here so TypeScript treats the guards below as necessary.
+interface PartialMutantCoverage {
+    'static'?: MutantCoverage['static']
+    perTest?:  MutantCoverage['perTest']
+}
+
 export function formatCoverageData(
-    mutantCoverage: MutantCoverage | undefined,
+    mutantCoverage: PartialMutantCoverage | undefined,
     counterToName: Map<string, string>
 ): CoverageFileData {
     if(!mutantCoverage) {
@@ -88,6 +97,5 @@ export function formatCoverageData(
 
 export function writeCoverageToFile(coverageFile: string, data: CoverageFileData): void {
     // eslint-disable-next-line n/no-sync -- sync required in afterAll hook to ensure write completes before process exit
-    appendFileSync(coverageFile, JSON.stringify(data) + '\n', 'utf-8');
+    appendFileSync(coverageFile, `${JSON.stringify(data)}\n`, 'utf8');
 }
-

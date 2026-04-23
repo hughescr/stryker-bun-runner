@@ -3,10 +3,10 @@
  * Sets up module mocks using Bun's mock.module() API
  */
 
-import { mock } from 'bun:test';
-import * as actualFs from 'node:fs/promises';
-import * as actualNet from 'net';
 import * as actualChildProcess from 'node:child_process';
+import * as actualFs from 'node:fs/promises';
+import * as actualNet from 'node:net';
+import { mock } from 'bun:test';
 import * as actualPortUtils from '../src/utils/port.js';
 
 // CRITICAL: Capture functions as local variables BEFORE mock.module()
@@ -14,6 +14,7 @@ import * as actualPortUtils from '../src/utils/port.js';
 // properties would point to the mocks, causing infinite recursion
 const originalReadFile = actualFs.readFile;
 const originalWriteFile = actualFs.writeFile;
+const originalRename = actualFs.rename;
 const originalMkdir = actualFs.mkdir;
 const originalUnlink = actualFs.unlink;
 const originalReaddir = actualFs.readdir;
@@ -28,6 +29,8 @@ export const mockReadFile = mock((...args: Parameters<typeof actualFs.readFile>)
     originalReadFile(...args));
 export const mockWriteFile = mock((...args: Parameters<typeof actualFs.writeFile>) =>
     originalWriteFile(...args));
+export const mockRename = mock((...args: Parameters<typeof actualFs.rename>) =>
+    originalRename(...args));
 export const mockMkdir = mock((...args: Parameters<typeof actualFs.mkdir>) =>
     originalMkdir(...args));
 export const mockUnlink = mock((...args: Parameters<typeof actualFs.unlink>) =>
@@ -65,6 +68,10 @@ export function resetFsMocks(): void {
     mockWriteFile.mockImplementation((...args: Parameters<typeof actualFs.writeFile>) =>
         originalWriteFile(...args));
 
+    mockRename.mockReset();
+    mockRename.mockImplementation((...args: Parameters<typeof actualFs.rename>) =>
+        originalRename(...args));
+
     mockMkdir.mockReset();
     mockMkdir.mockImplementation((...args: Parameters<typeof actualFs.mkdir>) =>
         originalMkdir(...args));
@@ -72,6 +79,10 @@ export function resetFsMocks(): void {
     mockUnlink.mockReset();
     mockUnlink.mockImplementation((...args: Parameters<typeof actualFs.unlink>) =>
         originalUnlink(...args));
+
+    mockReaddir.mockReset();
+    mockReaddir.mockImplementation((...args: Parameters<typeof actualFs.readdir>) =>
+        originalReaddir(...args));
 }
 
 /**
@@ -119,8 +130,10 @@ mock.module('node:fs/promises', () => ({
     ...actualFs,
     readFile:  mockReadFile,
     writeFile: mockWriteFile,
+    rename:    mockRename,
     mkdir:     mockMkdir,
     unlink:    mockUnlink,
+    readdir:   mockReaddir,
 }));
 
 // Mock the net module for createServer

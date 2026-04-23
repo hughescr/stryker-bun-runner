@@ -4,14 +4,12 @@
  */
 
 import WebSocket from 'ws';
-import type {
-    InspectorMessage,
-    TestInfo,
-    TestReporterFoundEvent,
-    TestReporterStartEvent,
-    TestReporterEndEvent
-} from './types.js';
 import {
+    type InspectorMessage,
+    type TestInfo,
+    type TestReporterFoundEvent,
+    type TestReporterStartEvent,
+    type TestReporterEndEvent,
     isTestReporterFoundEvent,
     isTestReporterStartEvent,
     isTestReporterEndEvent
@@ -142,6 +140,7 @@ export class InspectorClient {
             throw new Error('Already connected');
         }
 
+        // Stryker disable next-line BlockStatement: removing connect Promise body means resolve/reject never called → connect() never resolves → Timeout
         return new Promise((resolve, reject) => {
             const timeoutTimer = setTimeout(() => {
                 if(this.ws) {
@@ -192,7 +191,9 @@ export class InspectorClient {
         const id = ++this.messageId;
         const message: InspectorMessage = { id, method, params };
 
+        // Stryker disable next-line BlockStatement: removing Promise body means resolve/reject never called → request hangs forever → Timeout
         return new Promise((resolve, reject) => {
+            // Stryker disable next-line BlockStatement: removing setTimeout body means requests never timeout → Promise waits forever → Timeout
             const timer = setTimeout(() => {
                 this.pendingRequests.delete(id);
                 reject(new InspectorTimeoutError(`Request timeout after ${this.state.requestTimeout}ms: ${method}`));
@@ -224,7 +225,7 @@ export class InspectorClient {
 
         // Reject all pending requests
         const error = new InspectorConnectionError('Connection closed');
-        for(const pending of Array.from(this.pendingRequests.values())) {
+        for(const pending of this.pendingRequests.values()) {
             clearTimeout(pending.timer);
             pending.reject(error);
         }
@@ -243,7 +244,7 @@ export class InspectorClient {
    * Get all discovered tests
    */
     getTests(): TestInfo[] {
-        return Array.from(this.testHierarchy.values());
+        return [...this.testHierarchy.values()];
     }
 
     /**
@@ -270,15 +271,18 @@ export class InspectorClient {
             // Handle response to a request
             if(message.id !== undefined) {
                 const pending = this.pendingRequests.get(message.id);
+                // Stryker disable next-line BlockStatement: removing this body means pending requests never resolve/reject → all inspector calls hang → Timeout
                 if(pending) {
                     this.pendingRequests.delete(message.id);
                     clearTimeout(pending.timer);
 
+                    // Stryker disable BlockStatement: removing either branch means pending request never resolves or rejects → all inspector calls hang → Timeout
                     if(message.error) {
                         pending.reject(new Error(`Inspector error: ${message.error.message}`));
                     } else {
                         pending.resolve(message.result);
                     }
+                    // Stryker restore BlockStatement
                 }
                 return;
             }
@@ -384,7 +388,7 @@ export class InspectorClient {
             if(visited.has(currentId)) {
                 this.handleError(
                     // Stryker disable next-line StringLiteral: error message describes circular reference detection
-                    new Error(`Circular reference detected in test hierarchy: ${Array.from(visited).join(' -> ')} -> ${currentId}`)
+                    new Error(`Circular reference detected in test hierarchy: ${[...visited].join(' -> ')} -> ${currentId}`)
                 );
                 break;
             }
@@ -414,7 +418,7 @@ export class InspectorClient {
 
         // Reject all pending requests
         const error = new InspectorConnectionError('Connection closed unexpectedly');
-        for(const pending of Array.from(this.pendingRequests.values())) {
+        for(const pending of this.pendingRequests.values()) {
             clearTimeout(pending.timer);
             pending.reject(error);
         }

@@ -81,39 +81,23 @@ function extractFilePrefix(bunMain: string): string {
 
 if(syncPort && shouldCollectCoverage) {
     try {
-        ws = new WebSocket(`ws://localhost:${syncPort}/sync`);
-
-        ws.onmessage = (_event) => {
-            // Messages from the sync server are only 'ready' signals.
-            // No per-test relay needed — coverage keys are file-prefixed counters.
-        };
-
-        // Wait for ready signal
+        // Install the real 'ready' handler before yielding to the event loop so
+        // there is no window where an arriving message is silently dropped.
         await new Promise<void>((resolve) => {
+            ws = new WebSocket(`ws://localhost:${syncPort}/sync`);
             const timeout = setTimeout(() => {
                 console.warn('[Stryker] Timeout waiting for ready signal');
                 resolve();
-            }, 5000);
+            }, 2000);
 
-            const wsInstance = ws;
-            if(!wsInstance) {
-                clearTimeout(timeout);
-                resolve();
-                return;
-            }
-
-            const originalOnMessage = wsInstance.onmessage;
-            wsInstance.onmessage = (event) => {
+            ws.onmessage = (event) => {
                 if(event.data === 'ready') {
                     clearTimeout(timeout);
                     resolve();
                 }
-                if(originalOnMessage) {
-                    originalOnMessage.call(wsInstance, event);
-                }
             };
 
-            wsInstance.onerror = () => {
+            ws.onerror = () => {
                 clearTimeout(timeout);
                 console.warn('[Stryker] Failed to connect to sync server');
                 resolve();
@@ -125,23 +109,25 @@ if(syncPort && shouldCollectCoverage) {
 } else if(syncPort && !shouldCollectCoverage) {
     // No coverage collection, just wait for ready signal
     try {
-        const ws = new WebSocket(`ws://localhost:${syncPort}/sync`);
+        // Install the real 'ready' handler before yielding to the event loop so
+        // there is no window where an arriving message is silently dropped.
         await new Promise<void>((resolve) => {
+            const wsLocal = new WebSocket(`ws://localhost:${syncPort}/sync`);
             const timeout = setTimeout(() => {
-                ws.close();
+                wsLocal.close();
                 console.warn('[Stryker Sync] Timeout waiting for ready signal, proceeding anyway');
                 resolve();
-            }, 5000);
+            }, 2000);
 
-            ws.onmessage = (event) => {
+            wsLocal.onmessage = (event) => {
                 if(event.data === 'ready') {
                     clearTimeout(timeout);
-                    ws.close();
+                    wsLocal.close();
                     resolve();
                 }
             };
 
-            ws.onerror = () => {
+            wsLocal.onerror = () => {
                 clearTimeout(timeout);
                 console.warn('[Stryker Sync] Failed to connect to sync server, proceeding anyway');
                 resolve();

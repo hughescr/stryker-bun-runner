@@ -1,5 +1,6 @@
-import { describe, it, expect, spyOn, beforeEach, afterEach, test } from 'bun:test';
 import * as fs from 'node:fs';
+import type { MutantCoverage } from '@stryker-mutator/api/core';
+import { describe, it, expect, spyOn, beforeEach, afterEach, test } from 'bun:test';
 import {
     getPreloadConfig,
     shouldCollectCoverage,
@@ -7,7 +8,6 @@ import {
     setActiveMutant,
     formatCoverageData,
     writeCoverageToFile,
-    type MutantCoverage,
     type PreloadConfig,
     type StrykerNamespace
 } from '../../src/coverage/preload-logic';
@@ -153,8 +153,8 @@ describe('preload-logic', () => {
             });
 
             // Ensure both properties exist as own properties (not inherited)
-            expect(Object.prototype.hasOwnProperty.call(result.mutantCoverage, 'static')).toBe(true);
-            expect(Object.prototype.hasOwnProperty.call(result.mutantCoverage, 'perTest')).toBe(true);
+            expect(Object.hasOwn(result.mutantCoverage!, 'static')).toBe(true);
+            expect(Object.hasOwn(result.mutantCoverage!, 'perTest')).toBe(true);
 
             // Verify exactly 2 properties (no more, no less)
             const keys = Object.keys(result.mutantCoverage ?? {});
@@ -224,10 +224,10 @@ describe('preload-logic', () => {
         });
 
         it('sets __mutantCoverage__ reference on global object', () => {
-            const globalObj = {};
+            const globalObj: Record<string, unknown> = {};
             const result = initializeStrykerNamespace(globalObj);
             expect(globalObj).toHaveProperty('__mutantCoverage__');
-            expect((globalObj as unknown as Record<string, unknown>).__mutantCoverage__).toBe(result.mutantCoverage);
+            expect(globalObj.__mutantCoverage__).toBe(result.mutantCoverage);
         });
 
         it('returns the stryker namespace', () => {
@@ -425,7 +425,6 @@ describe('preload-logic', () => {
         let appendFileSyncSpy: ReturnType<typeof spyOn>;
 
         beforeEach(() => {
-            // eslint-disable-next-line @typescript-eslint/no-empty-function -- mock
             appendFileSyncSpy = spyOn(fs, 'appendFileSync').mockImplementation(() => {});
         });
 
@@ -435,8 +434,8 @@ describe('preload-logic', () => {
 
             expect(appendFileSyncSpy).toHaveBeenCalledWith(
                 '/tmp/coverage.json',
-                JSON.stringify(data) + '\n',
-                'utf-8'
+                `${JSON.stringify(data)}\n`,
+                'utf8'
             );
         });
 
@@ -447,7 +446,7 @@ describe('preload-logic', () => {
             };
             writeCoverageToFile('/tmp/coverage.json', data);
 
-            const expectedJson = JSON.stringify(data) + '\n';
+            const expectedJson = `${JSON.stringify(data)}\n`;
             expect(appendFileSyncSpy).toHaveBeenCalledWith(
                 expect.any(String),
                 expectedJson,
@@ -462,7 +461,7 @@ describe('preload-logic', () => {
             expect(appendFileSyncSpy).toHaveBeenCalledWith(
                 expect.any(String),
                 expect.any(String),
-                'utf-8'
+                'utf8'
             );
         });
 
@@ -490,7 +489,7 @@ describe('preload-logic', () => {
 
             expect(appendFileSyncSpy).toHaveBeenCalledWith(
                 expect.any(String),
-                JSON.stringify(data) + '\n',
+                `${JSON.stringify(data)}\n`,
                 expect.any(String)
             );
         });

@@ -77,6 +77,7 @@ This approach provides reliable test-to-mutant correlation, even with multiple t
 | `bun.inspectorTimeout` | `number` | `5000` | Timeout for Inspector WebSocket connection in milliseconds |
 | `bun.env` | `object` | `undefined` | Additional environment variables to pass to bun test |
 | `bun.bunArgs` | `string[]` | `undefined` | Additional bun test flags (e.g., `['--bail']`) |
+| `bun.testFiles` | `string[]` | `undefined` | Explicit list of test file paths (absolute or relative to cwd). When provided, skips auto-discovery and uses this list verbatim. Relative paths resolve against the bun subprocess's cwd. Useful for restricting mutation testing to a subset of test files. |
 
 ### Example with all options
 
