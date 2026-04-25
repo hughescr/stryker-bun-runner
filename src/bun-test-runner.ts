@@ -35,7 +35,7 @@ import type { TestInfo } from './inspector/types.js';
 import type { StrykerBunOptions } from './options.js';
 import { parseBunTestOutput, type ParsedTestResults } from './parsers/console-parser.js';
 import { runBunTests } from './process-runner.js';
-import { getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildTestNamePattern, discoverTestFiles } from './utils/index.js';
+import { getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, discoverTestFiles } from './utils/index.js';
 
 /**
  * Sleep for the given number of milliseconds.
@@ -356,13 +356,19 @@ export class BunTestRunner implements TestRunner {
     }
 
     /**
-   * Build test results from inspector data
+   * Build test results from inspector data.
+   *
+   * @param inspectorIdToProjectFile - Optional mapping from inspector ID to project file path.
+   *   When provided, the project file is used for TestResult.id, name, and fileName instead of
+   *   testInfo.url. This is important for tests defined via helpers (e.g. RuleTester.run()) where
+   *   Bun's inspector reports a url pointing to node_modules rather than the user's test file.
    */
     private buildTestsFromInspector(
         testHierarchy: TestInfo[],
         executionOrder: number[],
         parsed: ParsedTestResults,
-        totalElapsedMs: number
+        totalElapsedMs: number,
+        inspectorIdToProjectFile?: Map<number, string>
     ): (SuccessTestResult | FailedTestResult | SkippedTestResult)[] {
         if(executionOrder.length === 0) {
             // Fallback: use parsed console output when inspector didn't capture tests
@@ -417,7 +423,15 @@ export class BunTestRunner implements TestRunner {
                 } satisfies SuccessTestResult;
             }
 
-            const uniqueName = buildUniqueTestName(testInfo.fullName, testInfo.url);
+            // Prefer the project file from the coverage counter key mapping when available.
+            // The counter key prefix is always the user's test file (via Bun.main in the preload),
+            // so it is correct even when testInfo.url points to node_modules.
+            // Skipped and pending tests have no counter keys so they fall back to testInfo.url.
+            const projectFile = inspectorIdToProjectFile?.get(inspectorId);
+            const uniqueName = projectFile
+                ? buildProjectFileTestName(projectFile, testInfo.fullName)
+                : buildUniqueTestName(testInfo.fullName, testInfo.url);
+            const fileName = projectFile ?? normalizeTestFilePath(testInfo.url);
             const status = testInfo.status;
             const elapsed = testInfo.elapsed === undefined
                 ? timePerTest                                // Already in milliseconds
@@ -431,7 +445,7 @@ export class BunTestRunner implements TestRunner {
                 return {
                     id:             uniqueName,
                     name:           uniqueName,
-                    fileName:       normalizeTestFilePath(testInfo.url),
+                    fileName,
                     startPosition,
                     status:         TestStatus.Failed,
                     // Stryker disable next-line StringLiteral: fallback error message has no behavioral impact
@@ -444,7 +458,7 @@ export class BunTestRunner implements TestRunner {
                 return {
                     id:          uniqueName,
                     name:        uniqueName,
-                    fileName:    normalizeTestFilePath(testInfo.url),
+                    fileName,
                     startPosition,
                     status:      TestStatus.Skipped,
                     timeSpentMs: elapsed,
@@ -454,7 +468,7 @@ export class BunTestRunner implements TestRunner {
             return {
                 id:          uniqueName,
                 name:        uniqueName,
-                fileName:    normalizeTestFilePath(testInfo.url),
+                fileName,
                 startPosition,
                 status:      TestStatus.Success,
                 timeSpentMs: elapsed,
@@ -688,10 +702,10 @@ export class BunTestRunner implements TestRunner {
             }
 
             // 13. Collect and remap coverage data
-            const mutantCoverage = await this.collectAndRemapCoverage(testHierarchy, executionOrder);
+            const { coverage: mutantCoverage, inspectorIdToProjectFile } = await this.collectAndRemapCoverage(testHierarchy, executionOrder);
 
             // 14. Build test results from inspector data
-            const tests = this.buildTestsFromInspector(testHierarchy, executionOrder, parsed, totalElapsedMs);
+            const tests = this.buildTestsFromInspector(testHierarchy, executionOrder, parsed, totalElapsedMs, inspectorIdToProjectFile);
 
             // Sort tests by name to ensure consistent order across runs
             // This is critical for Stryker's incremental mode - test IDs are assigned
@@ -1019,17 +1033,24 @@ export class BunTestRunner implements TestRunner {
     private async collectAndRemapCoverage(
         testHierarchy:  TestInfo[],
         executionOrder: number[]
-    ): Promise<MutantCoverage | undefined> {
+    ): Promise<{ coverage: MutantCoverage | undefined, inspectorIdToProjectFile: Map<number, string> }> {
+        const testMap = new Map(testHierarchy.map(t => [t.id, t]));
+
         if(!this.coverageFilePath) {
-            return undefined;
+            return { coverage: undefined, inspectorIdToProjectFile: new Map() };
         }
         const rawCoverage = await collectCoverage(this.coverageFilePath, this.logger);
         await cleanupCoverageFile(this.coverageFilePath);
         if(!rawCoverage) {
-            return undefined;
+            return { coverage: undefined, inspectorIdToProjectFile: new Map() };
         }
-        const testMap = new Map(testHierarchy.map(t => [t.id, t]));
-        return mapCoverageToInspectorIds(rawCoverage, executionOrder, testMap, this.logger);
+
+        // Map coverage counter keys to full test names and extract the inspector-ID → project-file
+        // mapping in a single pass. The new file-prefixed format ("relativeFile@@test-N") produces
+        // a populated inspectorIdToProjectFile; legacy keys ("test-N") and unknown formats return
+        // an empty map so the runner falls back to testInfo.url-based naming.
+        const { coverage, inspectorIdToProjectFile } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testMap, this.logger);
+        return { coverage, inspectorIdToProjectFile };
     }
 
     /**

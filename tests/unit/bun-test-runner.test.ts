@@ -128,9 +128,9 @@ describe('BunTestRunner', () => {
         // Mock coverage mapper
         mockMapCoverageToInspectorIds = mock();
         mapCoverageToInspectorIdsSpy = spyOn(coverageMapper, 'mapCoverageToInspectorIds').mockImplementation(mockMapCoverageToInspectorIds);
-        // Default: pass through coverage unchanged (tests can override if needed)
+        // Default: wrap coverage in the new { coverage, inspectorIdToProjectFile } shape (tests can override if needed)
         // eslint-disable-next-line @typescript-eslint/no-explicit-any -- intentional pass-through mock
-        mockMapCoverageToInspectorIds.mockImplementation((coverage: any) => coverage);
+        mockMapCoverageToInspectorIds.mockImplementation((coverage: any) => ({ coverage, inspectorIdToProjectFile: new Map() }));
 
         // Default mock implementations
         mockCleanupCoverageFile.mockResolvedValue(undefined);
@@ -1490,6 +1490,190 @@ tests/example.test.ts:
             }
         });
 
+        it('should map passing status correctly via inspector path (kills ConditionalExpression mutant at pending-branch)', async () => {
+            // This test exercises the inspector path (non-empty executionOrder) with a passing test
+            // and asserts TestStatus.Success — killing the ConditionalExpression 'true' mutant at
+            // the skip/pending branch. With the mutant (if(true)), every test falls into the skip branch
+            // regardless of actual status, producing TestStatus.Skipped instead of TestStatus.Success.
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+            mockRunBunTests.mockImplementation((options: any) => {
+                if(options.onInspectorReady) {
+                    options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                }
+                return Promise.resolve({
+                    exitCode: 0,
+                    stdout:   '✓ passing test [1ms]\n 1 pass',
+                    stderr:   '',
+                    timedOut: false,
+                });
+            });
+            mockCollectCoverage.mockResolvedValue(undefined);
+            // Non-empty executionOrder triggers the inspector-based code path (not the fallback)
+            mockInspectorClient.getExecutionOrder.mockReturnValue([1]);
+            mockInspectorClient.getTests.mockReturnValue([{
+                id:       1,
+                name:     'passing test',
+                fullName: 'tests/example.test.ts > passing test',
+                type:     'test' as const,
+                status:   'pass' as const,
+                elapsed:  1_000_000, // 1ms in nanoseconds
+                url:      '/project/.stryker-tmp/sandbox-123/tests/example.test.ts',
+            } satisfies TestInfo]);
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+
+            const result = await runner.dryRun();
+
+            expect(result.status).toBe(DryRunStatus.Complete);
+            if(result.status === DryRunStatus.Complete) {
+                expect(result.tests).toHaveLength(1);
+                // Must be Success — with ConditionalExpression 'true' mutant, this would be Skipped
+                expect(result.tests[0].status).toBe(TestStatus.Success);
+            }
+        });
+
+        it('should use project file from coverage keys for TestResult.fileName when testInfo.url points to node_modules (RuleTester-style)', async () => {
+            // Simulates ESLint's RuleTester.run() pattern:
+            // - Test file is "tests/my-rule.test.ts" → counter key prefix via Bun.main
+            // - But Bun inspector reports url as node_modules because it() is called from there
+            // Without the fix, TestResult.fileName = "node_modules/eslint/..." → Stryker warns
+            // With the fix, TestResult.fileName = "tests/my-rule.test.ts"
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+            mockRunBunTests.mockImplementation((options: any) => {
+                if(options.onInspectorReady) {
+                    options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                }
+                return Promise.resolve({
+                    exitCode: 0,
+                    stdout:   '✓ my-rule valid 0 [1ms]\n 1 pass',
+                    stderr:   '',
+                    timedOut: false,
+                });
+            });
+
+            // Coverage has counter key with user's file prefix (from Bun.main in preload)
+            const originalCoverage = {
+                'static': {},
+                perTest:  {
+                    'tests/my-rule.test.ts@@test-1': { '1': 1 },
+                },
+            };
+            mockCollectCoverage.mockResolvedValue(originalCoverage);
+
+            // Mock mapCoverageToInspectorIds to return the project-file mapping for this test.
+            // The counter key prefix "tests/my-rule.test.ts" maps inspector 10 → project file.
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock override
+            mockMapCoverageToInspectorIds.mockImplementationOnce((_coverage: any) => ({
+                coverage:                 { 'static': {}, perTest: { 'tests/my-rule.test.ts > my-rule valid 0': { '1': 1 } } },
+                inspectorIdToProjectFile: new Map([[10, 'tests/my-rule.test.ts']]),
+            }));
+
+            // Inspector reports node_modules url for the test (RuleTester calls it() from there)
+            mockInspectorClient.getExecutionOrder.mockReturnValue([10]);
+            mockInspectorClient.getTests.mockReturnValue([{
+                id:       10,
+                name:     'my-rule valid 0',
+                fullName: 'my-rule valid 0',
+                type:     'test' as const,
+                status:   'pass' as const,
+                elapsed:  1_000_000, // 1ms in nanoseconds
+                url:      'node_modules/eslint/lib/rule-tester/rule-tester.js',
+                line:     42,
+            } satisfies TestInfo]);
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+
+            const result = await runner.dryRun();
+
+            expect(result.status).toBe(DryRunStatus.Complete);
+            if(result.status === DryRunStatus.Complete) {
+                expect(result.tests).toHaveLength(1);
+                const test = result.tests[0];
+                // Name uses the project file prefix from the counter key, not node_modules url
+                expect(test.name).toBe('tests/my-rule.test.ts > my-rule valid 0');
+                // fileName uses the project file, not node_modules path → Stryker won't warn
+                expect(test.fileName).toBe('tests/my-rule.test.ts');
+            }
+        });
+
+        it('should use computed project file (not testInfo.url) for skipped-test fileName when inspectorIdToProjectFile is populated (Issue 1 regression)', async () => {
+            // Regression test for bug: skip/pending branch used normalizeTestFilePath(testInfo.url) directly
+            // instead of the precomputed `fileName` variable (which uses the project file from coverage keys).
+            // When testInfo.url points to node_modules (RuleTester-style), this produced the wrong fileName.
+            //
+            // To trigger: provide a mix of a passing test (that generates a counter key → project-file
+            // mapping) and a skipped test (no counter key). The passing test's mapping populates
+            // inspectorIdToProjectFile for inspector ID 10. We then also include inspector ID 20 for the
+            // skipped test in the map by supplying a custom mock. The skipped branch must use `fileName`
+            // (precomputed) not `normalizeTestFilePath(testInfo.url)`.
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+            mockRunBunTests.mockImplementation((options: any) => {
+                if(options.onInspectorReady) {
+                    options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                }
+                return Promise.resolve({
+                    exitCode: 0,
+                    stdout:   '✓ my-rule valid 0 [1ms]\n- my-rule skip 0 [skipped]\n 1 pass\n 1 skip',
+                    stderr:   '',
+                    timedOut: false,
+                });
+            });
+
+            // Coverage has a key for the passing test only (skipped tests have no counter key)
+            mockCollectCoverage.mockResolvedValue({
+                'static': {},
+                perTest:  { 'tests/my-rule.test.ts@@test-1': { '1': 1 } },
+            });
+
+            // Both inspector tests have node_modules urls (RuleTester pattern)
+            mockInspectorClient.getExecutionOrder.mockReturnValue([10, 20]);
+            mockInspectorClient.getTests.mockReturnValue([
+                {
+                    id:       10,
+                    name:     'my-rule valid 0',
+                    fullName: 'my-rule valid 0',
+                    type:     'test' as const,
+                    status:   'pass' as const,
+                    elapsed:  1_000_000,
+                    url:      'node_modules/eslint/lib/rule-tester/rule-tester.js',
+                } satisfies TestInfo,
+                {
+                    id:       20,
+                    name:     'my-rule skip 0',
+                    fullName: 'my-rule skip 0',
+                    type:     'test' as const,
+                    status:   'skip' as const,
+                    url:      'node_modules/eslint/lib/rule-tester/rule-tester.js',
+                } satisfies TestInfo,
+            ]);
+
+            // Mock mapCoverageToInspectorIds to return a project-file map that includes
+            // BOTH the passing test (10) and the skipped test (20). This simulates the scenario
+            // where a future change includes skipped tests in the map, or for testing
+            // the fix in isolation without needing real coverage pairing logic.
+            mockMapCoverageToInspectorIds.mockImplementationOnce((_coverage: unknown) => ({
+                coverage:                 { 'static': {}, perTest: { 'tests/my-rule.test.ts > my-rule valid 0': { '1': 1 } } },
+                inspectorIdToProjectFile: new Map([[10, 'tests/my-rule.test.ts'], [20, 'tests/my-rule.test.ts']]),
+            }));
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+
+            const result = await runner.dryRun();
+
+            expect(result.status).toBe(DryRunStatus.Complete);
+            if(result.status === DryRunStatus.Complete) {
+                expect(result.tests).toHaveLength(2);
+                const skippedTest = result.tests.find(t => t.status === TestStatus.Skipped);
+                expect(skippedTest).toBeDefined();
+                // Bug: before fix, fileName was normalizeTestFilePath('node_modules/...') = 'node_modules/...'
+                // After fix, fileName correctly uses the precomputed `fileName` from inspectorIdToProjectFile
+                expect(skippedTest!.fileName).toBe('tests/my-rule.test.ts');
+            }
+        });
+
         it('should cleanup coverage file after reading', async () => {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
@@ -1544,7 +1728,7 @@ tests/example.test.ts:
                 },
                 'static': {},
             };
-            mockMapCoverageToInspectorIds.mockReturnValue(remappedCoverage);
+            mockMapCoverageToInspectorIds.mockReturnValue({ coverage: remappedCoverage, inspectorIdToProjectFile: new Map() });
 
             mockInspectorClient.getExecutionOrder.mockReturnValue([1]);
             mockInspectorClient.getTests.mockReturnValue([{
