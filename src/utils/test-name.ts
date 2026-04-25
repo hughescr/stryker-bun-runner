@@ -56,6 +56,30 @@ export function normalizeTestName(testName: string): string {
 }
 
 /**
+ * Builds a test name using a project file prefix and the full hierarchical test name.
+ *
+ * Used when the project file is known from the coverage counter key (Bun.main),
+ * rather than inferred from testInfo.url. Both the coverage mapper and the runner
+ * use this format so test IDs are consistent.
+ *
+ * Format: "path/to/file.test.ts > describe > test name"
+ *
+ * @param filePrefix - The project-relative file path (e.g. "tests/foo.test.ts")
+ * @param fullName - The full hierarchical test name from inspector (e.g. "Suite > test")
+ * @returns Normalized test name with project file prefix
+ *
+ * @example
+ * ```typescript
+ * buildProjectFileTestName("tests/foo.test.ts", "Suite > test")
+ * // Returns: "tests/foo.test.ts > Suite > test"
+ * ```
+ */
+export function buildProjectFileTestName(filePrefix: string, fullName: string): string {
+    // Stryker disable next-line StringLiteral: equivalent mutant — ' > ' separator is load-bearing for hierarchy display
+    return normalizeTestName(`${filePrefix} > ${fullName}`);
+}
+
+/**
  * Builds a unique test identifier by combining file path and test hierarchy.
  * This prevents test name collisions when multiple files have identical describe blocks.
  *

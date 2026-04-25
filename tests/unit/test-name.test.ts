@@ -5,7 +5,7 @@
  */
 
 import { describe, it, expect } from 'bun:test';
-import { normalizeTestFilePath, normalizeTestName, buildUniqueTestName } from '../../src/utils/test-name.js';
+import { normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName } from '../../src/utils/test-name.js';
 
 describe('normalizeTestFilePath', () => {
     it('returns undefined for undefined input', () => {
@@ -153,5 +153,32 @@ describe('buildUniqueTestName', () => {
         const fullName = 'Suite > test';
         const url = undefined;
         expect(buildUniqueTestName(fullName, url)).toBe('Suite > test');
+    });
+});
+
+describe('buildProjectFileTestName', () => {
+    it('combines file prefix and full test name with " > " separator (Issue 6)', () => {
+        // buildProjectFileTestName is the shared helper used by both coverage-mapper and
+        // bun-test-runner to format "filePrefix > fullName" consistently.
+        // This is the canonical form used in Stryker's perTest keys.
+        expect(buildProjectFileTestName('tests/foo.test.ts', 'Suite > test')).toBe('tests/foo.test.ts > Suite > test');
+    });
+
+    it('normalizes special characters in the combined name', () => {
+        // The result is passed through normalizeTestName, which replaces control chars
+        // with underscores and trims leading/trailing whitespace.
+        expect(buildProjectFileTestName('tests/foo.test.ts', 'Suite\nwith\nnewlines > test')).toBe('tests/foo.test.ts > Suite_with_newlines > test');
+    });
+
+    it('handles a simple test name with no hierarchy', () => {
+        expect(buildProjectFileTestName('tests/bar.test.ts', 'standalone test')).toBe('tests/bar.test.ts > standalone test');
+    });
+
+    it('handles deeply nested test hierarchy', () => {
+        expect(buildProjectFileTestName('tests/deep.test.ts', 'L1 > L2 > L3 > test')).toBe('tests/deep.test.ts > L1 > L2 > L3 > test');
+    });
+
+    it('preserves unicode characters in both prefix and full name', () => {
+        expect(buildProjectFileTestName('tests/café.test.ts', 'café > test 日本語')).toBe('tests/café.test.ts > café > test 日本語');
     });
 });
