@@ -1,6 +1,6 @@
 import * as fs from 'node:fs';
 import type { MutantCoverage } from '@stryker-mutator/api/core';
-import { describe, it, expect, spyOn, beforeEach, afterEach, test } from 'bun:test';
+import { describe, it, expect, spyOn, beforeEach, afterEach, test, mock, jest } from 'bun:test';
 import {
     getPreloadConfig,
     shouldCollectCoverage,
@@ -8,6 +8,7 @@ import {
     setActiveMutant,
     formatCoverageData,
     writeCoverageToFile,
+    startOrphanWatchdog,
     type PreloadConfig,
     type StrykerNamespace
 } from '../../src/coverage/preload-logic';
@@ -503,6 +504,102 @@ describe('preload-logic', () => {
                 '{"perTest":{},"static":[]}\n',
                 expect.any(String)
             );
+        });
+    });
+
+    describe('startOrphanWatchdog', () => {
+        afterEach(() => {
+            jest.useRealTimers();
+        });
+
+        it('does not invoke onOrphaned while the parent PID is unchanged', () => {
+            jest.useFakeTimers();
+            const onOrphaned = mock();
+            const stop = startOrphanWatchdog({
+                getPpid:    () => 1000,
+                onOrphaned,
+                intervalMs: 1000,
+            });
+
+            jest.advanceTimersByTime(5000);
+
+            expect(onOrphaned).not.toHaveBeenCalled();
+            stop();
+        });
+
+        it('invokes onOrphaned once the parent PID changes (reparented to a subreaper)', () => {
+            jest.useFakeTimers();
+            let ppid = 1000;
+            const onOrphaned = mock();
+            const stop = startOrphanWatchdog({
+                getPpid:    () => ppid,
+                onOrphaned,
+                intervalMs: 1000,
+            });
+
+            jest.advanceTimersByTime(1000);
+            expect(onOrphaned).not.toHaveBeenCalled();
+
+            // Original parent has died — the OS reparents this process, e.g. to PID 1.
+            ppid = 1;
+            jest.advanceTimersByTime(1000);
+
+            expect(onOrphaned).toHaveBeenCalledTimes(1);
+            stop();
+        });
+
+        it('invokes onOrphaned only once even if the interval ticks again before being stopped', () => {
+            jest.useFakeTimers();
+            let ppid = 1000;
+            const onOrphaned = mock();
+            const stop = startOrphanWatchdog({
+                getPpid:    () => ppid,
+                onOrphaned,
+                intervalMs: 1000,
+            });
+
+            ppid = 1;
+            jest.advanceTimersByTime(1000);
+            jest.advanceTimersByTime(1000);
+            jest.advanceTimersByTime(1000);
+
+            expect(onOrphaned).toHaveBeenCalledTimes(1);
+            stop();
+        });
+
+        it('defaults intervalMs to 1000ms when not provided', () => {
+            jest.useFakeTimers();
+            let ppid = 1000;
+            const onOrphaned = mock();
+            const stop = startOrphanWatchdog({
+                getPpid: () => ppid,
+                onOrphaned,
+            });
+
+            ppid = 1;
+            jest.advanceTimersByTime(999);
+            expect(onOrphaned).not.toHaveBeenCalled();
+
+            jest.advanceTimersByTime(1);
+            expect(onOrphaned).toHaveBeenCalledTimes(1);
+            stop();
+        });
+
+        it('stops polling once stop() is called', () => {
+            jest.useFakeTimers();
+            let ppid = 1000;
+            const onOrphaned = mock();
+            const stop = startOrphanWatchdog({
+                getPpid:    () => ppid,
+                onOrphaned,
+                intervalMs: 1000,
+            });
+
+            stop();
+            ppid = 1;
+            jest.advanceTimersByTime(10_000);
+
+            expect(onOrphaned).not.toHaveBeenCalled();
         });
     });
 

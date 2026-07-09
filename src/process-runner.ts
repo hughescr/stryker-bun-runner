@@ -3,7 +3,15 @@
  * Handles spawning and managing Bun test processes
  */
 
-import { type SpawnOptions, spawn } from 'node:child_process';
+import { type ChildProcess, type SpawnOptions, spawn } from 'node:child_process';
+import { getProcessRssBytes } from './utils/process-rss.js';
+
+/**
+ * Grace period (ms) between sending SIGTERM and escalating to SIGKILL if the
+ * child hasn't exited. Shared by the timeout, AbortSignal, and memory-ceiling
+ * kill paths so all three follow one consistent escalation policy.
+ */
+const KILL_GRACE_PERIOD_MS = 500;
 
 export interface BunTestRunOptions {
     /**
@@ -97,6 +105,41 @@ export interface BunTestRunOptions {
    * When omitted, Bun performs its normal file discovery.
    */
     testFiles?: string[]
+
+    /**
+   * When true, adds Bun's `--smol` flag, which trades some speed for a
+   * significantly smaller JavaScriptCore heap footprint. Recommended on
+   * memory-constrained machines, especially at higher Stryker `concurrency`
+   * (peak memory = concurrency × per-run suite footprint).
+   */
+    smol?: boolean
+
+    /**
+   * Soft memory ceiling in bytes for the child process's resident set size
+   * (RSS). When set, the child's RSS is polled periodically (see
+   * {@link rssCheckIntervalMs}); if it exceeds this value the child is killed
+   * (SIGTERM, escalating to SIGKILL) and the run resolves with
+   * `timedOut: true` and `memoryLimitExceeded: true` — a clean, attributable
+   * failure for that one run rather than system-wide swap exhaustion.
+   *
+   * This is a polled userspace check, not a kernel-enforced limit: it can
+   * overshoot the threshold between polls, and it is only as reliable as the
+   * underlying RSS probe (see {@link getProcessRssBytes}). Omit to disable.
+   */
+    maxChildRss?: number
+
+    /**
+   * Poll interval in milliseconds for the {@link maxChildRss} check.
+   * @default 1000
+   */
+    rssCheckIntervalMs?: number
+
+    /**
+   * Callback invoked once, at the moment {@link maxChildRss} is exceeded and
+   * the kill has been initiated. Receives the observed RSS in bytes. Intended
+   * for the caller to log a diagnostic warning.
+   */
+    onMemoryLimitExceeded?: (rssBytes: number) => void
 }
 
 export interface BunProcessResult {
@@ -104,6 +147,28 @@ export interface BunProcessResult {
     stderr:   string
     exitCode: number | null
     timedOut: boolean
+
+    /**
+   * True when the child was killed because it exceeded {@link BunTestRunOptions.maxChildRss}.
+   * Always false when `maxChildRss` was not set.
+   */
+    memoryLimitExceeded: boolean
+}
+
+/**
+ * Send SIGTERM to a child process, escalating to SIGKILL after a grace period
+ * if it hasn't exited by then. `isClosed` is checked right before the SIGKILL
+ * so an already-exited process (e.g. one that responded to SIGTERM promptly)
+ * is never signalled again.
+ */
+function killWithEscalation(childProcess: ChildProcess, isClosed: () => boolean, gracePeriodMs: number): void {
+    childProcess.kill('SIGTERM');
+    setTimeout(() => {
+        // Stryker disable next-line ConditionalExpression,BlockStatement: escalation guard — skipping SIGKILL when the process already exited is covered by 'does not escalate to SIGKILL when the process exits within the grace period'; the escalation-fires case is covered by 'escalates to SIGKILL when the process ignores SIGTERM'
+        if(!isClosed()) {
+            childProcess.kill('SIGKILL');
+        }
+    }, gracePeriodMs);
 }
 
 /**
@@ -153,6 +218,13 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
     }
     // Stryker restore StringLiteral
 
+    // Reduce Bun's JavaScriptCore heap growth at the cost of some speed.
+    // Useful on memory-constrained machines, especially at higher Stryker
+    // `concurrency` — see README "Memory containment" section.
+    if(options.smol) {
+        args.push('--smol');
+    }
+
     // Add any additional bun args
     // Stryker disable next-line EqualityOperator,ConditionalExpression: length >= 0 is equivalent to length > 0 for empty arrays (spreading [] is a no-op); ConditionalExpression would cause spread of undefined
     if(options.bunArgs && options.bunArgs.length > 0) {
@@ -197,11 +269,14 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
         const stderrChunks: Buffer[] = [];
         let timedOut = false;
         let processKilled = false;
+        let memoryLimitExceeded = false;
+        let hasClosed = false;
+        let rssIntervalHandle: ReturnType<typeof setInterval> | undefined;
 
         // If an AbortSignal was provided and is already aborted, resolve immediately
         // Stryker disable next-line ConditionalExpression,BlockStatement: abort-before-spawn guard; mutation caught by 'aborts child process when signal fires'
         if(options.signal?.aborted) {
-            resolve({ stdout: '', stderr: '', exitCode: null, timedOut: true });
+            resolve({ stdout: '', stderr: '', exitCode: null, timedOut: true, memoryLimitExceeded: false });
             return;
         }
 
@@ -216,33 +291,80 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
         };
         const childProcess = spawn(options.bunPath, args, spawnOpts);
 
-        // Set up timeout
+        // Set up timeout — escalate SIGTERM→SIGKILL via the shared helper so a
+        // process that responds promptly to SIGTERM isn't needlessly SIGKILLed.
         // Stryker disable next-line BlockStatement: removing timeout kill body means child process runs forever → Timeout on the Stryker test for this mutation
         const timeoutHandle = setTimeout(() => {
             timedOut = true;
             processKilled = true;
-            childProcess.kill('SIGKILL');
+            killWithEscalation(childProcess, () => hasClosed, KILL_GRACE_PERIOD_MS);
         }, options.timeout);
 
         // Wire up the AbortSignal if provided.
         // On abort: send SIGTERM for a graceful shutdown; if the process is still
-        // alive after 500ms, escalate to SIGKILL.  The promise resolves with
-        // timedOut:true to signal the caller that we stopped early.
+        // alive after the grace period, escalate to SIGKILL.  The promise resolves
+        // with timedOut:true to signal the caller that we stopped early.
         // Stryker disable next-line ConditionalExpression,BlockStatement: abort-signal wiring; mutation caught by 'aborts child process when signal fires'
         if(options.signal) {
             const onAbort = (): void => {
                 clearTimeout(timeoutHandle);
                 processKilled = true;
                 timedOut = true;
-                childProcess.kill('SIGTERM');
-                // Escalate to SIGKILL after 500ms grace period
-                // Stryker disable next-line BlockStatement: grace-period escalation; removing body means SIGKILL never sent for stubborn processes
-                setTimeout(() => {
-                    childProcess.kill('SIGKILL');
-                }, 500);
+                killWithEscalation(childProcess, () => hasClosed, KILL_GRACE_PERIOD_MS);
             };
             // Stryker disable next-line ObjectLiteral,BooleanLiteral: AbortSignal 'abort' fires at most once per controller (spec guarantee — WHATWG DOM §9.1), so { once: true } is semantically redundant; mutating to {} or { once: false } is equivalent
             options.signal.addEventListener('abort', onAbort, { once: true });
+        }
+
+        // Wire up the soft memory ceiling if requested. Polls the child's RSS
+        // and kills it (with the same SIGTERM→SIGKILL escalation) if it's
+        // exceeded, converting a runaway run into a clean, attributable
+        // failure instead of unbounded growth. See BunTestRunOptions.maxChildRss.
+        if(options.maxChildRss !== undefined) {
+            const rssLimit = options.maxChildRss;
+            const checkMemoryCeiling = async (): Promise<void> => {
+                // Defensive re-entrancy guard: setInterval ticks are fire-and-forget
+                // (not awaited), so in principle a new tick could start while an
+                // earlier tick's RSS probe is still pending. In practice, Node/Bun
+                // drain the microtask queue between timer macrotasks, so by the time
+                // a later tick's synchronous prefix runs, an already-settled earlier
+                // tick has already flipped hasClosed/memoryLimitExceeded and cleared
+                // the interval — this guard is not reachable under real timer
+                // semantics, only defensive against a future change to that ordering.
+                // Stryker disable next-line all: unreachable under real timer semantics; see comment above — not exercised by tests
+                if(hasClosed || memoryLimitExceeded) {
+                    return;
+                }
+                const pid = childProcess.pid;
+                // Stryker disable next-line ConditionalExpression,EqualityOperator,BlockStatement: pid can be undefined for a spawn that failed before assignment; covered by 'does not probe RSS when the child has no pid'
+                if(pid === undefined) {
+                    return;
+                }
+                const rssBytes = await getProcessRssBytes(pid);
+                // Stryker disable next-line ConditionalExpression,EqualityOperator,BlockStatement,LogicalOperator: null probe result (unknown RSS) must not be treated as exceeding the ceiling; covered by 'does not kill when the RSS probe returns null'; the hasClosed re-check guards against the process closing while the probe awaited
+                // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- hasClosed is set by the 'close'/'error' handlers, a different closure; TypeScript cannot track that cross-await mutation
+                if(rssBytes === null || hasClosed) {
+                    return;
+                }
+                if(rssBytes > rssLimit) {
+                    // eslint-disable-next-line require-atomic-updates -- single-threaded reentrancy guarded by the hasClosed/memoryLimitExceeded check at function entry; no concurrent writer can race this assignment
+                    memoryLimitExceeded = true;
+                    timedOut = true;
+                    processKilled = true;
+                    // Stryker disable next-line ConditionalExpression: equivalent mutant — rssIntervalHandle is always defined at this point (assigned synchronously right after this whole maxChildRss block starts, before any tick can run); mutating the guard to `true` only changes clearInterval's argument from a real handle to itself, never to undefined
+                    if(rssIntervalHandle) {
+                        clearInterval(rssIntervalHandle);
+                    }
+                    options.onMemoryLimitExceeded?.(rssBytes);
+                    killWithEscalation(childProcess, () => hasClosed, KILL_GRACE_PERIOD_MS);
+                }
+            };
+            rssIntervalHandle = setInterval(() => {
+                // eslint-disable-next-line @typescript-eslint/no-floating-promises -- fire-and-forget poll tick; errors are already swallowed inside getProcessRssBytes
+                checkMemoryCeiling();
+            }, options.rssCheckIntervalMs ?? 1000);
+            // Don't let the poller keep the event loop alive on its own.
+            rssIntervalHandle.unref();
         }
 
         // Collect stdout silently - don't forward to parent to avoid interfering with Stryker's progress reporter
@@ -278,19 +400,31 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
         // Handle process exit
         // Stryker disable next-line BlockStatement,StringLiteral: Promise.resolve never called without 'close' handler → Timeout
         childProcess.on('close', (code) => {
+            hasClosed = true;
             clearTimeout(timeoutHandle);
+            // Stryker disable next-line ConditionalExpression: equivalent mutant — when rssIntervalHandle is undefined (maxChildRss not set), clearInterval(undefined) is a silent no-op in Node/Bun; mutating the guard to `true` cannot introduce an observable difference
+            if(rssIntervalHandle) {
+                clearInterval(rssIntervalHandle);
+            }
 
             resolve({
                 stdout:   Buffer.concat(stdoutChunks).toString(),
                 stderr:   Buffer.concat(stderrChunks).toString(),
                 exitCode: processKilled ? null : code,
                 timedOut,
+                memoryLimitExceeded,
             });
         });
 
         // Handle process errors
+        // Stryker disable next-line BlockStatement: emptying this handler means resolve() is never called on a spawn/child error → Timeout — expected, mirrors the 'close' handler's disable comment above
         childProcess.on('error', (error) => {
+            hasClosed = true;
             clearTimeout(timeoutHandle);
+            // Stryker disable next-line ConditionalExpression: equivalent mutant — when rssIntervalHandle is undefined (maxChildRss not set), clearInterval(undefined) is a silent no-op in Node/Bun; mutating the guard to `true` cannot introduce an observable difference
+            if(rssIntervalHandle) {
+                clearInterval(rssIntervalHandle);
+            }
             const stderrOutput = Buffer.concat(stderrChunks).toString();
 
             resolve({
@@ -298,6 +432,7 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
                 stderr:   `${stderrOutput}\nProcess error: ${error.message}`,
                 exitCode: null,
                 timedOut,
+                memoryLimitExceeded,
             });
         });
     });

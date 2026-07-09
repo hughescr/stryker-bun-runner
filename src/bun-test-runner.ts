@@ -66,25 +66,36 @@ interface RegistryFileV1 {
 export class BunTestRunner implements TestRunner {
     public static readonly inject = tokens(commonTokens.logger, commonTokens.options);
 
-    private readonly bunPath:            string;
-    private readonly timeout:            number;
-    private readonly inspectorTimeout:   number;
-    private readonly env?:               Record<string, string>;
-    private readonly bunArgs?:           string[];
-    private readonly testFilesOverride?: string[];
-    private readonly mutateGlobs:        readonly string[];
-    private preloadScriptPath?:          string;
-    private coverageFilePath?:           string;
-    private sanitizedBunfigPath?:        string;
-    private sanitizedBunfigCwd?:         string;
-    private tempDir?:                    string;
-    private cachedTestNames?:            Set<string>;
-    private baseNameIndex?:              Map<string, string[]>;
-    private cachedTestFiles?:            string[];
-    private cachedTestFilesCwd?:         string;
-    private cachedEagerModules?:         string[];
-    private cachedEagerModulesCwd?:      string;
-    private lastRegistryTmpPath?:        string;
+    private readonly bunPath:             string;
+    private readonly timeout:             number;
+    private readonly inspectorTimeout:    number;
+    private readonly env?:                Record<string, string>;
+    private readonly bunArgs?:            string[];
+    private readonly testFilesOverride?:  string[];
+    private readonly mutateGlobs:         readonly string[];
+    private readonly smol:                boolean;
+    private readonly maxChildRss?:        number;
+    private readonly rssCheckIntervalMs?: number;
+    private preloadScriptPath?:           string;
+    private coverageFilePath?:            string;
+    private sanitizedBunfigPath?:         string;
+    private sanitizedBunfigCwd?:          string;
+    private tempDir?:                     string;
+    private cachedTestNames?:             Set<string>;
+    private baseNameIndex?:               Map<string, string[]>;
+    private cachedTestFiles?:             string[];
+    private cachedTestFilesCwd?:          string;
+    private cachedEagerModules?:          string[];
+    private cachedEagerModulesCwd?:       string;
+    private lastRegistryTmpPath?:         string;
+
+    /**
+   * AbortController for whichever `dryRun`/`mutantRun` child process is
+   * currently in flight, if any. Lets {@link dispose} kill an orphaned child
+   * if Stryker disposes this runner while a run hasn't finished — see README
+   * "Orphan prevention".
+   */
+    private currentAbortController?: AbortController;
 
     constructor(
         private readonly logger: Logger,
@@ -97,6 +108,9 @@ export class BunTestRunner implements TestRunner {
         this.inspectorTimeout = bunOptions.inspectorTimeout ?? 5000;
         this.env = bunOptions.env;
         this.bunArgs = bunOptions.bunArgs;
+        this.smol = bunOptions.smol ?? false;
+        this.maxChildRss = bunOptions.maxChildRss;
+        this.rssCheckIntervalMs = bunOptions.rssCheckIntervalMs;
         // Treat empty array as undefined — an empty testFiles list is useless and
         // is most likely a configuration mistake.  getOrDiscoverTestFiles() will
         // auto-discover instead.  A warning is logged so the user is not surprised.
@@ -114,11 +128,14 @@ export class BunTestRunner implements TestRunner {
 
         // Stryker disable next-line StringLiteral: logging message only
         this.logger.debug('BunTestRunner initialized with options: %o', {
-            bunPath:          this.bunPath,
-            timeout:          this.timeout,
-            inspectorTimeout: this.inspectorTimeout,
-            env:              this.env,
-            bunArgs:          this.bunArgs,
+            bunPath:            this.bunPath,
+            timeout:            this.timeout,
+            inspectorTimeout:   this.inspectorTimeout,
+            env:                this.env,
+            bunArgs:            this.bunArgs,
+            smol:               this.smol,
+            maxChildRss:        this.maxChildRss,
+            rssCheckIntervalMs: this.rssCheckIntervalMs,
         });
 
         // Warn when absolute testFiles paths are used inside a Stryker sandbox.
@@ -533,7 +550,10 @@ export class BunTestRunner implements TestRunner {
         // connection fails before the test run completes.  Without this, a failed
         // inspector.connect() would leave the child process running until its own
         // process-level timeout fires — unnecessarily delaying the error result.
+        // Also tracked on `this` so dispose() can kill an orphaned child if this
+        // runner is disposed while the run is still in flight.
         const abortController = new AbortController();
+        this.currentAbortController = abortController;
 
         // 1. Get available ports for inspector and sync server
         const inspectPort = await getAvailablePort();
@@ -585,18 +605,27 @@ export class BunTestRunner implements TestRunner {
 
             // Start test process with callback to get inspector URL
             const testProcess = runBunTests({
-                bunPath:          this.bunPath,
-                timeout:          this.timeout,
-                env:              this.env,
-                bunArgs:          this.bunArgs,
+                bunPath:               this.bunPath,
+                timeout:               this.timeout,
+                env:                   this.env,
+                bunArgs:               this.bunArgs,
                 bunfigPath,
-                preloadScript:    this.preloadScriptPath,
-                coverageFile:     this.coverageFilePath,
-                inspectWaitPort:  inspectPort,
-                sequentialMode:   true,  // Critical for correlation
+                preloadScript:         this.preloadScriptPath,
+                coverageFile:          this.coverageFilePath,
+                inspectWaitPort:       inspectPort,
+                sequentialMode:        true,  // Critical for correlation
                 syncPort, // Pass sync port to preload script via env var
                 testFiles,
-                signal:           abortController.signal,
+                signal:                abortController.signal,
+                smol:                  this.smol,
+                maxChildRss:           this.maxChildRss,
+                rssCheckIntervalMs:    this.rssCheckIntervalMs,
+                onMemoryLimitExceeded: (rssBytes: number) => {
+                    this.logger.warn(
+                        'bun test child exceeded maxChildRss (%d bytes observed) during dryRun — killing and reporting as a timeout for this run',
+                        rssBytes
+                    );
+                },
                 // Stryker disable next-line BlockStatement: removing callback body means inspectorUrl never set → infinite poll → Timeout
                 onInspectorReady: (url: string) => {
                     inspectorUrl = url;
@@ -725,6 +754,10 @@ export class BunTestRunner implements TestRunner {
             // if the process already exited normally, the signal fires to a dead process
             // and the close-event has already resolved the promise.
             abortController.abort();
+            // Stryker disable next-line ConditionalExpression,EqualityOperator,BlockStatement: clears the in-flight tracking so dispose() doesn't abort a stale/already-finished controller; covered by 'clears currentAbortController after dryRun completes'
+            if(this.currentAbortController === abortController) {
+                this.currentAbortController = undefined;
+            }
             // 10 (always). Close sync server — idempotent, safe even after early-return paths
             await syncServer.close();
         }
@@ -862,19 +895,42 @@ export class BunTestRunner implements TestRunner {
         // When testFilesOverride is set, use it directly without globbing.
         this.cachedTestFiles = await this.getOrDiscoverTestFiles();
 
-        const result = await runBunTests({
-            bunPath:        this.bunPath,
-            timeout:        this.timeout,
-            env:            this.env,
-            bunArgs:        this.bunArgs,
-            bunfigPath,
-            activeMutant:   options.activeMutant.id,
-            bail:           true,            // Bail on first failure for mutant runs
-            sequentialMode: true,            // Match dryRun's serialized execution for deterministic results
-            preloadScript:  this.preloadScriptPath, // Needed to set globalThis.__stryker__.activeMutant
-            testNamePattern, // undefined → no filter → full suite (current behaviour)
-            testFiles:      this.cachedTestFiles,
-        });
+        // Tracked on `this` so dispose() can kill an orphaned child if this runner
+        // is disposed while a mutant run is still in flight — mirrors dryRun().
+        const abortController = new AbortController();
+        this.currentAbortController = abortController;
+        let result;
+        try {
+            result = await runBunTests({
+                bunPath:               this.bunPath,
+                timeout:               this.timeout,
+                env:                   this.env,
+                bunArgs:               this.bunArgs,
+                bunfigPath,
+                activeMutant:          options.activeMutant.id,
+                bail:                  true,            // Bail on first failure for mutant runs
+                sequentialMode:        true,            // Match dryRun's serialized execution for deterministic results
+                preloadScript:         this.preloadScriptPath, // Needed to set globalThis.__stryker__.activeMutant
+                testNamePattern, // undefined → no filter → full suite (current behaviour)
+                testFiles:             this.cachedTestFiles,
+                signal:                abortController.signal,
+                smol:                  this.smol,
+                maxChildRss:           this.maxChildRss,
+                rssCheckIntervalMs:    this.rssCheckIntervalMs,
+                onMemoryLimitExceeded: (rssBytes: number) => {
+                    this.logger.warn(
+                        'bun test child exceeded maxChildRss (%d bytes observed) during mutant run %s — killing and reporting as a timeout for this mutant',
+                        rssBytes,
+                        options.activeMutant.id
+                    );
+                },
+            });
+        } finally {
+            // Stryker disable next-line ConditionalExpression,EqualityOperator,BlockStatement: clears the in-flight tracking so dispose() doesn't abort a stale/already-finished controller; covered by 'clears currentAbortController after mutantRun completes'
+            if(this.currentAbortController === abortController) {
+                this.currentAbortController = undefined;
+            }
+        }
 
         if(result.timedOut) {
             // Stryker disable next-line all: Logging statement
@@ -1161,6 +1217,17 @@ export class BunTestRunner implements TestRunner {
     public async dispose(): Promise<void> {
         // Stryker disable next-line StringLiteral: logging message only
         this.logger.debug('Disposing BunTestRunner');
+
+        // If a dryRun/mutantRun child is still in flight when Stryker disposes
+        // this runner (e.g. a hung worker being torn down), kill it rather than
+        // leaving it orphaned. runBunTests' SIGTERM→SIGKILL escalation applies
+        // the same as any other abort path.
+        if(this.currentAbortController) {
+            // Stryker disable next-line StringLiteral: logging message only
+            this.logger.debug('Aborting in-flight bun test child during dispose');
+            this.currentAbortController.abort();
+            this.currentAbortController = undefined;
+        }
 
         // Clean up preload script
         if(this.preloadScriptPath) {

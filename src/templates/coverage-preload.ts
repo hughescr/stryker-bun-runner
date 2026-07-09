@@ -12,8 +12,30 @@ import {
     setActiveMutant,
     formatCoverageData,
     writeCoverageToFile,
+    startOrphanWatchdog,
     type StrykerNamespace
 } from '__PRELOAD_LOGIC_PATH__';
+
+// ============================================================================
+// Section 0: Orphan prevention
+// ============================================================================
+// Every bun test child loads this preload script (dryRun AND mutant runs), so
+// this watchdog runs unconditionally, regardless of coverage collection.
+// If the Stryker worker that spawned this process dies (including via
+// SIGKILL, which gives it no chance to kill its children), this process would
+// otherwise run forever, or until its own --timeout is reached — see README
+// "Orphan prevention".
+const stopOrphanWatchdog = startOrphanWatchdog({
+    getPpid:    () => process.ppid,
+    onOrphaned: () => {
+        console.warn('[Stryker] Parent process is no longer running — terminating to avoid an orphaned bun test process');
+        // eslint-disable-next-line n/no-process-exit, unicorn/no-process-exit -- deliberate self-termination once orphaned; nothing else can stop this process from running forever
+        process.exit(1);
+    },
+});
+afterAll(() => {
+    stopOrphanWatchdog();
+});
 
 // Patch .concurrent() to be regular sequential execution
 // This ensures accurate coverage tracking during mutation testing

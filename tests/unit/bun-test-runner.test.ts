@@ -2117,6 +2117,130 @@ tests/example.test.ts:
                 }
             });
         });
+
+        describe('memory containment options', () => {
+            beforeEach(() => {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
+                });
+            });
+
+            it('passes smol, maxChildRss, and rssCheckIntervalMs through to runBunTests', async () => {
+                const runner = new BunTestRunner(mockLogger, {
+                    bun: { smol: true, maxChildRss: 500_000_000, rssCheckIntervalMs: 2000 },
+                } as unknown as StrykerOptions);
+                await runner.init();
+
+                await runner.dryRun();
+
+                expect(mockRunBunTests).toHaveBeenCalledWith(
+                    expect.objectContaining({
+                        smol:               true,
+                        maxChildRss:        500_000_000,
+                        rssCheckIntervalMs: 2000,
+                    })
+                );
+            });
+
+            it('defaults smol to false when bun.smol is not configured', async () => {
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+
+                await runner.dryRun();
+
+                expect(mockRunBunTests).toHaveBeenCalledWith(
+                    expect.objectContaining({ smol: false })
+                );
+            });
+
+            it('logs a warning via onMemoryLimitExceeded when the child exceeds maxChildRss', async () => {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    options.onMemoryLimitExceeded?.(600_000_000);
+                    return Promise.resolve({ exitCode: null, stdout: '', stderr: '', timedOut: true, memoryLimitExceeded: true });
+                });
+
+                const runner = new BunTestRunner(mockLogger, { bun: { maxChildRss: 500_000_000 } } as unknown as StrykerOptions);
+                await runner.init();
+
+                await runner.dryRun();
+
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect.stringContaining('exceeded maxChildRss'),
+                    600_000_000
+                );
+            });
+        });
+
+        describe('in-flight abort via dispose', () => {
+            it('clears currentAbortController after dryRun completes (subsequent dispose does not re-abort a finished run)', async () => {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
+                });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+
+                // dryRun has fully completed — dispose() must not log the
+                // "aborting in-flight" debug message since nothing is in flight.
+                await runner.dispose();
+
+                expect(mockLogger.debug).not.toHaveBeenCalledWith('Aborting in-flight bun test child during dispose');
+            });
+
+            it('aborts the in-flight child when dispose() runs while dryRun has not yet resolved', async () => {
+                let capturedSignal: AbortSignal | undefined;
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                let releaseRunBunTests: (value: any) => void = () => {};
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    capturedSignal = options.signal;
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                    return new Promise((resolve: (value: any) => void) => {
+                        releaseRunBunTests = resolve;
+                    });
+                });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+
+                const dryRunPromise = runner.dryRun();
+
+                // Let the dryRun() microtasks run up to the point where runBunTests
+                // has been called and the inspector connection has been established,
+                // but the child process promise itself is still pending.
+                await Promise.resolve();
+                await Promise.resolve();
+                await Promise.resolve();
+
+                expect(capturedSignal?.aborted).toBe(false);
+
+                await runner.dispose();
+
+                expect(capturedSignal?.aborted).toBe(true);
+                expect(mockLogger.debug).toHaveBeenCalledWith('Aborting in-flight bun test child during dispose');
+
+                // Let the still-pending dryRun() promise resolve so it doesn't leak
+                // into other tests.
+                releaseRunBunTests({ exitCode: null, stdout: '', stderr: '', timedOut: true });
+                await dryRunPromise;
+            });
+        });
     });
 
     describe('mutantRun', () => {
@@ -3763,6 +3887,131 @@ tests/example.test.ts:
                 expect(readFileSpy.mock.calls.length).toBeGreaterThan(callsAfterFirst);
             });
         });
+
+        describe('memory containment options', () => {
+            it('passes smol, maxChildRss, and rssCheckIntervalMs through to runBunTests', async () => {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
+                });
+
+                const runner = new BunTestRunner(mockLogger, {
+                    bun: { smol: true, maxChildRss: 500_000_000, rssCheckIntervalMs: 2000 },
+                } as unknown as StrykerOptions);
+                await runner.init();
+
+                await runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '1' } as any,
+                    testFilter:      [],
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+
+                expect(mockRunBunTests).toHaveBeenCalledWith(
+                    expect.objectContaining({
+                        smol:               true,
+                        maxChildRss:        500_000_000,
+                        rssCheckIntervalMs: 2000,
+                    })
+                );
+            });
+
+            it('logs a warning identifying the mutant via onMemoryLimitExceeded when the child exceeds maxChildRss', async () => {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    options.onMemoryLimitExceeded?.(600_000_000);
+                    return Promise.resolve({ exitCode: null, stdout: '', stderr: '', timedOut: true, memoryLimitExceeded: true });
+                });
+
+                const runner = new BunTestRunner(mockLogger, { bun: { maxChildRss: 500_000_000 } } as unknown as StrykerOptions);
+                await runner.init();
+
+                await runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: 'mutant-42' } as any,
+                    testFilter:      [],
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect.stringContaining('exceeded maxChildRss'),
+                    600_000_000,
+                    'mutant-42'
+                );
+            });
+        });
+
+        describe('in-flight abort via dispose', () => {
+            it('clears currentAbortController after mutantRun completes (subsequent dispose does not re-abort a finished run)', async () => {
+                mockRunBunTests.mockImplementation(() => Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false }));
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '1' } as any,
+                    testFilter:      [],
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+
+                await runner.dispose();
+
+                expect(mockLogger.debug).not.toHaveBeenCalledWith('Aborting in-flight bun test child during dispose');
+            });
+
+            it('aborts the in-flight child when dispose() runs while mutantRun has not yet resolved', async () => {
+                let capturedSignal: AbortSignal | undefined;
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                let releaseRunBunTests: (value: any) => void = () => {};
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    capturedSignal = options.signal;
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                    return new Promise((resolve: (value: any) => void) => {
+                        releaseRunBunTests = resolve;
+                    });
+                });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+
+                const mutantRunPromise = runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '1' } as any,
+                    testFilter:      [],
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+
+                // mutantRun() does real (non-mocked-away) fs.readFile/discovery work
+                // before reaching runBunTests, which needs at least one real
+                // macrotask tick to settle — plain Promise.resolve() microtask
+                // chains aren't enough here (unlike the dryRun equivalent test).
+                // eslint-disable-next-line no-unmodified-loop-condition -- capturedSignal is set by the mockRunBunTests closure above, a different function; ESLint cannot track that cross-closure mutation
+                for(let i = 0; i < 5 && !capturedSignal; i++) {
+                    // eslint-disable-next-line no-await-in-loop -- sequential polling to let pending I/O settle before asserting
+                    await new Promise<void>((resolve) => {
+                        setTimeout(resolve, 0);
+                    });
+                }
+
+                expect(capturedSignal?.aborted).toBe(false);
+
+                await runner.dispose();
+
+                expect(capturedSignal?.aborted).toBe(true);
+                expect(mockLogger.debug).toHaveBeenCalledWith('Aborting in-flight bun test child during dispose');
+
+                releaseRunBunTests({ exitCode: null, stdout: '', stderr: '', timedOut: true });
+                await mutantRunPromise;
+            });
+        });
     });
 
     describe('dispose', () => {
@@ -3943,6 +4192,99 @@ tests/example.test.ts:
 
                 unlinkSpy.mockRestore();
             });
+        });
+    });
+
+    describe('maxTestRunnerReuse compatibility (dispose + fresh-instance cycle)', () => {
+        // Simulates what Stryker core does when `maxTestRunnerReuse` is configured:
+        // dispose() the current TestRunner, then construct and init() a BRAND NEW
+        // instance (not the disposed one) to continue the campaign. The plugin has
+        // no hook into that recycling decision — it only needs to (a) leave no state
+        // behind that the next instance depends on, and (b) tolerate never having
+        // run dryRun itself, falling back to the shared on-disk registry exactly as
+        // it already does for any other multi-worker Stryker run.
+        it('a fresh instance can resolve killedBy via the registry file written by the disposed instance', async () => {
+            let storedRegistry: string | undefined;
+
+            const writeFileSpy = spyOn(fsPromises, 'writeFile').mockImplementation(((_path: string, data: string) => {
+                storedRegistry = data;
+                return Promise.resolve();
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock signature narrower than fsPromises.writeFile's real overloads
+            }) as any);
+            const renameSpy = spyOn(fsPromises, 'rename').mockResolvedValue(undefined);
+
+            const readFileSpy = spyOn(fsPromises, 'readFile').mockImplementation((() => {
+                if(storedRegistry === undefined) {
+                    return Promise.reject(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+                }
+                return Promise.resolve(storedRegistry);
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock signature narrower than fsPromises.readFile's real overloads
+            }) as any);
+
+            try {
+                mockInspectorClient.getTests.mockReturnValue([]);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([]);
+                mockCollectCoverage.mockResolvedValue(undefined);
+
+                // --- Instance 1: runs dryRun, then Stryker disposes it (maxTestRunnerReuse hit) ---
+                mockGeneratePreloadScript.mockResolvedValue('/tmp/preload-1.ts');
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({
+                        exitCode: 0,
+                        stdout:   'tests/foo.test.ts:\n✓ my test [1ms]\n\n 1 pass\n',
+                        stderr:   '',
+                        timedOut: false,
+                    });
+                });
+
+                const runner1 = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner1.init();
+                const dryRunResult = await runner1.dryRun();
+                expect(dryRunResult.status).toBe(DryRunStatus.Complete);
+
+                await runner1.dispose();
+                expect(storedRegistry).toBeDefined();
+
+                // --- Instance 2: a brand-new BunTestRunner, exactly as Stryker constructs
+                // after disposing the old one under maxTestRunnerReuse. It never ran
+                // dryRun, so testFilter is empty (as Stryker sends for static-coverage
+                // mutants) and localRegistry is empty — resolution MUST come from the
+                // lazily-loaded, file-backed registry written by instance 1.
+                mockGeneratePreloadScript.mockResolvedValue('/tmp/preload-2.ts');
+                mockRunBunTests.mockImplementation(() => Promise.resolve({
+                    exitCode: 1,
+                    stdout:   'tests/foo.test.ts:\n✗ my test [1ms]\n  error: fail\n\n 0 pass\n 1 fail\n',
+                    stderr:   '',
+                    timedOut: false,
+                }));
+
+                const runner2 = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner2.init();
+
+                const mutantResult = await runner2.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '99' } as any,
+                    testFilter:      [],
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+
+                expect(mutantResult.status).toBe(MutantRunStatus.Killed);
+                if(mutantResult.status === MutantRunStatus.Killed) {
+                    expect(mutantResult.killedBy).toContain('tests/foo.test.ts > my test');
+                    expect(mutantResult.killedBy).not.toContain('unknown');
+                }
+
+                await runner2.dispose();
+            } finally {
+                writeFileSpy.mockRestore();
+                renameSpy.mockRestore();
+                readFileSpy.mockRestore();
+            }
         });
     });
 

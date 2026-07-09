@@ -62,6 +62,34 @@ export interface BunTestRunnerOptions {
    * fall back to auto-discovery.
    */
     testFiles?: string[]
+
+    /**
+   * Pass Bun's `--smol` flag to every `bun test` child, trading some speed for
+   * a significantly smaller JavaScriptCore heap footprint. Recommended on
+   * memory-constrained machines, especially at higher Stryker `concurrency`,
+   * since peak memory during a campaign is roughly
+   * `concurrency × per-run suite footprint` (each run is an isolated process
+   * that exits when it completes — see README "Memory model").
+   * @default false
+   */
+    smol?: boolean
+
+    /**
+   * Soft memory ceiling, in bytes, for each `bun test` child's resident set
+   * size (RSS). When set, the child's RSS is polled periodically; a run that
+   * exceeds this ceiling is killed and reported as a clean timeout/error for
+   * that one mutant, rather than being left to grow toward system-wide swap
+   * exhaustion. This is a polled userspace check, not a kernel-enforced
+   * limit — see README "Memory containment" for why a true hard ceiling
+   * (rlimit/cgroup) isn't used. Omit to disable.
+   */
+    maxChildRss?: number
+
+    /**
+   * Poll interval in milliseconds for the {@link maxChildRss} check.
+   * @default 1000
+   */
+    rssCheckIntervalMs?: number
 }
 
 /**

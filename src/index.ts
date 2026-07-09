@@ -66,6 +66,22 @@ export const strykerValidationSchema = {
                         type: 'string',
                     },
                 },
+                smol: {
+                    type:        'boolean',
+                    description: 'Pass Bun\'s --smol flag to every child (smaller JavaScriptCore heap, some speed cost). Recommended on memory-constrained machines (default: false).',
+                    'default':   false,
+                },
+                maxChildRss: {
+                    type:        'number',
+                    minimum:     0,
+                    description: 'Soft memory ceiling in bytes for each bun test child\'s RSS. A child exceeding this is killed and the run reported as a clean timeout for that mutant. Polled userspace check, not a kernel-enforced limit. Omit to disable.',
+                },
+                rssCheckIntervalMs: {
+                    type:        'number',
+                    minimum:     0,
+                    description: 'Poll interval in milliseconds for the maxChildRss check (default: 1000).',
+                    'default':   1000,
+                },
             },
             additionalProperties: false,
         },

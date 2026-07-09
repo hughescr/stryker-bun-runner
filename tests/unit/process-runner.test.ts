@@ -4,8 +4,9 @@
  */
 
 import type { ChildProcess } from 'node:child_process';
-import { describe, it, expect, beforeEach, afterEach, mock, jest } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, mock, jest, spyOn } from 'bun:test';
 import { runBunTests } from '../../src/process-runner.js';
+import * as processRss from '../../src/utils/process-rss.js';
 import { mockSpawn, resetChildProcessMocks } from '../test-preload.js';
 
 /**
@@ -52,6 +53,7 @@ describe('runBunTests', () => {
                 return mockChildProcess as ChildProcess;
             }) as any,
             kill: mock(() => true),
+            pid:  12_345,
         };
         /* eslint-enable @typescript-eslint/no-explicit-any -- re-enable after mock setup */
 
@@ -179,7 +181,7 @@ describe('runBunTests', () => {
     });
 
     describe('timeout handling', () => {
-        it('should timeout and kill process after timeout period', async () => {
+        it('should send SIGTERM (not immediate SIGKILL) when the timeout fires', async () => {
             jest.useFakeTimers();
 
             const resultPromise = runBunTests({
@@ -187,19 +189,103 @@ describe('runBunTests', () => {
                 timeout: 100, // Short timeout for testing
             });
 
-            // Advance timers past the timeout
+            // Advance timers past the timeout, but not past the SIGKILL grace period
             jest.advanceTimersByTime(150);
 
-            // Simulate process close after kill
+            // Process responds to SIGTERM and exits promptly
             mockChildProcess.closeHandler?.(null);
 
             const result = await resultPromise;
 
             expect(result.timedOut).toBe(true);
             expect(result.exitCode).toBeNull();
-            expect(mockChildProcess.kill).toHaveBeenCalledWith('SIGKILL');
+            expect(mockChildProcess.kill).toHaveBeenCalledWith('SIGTERM');
+            expect(mockChildProcess.kill).not.toHaveBeenCalledWith('SIGKILL');
 
             jest.useRealTimers();
+        });
+
+        it('should escalate to SIGKILL when the process ignores SIGTERM past the grace period', async () => {
+            jest.useFakeTimers();
+
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 100,
+            });
+
+            // Fire the timeout (sends SIGTERM) then let the grace period elapse
+            // WITHOUT the process closing — it should escalate to SIGKILL.
+            jest.advanceTimersByTime(100 + 500 + 1);
+
+            expect(mockChildProcess.kill).toHaveBeenCalledWith('SIGTERM');
+            expect(mockChildProcess.kill).toHaveBeenCalledWith('SIGKILL');
+
+            // Now let the (unresponsive) process actually close so the promise resolves
+            mockChildProcess.closeHandler?.(null);
+            const result = await resultPromise;
+
+            expect(result.timedOut).toBe(true);
+            expect(result.exitCode).toBeNull();
+
+            jest.useRealTimers();
+        });
+
+        it('does not escalate to SIGKILL if the process closes within the grace period, even once time advances past it', async () => {
+            jest.useFakeTimers();
+            try {
+                const resultPromise = runBunTests({
+                    bunPath: 'bun',
+                    timeout: 100,
+                });
+
+                // Fire the timeout (sends SIGTERM, schedules a grace-period SIGKILL).
+                jest.advanceTimersByTime(100);
+
+                // The process responds promptly and exits — this must mark the run as
+                // closed (hasClosed) so the still-pending grace-period escalation is
+                // skipped even once that timer later fires.
+                mockChildProcess.closeHandler?.(null);
+
+                // Advance well past the 500ms grace period.
+                jest.advanceTimersByTime(600);
+
+                expect(mockChildProcess.kill).toHaveBeenCalledWith('SIGTERM');
+                expect(mockChildProcess.kill).not.toHaveBeenCalledWith('SIGKILL');
+
+                const result = await resultPromise;
+                expect(result.timedOut).toBe(true);
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('does not escalate to SIGKILL if the process errors within the grace period, even once time advances past it', async () => {
+            jest.useFakeTimers();
+            try {
+                const resultPromise = runBunTests({
+                    bunPath: 'bun',
+                    timeout: 100,
+                });
+
+                // Fire the timeout (sends SIGTERM, schedules a grace-period SIGKILL).
+                jest.advanceTimersByTime(100);
+
+                // The process errors out (e.g. spawn failure surfaced late) — this must
+                // mark the run as closed (hasClosed) via the 'error' handler so the
+                // still-pending grace-period escalation is skipped once that timer fires.
+                mockChildProcess.errorHandler?.(new Error('boom'));
+
+                // Advance well past the 500ms grace period.
+                jest.advanceTimersByTime(600);
+
+                expect(mockChildProcess.kill).toHaveBeenCalledWith('SIGTERM');
+                expect(mockChildProcess.kill).not.toHaveBeenCalledWith('SIGKILL');
+
+                const result = await resultPromise;
+                expect(result.timedOut).toBe(true);
+            } finally {
+                jest.useRealTimers();
+            }
         });
 
         it('should not timeout if process completes in time', async () => {
@@ -1209,6 +1295,7 @@ describe('runBunTests', () => {
             // Must resolve immediately without spawning a child process
             expect(result.timedOut).toBe(true);
             expect(result.exitCode).toBeNull();
+            expect(result.memoryLimitExceeded).toBe(false);
             expect(result.stdout).toBe('');
             expect(result.stderr).toBe('');
         });
@@ -1232,6 +1319,417 @@ describe('runBunTests', () => {
                 // Normal exit — no abort involvement
                 expect(result.exitCode).toBe(0);
                 expect(result.timedOut).toBe(false);
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('escalates to SIGKILL when the process ignores SIGTERM after abort', async () => {
+            jest.useFakeTimers();
+            try {
+                const controller = new AbortController();
+
+                const resultPromise = runBunTests({
+                    bunPath: 'bun',
+                    timeout: 10_000,
+                    signal:  controller.signal,
+                });
+
+                await Promise.resolve();
+                controller.abort();
+
+                // Let the 500ms grace period elapse without the process closing
+                jest.advanceTimersByTime(501);
+
+                expect(mockChildProcess.kill).toHaveBeenCalledWith('SIGTERM');
+                expect(mockChildProcess.kill).toHaveBeenCalledWith('SIGKILL');
+
+                mockChildProcess.closeHandler?.(null);
+                const result = await resultPromise;
+
+                expect(result.timedOut).toBe(true);
+                expect(result.exitCode).toBeNull();
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+    });
+
+    describe('smol option', () => {
+        it('adds --smol flag when smol is true', async () => {
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+                smol:    true,
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const args = mockSpawn.mock.calls[0][1];
+            expect(args).toContain('--smol');
+        });
+
+        it('does not add --smol flag when smol is false', async () => {
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+                smol:    false,
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const args = mockSpawn.mock.calls[0][1];
+            expect(args).not.toContain('--smol');
+        });
+
+        it('does not add --smol flag when smol is undefined', async () => {
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const args = mockSpawn.mock.calls[0][1];
+            expect(args).not.toContain('--smol');
+        });
+    });
+
+    describe('maxChildRss memory ceiling', () => {
+        let getRssSpy: ReturnType<typeof spyOn>;
+        let clearIntervalSpy: ReturnType<typeof spyOn>;
+
+        beforeEach(() => {
+            getRssSpy = spyOn(processRss, 'getProcessRssBytes');
+            clearIntervalSpy = spyOn(globalThis, 'clearInterval');
+        });
+
+        afterEach(() => {
+            getRssSpy.mockRestore();
+            clearIntervalSpy.mockRestore();
+        });
+
+        it('does not probe RSS at all when maxChildRss is not set', async () => {
+            jest.useFakeTimers();
+            try {
+                const resultPromise = runBunTests({ bunPath: 'bun', timeout: 5000 });
+
+                jest.advanceTimersByTime(5000);
+                mockChildProcess.closeHandler?.(0);
+                await resultPromise;
+
+                expect(getRssSpy).not.toHaveBeenCalled();
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('kills the child and resolves memoryLimitExceeded:true when RSS exceeds maxChildRss', async () => {
+            jest.useFakeTimers();
+            try {
+                getRssSpy.mockResolvedValue(200 * 1024 * 1024);
+                const onMemoryLimitExceeded = mock();
+
+                const resultPromise = runBunTests({
+                    bunPath:            'bun',
+                    timeout:            60_000,
+                    maxChildRss:        100 * 1024 * 1024,
+                    rssCheckIntervalMs: 1000,
+                    onMemoryLimitExceeded,
+                });
+
+                // Fire one poll tick and let the RSS probe's promise settle
+                jest.advanceTimersByTime(1000);
+                await Promise.resolve();
+                await Promise.resolve();
+
+                expect(getRssSpy).toHaveBeenCalledWith(12_345);
+                expect(onMemoryLimitExceeded).toHaveBeenCalledWith(200 * 1024 * 1024);
+                expect(mockChildProcess.kill).toHaveBeenCalledWith('SIGTERM');
+
+                // Close with a non-null "exit code" (e.g. 137, typical for SIGKILL) to
+                // prove exitCode is forced to null via processKilled, not merely because
+                // we happened to pass null as the close code.
+                mockChildProcess.closeHandler?.(137);
+                const result = await resultPromise;
+
+                expect(result.memoryLimitExceeded).toBe(true);
+                expect(result.timedOut).toBe(true);
+                expect(result.exitCode).toBeNull();
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('clears the RSS poll interval as soon as the ceiling is exceeded (before the process closes)', async () => {
+            jest.useFakeTimers();
+            try {
+                getRssSpy.mockResolvedValue(200 * 1024 * 1024);
+
+                const resultPromise = runBunTests({
+                    bunPath:            'bun',
+                    timeout:            60_000,
+                    maxChildRss:        100 * 1024 * 1024,
+                    rssCheckIntervalMs: 1000,
+                });
+
+                jest.advanceTimersByTime(1000);
+                await Promise.resolve();
+                await Promise.resolve();
+
+                // The interval must already be cleared at this point — the process
+                // hasn't closed yet (mockChildProcess.closeHandler has not fired).
+                expect(clearIntervalSpy).toHaveBeenCalled();
+
+                mockChildProcess.closeHandler?.(null);
+                await resultPromise;
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('clears the RSS poll interval when the process closes normally (maxChildRss set, ceiling never exceeded)', async () => {
+            jest.useFakeTimers();
+            try {
+                getRssSpy.mockResolvedValue(10 * 1024 * 1024);
+
+                const resultPromise = runBunTests({
+                    bunPath:            'bun',
+                    timeout:            60_000,
+                    maxChildRss:        100 * 1024 * 1024,
+                    rssCheckIntervalMs: 1000,
+                });
+
+                mockChildProcess.closeHandler?.(0);
+                await resultPromise;
+
+                expect(clearIntervalSpy).toHaveBeenCalled();
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('clears the RSS poll interval when the process errors (maxChildRss set)', async () => {
+            jest.useFakeTimers();
+            try {
+                getRssSpy.mockResolvedValue(10 * 1024 * 1024);
+
+                const resultPromise = runBunTests({
+                    bunPath:            'bun',
+                    timeout:            60_000,
+                    maxChildRss:        100 * 1024 * 1024,
+                    rssCheckIntervalMs: 1000,
+                });
+
+                mockChildProcess.errorHandler?.(new Error('spawn failed'));
+                await resultPromise;
+
+                expect(clearIntervalSpy).toHaveBeenCalled();
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('does not kill the child when RSS is exactly equal to maxChildRss (only strictly greater kills)', async () => {
+            jest.useFakeTimers();
+            try {
+                const ceiling = 100 * 1024 * 1024;
+                getRssSpy.mockResolvedValue(ceiling);
+
+                const resultPromise = runBunTests({
+                    bunPath:            'bun',
+                    timeout:            60_000,
+                    maxChildRss:        ceiling,
+                    rssCheckIntervalMs: 1000,
+                });
+
+                jest.advanceTimersByTime(1000);
+                await Promise.resolve();
+                await Promise.resolve();
+
+                expect(mockChildProcess.kill).not.toHaveBeenCalled();
+
+                mockChildProcess.closeHandler?.(0);
+                const result = await resultPromise;
+
+                expect(result.memoryLimitExceeded).toBe(false);
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('does not re-kill or re-fire the callback if a poll tick was already queued when the ceiling was exceeded', async () => {
+            jest.useFakeTimers();
+            try {
+                getRssSpy.mockResolvedValue(200 * 1024 * 1024);
+                const onMemoryLimitExceeded = mock();
+
+                const resultPromise = runBunTests({
+                    bunPath:            'bun',
+                    timeout:            60_000,
+                    maxChildRss:        100 * 1024 * 1024,
+                    rssCheckIntervalMs: 10,
+                    onMemoryLimitExceeded,
+                });
+
+                // Advance past several poll intervals in one shot. Fake-timer
+                // implementations commonly invoke all due callbacks in a single
+                // synchronous burst, so a second (and third) tick's synchronous
+                // prefix can run before the first tick's probe promise resolves —
+                // exercising the reentrancy guard at the top of checkMemoryCeiling.
+                jest.advanceTimersByTime(35);
+                await Promise.resolve();
+                await Promise.resolve();
+                await Promise.resolve();
+
+                // Regardless of how many ticks fired before the first kill took
+                // effect, the ceiling must only be reported/acted on once.
+                expect(onMemoryLimitExceeded).toHaveBeenCalledTimes(1);
+                const killMock = mockChildProcess.kill as ReturnType<typeof mock>;
+                const sigtermCalls = killMock.mock.calls.filter((c: unknown[]) => c[0] === 'SIGTERM');
+                expect(sigtermCalls.length).toBe(1);
+
+                mockChildProcess.closeHandler?.(null);
+                const result = await resultPromise;
+
+                expect(result.memoryLimitExceeded).toBe(true);
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('does not kill the child while RSS stays below maxChildRss', async () => {
+            jest.useFakeTimers();
+            try {
+                getRssSpy.mockResolvedValue(10 * 1024 * 1024);
+
+                const resultPromise = runBunTests({
+                    bunPath:            'bun',
+                    timeout:            60_000,
+                    maxChildRss:        100 * 1024 * 1024,
+                    rssCheckIntervalMs: 1000,
+                });
+
+                jest.advanceTimersByTime(1000);
+                await Promise.resolve();
+                await Promise.resolve();
+
+                expect(mockChildProcess.kill).not.toHaveBeenCalled();
+
+                mockChildProcess.closeHandler?.(0);
+                const result = await resultPromise;
+
+                expect(result.memoryLimitExceeded).toBe(false);
+                expect(result.timedOut).toBe(false);
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('treats a null RSS probe result as unknown and does not kill the child', async () => {
+            jest.useFakeTimers();
+            try {
+                getRssSpy.mockResolvedValue(null);
+
+                const resultPromise = runBunTests({
+                    bunPath:            'bun',
+                    timeout:            60_000,
+                    maxChildRss:        100 * 1024 * 1024,
+                    rssCheckIntervalMs: 1000,
+                });
+
+                jest.advanceTimersByTime(1000);
+                await Promise.resolve();
+                await Promise.resolve();
+
+                expect(mockChildProcess.kill).not.toHaveBeenCalled();
+
+                mockChildProcess.closeHandler?.(0);
+                const result = await resultPromise;
+
+                expect(result.memoryLimitExceeded).toBe(false);
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('stops polling once the process has already closed', async () => {
+            jest.useFakeTimers();
+            try {
+                getRssSpy.mockResolvedValue(10 * 1024 * 1024);
+
+                const resultPromise = runBunTests({
+                    bunPath:            'bun',
+                    timeout:            60_000,
+                    maxChildRss:        100 * 1024 * 1024,
+                    rssCheckIntervalMs: 1000,
+                });
+
+                mockChildProcess.closeHandler?.(0);
+                await resultPromise;
+
+                const callsAtClose = getRssSpy.mock.calls.length;
+
+                // Advance well past several more poll intervals — the interval was
+                // cleared on close, so the call count must not increase.
+                jest.advanceTimersByTime(5000);
+                await Promise.resolve();
+
+                expect(getRssSpy.mock.calls.length).toBe(callsAtClose);
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('defaults the poll interval to 1000ms when rssCheckIntervalMs is not provided', async () => {
+            jest.useFakeTimers();
+            try {
+                getRssSpy.mockResolvedValue(10 * 1024 * 1024);
+
+                const resultPromise = runBunTests({
+                    bunPath:     'bun',
+                    timeout:     60_000,
+                    maxChildRss: 100 * 1024 * 1024,
+                });
+
+                jest.advanceTimersByTime(999);
+                await Promise.resolve();
+                expect(getRssSpy).not.toHaveBeenCalled();
+
+                jest.advanceTimersByTime(1);
+                await Promise.resolve();
+                expect(getRssSpy).toHaveBeenCalledTimes(1);
+
+                mockChildProcess.closeHandler?.(0);
+                await resultPromise;
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('does not probe RSS when the child has no pid', async () => {
+            jest.useFakeTimers();
+            try {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test override of mock child process shape
+                (mockChildProcess as any).pid = undefined;
+
+                const resultPromise = runBunTests({
+                    bunPath:            'bun',
+                    timeout:            60_000,
+                    maxChildRss:        100 * 1024 * 1024,
+                    rssCheckIntervalMs: 1000,
+                });
+
+                jest.advanceTimersByTime(1000);
+                await Promise.resolve();
+
+                expect(getRssSpy).not.toHaveBeenCalled();
+
+                mockChildProcess.closeHandler?.(0);
+                await resultPromise;
             } finally {
                 jest.useRealTimers();
             }

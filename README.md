@@ -78,6 +78,9 @@ This approach provides reliable test-to-mutant correlation, even with multiple t
 | `bun.env` | `object` | `undefined` | Additional environment variables to pass to bun test |
 | `bun.bunArgs` | `string[]` | `undefined` | Additional bun test flags (e.g., `['--bail']`) |
 | `bun.testFiles` | `string[]` | `undefined` | Explicit list of test file paths (absolute or relative to cwd). When provided, skips auto-discovery and uses this list verbatim. Relative paths resolve against the bun subprocess's cwd. Useful for restricting mutation testing to a subset of test files. |
+| `bun.smol` | `boolean` | `false` | Pass Bun's `--smol` flag to every child: a smaller JavaScriptCore heap at some cost to speed. Recommended on memory-constrained machines — see [Memory model](#memory-model). |
+| `bun.maxChildRss` | `number` | `undefined` | Soft memory ceiling in bytes for each child's RSS. A child that exceeds it is killed and the run reported as a clean timeout for that mutant. See [Memory containment](#memory-containment). |
+| `bun.rssCheckIntervalMs` | `number` | `1000` | Poll interval in milliseconds for the `maxChildRss` check. |
 
 ### Example with all options
 
@@ -88,6 +91,9 @@ bun: {
   inspectorTimeout: 10000,   // 10 second connection timeout
   env: { DEBUG: 'true' },    // Extra environment variables
   bunArgs: ['--bail'],       // Stop on first failure
+  smol: true,                // Smaller JSC heap, some speed cost — see Memory model
+  maxChildRss: 1_500_000_000, // Kill+report-timeout a child using more than ~1.5GB RSS
+  rssCheckIntervalMs: 1000,  // How often to poll RSS when maxChildRss is set
 }
 ```
 
@@ -100,6 +106,66 @@ bunx stryker run
 ## How the sandboxed config works
 
 When the plugin initialises it reads your project's `bunfig.toml` (if present) and writes a sanitized copy that is passed to every `bun test` invocation via `--config`. The sanitizer forwards only an explicit allowlist of `[test]` keys; everything else is stripped. The forwarded keys are: `preload`, `root`, `pathIgnorePatterns`, `timeout`, `smol`, `rerunEach`, `retry`, `randomize`, `seed`. The `[install]` table is copied verbatim. Two keys are always forced: `coverage = false` and `onlyFailures = false`. This prevents `coverageThreshold` misses (which cause Bun to exit 1 even when no test actually fails) from being mistaken for mutant kills. If you need additional `[test]` settings forwarded, add their key names to the `SAFE_TEST_KEYS` set in `src/utils/bunfig-sanitizer.ts`.
+
+## Memory model
+
+Every `dryRun` and `mutantRun` spawns a **brand-new `bun test` OS process** and waits for it to fully exit before returning a result — the plugin never reuses a `bun test` child across runs. This is deliberate: it's what makes per-run isolation and coverage correlation reliable, and it means a child process's memory is always fully reclaimed by the OS the moment that one run ends. There is no cross-mutant memory accumulation to "fix" in the spawned child — each mutant gets a clean process.
+
+What this means for memory planning on a mutation-testing machine:
+
+- **Peak memory ≈ `concurrency` × per-run suite footprint.** If your test suite loads heavyweight dependencies at module scope (real ML models, native bindings like `sqlite`/`onnxruntime`, PDF/DOCX extractors, etc. across many test files), each individual `bun test` run pays that footprint once — and Stryker runs `concurrency` of them in parallel. 12 concurrent workers × a 2–3GB suite footprint is 24–36GB of *simultaneous* peak usage, not a leak.
+- **A mutant that breaks cleanup code (`dispose()`/`close()`/`finally`) still leaks *within* that one run.** Because mutation campaigns exhaustively try every "what if this cleanup were skipped" variant, they will execute every broken-`dispose()` mutant your suite has — and each one runs to completion inside its own process before exiting, so the extra native memory is held only for that run's duration, not across the whole campaign. Well-behaved `afterAll`/`afterEach` cleanup in the tests being mutated is what keeps a single run's peak down; no plugin option can substitute for that.
+- **Recommended settings for memory-constrained machines:**
+  - Lower `concurrency` in your `stryker.conf.mjs` first — it has the largest, most direct effect on peak memory (linear multiplier).
+  - Set `bun.smol: true` to shrink each child's JSC heap ceiling at some speed cost.
+  - Set `bun.maxChildRss` as a backstop against a single run growing unexpectedly large (see [Memory containment](#memory-containment)).
+  - Use Stryker core's [`maxTestRunnerReuse`](#maxtestrunnerreuse-compatibility) to periodically recycle the *Stryker worker* process itself (see below) — this is orthogonal to the spawned `bun test` child and addresses a different, much smaller source of growth.
+
+## Memory containment
+
+Two independent knobs help bound the memory a single `bun test` child can use, on top of the isolation the [memory model](#memory-model) already provides:
+
+- **`bun.smol`** passes Bun's own `--smol` flag, which reduces JavaScriptCore's heap growth at some cost to speed. Cheap to enable, no behavior change beyond memory/speed trade-off.
+- **`bun.maxChildRss`** is a *soft, polled userspace* memory ceiling: the plugin periodically reads the child's actual resident set size (RSS) — via `/proc/<pid>/status` on Linux, `ps -o rss=` elsewhere — and if it exceeds the configured byte threshold, kills the child (SIGTERM, escalating to SIGKILL after a grace period) and reports that one run as a clean timeout. This converts "one runaway mutant slowly drags the machine into swap" into "one mutant times out," without corrupting the rest of the campaign.
+
+**Why not a hard, kernel-enforced ceiling (`ulimit -v`, cgroups)?** We looked at this and decided against it:
+- `RLIMIT_AS` (what `ulimit -v` sets) caps *virtual address space*, not RSS. Modern JS engines (Bun's JavaScriptCore, V8) reserve large virtual ranges up front — for JIT code, WASM, guard pages — regardless of how much is actually resident. A ceiling tight enough to matter for real RSS would make the engine fail to start, unrelated to any actual leak.
+- `RLIMIT_RSS` has been a no-op on Linux since kernel 2.4.30 — the kernel accepts the limit but never enforces it.
+- cgroup `memory.max` is the modern, correct mechanism for a true hard ceiling, but requires delegated cgroup access that isn't guaranteed on developer machines, most CI runners, or inside existing containers — wiring it up reliably cross-platform (it doesn't exist at all on macOS) was out of scope for what should be a portable, dependency-free plugin option.
+
+`bun.maxChildRss` gets you the practical outcome (a runaway run fails cleanly instead of taking down the machine) without those platform landmines. If you need a true hard ceiling, run Stryker itself inside a container/cgroup with a memory limit at the orchestration layer — that composes fine with this plugin.
+
+## Orphan prevention
+
+Each spawned `bun test` child is protected against being left running forever if something goes wrong:
+
+- **Timeouts and aborts escalate gracefully.** When the per-run `bun.timeout` fires, or when the plugin internally aborts a run (e.g. dry-run inspector connection failure), the child receives SIGTERM first; if it hasn't exited after a short grace period, it's escalated to SIGKILL. The same escalation covers `bun.maxChildRss` kills.
+- **`dispose()` kills any run still in flight.** If Stryker disposes a `TestRunner` instance while its `dryRun`/`mutantRun` hasn't resolved yet (e.g. tearing down a stuck worker), the in-flight child is aborted using the same escalation path — it isn't left running after the plugin instance that spawned it goes away.
+- **A parent-liveness watchdog guards against the parent being killed outright.** If the Stryker worker process itself is killed with SIGKILL, it gets no chance to run any cleanup code at all — `dispose()` never fires. To prevent an orphaned `bun test` process in that case, every child's preload script polls its own `process.ppid` against the value captured at startup. POSIX reparents an orphaned child to the nearest subreaper (commonly PID 1) as soon as its original parent exits, so a changed `ppid` reliably signals "my parent is gone" — no `prctl(PR_SET_PDEATHSIG)` or native addon required, and it works the same on Linux and macOS. On detecting this, the child logs a warning and exits.
+
+## `maxTestRunnerReuse` compatibility
+
+Stryker core's own [`maxTestRunnerReuse`](https://stryker-mutator.io/docs/stryker-js/configuration/#maxtestrunnerreuse-number) option periodically disposes and reconstructs the *TestRunner instance* (and, depending on core's process-pooling, the worker process hosting it) after a configured number of runs — this is the right lever for bounding growth in the long-lived Stryker worker itself, as opposed to the already-isolated, per-run `bun test` children this plugin spawns (see [Memory model](#memory-model)).
+
+This plugin is designed to tolerate that recycling cleanly:
+
+- `dispose()` cleans up its preload script, coverage file, sanitized bunfig, and registry temp file, and aborts any run still in flight (see [Orphan prevention](#orphan-prevention)).
+- A fresh `BunTestRunner` instance that never ran its own `dryRun` (as happens after a recycle) still resolves `killedBy` names correctly: it lazily loads the shared, file-backed dry-run test registry written by whichever instance *did* run `dryRun`, exactly as it already does for any other multi-worker Stryker run.
+
+```javascript
+// stryker.conf.mjs
+export default {
+  testRunner: 'bun',
+  coverageAnalysis: 'perTest',
+  mutate: ['src/**/*.ts'],
+  concurrency: 8,               // tune down first on memory-constrained machines
+  maxTestRunnerReuse: 100,      // recycle each Stryker worker after 100 runs
+  bun: {
+    smol: true,
+    maxChildRss: 1_500_000_000, // ~1.5GB soft ceiling per bun test child
+  },
+};
+```
 
 ## Known Limitations
 

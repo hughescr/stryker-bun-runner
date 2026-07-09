@@ -5,3 +5,4 @@ export { generateSanitizedBunfig, cleanupSanitizedBunfig } from './bunfig-saniti
 export { normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName } from './test-name.js';
 export { buildTestNamePattern } from './test-name-pattern.js';
 export { discoverTestFiles } from './test-file-discovery.js';
+export { getProcessRssBytes, parseVmRss, parsePsRssOutput } from './process-rss.js';
