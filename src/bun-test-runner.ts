@@ -50,15 +50,59 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Shape of the persisted dryRun registry file (version 1).
- * Validated by loadRegistryFile before use.
+ * Shape of the persisted dryRun registry file (version 2).
+ * Version 2 adds testNameIndex: the FINAL test id (dedup ' [N]' suffix
+ * included) → Bun's exact internal matching name (TestInfo.bunName), used by
+ * buildTestNamePattern's exact-name fast path. Version-1 files are rejected
+ * by loadRegistryFile — they can only be stale data from a prior plugin
+ * version, and the reader safely degrades to the lossy pattern path.
  */
-interface RegistryFileV1 {
+interface RegistryFileV2 {
     version:         number
     writtenAt:       number
     cachedTestNames: string[]
     baseNameIndex:   [string, string[]][]
+    testNameIndex:   [string, string][]
 }
+
+/** Union of the per-test result shapes the runner produces for Stryker. */
+type RunnerTestResult = SuccessTestResult | FailedTestResult | SkippedTestResult;
+
+/**
+ * Zip per-execution-order bun names onto FINAL test ids.
+ *
+ * Must run AFTER buildTestsFromInspector's duplicate-name dedup loop: that loop
+ * mutates test.id/test.name in place and never reorders the array, so tests[i]
+ * still corresponds to bunNames[i]. Keys are the FINAL test.id (' [N]' dedup
+ * suffix included) — the exact strings Stryker later echoes back in
+ * options.testFilter. Entries whose bunName is undefined (unknown-inspectorId
+ * placeholders, TestInfo without bunName) are omitted so those ids stay on the
+ * lossy pattern path.
+ */
+function buildTestNameIndex(
+    tests: readonly RunnerTestResult[],
+    bunNames: readonly (string | undefined)[]
+): Map<string, string> {
+    const testNameIndex = new Map<string, string>();
+    for(const [i, test] of tests.entries()) {
+        const bunName = bunNames[i];
+        if(bunName !== undefined) {
+            testNameIndex.set(test.id, bunName);
+        }
+    }
+    return testNameIndex;
+}
+
+/**
+ * Contiguous plain-text fragment of bun's zero-match --test-name-pattern stderr
+ * (byte-verified, bun 1.3.14, including under FORCE_COLOR=3): bun ANSI-colors
+ * "error:" and the quoted pattern even when piped, but never this fragment.
+ * Emitted only when matches across the WHOLE run are 0 — a partial pattern
+ * miss exits 0 with no error text (verified live), so this can never fire on
+ * a partial miss, only a total one.
+ */
+// Stryker disable next-line Regex: version-coupled to bun's exact wording; see the doc comment above and mutantRun/checkRuntimeError's behavioral tests
+const ZERO_MATCH_TEST_PATTERN_RE = /matched 0 tests\./;
 
 /**
  * Bun test runner for Stryker mutation testing
@@ -83,6 +127,7 @@ export class BunTestRunner implements TestRunner {
     private tempDir?:                     string;
     private cachedTestNames?:             Set<string>;
     private baseNameIndex?:               Map<string, string[]>;
+    private testNameIndex?:               Map<string, string>;
     private cachedTestFiles?:             string[];
     private cachedTestFilesCwd?:          string;
     private cachedEagerModules?:          string[];
@@ -322,33 +367,48 @@ export class BunTestRunner implements TestRunner {
 
     /**
    * Load the shared dryRun registry written by the one worker that ran dryRun.
-   * Populates this.cachedTestNames and this.baseNameIndex so that subsequent
-   * mutantRun calls on this worker can resolve killedBy names correctly, even
-   * for static-coverage mutants where testFilter is empty.
+   * Populates this.cachedTestNames, this.baseNameIndex, and this.testNameIndex
+   * so that subsequent mutantRun calls on this worker can resolve killedBy names
+   * and build exact --test-name-pattern alternatives, even for static-coverage
+   * mutants where testFilter is empty.
    *
-   * Failures are non-fatal — the worker falls back to raw console names (current
-   * behaviour before this fix), and a warning is logged so the issue is visible.
+   * Loading is all-or-nothing: a wrong version or a malformed field rejects the
+   * whole file (never a half-initialised registry). Failures are non-fatal — the
+   * worker falls back to raw console names and the lossy pattern reconstruction,
+   * and a warning is logged so the issue is visible.
    */
     private async loadRegistryFile(): Promise<void> {
         const registryPath = this.registryPath;
         try {
             const raw = await fsPromises.readFile(registryPath, 'utf8');
-            const parsed = JSON.parse(raw) as RegistryFileV1;
-            // Stryker disable next-line ConditionalExpression,BlockStatement: version guard covered by test 'skips registry with unexpected version'
-            if(parsed.version !== 1) {
+            const parsed = JSON.parse(raw) as RegistryFileV2;
+            if(parsed.version !== 2) {
                 // Stryker disable next-line StringLiteral: diagnostic logging message
                 this.logger.warn('dryRun registry file has unexpected version %s; skipping', String(parsed.version));
                 return;
             }
-            if(!Array.isArray(parsed.cachedTestNames) || !Array.isArray(parsed.baseNameIndex)) {
+            if(!Array.isArray(parsed.cachedTestNames) || !Array.isArray(parsed.baseNameIndex) || !Array.isArray(parsed.testNameIndex)) {
                 // Stryker disable next-line StringLiteral: diagnostic logging message
                 this.logger.warn(
-                    'dryRun registry file is malformed (cachedTestNames or baseNameIndex missing or not an array); treating as absent'
+                    'dryRun registry file is malformed (cachedTestNames, baseNameIndex, or testNameIndex missing or not an array); treating as absent'
+                );
+                return;
+            }
+            // Per-entry validation is limited to testNameIndex: its values feed
+            // escapeRegex() on the exact-name fast path, where a non-string would
+            // throw mid-mutantRun. cachedTestNames/baseNameIndex flow only into
+            // Set/Map lookups, where malformed entries are inert, so they keep
+            // the shape-level-only guard above.
+            if(!parsed.testNameIndex.every((entry: unknown) => Array.isArray(entry) && entry.length === 2 && typeof entry[0] === 'string' && typeof entry[1] === 'string')) {
+                // Stryker disable next-line StringLiteral: diagnostic logging message
+                this.logger.warn(
+                    'dryRun registry file is malformed (testNameIndex entry is not a [string, string] pair); treating as absent'
                 );
                 return;
             }
             this.cachedTestNames = new Set<string>(parsed.cachedTestNames);
             this.baseNameIndex   = new Map<string, string[]>(parsed.baseNameIndex);
+            this.testNameIndex   = new Map<string, string>(parsed.testNameIndex);
             // Stryker disable next-line StringLiteral: diagnostic logging message
             this.logger.debug('Loaded dryRun registry from %s (%d entries)', registryPath, this.cachedTestNames.size);
         } catch (err) {
@@ -375,6 +435,12 @@ export class BunTestRunner implements TestRunner {
     /**
    * Build test results from inspector data.
    *
+   * Also returns a testNameIndex mapping each FINAL test id (dedup ' [N]'
+   * suffix included) to Bun's exact internal matching name (TestInfo.bunName)
+   * for --test-name-pattern generation. Tests without a bunName — console-
+   * fallback results and unknown-inspectorId placeholders — get no index entry
+   * and stay on the lossy pattern reconstruction path (never worse than before).
+   *
    * @param inspectorIdToProjectFile - Optional mapping from inspector ID to project file path.
    *   When provided, the project file is used for TestResult.id, name, and fileName instead of
    *   testInfo.url. This is important for tests defined via helpers (e.g. RuleTester.run()) where
@@ -386,10 +452,12 @@ export class BunTestRunner implements TestRunner {
         parsed: ParsedTestResults,
         totalElapsedMs: number,
         inspectorIdToProjectFile?: Map<number, string>
-    ): (SuccessTestResult | FailedTestResult | SkippedTestResult)[] {
+    ): { tests: RunnerTestResult[], testNameIndex: Map<string, string> } {
         if(executionOrder.length === 0) {
-            // Fallback: use parsed console output when inspector didn't capture tests
-            return parsed.tests.map((t) => {
+            // Fallback: use parsed console output when inspector didn't capture tests.
+            // No TestInfo is available here, so no exact bun names either — the
+            // returned index is empty and these ids stay on the lossy pattern path.
+            const fallbackTests = parsed.tests.map((t) => {
                 const normalizedName = normalizeTestName(t.name);
                 if(t.status === 'failed') {
                     return {
@@ -416,6 +484,7 @@ export class BunTestRunner implements TestRunner {
                     timeSpentMs: Math.round(t.duration ?? 1),
                 } satisfies SuccessTestResult;
             });
+            return { tests: fallbackTests, testNameIndex: new Map<string, string>() };
         }
 
         // Stryker disable next-line EqualityOperator, ConditionalExpression: mutating > 0 to >= 0 is equivalent here because the early return above already handles executionOrder.length === 0, so length is guaranteed > 0 at this point and the else branch is dead code; ConditionalExpression: true is equivalent for the same reason
@@ -428,6 +497,10 @@ export class BunTestRunner implements TestRunner {
         for(const test of testHierarchy) {
             testMap.set(test.id, test);
         }
+
+        // Bun's exact matching names, index-aligned with executionOrder (and thus
+        // with `tests` below). Unknown inspector ids yield undefined → no index entry.
+        const bunNames = executionOrder.map(inspectorId => testMap.get(inspectorId)?.bunName);
 
         const tests = executionOrder.map((inspectorId) => {
             const testInfo = testMap.get(inspectorId);
@@ -492,8 +565,11 @@ export class BunTestRunner implements TestRunner {
             } satisfies SuccessTestResult;
         });
 
-        // Handle duplicate test names (e.g., from it.each with %s placeholders)
-        // Bun's inspector reports the template literal instead of interpolated values.
+        // Handle duplicate test names — the same title registered more than once,
+        // e.g. two it('same name') calls in one describe, or it.each on older Bun
+        // versions. Bun >=1.3.x reports interpolated it.each names (verified live
+        // on 1.3.14), so %s template literals no longer collide here; the dedup
+        // machinery is retained for genuinely-duplicate titles and older Bun.
         //
         // IMPORTANT: index assignment must be deterministic regardless of WebSocket
         // message arrival order.  We sort each group of duplicate-named tests by their
@@ -536,7 +612,8 @@ export class BunTestRunner implements TestRunner {
             }
         }
 
-        return tests;
+        // Zip by index AFTER the dedup loop above — see buildTestNameIndex.
+        return { tests, testNameIndex: buildTestNameIndex(tests, bunNames) };
     }
 
     /**
@@ -734,7 +811,7 @@ export class BunTestRunner implements TestRunner {
             const { coverage: mutantCoverage, inspectorIdToProjectFile } = await this.collectAndRemapCoverage(testHierarchy, executionOrder);
 
             // 14. Build test results from inspector data
-            const tests = this.buildTestsFromInspector(testHierarchy, executionOrder, parsed, totalElapsedMs, inspectorIdToProjectFile);
+            const { tests, testNameIndex } = this.buildTestsFromInspector(testHierarchy, executionOrder, parsed, totalElapsedMs, inspectorIdToProjectFile);
 
             // Sort tests by name to ensure consistent order across runs
             // This is critical for Stryker's incremental mode - test IDs are assigned
@@ -742,7 +819,7 @@ export class BunTestRunner implements TestRunner {
             tests.sort((a, b) => a.name.localeCompare(b.name));
 
             // Cache test names and persist registry for killedBy resolution in mutantRun
-            await this.buildAndPersistTestRegistry(tests);
+            await this.buildAndPersistTestRegistry(tests, testNameIndex);
 
             return {
                 status: DryRunStatus.Complete,
@@ -765,14 +842,17 @@ export class BunTestRunner implements TestRunner {
 
     /**
    * Build the in-memory test name cache and base-name index, then atomically
-   * persist them to a well-known file so other worker processes can lazy-load
-   * them when handling static-coverage mutants (testFilter is empty for those).
+   * persist them — together with the exact-name testNameIndex from
+   * buildTestsFromInspector — to a well-known file so other worker processes
+   * can lazy-load them when handling static-coverage mutants (testFilter is
+   * empty for those) and build exact --test-name-pattern alternatives.
    *
    * Writing to a .tmp path then renaming is atomic on POSIX: readers always see
    * either the previous complete file or the new one — never a partial write.
    */
     private async buildAndPersistTestRegistry(
-        tests: (SuccessTestResult | FailedTestResult | SkippedTestResult)[]
+        tests: RunnerTestResult[],
+        testNameIndex: Map<string, string>
     ): Promise<void> {
         this.cachedTestNames = new Set(tests.map(t => t.name));
         // Stryker disable all: defensive check — buildTestsFromInspector always deduplicates names, so tests.length === cachedTestNames.size in normal operation; this entire block is unreachable defensive code
@@ -820,15 +900,21 @@ export class BunTestRunner implements TestRunner {
         // Stryker disable next-line StringLiteral: diagnostic logging message
         this.logger.debug('Cached %d test names from dry run for killedBy resolution', this.cachedTestNames.size);
 
+        // Keep the exact-name index on the instance BEFORE attempting the write
+        // (mirrors cachedTestNames) so this worker's own mutantRuns can use it
+        // even when the registry file write below fails.
+        this.testNameIndex = testNameIndex;
+
         try {
             const registryPath = this.registryPath;
             const tmpPath = this.registryTmpPath;
             const registryData = JSON.stringify({
-                version:         1,
+                version:         2,
                 writtenAt:       Date.now(),
                 // Stryker disable next-line ArrayDeclaration: equivalent mutant — prepending "Stryker was here" leaves all real test names in place; killedBy resolution is unaffected
                 cachedTestNames: [...this.cachedTestNames],
                 baseNameIndex:   [...this.baseNameIndex.entries()],
+                testNameIndex:   [...testNameIndex.entries()],
             });
             await fsPromises.writeFile(tmpPath, registryData, 'utf8');
             this.lastRegistryTmpPath = tmpPath;
@@ -848,17 +934,73 @@ export class BunTestRunner implements TestRunner {
     }
 
     /**
+   * Lossy-visibility warns for a mutant run's --test-name-pattern.
+   *
+   * Bun exits 0 on a PARTIAL pattern miss (verified live, bun 1.3.14),
+   * silently dropping the missed tests — so these warns are the only signal
+   * that some covering-test alternatives were built via the lossy
+   * ' > '-collapsing reconstruction instead of exact bun names. Must be called
+   * AFTER the registry lazy-load so this.testNameIndex reflects reality.
+   */
+    private warnLossyPatternAlternatives(filterIds: readonly string[], mutantId: string): void {
+        // Empty filter → no pattern is built at all, nothing lossy to warn about.
+        if(filterIds.length === 0) {
+            return;
+        }
+        const exactNameIndex = this.testNameIndex;
+        if(exactNameIndex === undefined) {
+            // Stryker disable next-line StringLiteral: diagnostic logging message
+            this.logger.warn('Mutant %s: no exact-name registry available — all %d covering-test pattern alternatives use lossy reconstruction; tests with " > " in their titles may be silently dropped', mutantId, filterIds.length);
+            return;
+        }
+        const missed = filterIds.filter(id => !exactNameIndex.has(id));
+        if(missed.length > 0) {
+            // Stryker disable StringLiteral,MethodExpression,ConditionalExpression,EqualityOperator: diagnostic warn — the slice(0, 5) sample cap and the ', …' ellipsis ternary only shape log output; the guarding conditionals around this warn are behaviorally tested
+            this.logger.warn(
+                'Mutant %s: %d of %d testFilter ids missing from exact-name registry (lossy fallback; " > " titles among them may be silently dropped): %s%s',
+                mutantId,
+                missed.length,
+                filterIds.length,
+                missed.slice(0, 5).join(', '),
+                missed.length > 5 ? ', …' : ''
+            );
+            // Stryker restore StringLiteral,MethodExpression,ConditionalExpression,EqualityOperator
+        }
+    }
+
+    /**
    * Run tests with an active mutant
    */
     public async mutantRun(options: MutantRunOptions): Promise<MutantRunResult> {
         // Stryker disable next-line StringLiteral: logging message only
         this.logger.debug('Running mutant run for mutant %s', options.activeMutant.id);
 
+        // Stryker disable next-line ArrayDeclaration: equivalent mutant — options.testFilter is always a non-null array in all tests; ?? fallback never fires, so ['Stryker was here'] = [] in practice
+        const filterIds = options.testFilter ?? [];
+
+        // Lazy-load the shared dryRun registry when this worker's instance registry is
+        // not yet populated (i.e. this worker never ran dryRun).  We load it
+        // regardless of whether testFilter is empty, because Bun's --test-name-pattern
+        // is a hierarchy regex that can leak: tests NOT in testFilter may still run and
+        // kill the mutant first.  Their names won't be in localRegistry, so we need the
+        // instance registry as a fallback to avoid storing raw console names in killedBy.
+        // IMPORTANT: this must run BEFORE buildTestNamePattern below — the load also
+        // populates this.testNameIndex, whose exact bun names the pattern builder
+        // needs for titles that legitimately contain ' > '.
+        if(!this.cachedTestNames) {
+            await this.loadRegistryFile();
+        }
+
+        // Lossy-visibility warns — see warnLossyPatternAlternatives.
+        this.warnLossyPatternAlternatives(filterIds, options.activeMutant.id);
+
         // Translate testFilter into --test-name-pattern to run only the covering tests.
-        // Each test ID is the full "file.test.ts > Suite > test name" string from dryRun;
-        // we strip the file-path prefix (Bun's pattern matches the hierarchy without it)
-        // and collapse duplicate-name tests (those with a " [N]" dedup suffix) to a single
-        // alternative — Bun cannot distinguish them at runtime, but running both is correct.
+        // Each test ID is the full "file.test.ts > Suite > test name" string from dryRun.
+        // When the exact-name registry has an entry for an id, Bun's exact matching
+        // name is used verbatim; otherwise we strip the file-path prefix (Bun's
+        // pattern matches the hierarchy without it) and collapse duplicate-name tests
+        // (those with a " [N]" dedup suffix) to a single alternative — Bun cannot
+        // distinguish them at runtime, but running both is correct.
         // --bail is applied unless Stryker's disableBail option is set — without bail
         // every covering test runs to completion, so killedBy can list all killing tests.
         // When the covering set is too large to encode safely in a single argv entry
@@ -868,23 +1010,11 @@ export class BunTestRunner implements TestRunner {
         // execution semantics — parallel timing can cause mutants to escape detection.
         // IMPORTANT: Preload script IS needed to set globalThis.__stryker__.activeMutant
         // The preload script skips coverage collection when __STRYKER_ACTIVE_MUTANT__ is set
-        const testNamePattern = buildTestNamePattern(options.testFilter ?? []);
+        const testNamePattern = buildTestNamePattern(filterIds, this.testNameIndex);
 
         // Build a LOCAL index from options.testFilter so that every worker — not just
         // the one that ran dryRun — can resolve rawFailedNames into killedBy IDs.
-        // Stryker disable next-line ArrayDeclaration: equivalent mutant — options.testFilter is always a non-null array in all tests; ?? fallback never fires, so ['Stryker was here'] = [] in practice
-        const localTestFilter = options.testFilter ?? [];
-        const { localRegistry, localBaseIndex } = this.buildLocalTestFilterIndex(localTestFilter);
-
-        // Lazy-load the shared dryRun registry when this worker's instance registry is
-        // not yet populated (i.e. this worker never ran dryRun).  We now load it
-        // regardless of whether testFilter is empty, because Bun's --test-name-pattern
-        // is a hierarchy regex that can leak: tests NOT in testFilter may still run and
-        // kill the mutant first.  Their names won't be in localRegistry, so we need the
-        // instance registry as a fallback to avoid storing raw console names in killedBy.
-        if(!this.cachedTestNames) {
-            await this.loadRegistryFile();
-        }
+        const { localRegistry, localBaseIndex } = this.buildLocalTestFilterIndex(filterIds);
 
         // Use cached bunfig path synchronously when available (pre-warmed by init()).
         const mutantCwd = process.cwd();
@@ -899,6 +1029,26 @@ export class BunTestRunner implements TestRunner {
         // When testFilesOverride is set, use it directly without globbing.
         this.cachedTestFiles = await this.getOrDiscoverTestFiles();
 
+        return this.executeMutantRun(options, bunfigPath, testNamePattern, localRegistry, localBaseIndex);
+    }
+
+    /**
+   * Spawn bun for a mutant run and interpret the result. Extracted from
+   * mutantRun so that a --test-name-pattern which matched 0 tests can retry
+   * once with the full suite (testNamePattern undefined) while reusing the
+   * SAME localRegistry/localBaseIndex built from the original testFilter for
+   * killedBy resolution — avoiding both a false Killed and redundant setup.
+   * The retry always recurses with testNamePattern undefined, so the retry
+   * gate's first conjunct is false on that call: recursion is bounded to
+   * depth 1 by construction, never a retry-of-a-retry.
+   */
+    private async executeMutantRun(
+        options:         MutantRunOptions,
+        bunfigPath:      string,
+        testNamePattern: string | undefined,
+        localRegistry:   Set<string>,
+        localBaseIndex:  Map<string, string[]>
+    ): Promise<MutantRunResult> {
         // Tracked on `this` so dispose() can kill an orphaned child if this runner
         // is disposed while a mutant run is still in flight — mirrors dryRun().
         const abortController = new AbortController();
@@ -956,6 +1106,19 @@ export class BunTestRunner implements TestRunner {
 
         // Non-zero exit code means tests failed, mutant is killed.
         if(result.exitCode !== 0) {
+            // A pattern that matched zero tests across the WHOLE run (bun's zero-match
+            // error is total, never partial — verified live, bun 1.3.14) is a runner
+            // pattern gap or a mutant that changed an interpolated test title, not a
+            // genuine kill: retry once with the full suite before giving up.
+            // eslint-disable-next-line @typescript-eslint/prefer-includes -- kept as a RegExp (not includes()) to match the module-level ZERO_MATCH_TEST_PATTERN_RE declaration shared with checkRuntimeError; behaviorally identical for this literal pattern
+            if(testNamePattern !== undefined && parsed.tests.length === 0 && ZERO_MATCH_TEST_PATTERN_RE.test(result.stderr)) {
+                // Stryker disable next-line StringLiteral: diagnostic logging message
+                this.logger.warn(
+                    'Mutant %s: --test-name-pattern matched 0 tests — usually a runner pattern gap or a mutant that changed an interpolated test title (it.each); retrying once with the full suite',
+                    options.activeMutant.id
+                );
+                return this.executeMutantRun(options, bunfigPath, undefined, localRegistry, localBaseIndex);
+            }
             return this.buildMutantKilledResult(result, parsed, localRegistry, localBaseIndex, options.activeMutant.id);
         }
 
@@ -1035,6 +1198,27 @@ export class BunTestRunner implements TestRunner {
         mutantId: string
     ): MutantRunResult | null {
         const stderr = result.stderr;
+
+        // A zero-match --test-name-pattern that reaches here either exhausted
+        // mutantRun's one-shot full-suite retry, or never had a Stryker-built
+        // pattern to retry (empty testFilter, user-supplied -t via bunArgs).
+        // Classify distinctly from the generic runtime-error messages below so
+        // operators can tell a runner pattern gap apart from a real crash.
+        // eslint-disable-next-line @typescript-eslint/prefer-includes -- kept as a RegExp (not includes()) to match the module-level ZERO_MATCH_TEST_PATTERN_RE declaration shared with executeMutantRun's retry gate; behaviorally identical for this literal pattern
+        if(ZERO_MATCH_TEST_PATTERN_RE.test(stderr)) {
+            // Stryker disable next-line StringLiteral: diagnostic logging message
+            this.logger.warn(
+                'Mutant %s: --test-name-pattern matched 0 tests with no covering tests left to retry — not a kill: %s',
+                mutantId,
+                stderr.slice(0, 200)
+            );
+            return {
+                status:       MutantRunStatus.Error,
+                // Stryker disable next-line StringLiteral: diagnostic error message text — behaviorally tested via .toContain, not exact-matched
+                errorMessage: `stryker-bun-runner: bun's --test-name-pattern matched 0 tests for this mutant (runner pattern gap or mutant-changed interpolated title — not a kill): ${stderr.slice(0, 500)}`,
+            };
+        }
+
         const isRuntimeError
             = stderr.includes('Unhandled error')
               || stderr.includes('Cannot find module')

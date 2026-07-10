@@ -365,6 +365,7 @@ describe('InspectorClient', () => {
                 id:       1,
                 name:     'test1',
                 fullName: 'test1',
+                bunName:  'test1',
                 type:     'test',
                 url:      '/path/to/test.ts',
                 line:     10,
@@ -410,6 +411,7 @@ describe('InspectorClient', () => {
                 id:       1,
                 name:     'test1',
                 fullName: 'test1',
+                bunName:  'test1',
                 type:     'test',
             });
         });
@@ -878,6 +880,243 @@ describe('InspectorClient', () => {
 
             const executionOrder = client.getExecutionOrder();
             expect(executionOrder).toEqual([2, 3]);
+        });
+    });
+
+    describe('bunName', () => {
+        it('should join nested describe and test titles with a single space (fullName stays " > "-joined)', async () => {
+            const client = new InspectorClient({
+                url: 'ws://localhost:6499',
+
+                WebSocketClass: MockWebSocketConstructor,
+            });
+
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            mockWs.simulateMessage(
+                JSON.stringify({
+                    method: 'TestReporter.found',
+                    params: {
+                        id:   1,
+                        name: 'Suite',
+                        type: 'describe',
+                    },
+                })
+            );
+
+            mockWs.simulateMessage(
+                JSON.stringify({
+                    method: 'TestReporter.found',
+                    params: {
+                        id:       2,
+                        name:     'Nested',
+                        type:     'describe',
+                        parentId: 1,
+                    },
+                })
+            );
+
+            mockWs.simulateMessage(
+                JSON.stringify({
+                    method: 'TestReporter.found',
+                    params: {
+                        id:       3,
+                        name:     'test1',
+                        type:     'test',
+                        parentId: 2,
+                    },
+                })
+            );
+
+            const test = client.getTest(3);
+            expect(test?.bunName).toBe('Suite Nested test1');
+            expect(test?.fullName).toBe('Suite > Nested > test1');
+        });
+
+        it('should preserve exactly 3 spaces for padded titles (no per-level trim)', async () => {
+            const client = new InspectorClient({
+                url: 'ws://localhost:6499',
+
+                WebSocketClass: MockWebSocketConstructor,
+            });
+
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            mockWs.simulateMessage(
+                JSON.stringify({
+                    method: 'TestReporter.found',
+                    params: {
+                        id:   1,
+                        name: 'outer ',
+                        type: 'describe',
+                    },
+                })
+            );
+
+            mockWs.simulateMessage(
+                JSON.stringify({
+                    method: 'TestReporter.found',
+                    params: {
+                        id:       2,
+                        name:     ' inner test',
+                        type:     'test',
+                        parentId: 1,
+                    },
+                })
+            );
+
+            const test = client.getTest(2);
+            expect(test?.bunName).toBe('outer   inner test');
+            expect(test?.fullName).toBe('outer  >  inner test');
+        });
+
+        it('should preserve a literal " > " substring in a leaf title verbatim', async () => {
+            const client = new InspectorClient({
+                url: 'ws://localhost:6499',
+
+                WebSocketClass: MockWebSocketConstructor,
+            });
+
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            mockWs.simulateMessage(
+                JSON.stringify({
+                    method: 'TestReporter.found',
+                    params: {
+                        id:   1,
+                        name: 'createContextBuilder loading methods',
+                        type: 'describe',
+                    },
+                })
+            );
+
+            mockWs.simulateMessage(
+                JSON.stringify({
+                    method: 'TestReporter.found',
+                    params: {
+                        id:       2,
+                        name:     'should call listMessages with CleanInbox when unread > 0',
+                        type:     'test',
+                        parentId: 1,
+                    },
+                })
+            );
+
+            const test = client.getTest(2);
+            expect(test?.bunName).toBe('createContextBuilder loading methods should call listMessages with CleanInbox when unread > 0');
+            expect(test?.fullName).toBe('createContextBuilder loading methods > should call listMessages with CleanInbox when unread > 0');
+        });
+
+        it('should preserve a literal " > " substring in a describe name verbatim', async () => {
+            const client = new InspectorClient({
+                url: 'ws://localhost:6499',
+
+                WebSocketClass: MockWebSocketConstructor,
+            });
+
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            mockWs.simulateMessage(
+                JSON.stringify({
+                    method: 'TestReporter.found',
+                    params: {
+                        id:   1,
+                        name: 'Suite > with arrow in name',
+                        type: 'describe',
+                    },
+                })
+            );
+
+            mockWs.simulateMessage(
+                JSON.stringify({
+                    method: 'TestReporter.found',
+                    params: {
+                        id:       2,
+                        name:     'works',
+                        type:     'test',
+                        parentId: 1,
+                    },
+                })
+            );
+
+            const test = client.getTest(2);
+            expect(test?.bunName).toBe('Suite > with arrow in name works');
+            expect(test?.fullName).toBe('Suite > with arrow in name > works');
+        });
+
+        it('should preserve a tab character in a title raw (no control-char substitution)', async () => {
+            const client = new InspectorClient({
+                url: 'ws://localhost:6499',
+
+                WebSocketClass: MockWebSocketConstructor,
+            });
+
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            mockWs.simulateMessage(
+                JSON.stringify({
+                    method: 'TestReporter.found',
+                    params: {
+                        id:   1,
+                        name: 'Suite',
+                        type: 'describe',
+                    },
+                })
+            );
+
+            mockWs.simulateMessage(
+                JSON.stringify({
+                    method: 'TestReporter.found',
+                    params: {
+                        id:       2,
+                        name:     'has\ttab',
+                        type:     'test',
+                        parentId: 1,
+                    },
+                })
+            );
+
+            const test = client.getTest(2);
+            expect(test?.bunName).toBe('Suite has\ttab');
+            expect(test?.fullName).toBe('Suite > has\ttab');
+        });
+
+        it('should set bunName equal to name (verbatim) for a root-level test', async () => {
+            const client = new InspectorClient({
+                url: 'ws://localhost:6499',
+
+                WebSocketClass: MockWebSocketConstructor,
+            });
+
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            mockWs.simulateMessage(
+                JSON.stringify({
+                    method: 'TestReporter.found',
+                    params: {
+                        id:   1,
+                        name: 'RootTest',
+                        type: 'test',
+                        // No parentId
+                    },
+                })
+            );
+
+            const test = client.getTest(1);
+            expect(test?.bunName).toBe('RootTest');
+            expect(test?.fullName).toBe('RootTest');
         });
     });
 

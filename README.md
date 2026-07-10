@@ -69,6 +69,8 @@ The plugin uses Bun's Inspector Protocol (WebSocket) to:
 
 Oversized covering-test patterns (over 100,000 UTF-8 bytes) fall back to running the full suite, to stay within OS argument-length limits. This approach provides reliable test-to-mutant correlation, even with multiple test files.
 
+A second full-suite fallback happens at run time: a `--test-name-pattern` that matches zero tests triggers a one-shot full-suite retry (see [Diagnostic warnings worth grepping for in CI](#diagnostic-warnings-worth-grepping-for-in-ci)).
+
 ## Options
 
 | Option | Type | Default | Description |
@@ -167,6 +169,37 @@ export default {
   },
 };
 ```
+
+## Diagnostic warnings worth grepping for in CI
+
+The runner logs three warnings that flag when a mutant run's `--test-name-pattern`
+couldn't be built or applied with full fidelity. None of them indicate a wrong
+mutation-testing verdict by themselves, but they're worth grepping your CI logs for
+because they mark where the runner fell back to less-precise behavior:
+
+- **`--test-name-pattern matched 0 tests`** — the pattern for a mutant's covering
+  tests matched nothing across the whole run (usually because a mutant changed a
+  value interpolated into an `it.each` title). The runner retries once with the
+  full suite rather than reporting a false kill, so the eventual verdict is still
+  genuine — if the retry itself also matches zero tests (or the zero-match came
+  from a user-supplied `--test-name-pattern` in `bunArgs`, which is never retried),
+  the mutant is classified as an infrastructure `Error`, never a kill. Every
+  occurrence is worth spot-checking that it's explained by an interpolated-title
+  change, not a real pattern gap.
+- **`no exact-name registry available`** — this worker couldn't load the shared
+  dry-run test-name registry, so every alternative in that mutant's pattern used
+  the lossy `' > '`-collapsing reconstruction instead of Bun's exact matching
+  names. Tests whose titles legitimately contain `" > "` may have been silently
+  excluded from that run.
+- **`missing from exact-name registry`** — the registry loaded, but one or more
+  `testFilter` ids for this mutant weren't in it (falls back to the same lossy
+  reconstruction for just those ids, listing up to 5 of the missing ids).
+
+The last two matter because Bun only errors when a pattern matches **zero** tests
+across the whole run; a *partial* miss — some alternatives hit, others silently
+don't — exits 0 with no error text at all. These two warns are the only signal
+that a partial silent drop was possible for a given mutant run, so seeing either
+of them in a clean run's logs is worth investigating before trusting the score.
 
 ## Known Limitations
 

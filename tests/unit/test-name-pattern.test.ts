@@ -163,3 +163,107 @@ describe('buildTestNamePattern', () => {
         expect(buildTestNamePattern([name])).toBeUndefined();
     });
 });
+
+// ── buildTestNamePattern testNameIndex exact-lookup fast path ─────────────
+//
+// The single-arg call above is the never-worse-than-today contract: every
+// case in that describe block must stay byte-identical whether or not this
+// second, optional argument exists. These tests cover the fast path added
+// on top: an exact-name registry keyed by the FULL Stryker test id (dedup
+// suffix included) that, on a hit, bypasses the lossy " > "-collapsing
+// reconstruction entirely.
+
+describe('buildTestNamePattern — testNameIndex fast path', () => {
+    it('index hit takes precedence over lossy reconstruction and is regex-escaped verbatim', () => {
+        const testFilter = ['tests/foo.test.ts > Suite > weird test'];
+        const index = new Map([
+            ['tests/foo.test.ts > Suite > weird test', 'Suite > wei.rd $1 test'],
+        ]);
+        const result = buildTestNamePattern(testFilter, index);
+        // Lossy reconstruction of this id would collapse " > " to " " and yield
+        // "Suite weird test" — the literal " > " and the escaped "$1"/"." below
+        // prove the exact bunName from the index was used verbatim, not the
+        // lossy path.
+        expect(result).toBe(String.raw`^(?:Suite > wei\.rd \$1 test)$`);
+    });
+
+    it('falls through to lossy reconstruction on an index miss, byte-identical to omitting the index entirely', () => {
+        const testFilter = ['tests/foo.test.ts > Suite > adds 1'];
+        const withoutIndex = buildTestNamePattern(testFilter);
+        const withIndexMiss = buildTestNamePattern(testFilter, new Map([['some other id', 'irrelevant']]));
+        expect(withIndexMiss).toBe(withoutIndex);
+        expect(withIndexMiss).toBe('^(?:Suite adds 1)$');
+    });
+
+    it('mixes an index hit and a lossy-fallback miss in a single call, preserving order', () => {
+        const testFilter = [
+            'tests/a.test.ts > A > hit',
+            'tests/b.test.ts > B > miss',
+        ];
+        const index = new Map([
+            ['tests/a.test.ts > A > hit', 'A > raw hit'],
+        ]);
+        const result = buildTestNamePattern(testFilter, index);
+        expect(result).toBe('^(?:A > raw hit|B miss)$');
+    });
+
+    it('keys the index by the FULL suffixed id so two structures collapsing to the same id each get their own alternative', () => {
+        const testFilter = [
+            'f.test.ts > A > B > t [0]',
+            'f.test.ts > A > B > t [1]',
+        ];
+        const index = new Map([
+            ['f.test.ts > A > B > t [0]', 'A B t'],   // nested describe A > describe B > test t
+            ['f.test.ts > A > B > t [1]', 'A > B t'], // describe literally named "A > B" > test t
+        ]);
+        const result = buildTestNamePattern(testFilter, index);
+        expect(result).toBe('^(?:A B t|A > B t)$');
+    });
+
+    it('Set-dedups two genuinely-duplicate titles that share one bunName to a single alternative', () => {
+        // Two real it('same title') tests under the same describe: distinct
+        // dedup-suffixed ids, but identical structure means identical bunName.
+        // (Not built from it.each %s — bun 1.3.14 interpolates those names, so
+        // template-literal duplicates no longer occur there.)
+        const testFilter = [
+            'tests/foo.test.ts > Suite > same title [0]',
+            'tests/foo.test.ts > Suite > same title [1]',
+        ];
+        const index = new Map([
+            ['tests/foo.test.ts > Suite > same title [0]', 'Suite same title'],
+            ['tests/foo.test.ts > Suite > same title [1]', 'Suite same title'],
+        ]);
+        const result = buildTestNamePattern(testFilter, index);
+        expect(result).toBe('^(?:Suite same title)$');
+    });
+
+    it('falls through to lossy reconstruction when the indexed bunName is an empty string', () => {
+        const testFilter = ['tests/foo.test.ts > Suite > adds 1'];
+        const index = new Map([['tests/foo.test.ts > Suite > adds 1', '']]);
+        const result = buildTestNamePattern(testFilter, index);
+        expect(result).toBe('^(?:Suite adds 1)$');
+    });
+
+    it('falls through to lossy reconstruction when the indexed bunName contains a NUL byte', () => {
+        const testFilter = ['tests/foo.test.ts > Suite > adds 1'];
+        const index = new Map([['tests/foo.test.ts > Suite > adds 1', 'Suite\u0000 adds 1']]);
+        const result = buildTestNamePattern(testFilter, index);
+        expect(result).toBe('^(?:Suite adds 1)$');
+    });
+
+    it('still returns undefined when an exact-hit bunName from the index pushes the pattern over the byte cap', () => {
+        const bigName = 'a'.repeat(MAX_TEST_NAME_PATTERN_LENGTH);
+        const testFilter = ['tests/foo.test.ts > Suite > huge'];
+        const index = new Map([['tests/foo.test.ts > Suite > huge', bigName]]);
+        expect(buildTestNamePattern(testFilter, index)).toBeUndefined();
+    });
+
+    it('an index keyed without the " [N]" suffix must MISS a suffixed filter id (pins the full-id keying contract)', () => {
+        const testFilter = ['tests/foo.test.ts > Suite > dup [0]'];
+        // Index keyed by the UNSUFFIXED id — must not match the suffixed filter id.
+        const index = new Map([['tests/foo.test.ts > Suite > dup', 'Suite dup EXACT']]);
+        const result = buildTestNamePattern(testFilter, index);
+        // Falls through to lossy reconstruction (suffix stripped), NOT the exact value above.
+        expect(result).toBe('^(?:Suite dup)$');
+    });
+});

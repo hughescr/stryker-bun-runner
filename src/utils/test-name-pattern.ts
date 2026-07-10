@@ -23,6 +23,28 @@
  */
 export const MAX_TEST_NAME_PATTERN_LENGTH = 100_000;
 
+// File-extension suffixes that mark the first path segment as a file prefix.
+// Stryker disable next-line Regex: character class lists recognised test-file extensions
+const fileExtRe = /\.(?:test|spec)\.(?:[jt]sx?|m[jt]s)$/;
+
+// Stryker disable next-line Regex: suffix regex is anchored and defensive
+const dedupSuffixRe = / \[\d+\]$/;
+
+// Characters that carry special meaning inside a regex literal.
+// Stryker disable next-line Regex: character class enumerates metacharacters to escape
+const metaRe = /[.*+?^${}()|[\]\\/]/g;
+
+/**
+ * Escape regex metacharacters in `str` so it is matched literally when
+ * embedded as an alternative inside a --test-name-pattern regex.
+ *
+ * @param str - Raw literal text to embed in the generated regex
+ * @returns `str` with every regex metacharacter backslash-escaped
+ */
+function escapeRegex(str: string): string {
+    return str.replaceAll(metaRe, String.raw`\$&`);
+}
+
 /**
  * Convert an array of Stryker test IDs (from options.testFilter) into a
  * Bun --test-name-pattern regex string.
@@ -43,31 +65,40 @@ export const MAX_TEST_NAME_PATTERN_LENGTH = 100_000;
  * distinguish at runtime; we strip the suffix so both "foo [0]" and "foo [1]"
  * collapse to a single "foo" alternative that runs both (safe superset).
  *
+ * When `testNameIndex` is supplied and has an entry for an id, that entry —
+ * Bun's exact internal matching name, raw and byte-for-byte (see
+ * InspectorClient.buildFullName) — is used verbatim (regex-escaped) instead
+ * of the lossy reconstruction above, so titles that legitimately contain
+ * " > " are matched correctly. The index must be keyed by the FULL id,
+ * dedup suffix included; an id absent from the index (or mapped to an empty
+ * or NUL-containing value) falls through to the lossy path unchanged.
+ *
  * @param testFilter - Array of test IDs from Stryker's dryRun
+ * @param testNameIndex - Optional map from the full Stryker test id (dedup
+ *          suffix included) to Bun's exact internal matching name
  * @returns A regex string suitable for --test-name-pattern, or undefined when
  *          the filter is empty, yields no usable alternatives, or would produce
  *          a pattern whose UTF-8 byte length exceeds MAX_TEST_NAME_PATTERN_LENGTH
  *          (caller falls back to the full suite)
  */
-export function buildTestNamePattern(testFilter: readonly string[]): string | undefined {
+export function buildTestNamePattern(testFilter: readonly string[], testNameIndex?: ReadonlyMap<string, string>): string | undefined {
     // Stryker disable next-line ConditionalExpression,BlockStatement: equivalent mutant — empty filter also returns undefined via the alternatives.size === 0 check below
     if(testFilter.length === 0) {
         return undefined;
     }
 
-    // File-extension suffixes that mark the first path segment as a file prefix.
-    // Stryker disable next-line Regex: character class lists recognised test-file extensions
-    const fileExtRe = /\.(?:test|spec)\.(?:[jt]sx?|m[jt]s)$/;
-
-    // Stryker disable next-line Regex: suffix regex is anchored and defensive
-    const dedupSuffixRe = / \[\d+\]$/;
-
-    // Characters that carry special meaning inside a regex literal.
-    // Stryker disable next-line Regex: character class enumerates metacharacters to escape
-    const metaRe = /[.*+?^${}()|[\]\\/]/g;
-
     const alternatives = new Set<string>();
     for(const id of testFilter) {
+        // Exact-name fast path: when the registry has Bun's raw matching name
+        // for this FULL id, use it verbatim (escaped) and skip the lossy
+        // reconstruction below entirely — it never mangles a legitimate " > "
+        // inside a title because it never round-trips through that delimiter.
+        const exact = testNameIndex?.get(id);
+        if(exact !== undefined && exact.length > 0 && !exact.includes('\0')) {
+            alternatives.add(escapeRegex(exact));
+            continue;
+        }
+
         // Strip the leading file-path prefix when the first component ends in a
         // recognised test-file extension.  The separator is " > ".
         const firstSepIdx = id.indexOf(' > ');
@@ -85,8 +116,7 @@ export function buildTestNamePattern(testFilter: readonly string[]): string | un
         name = name.replaceAll(' > ', ' ');
 
         // Escape regex metacharacters so the string is matched literally.
-        // Stryker disable next-line Regex: character class enumerates metacharacters to escape
-        name = name.replaceAll(metaRe, String.raw`\$&`);
+        name = escapeRegex(name);
 
         if(name.length > 0) {
             alternatives.add(name);

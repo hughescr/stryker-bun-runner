@@ -2354,6 +2354,183 @@ tests/example.test.ts:
             }
         });
 
+        describe('zero-match retry (defect 2)', () => {
+            it('retries once with the full suite when --test-name-pattern matches 0 tests, and reports Survived from the retry', async () => {
+                // First call: the covering-set pattern matches nothing — real bun 1.3.14
+                // zero-match wording (verified live), a runner pattern gap, not a kill.
+                mockRunBunTests.mockResolvedValueOnce({
+                    exitCode: 1,
+                    stdout:   '',
+                    stderr:   'error: regex "^(?:handles alpha)$" matched 0 tests. Searched 2 files (skipping 5 tests) [4.00ms]',
+                    timedOut: false,
+                });
+                // Second call: the retry, with no pattern — full suite runs and passes.
+                mockRunBunTests.mockResolvedValueOnce({
+                    exitCode: 0,
+                    stdout:   ' 5 pass\n',
+                    stderr:   '',
+                    timedOut: false,
+                });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+
+                const result = await runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '900' } as any,
+                    testFilter:      ['tests/example.test.ts > handles alpha'],
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+
+                expect(mockRunBunTests).toHaveBeenCalledTimes(2);
+                // The retry drops the pattern entirely so the full suite runs.
+                expect(mockRunBunTests.mock.calls[1][0].testNamePattern).toBeUndefined();
+
+                expect(result.status).toBe(MutantRunStatus.Survived);
+                if(result.status === MutantRunStatus.Survived) {
+                    expect(result.nrOfTests).toBe(5);
+                }
+
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect.stringContaining('matched 0 tests'),
+                    '900'
+                );
+            });
+
+            it('resolves killedBy against the ORIGINAL testFilter when the full-suite retry finds a genuine failure', async () => {
+                mockRunBunTests.mockResolvedValueOnce({
+                    exitCode: 1,
+                    stdout:   '',
+                    stderr:   'error: regex "^(?:handles alpha)$" matched 0 tests. Searched 2 files (skipping 5 tests) [4.00ms]',
+                    timedOut: false,
+                });
+                mockRunBunTests.mockResolvedValueOnce({
+                    exitCode: 1,
+                    stdout:   'tests/example.test.ts:\n✗ handles alpha [1ms]\n  error: mutant escaped\n\n 0 pass\n 1 fail\n',
+                    stderr:   '',
+                    timedOut: false,
+                });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+
+                const result = await runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '901' } as any,
+                    testFilter:      ['tests/example.test.ts > handles alpha'],
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+
+                expect(mockRunBunTests).toHaveBeenCalledTimes(2);
+                expect(result.status).toBe(MutantRunStatus.Killed);
+                if(result.status === MutantRunStatus.Killed) {
+                    // Resolved via the ORIGINAL localRegistry (built from options.testFilter
+                    // before the retry), not a fresh index derived from the full-suite run.
+                    expect(result.killedBy).toEqual(['tests/example.test.ts > handles alpha']);
+                }
+            });
+
+            it('reports Error (never Killed) when the retry also matches 0 tests — runBunTests called EXACTLY twice', async () => {
+                mockRunBunTests.mockResolvedValueOnce({
+                    exitCode: 1,
+                    stdout:   '',
+                    stderr:   'error: regex "^(?:handles alpha)$" matched 0 tests. Searched 2 files (skipping 5 tests) [4.00ms]',
+                    timedOut: false,
+                });
+                // Contrived: the full-suite retry itself reports a zero-match line too. The
+                // retry gate must not fire again — testNamePattern is undefined on this call,
+                // so the first conjunct is false by construction (the recursion bound).
+                mockRunBunTests.mockResolvedValueOnce({
+                    exitCode: 1,
+                    stdout:   '',
+                    stderr:   'error: regex "^(?:.*)$" matched 0 tests. Searched 0 files (skipping 0 tests) [1.00ms]',
+                    timedOut: false,
+                });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+
+                const result = await runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '902' } as any,
+                    testFilter:      ['tests/example.test.ts > handles alpha'],
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+
+                // The recursion-bound proof: exactly two calls, never a retry-of-a-retry.
+                expect(mockRunBunTests).toHaveBeenCalledTimes(2);
+                expect(result.status).toBe(MutantRunStatus.Error);
+                if(result.status === MutantRunStatus.Error) {
+                    expect(result.errorMessage).toContain('matched 0 tests');
+                    expect(result.errorMessage).not.toContain('SyntaxError');
+                }
+            });
+
+            it('does not retry when testFilter is empty (no pattern to retry) — reports the distinct runner-gap Error directly', async () => {
+                // No testFilter → buildTestNamePattern returns undefined before
+                // executeMutantRun is ever entered with a defined pattern, so the retry
+                // gate's first conjunct is false on the only call. Contrived stderr
+                // simulates a user-supplied -t via bunArgs producing bun's zero-match
+                // wording with no Stryker-built pattern left to retry.
+                mockRunBunTests.mockResolvedValueOnce({
+                    exitCode: 1,
+                    stdout:   '',
+                    stderr:   'error: regex "^nope$" matched 0 tests. Searched 2 files (skipping 5 tests) [4.00ms]',
+                    timedOut: false,
+                });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+
+                const result = await runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '903' } as any,
+                    testFilter:      [],
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+
+                expect(mockRunBunTests).toHaveBeenCalledTimes(1);
+                expect(result.status).toBe(MutantRunStatus.Error);
+                if(result.status === MutantRunStatus.Error) {
+                    // Distinct wording — never the SyntaxError/runtime-error message.
+                    expect(result.errorMessage).toContain('matched 0 tests');
+                    expect(result.errorMessage).not.toContain('SyntaxError');
+                }
+            });
+
+            it('does not retry when tests actually ran, even if stderr also contains zero-match wording (normal Killed, not Error)', async () => {
+                mockRunBunTests.mockResolvedValueOnce({
+                    exitCode: 1,
+                    stdout:   'tests/example.test.ts:\n✗ handles alpha [1ms]\n  error: mutant escaped\n\n 0 pass\n 1 fail\n',
+                    // Contrived: zero-match wording alongside real test output — parsed.tests
+                    // is non-empty, so the retry gate's second conjunct must stay false.
+                    stderr:   'error: regex "^(?:handles alpha)$" matched 0 tests. Searched 2 files (skipping 5 tests) [4.00ms]',
+                    timedOut: false,
+                });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+
+                const result = await runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '904' } as any,
+                    testFilter:      ['tests/example.test.ts > handles alpha'],
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+
+                expect(mockRunBunTests).toHaveBeenCalledTimes(1);
+                expect(result.status).toBe(MutantRunStatus.Killed);
+                if(result.status === MutantRunStatus.Killed) {
+                    expect(result.killedBy).toContain('tests/example.test.ts > handles alpha');
+                }
+            });
+        });
+
         it('should filter out null failure messages', async () => {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
@@ -3471,7 +3648,7 @@ tests/example.test.ts:
 
                 const written = JSON.parse(writeCall![1] as string);
 
-                expect(written.version).toBe(1);
+                expect(written.version).toBe(2);
 
                 expect(written.writtenAt).toBeNumber();
                 // cachedTestNames: unique test + dup test [0] + dup test [1]
@@ -3497,6 +3674,15 @@ tests/example.test.ts:
                 // Verify the structure can be reconstructed as a Map (as loadRegistryFile does)
                 const reconstructed = new Map<string, string[]>(written.baseNameIndex);
                 expect(reconstructed.size).toBeGreaterThan(0);
+                // Version-2 registries carry the exact-name index, serialised as
+                // [id, bunName] entry pairs. Empty here: these hand-built TestInfo
+                // fixtures carry no bunName, so no entries are emitted.
+                expect(written.testNameIndex).toBeArray();
+                for(const entry of written.testNameIndex) {
+                    expect(Array.isArray(entry)).toBe(true);
+                    expect(typeof entry[0]).toBe('string');
+                    expect(typeof entry[1]).toBe('string');
+                }
             });
 
             it('uses atomic write-to-tmp-then-rename pattern for the registry file', async () => {
@@ -3574,6 +3760,160 @@ tests/example.test.ts:
                     expect.stringContaining('ENOSPC')
                 );
             });
+
+            it('persists a version-2 registry whose testNameIndex maps final test ids to bun-exact names', async () => {
+                mockInspectorClient.getTests.mockReturnValue([
+                    { id: 1, name: 'works when unread > 0', fullName: 'Suite > works when unread > 0', bunName: 'Suite works when unread > 0', type: 'test' as const, url: 'file:///proj/.stryker-tmp/sandbox-ABC/tests/ctx.test.ts', status: 'pass' },
+                    { id: 2, name: 'plain test', fullName: 'Suite > plain test', bunName: 'Suite plain test', type: 'test' as const, url: 'file:///proj/.stryker-tmp/sandbox-ABC/tests/ctx.test.ts', status: 'pass' },
+                ]);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([1, 2]);
+                mockCollectCoverage.mockResolvedValue(undefined);
+
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
+                });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+
+                const writeCall = writeFileSpy.mock.calls.find(
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dynamic arg
+                    (args: any) => String(args[0]).endsWith('.stryker-bun-runner-registry.json.tmp')
+                );
+                expect(writeCall).toBeDefined();
+
+                const written = JSON.parse(writeCall![1] as string);
+
+                expect(written.version).toBe(2);
+
+                expect(written.testNameIndex).toBeArray();
+                const nameIndex = new Map<string, string>(written.testNameIndex);
+
+                expect(nameIndex.get('tests/ctx.test.ts > Suite > works when unread > 0')).toBe('Suite works when unread > 0');
+
+                expect(nameIndex.get('tests/ctx.test.ts > Suite > plain test')).toBe('Suite plain test');
+
+                expect(nameIndex.size).toBe(2);
+            });
+
+            it('persists distinct testNameIndex entries per final [N]-suffixed id when two hierarchies flatten to the same id', async () => {
+                // Nested describes A / B with test t vs a describe literally named
+                // 'A > B' with test t: both flatten to 'tests/col.test.ts > A > B > t',
+                // but each has a DIFFERENT bun-exact matching name. The dedup loop
+                // assigns [0]/[1] by source line; each FINAL id must map to its own
+                // bunName (executionOrder is deliberately reversed to prove keying
+                // is by final id, not by execution position).
+                mockInspectorClient.getTests.mockReturnValue([
+                    { id: 1, name: 't', fullName: 'A > B > t', bunName: 'A B t', type: 'test' as const, url: 'file:///proj/.stryker-tmp/sandbox-ABC/tests/col.test.ts', status: 'pass', line: 3 },
+                    { id: 2, name: 't', fullName: 'A > B > t', bunName: 'A > B t', type: 'test' as const, url: 'file:///proj/.stryker-tmp/sandbox-ABC/tests/col.test.ts', status: 'pass', line: 9 },
+                ]);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([2, 1]);
+                mockCollectCoverage.mockResolvedValue(undefined);
+
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
+                });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+
+                const writeCall = writeFileSpy.mock.calls.find(
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dynamic arg
+                    (args: any) => String(args[0]).endsWith('.stryker-bun-runner-registry.json.tmp')
+                );
+                expect(writeCall).toBeDefined();
+
+                const written = JSON.parse(writeCall![1] as string);
+                const nameIndex = new Map<string, string>(written.testNameIndex);
+
+                expect(nameIndex.get('tests/col.test.ts > A > B > t [0]')).toBe('A B t');
+
+                expect(nameIndex.get('tests/col.test.ts > A > B > t [1]')).toBe('A > B t');
+
+                expect(nameIndex.size).toBe(2);
+            });
+
+            it('persists an empty testNameIndex when the inspector reported no execution order (console-fallback ids stay lossy)', async () => {
+                mockInspectorClient.getTests.mockReturnValue([]);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([]);
+                mockCollectCoverage.mockResolvedValue(undefined);
+
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({ exitCode: 0, stdout: 'tests/fb.test.ts:\n✓ fallback test [1ms]\n\n 1 pass\n', stderr: '', timedOut: false });
+                });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+
+                const writeCall = writeFileSpy.mock.calls.find(
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dynamic arg
+                    (args: any) => String(args[0]).endsWith('.stryker-bun-runner-registry.json.tmp')
+                );
+                expect(writeCall).toBeDefined();
+
+                const written = JSON.parse(writeCall![1] as string);
+
+                expect(written.version).toBe(2);
+
+                expect(written.testNameIndex).toEqual([]);
+                // The console-fallback id is still registered for killedBy resolution
+
+                expect(written.cachedTestNames).toContain('tests/fb.test.ts > fallback test');
+            });
+
+            it('omits testNameIndex entries for unknown-inspectorId placeholder tests', async () => {
+                mockInspectorClient.getTests.mockReturnValue([
+                    { id: 1, name: 'known test', fullName: 'known test', bunName: 'known test', type: 'test' as const, url: 'file:///proj/.stryker-tmp/sandbox-ABC/tests/unk.test.ts', status: 'pass' },
+                ]);
+                // 99 has no TestInfo → placeholder result 'unknown-99'
+                mockInspectorClient.getExecutionOrder.mockReturnValue([1, 99]);
+                mockCollectCoverage.mockResolvedValue(undefined);
+
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
+                });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+
+                const writeCall = writeFileSpy.mock.calls.find(
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dynamic arg
+                    (args: any) => String(args[0]).endsWith('.stryker-bun-runner-registry.json.tmp')
+                );
+                expect(writeCall).toBeDefined();
+
+                const written = JSON.parse(writeCall![1] as string);
+                const nameIndex = new Map<string, string>(written.testNameIndex);
+
+                expect(nameIndex.size).toBe(1);
+
+                expect(nameIndex.get('tests/unk.test.ts > known test')).toBe('known test');
+
+                expect(nameIndex.has('unknown-99')).toBe(false);
+                // The placeholder test itself still exists in the registry names
+
+                expect(written.cachedTestNames).toContain('unknown-99');
+            });
         });
 
         describe('mutantRun registry lazy-load', () => {
@@ -3605,7 +3945,7 @@ tests/example.test.ts:
                 // Simulate a non-dryRun worker: no cachedTestNames, testFilter is empty.
                 // The registry file contains a test that has a " [N]" suffix.
                 const registryJson = JSON.stringify({
-                    version:         1,
+                    version:         2,
                     writtenAt:       Date.now(),
                     cachedTestNames: [
                         'tests/static.test.ts > static test [0]',
@@ -3616,6 +3956,7 @@ tests/example.test.ts:
                         ['tests/static.test.ts > static test [0]', ['tests/static.test.ts > static test [0]']],
                         ['tests/static.test.ts > static test [1]', ['tests/static.test.ts > static test [1]']],
                     ],
+                    testNameIndex: [],
                 });
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock returns string
                 readFileSpy.mockResolvedValue(registryJson as any);
@@ -3667,13 +4008,14 @@ tests/example.test.ts:
                 // This ensures leaked tests (tests NOT in testFilter that Bun's hierarchy
                 // regex may still run) can be resolved via the instance registry.
                 const registryJson = JSON.stringify({
-                    version:         1,
+                    version:         2,
                     writtenAt:       Date.now(),
                     cachedTestNames: ['tests/foo.test.ts > should work [0]'],
                     baseNameIndex:   [
                         ['tests/foo.test.ts > should work', ['tests/foo.test.ts > should work [0]']],
                         ['tests/foo.test.ts > should work [0]', ['tests/foo.test.ts > should work [0]']],
                     ],
+                    testNameIndex: [],
                 });
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock returns string
                 readFileSpy.mockResolvedValue(registryJson as any);
@@ -3803,12 +4145,13 @@ tests/example.test.ts:
 
             it('caches registry after first load (does not re-read file on second mutantRun)', async () => {
                 const registryJson = JSON.stringify({
-                    version:         1,
+                    version:         2,
                     writtenAt:       Date.now(),
                     cachedTestNames: ['tests/cache.test.ts > cached test'],
                     baseNameIndex:   [
                         ['tests/cache.test.ts > cached test', ['tests/cache.test.ts > cached test']],
                     ],
+                    testNameIndex: [],
                 });
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock returns string
                 readFileSpy.mockResolvedValue(registryJson as any);
@@ -3855,12 +4198,13 @@ tests/example.test.ts:
             });
 
             it('logs malformed warning and treats registry as absent when cachedTestNames is not an array', async () => {
-                // Registry file has version:1 but cachedTestNames is a string (malformed)
+                // Registry file has version:2 but cachedTestNames is a string (malformed)
                 const malformedJson = JSON.stringify({
-                    version:         1,
+                    version:         2,
                     writtenAt:       Date.now(),
                     cachedTestNames: 'not-an-array',
                     baseNameIndex:   [],
+                    testNameIndex:   [],
                 });
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock returns string
                 readFileSpy.mockResolvedValue(malformedJson as any);
@@ -3909,8 +4253,8 @@ tests/example.test.ts:
             });
 
             it('rejects registry file where cachedTestNames is missing', async () => {
-                // Registry has version:1 but both cachedTestNames AND baseNameIndex are absent.
-                const missingJson = JSON.stringify({ version: 1 });
+                // Registry has version:2 but both cachedTestNames AND baseNameIndex are absent.
+                const missingJson = JSON.stringify({ version: 2 });
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock returns string
                 readFileSpy.mockResolvedValue(missingJson as any);
 
@@ -3955,6 +4299,441 @@ tests/example.test.ts:
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
                 } as any);
                 expect(readFileSpy.mock.calls.length).toBeGreaterThan(callsAfterFirst);
+            });
+
+            it('builds --test-name-pattern AFTER lazy-loading the registry (fresh worker gets the exact bunName pattern on its first mutantRun)', async () => {
+                // ORDER-SENSITIVE by construction: this worker never ran dryRun, so
+                // this.testNameIndex can only come from the lazy-loaded registry
+                // file. If mutantRun built the pattern before loading the registry,
+                // the id below would take the lossy path — the ' > ' inside the
+                // title collapses to ' ' and the pattern comes out wrong.
+                const registryJson = JSON.stringify({
+                    version:         2,
+                    writtenAt:       Date.now(),
+                    cachedTestNames: ['tests/ctx.test.ts > Suite > works when unread > 0'],
+                    baseNameIndex:   [
+                        ['tests/ctx.test.ts > Suite > works when unread > 0', ['tests/ctx.test.ts > Suite > works when unread > 0']],
+                    ],
+                    testNameIndex: [
+                        ['tests/ctx.test.ts > Suite > works when unread > 0', 'Suite works when unread > 0'],
+                    ],
+                });
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock returns string
+                readFileSpy.mockResolvedValue(registryJson as any);
+
+                mockRunBunTests.mockResolvedValue({ exitCode: 0, stdout: ' 1 pass\n', stderr: '', timedOut: false });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+
+                await runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '300' } as any,
+                    testFilter:      ['tests/ctx.test.ts > Suite > works when unread > 0'],
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+
+                // Exact bunName-derived alternative — ' > 0' preserved verbatim
+
+                expect(mockRunBunTests).toHaveBeenCalledWith(
+                    expect.objectContaining({ testNamePattern: '^(?:Suite works when unread > 0)$' })
+                );
+
+                // …and NOT the lossy reconstruction (pattern built before the load)
+
+                expect(mockRunBunTests).not.toHaveBeenCalledWith(
+                    expect.objectContaining({ testNamePattern: '^(?:Suite works when unread 0)$' })
+                );
+            });
+
+            it('populates all three registry fields from a version-2 file and reads it only once across two mutantRuns', async () => {
+                const registryJson = JSON.stringify({
+                    version:         2,
+                    writtenAt:       Date.now(),
+                    cachedTestNames: [
+                        'tests/static.test.ts > static test [0]',
+                        'tests/static.test.ts > static test [1]',
+                        'tests/ctx.test.ts > Suite > works when unread > 0',
+                    ],
+                    baseNameIndex: [
+                        ['tests/static.test.ts > static test', ['tests/static.test.ts > static test [0]', 'tests/static.test.ts > static test [1]']],
+                        ['tests/static.test.ts > static test [0]', ['tests/static.test.ts > static test [0]']],
+                        ['tests/static.test.ts > static test [1]', ['tests/static.test.ts > static test [1]']],
+                        ['tests/ctx.test.ts > Suite > works when unread > 0', ['tests/ctx.test.ts > Suite > works when unread > 0']],
+                    ],
+                    testNameIndex: [
+                        ['tests/ctx.test.ts > Suite > works when unread > 0', 'Suite works when unread > 0'],
+                    ],
+                });
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock returns string
+                readFileSpy.mockResolvedValue(registryJson as any);
+
+                // Run 1: non-empty filter → testNameIndex drives the exact pattern
+                mockRunBunTests.mockResolvedValueOnce({ exitCode: 0, stdout: ' 1 pass\n', stderr: '', timedOut: false });
+                // Run 2: static-coverage mutant killed by a duplicate-named test
+                mockRunBunTests.mockResolvedValueOnce({
+                    exitCode: 1,
+                    stdout:   'tests/static.test.ts:\n✗ static test [1ms]\n  error: mutant escaped\n\n 0 pass\n 1 fail\n',
+                    stderr:   '',
+                    timedOut: false,
+                });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+
+                await runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '301' } as any,
+                    testFilter:      ['tests/ctx.test.ts > Suite > works when unread > 0'],
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+
+                // testNameIndex loaded → exact pattern (lossy would drop the ' > 0')
+
+                expect(mockRunBunTests).toHaveBeenCalledWith(
+                    expect.objectContaining({ testNamePattern: '^(?:Suite works when unread > 0)$' })
+                );
+
+                const result = await runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '302' } as any,
+                    testFilter:      [],
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+
+                // baseNameIndex loaded → base name expands to both suffixed ids
+
+                expect(result.status).toBe(MutantRunStatus.Killed);
+                if(result.status === MutantRunStatus.Killed) {
+                    expect(result.killedBy).toContain('tests/static.test.ts > static test [0]');
+
+                    expect(result.killedBy).toContain('tests/static.test.ts > static test [1]');
+                }
+
+                // cachedTestNames loaded → the lazy-load guard is satisfied, so the
+                // registry file is read exactly once across both mutantRuns
+
+                expect(readFileSpy).toHaveBeenCalledTimes(1);
+            });
+
+            it('rejects a version-1 registry file with an unexpected-version warning and loads nothing from it', async () => {
+                // Version-1 files can only be stale data from a prior plugin version
+                // (e.g. --inPlace plus a current-run write failure) — reject them
+                // all-or-nothing rather than trusting stale names.
+                const v1Json = JSON.stringify({
+                    version:         1,
+                    writtenAt:       Date.now(),
+                    cachedTestNames: [
+                        'tests/static.test.ts > static test [0]',
+                        'tests/static.test.ts > static test [1]',
+                    ],
+                    baseNameIndex: [
+                        ['tests/static.test.ts > static test', ['tests/static.test.ts > static test [0]', 'tests/static.test.ts > static test [1]']],
+                    ],
+                });
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock returns string
+                readFileSpy.mockResolvedValue(v1Json as any);
+
+                mockRunBunTests.mockResolvedValue({
+                    exitCode: 1,
+                    stdout:   'tests/static.test.ts:\n✗ static test [1ms]\n  error: mutant escaped\n\n 0 pass\n 1 fail\n',
+                    stderr:   '',
+                    timedOut: false,
+                });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+
+                const result = await runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '303' } as any,
+                    testFilter:      [],
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+
+                // Exact warn format (kills version-guard ConditionalExpression/BlockStatement mutants)
+
+                expect(mockLogger.warn).toHaveBeenCalledWith('dryRun registry file has unexpected version %s; skipping', '1');
+
+                // Nothing loaded → the base name is NOT expanded via the stale v1 baseNameIndex
+
+                expect(result.status).toBe(MutantRunStatus.Killed);
+                if(result.status === MutantRunStatus.Killed) {
+                    expect(result.killedBy).toEqual(['tests/static.test.ts > static test']);
+                }
+            });
+
+            it('treats a version-2 registry with a non-array testNameIndex as malformed and rejects it all-or-nothing', async () => {
+                // cachedTestNames and baseNameIndex are VALID here — only
+                // testNameIndex is malformed. The loader must reject the whole
+                // file (all-or-nothing), never half-initialise.
+                const malformedV2 = JSON.stringify({
+                    version:         2,
+                    writtenAt:       Date.now(),
+                    cachedTestNames: ['tests/static.test.ts > static test [0]'],
+                    baseNameIndex:   [
+                        ['tests/static.test.ts > static test', ['tests/static.test.ts > static test [0]']],
+                    ],
+                    testNameIndex: 'not-an-array',
+                });
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock returns string
+                readFileSpy.mockResolvedValue(malformedV2 as any);
+
+                mockRunBunTests.mockResolvedValue({
+                    exitCode: 1,
+                    stdout:   'tests/static.test.ts:\n✗ static test [1ms]\n  error: mutant escaped\n\n 0 pass\n 1 fail\n',
+                    stderr:   '',
+                    timedOut: false,
+                });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+
+                const result = await runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '304' } as any,
+                    testFilter:      [],
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect.stringContaining('malformed')
+                );
+
+                // All-or-nothing: the (valid) baseNameIndex must NOT have been
+                // half-loaded — the raw base name stays unexpanded
+
+                expect(result.status).toBe(MutantRunStatus.Killed);
+                if(result.status === MutantRunStatus.Killed) {
+                    expect(result.killedBy).toEqual(['tests/static.test.ts > static test']);
+                }
+
+                // …and the lazy-load guard fires again on the next mutantRun
+                const callsAfterFirst = readFileSpy.mock.calls.length;
+
+                await runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '305' } as any,
+                    testFilter:      [],
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+                expect(readFileSpy.mock.calls.length).toBeGreaterThan(callsAfterFirst);
+            });
+
+            // Per-entry testNameIndex validation: each file below is a version-2
+            // registry whose cachedTestNames/baseNameIndex are VALID and whose
+            // testNameIndex holds one valid entry plus ONE malformed entry. The
+            // loader must reject the whole file (all-or-nothing) — a half-accepted
+            // index would later throw inside the exact-name fast path (escapeRegex
+            // on a non-string) instead of degrading to the lossy fallback.
+            it.each([
+                ['its second element is an array, not a string', ['tests/static.test.ts > static test [0]', ['not-a-string']]],
+                ['its first element is a number, not a string', [42, 'static test']],
+                ['it has three elements instead of two', ['tests/static.test.ts > static test [0]', 'static test', 'extra']],
+                ['it is a bare two-character string, not a [string, string] pair', 'ab'],
+            ] as [string, unknown][])(
+                'treats a version-2 registry as malformed and rejects it all-or-nothing when a testNameIndex entry is bad because %s',
+                async (_malformation, badEntry) => {
+                    const malformedV2 = JSON.stringify({
+                        version:         2,
+                        writtenAt:       Date.now(),
+                        cachedTestNames: ['tests/static.test.ts > static test [0]'],
+                        baseNameIndex:   [
+                            ['tests/static.test.ts > static test', ['tests/static.test.ts > static test [0]']],
+                        ],
+                        // One VALID entry ahead of the malformed one: a loader that
+                        // accepts the file when ANY entry is well-formed (every →
+                        // some) must still reject it.
+                        testNameIndex: [
+                            ['tests/static.test.ts > static test [0]', 'static test'],
+                            badEntry,
+                        ],
+                    });
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock returns string
+                    readFileSpy.mockResolvedValue(malformedV2 as any);
+
+                    mockRunBunTests.mockResolvedValue({
+                        exitCode: 1,
+                        stdout:   'tests/static.test.ts:\n✗ static test [1ms]\n  error: mutant escaped\n\n 0 pass\n 1 fail\n',
+                        stderr:   '',
+                        timedOut: false,
+                    });
+
+                    const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                    await runner.init();
+
+                    const result = await runner.mutantRun({
+                        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                        activeMutant:    { id: '306' } as any,
+                        testFilter:      [],
+                        sandboxFileName: 'sandbox',
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                    } as any);
+
+                    // The per-entry guard (not the shape guard) must fire
+
+                    expect(mockLogger.warn).toHaveBeenCalledWith(
+                        expect.stringContaining('testNameIndex entry')
+                    );
+
+                    // All-or-nothing: the (valid) baseNameIndex must NOT have been
+                    // half-loaded — the raw base name stays unexpanded
+
+                    expect(result.status).toBe(MutantRunStatus.Killed);
+                    if(result.status === MutantRunStatus.Killed) {
+                        expect(result.killedBy).toEqual(['tests/static.test.ts > static test']);
+                    }
+                }
+            );
+
+            it('warns that pattern alternatives are lossy when testFilter is non-empty and no exact-name registry is available', async () => {
+                const enoentErr = Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' });
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock returns error
+                readFileSpy.mockRejectedValue(enoentErr as any);
+
+                mockRunBunTests.mockResolvedValue({ exitCode: 0, stdout: ' 1 pass\n', stderr: '', timedOut: false });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+
+                await runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '310' } as any,
+                    testFilter:      ['tests/foo.test.ts > Suite > my test'],
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect.stringContaining('no exact-name registry available'),
+                    '310',
+                    1
+                );
+            });
+
+            it('warns listing the missing ids when some testFilter ids are absent from the exact-name registry', async () => {
+                const registryJson = JSON.stringify({
+                    version:         2,
+                    writtenAt:       Date.now(),
+                    cachedTestNames: ['tests/foo.test.ts > Suite > present test'],
+                    baseNameIndex:   [
+                        ['tests/foo.test.ts > Suite > present test', ['tests/foo.test.ts > Suite > present test']],
+                    ],
+                    testNameIndex: [
+                        ['tests/foo.test.ts > Suite > present test', 'Suite present test'],
+                    ],
+                });
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock returns string
+                readFileSpy.mockResolvedValue(registryJson as any);
+
+                mockRunBunTests.mockResolvedValue({ exitCode: 0, stdout: ' 1 pass\n', stderr: '', timedOut: false });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+
+                await runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant: { id: '311' } as any,
+                    testFilter:   [
+                        'tests/foo.test.ts > Suite > present test',
+                        'tests/foo.test.ts > Suite > absent test',
+                    ],
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect.stringContaining('missing from exact-name registry'),
+                    '311',
+                    1,
+                    2,
+                    'tests/foo.test.ts > Suite > absent test',
+                    ''
+                );
+            });
+
+            it('emits neither lossy-visibility warn when every testFilter id is present in the exact-name registry', async () => {
+                const registryJson = JSON.stringify({
+                    version:         2,
+                    writtenAt:       Date.now(),
+                    cachedTestNames: [
+                        'tests/ctx.test.ts > Suite > works when unread > 0',
+                        'tests/ctx.test.ts > Suite > plain test',
+                    ],
+                    baseNameIndex: [
+                        ['tests/ctx.test.ts > Suite > works when unread > 0', ['tests/ctx.test.ts > Suite > works when unread > 0']],
+                        ['tests/ctx.test.ts > Suite > plain test', ['tests/ctx.test.ts > Suite > plain test']],
+                    ],
+                    testNameIndex: [
+                        ['tests/ctx.test.ts > Suite > works when unread > 0', 'Suite works when unread > 0'],
+                        ['tests/ctx.test.ts > Suite > plain test', 'Suite plain test'],
+                    ],
+                });
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock returns string
+                readFileSpy.mockResolvedValue(registryJson as any);
+
+                mockRunBunTests.mockResolvedValue({ exitCode: 0, stdout: ' 2 pass\n', stderr: '', timedOut: false });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+
+                await runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant: { id: '312' } as any,
+                    testFilter:   [
+                        'tests/ctx.test.ts > Suite > works when unread > 0',
+                        'tests/ctx.test.ts > Suite > plain test',
+                    ],
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+
+                // Both alternatives exact, in filter order
+
+                expect(mockRunBunTests).toHaveBeenCalledWith(
+                    expect.objectContaining({ testNamePattern: '^(?:Suite works when unread > 0|Suite plain test)$' })
+                );
+
+                const lossyWarns = (mockLogger.warn as ReturnType<typeof mock>).mock.calls
+                    .filter(args => String(args[0]).includes('no exact-name registry available')
+                      || String(args[0]).includes('missing from exact-name registry'));
+
+                expect(lossyWarns).toEqual([]);
+            });
+
+            it('does not warn about a missing exact-name registry when testFilter is empty (regression guard)', async () => {
+                // Regression guard for the mutation gate: kills the
+                // ConditionalExpression→true mutant on the filterIds.length guard —
+                // an empty filter builds no pattern, so there is nothing lossy to
+                // warn about even when no registry is loadable.
+                const enoentErr = Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' });
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock returns error
+                readFileSpy.mockRejectedValue(enoentErr as any);
+
+                mockRunBunTests.mockResolvedValue({ exitCode: 0, stdout: ' 1 pass\n', stderr: '', timedOut: false });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+
+                await runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '313' } as any,
+                    testFilter:      [],
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+
+                const lossyWarns = (mockLogger.warn as ReturnType<typeof mock>).mock.calls
+                    .filter(args => String(args[0]).includes('no exact-name registry available')
+                      || String(args[0]).includes('missing from exact-name registry'));
+
+                expect(lossyWarns).toEqual([]);
             });
         });
 
@@ -4348,6 +5127,78 @@ tests/example.test.ts:
                     expect(mutantResult.killedBy).toContain('tests/foo.test.ts > my test');
                     expect(mutantResult.killedBy).not.toContain('unknown');
                 }
+
+                await runner2.dispose();
+            } finally {
+                writeFileSpy.mockRestore();
+                renameSpy.mockRestore();
+                readFileSpy.mockRestore();
+            }
+        });
+
+        it('a fresh instance resolves the exact bunName-derived pattern from the registry file written by the disposed instance', async () => {
+            let storedRegistry: string | undefined;
+
+            const writeFileSpy = spyOn(fsPromises, 'writeFile').mockImplementation(((_path: string, data: string) => {
+                storedRegistry = data;
+                return Promise.resolve();
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock signature narrower than fsPromises.writeFile's real overloads
+            }) as any);
+            const renameSpy = spyOn(fsPromises, 'rename').mockResolvedValue(undefined);
+
+            const readFileSpy = spyOn(fsPromises, 'readFile').mockImplementation((() => {
+                if(storedRegistry === undefined) {
+                    return Promise.reject(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+                }
+                return Promise.resolve(storedRegistry);
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock signature narrower than fsPromises.readFile's real overloads
+            }) as any);
+
+            try {
+                // Instance 1's dryRun captures the exact bun name for a title that
+                // contains a literal ' > ' and persists it in the v2 registry.
+                mockInspectorClient.getTests.mockReturnValue([
+                    { id: 1, name: 'works when unread > 0', fullName: 'Suite > works when unread > 0', bunName: 'Suite works when unread > 0', type: 'test' as const, url: 'file:///proj/.stryker-tmp/sandbox-ABC/tests/ctx.test.ts', status: 'pass' },
+                ]);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([1]);
+                mockCollectCoverage.mockResolvedValue(undefined);
+
+                mockGeneratePreloadScript.mockResolvedValue('/tmp/preload-1.ts');
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
+                });
+
+                const runner1 = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner1.init();
+                const dryRunResult = await runner1.dryRun();
+                expect(dryRunResult.status).toBe(DryRunStatus.Complete);
+
+                await runner1.dispose();
+                expect(storedRegistry).toBeDefined();
+
+                // Instance 2 never ran dryRun — the exact pattern MUST come from
+                // the lazily-loaded registry file written by instance 1.
+                mockGeneratePreloadScript.mockResolvedValue('/tmp/preload-2.ts');
+                mockRunBunTests.mockImplementation(() => Promise.resolve({ exitCode: 0, stdout: ' 1 pass\n', stderr: '', timedOut: false }));
+
+                const runner2 = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner2.init();
+
+                await runner2.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '100' } as any,
+                    testFilter:      ['tests/ctx.test.ts > Suite > works when unread > 0'],
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+
+                expect(mockRunBunTests).toHaveBeenCalledWith(
+                    expect.objectContaining({ testNamePattern: '^(?:Suite works when unread > 0)$' })
+                );
 
                 await runner2.dispose();
             } finally {

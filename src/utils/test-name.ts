@@ -38,9 +38,19 @@ export function normalizeTestFilePath(url: string | undefined): string | undefin
  * Safe characters: everything except C0 control chars (U+0000–U+001F) and DEL (U+007F).
  * Unsafe characters: only control chars → replaced with underscore 1:1.
  *
- * Note: The ' > ' sequence is used as a hierarchy delimiter by this plugin when
- * assembling `tests[].id`. If a test name literally contains ' > ', it will
- * cause parsing ambiguity — that is a known limitation.
+ * Note: `tests[].id` still joins describe/test hierarchy levels with ' > ' for
+ * display and killedBy correlation — that format is unchanged and a title
+ * legitimately containing ' > ' causes no ambiguity there (join-only, never
+ * re-parsed). Building a bun `--test-name-pattern`, however, no longer
+ * round-trips through that delimiter: it is keyed off a side-channel registry
+ * of Bun's exact internal matching name (see InspectorClient.buildFullName /
+ * buildTestNamePattern), so titles containing ' > ' match correctly. Residual
+ * lossy cases are the id-reconstruction fallback (fallback-path ids, an id
+ * missing from the registry) — a pattern that ends up matching zero tests
+ * across the whole run degrades to a warn + one-shot full-suite retry (never a
+ * false verdict), but a *partial* miss can still silently drop just the missed
+ * tests, same as before this fix; that case is now warn-logged per mutant run
+ * (see bun-test-runner.ts's lossy-visibility warns).
  *
  * @param testName - The test name to normalize
  * @returns Normalized test name with control characters replaced by underscores

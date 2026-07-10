@@ -308,12 +308,13 @@ export class InspectorClient {
    * Handle TestReporter.found event
    */
     private handleTestFound(params: TestReporterFoundEvent): void {
-        const fullName = this.buildFullName(params.id, params.name, params.parentId);
+        const { fullName, bunName } = this.buildFullName(params.id, params.name, params.parentId);
 
         const testInfo: TestInfo = {
             id:       params.id,
             name:     params.name,
             fullName,
+            bunName,
             type:     params.type,
             parentId: params.parentId,
             url:      params.url,
@@ -372,11 +373,15 @@ export class InspectorClient {
     /**
    * Build full hierarchical name by walking parent chain
    * Detects circular references to prevent infinite loops
+   *
+   * Returns both the display-oriented `fullName` (' > '-joined, used for IDs and
+   * console correlation) and `bunName` (raw single-space join, byte-for-byte what
+   * `bun test -t` matches against — no per-level trim, no control-char substitution).
    */
-    private buildFullName(id: number, name: string, parentId?: number): string {
+    private buildFullName(id: number, name: string, parentId?: number): { fullName: string, bunName: string } {
         // Stryker disable next-line all: early return for undefined parentId prevents unnecessary hierarchy walk, tested thoroughly
         if(parentId === undefined) {
-            return name;
+            return { fullName: name, bunName: name };
         }
 
         const parts: string[] = [name];
@@ -404,7 +409,7 @@ export class InspectorClient {
             currentId = parent.parentId;
         }
 
-        return parts.join(' > ');
+        return { fullName: parts.join(' > '), bunName: parts.join(' ') };
     }
 
     /**

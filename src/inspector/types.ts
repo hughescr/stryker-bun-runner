@@ -91,6 +91,10 @@ export interface TestInfo {
     name:      string
     /** Full hierarchical name (e.g., "Suite > Nested > Test") */
     fullName:  string
+    /** Bun's exact internal matching name: raw per-level titles joined with a single
+     *  space. NOT trimmed, control chars NOT substituted — byte-for-byte what
+     *  `bun test -t` matches against (verified empirically, bun 1.3.14). */
+    bunName?:  string
     /** Type of entity (test or describe block) */
     type:      TestEntityType
     /** Parent describe block ID (undefined for top-level entities) */
