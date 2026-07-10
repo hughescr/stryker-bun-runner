@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect } from 'bun:test';
-import { buildTestNamePattern } from '../../src/utils/test-name-pattern.js';
+import { buildTestNamePattern, MAX_TEST_NAME_PATTERN_LENGTH } from '../../src/utils/test-name-pattern.js';
 
 // ── buildTestNamePattern unit tests ────────────────────────────────────────
 
@@ -139,5 +139,27 @@ describe('buildTestNamePattern', () => {
         // In practice this cannot be produced by buildUniqueTestName, but guard anyway.
         // We simulate by passing an empty string directly (no separator at all).
         expect(buildTestNamePattern([''])).toBeUndefined();
+    });
+
+    // Linux caps a single argv string at MAX_ARG_STRLEN (131,072 BYTES). The kernel
+    // counts UTF-8 bytes, not JS chars, so these tests pin the byte-length cap and its
+    // full-suite fallback (buildTestNamePattern returns undefined when over cap).
+    it('returns the pattern when its byte length is exactly MAX_TEST_NAME_PATTERN_LENGTH', () => {
+        const name = 'a'.repeat(MAX_TEST_NAME_PATTERN_LENGTH - '^(?:)$'.length);
+        expect(buildTestNamePattern([name])).toBe(`^(?:${name})$`);
+    });
+
+    it('returns undefined when the pattern byte length would exceed MAX_TEST_NAME_PATTERN_LENGTH', () => {
+        const name = 'a'.repeat(MAX_TEST_NAME_PATTERN_LENGTH - '^(?:)$'.length + 1);
+        expect(buildTestNamePattern([name])).toBeUndefined();
+    });
+
+    it('compares UTF-8 bytes, not chars: multibyte names under the char cap but over the byte cap fall back', () => {
+        // '★' (U+2605) is 1 UTF-16 code unit but 3 UTF-8 bytes; kernel argv limits are in bytes.
+        const starCount = Math.ceil((MAX_TEST_NAME_PATTERN_LENGTH - '^(?:)$'.length + 1) / 3);
+        const name = '★'.repeat(starCount);
+        // Sanity: char length alone would slip under the cap — the byte comparison must catch it.
+        expect(name.length + '^(?:)$'.length).toBeLessThanOrEqual(MAX_TEST_NAME_PATTERN_LENGTH);
+        expect(buildTestNamePattern([name])).toBeUndefined();
     });
 });

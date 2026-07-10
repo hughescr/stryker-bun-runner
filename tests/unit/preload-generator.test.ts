@@ -440,3 +440,21 @@ describe('resolveEagerModulesFromGlobs', () => {
         expect(result).toEqual([path.resolve(absA)]);
     });
 });
+
+describe('eager-import determinism guard', () => {
+    // The coverage-mapper's static-wins rule (stabilizeCoverage) relies on this
+    // template block: every mutated module is imported during preload while
+    // currentTestId is undefined, so module-init mutants land deterministically
+    // in the RAW static bucket. If this block is removed, module-level coverage
+    // attribution becomes nondeterministic again — do not delete it without
+    // reworking coverage-mapper.ts.
+    it('template eagerly imports EAGER_MODULES during coverage collection', async () => {
+        const templateSource = await Bun.file(new URL('../../src/templates/coverage-preload.ts', import.meta.url)).text();
+        expect(templateSource).toContain('const EAGER_MODULES: string[] = __EAGER_MODULES__;');
+        // Whitespace-tolerant: proves the for-loop sits inside the
+        // shouldCollectCoverage block (no closing brace may intervene) without
+        // tripping on a pure reformat of the template.
+        expect(templateSource).toMatch(/if\s*\(shouldCollectCoverage\)\s*\{[^}]*for\s*\(const modPath of EAGER_MODULES\)/);
+        expect(templateSource).toContain('await import(modPath);');
+    });
+});

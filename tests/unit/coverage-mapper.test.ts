@@ -1327,11 +1327,13 @@ describe('mapCoverageToInspectorIds', () => {
     });
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Static/perTest stabilization (Drift 1 fix)
+    // Static-wins attribution (raw static bucket strips perTest duplicates)
     // ─────────────────────────────────────────────────────────────────────────
-    describe('static/perTest stabilization', () => {
-        it('should promote a mutant that appears in multiple perTest entries to static', () => {
-            // Mutant '5' appears in both test-1 and test-2 (module-level code reached from two tests)
+    describe('static-wins attribution', () => {
+        it('keeps a mutant that appears in multiple perTest entries in both entries (no promotion to static)', () => {
+            // Mutant '5' is ordinary shared code hit by two tests — the NORMAL shape for
+            // perTest coverage; it must stay in both entries and must NOT be reported as
+            // static (regression for the count>1 promotion bug). FAILS pre-fix.
             const rawCoverage: MutantCoverage = {
                 'static': {},
                 perTest:  {
@@ -1347,11 +1349,12 @@ describe('mapCoverageToInspectorIds', () => {
 
             const { coverage: result } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
 
-            // Mutant '5' should be promoted to static because it appears in both tests
-            expect(result!.static).toMatchObject({ '5': expect.any(Number) });
-            // Mutant '5' should NOT appear in any perTest entry
+            // Mutant '5' must NOT be promoted to static — it has no raw static record
+            expect(result!.static).toEqual({});
+            // Both perTest entries survive
+            expect(Object.keys(result!.perTest)).toHaveLength(2);
             for(const counts of Object.values(result!.perTest)) {
-                expect(Object.keys(counts)).not.toContain('5');
+                expect(counts['5']).toBe(1);
             }
             // Mutants '10' and '20' are uniquely attributed — they stay in perTest
             expect(Object.values(result!.perTest).some(c => '10' in c)).toBe(true);
@@ -1408,10 +1411,14 @@ describe('mapCoverageToInspectorIds', () => {
             expect(Object.values(result!.perTest).some(c => '3' in c)).toBe(true);
         });
 
-        it('should drop perTest entry completely when all its mutants are promoted to static', () => {
-            // Both mutants in test-2 also appear in test-1 — after promotion, test-2 has nothing left
+        it('drops a perTest entry completely when all its mutants are already static', () => {
+            // NOTE: this test passes BOTH pre- and post-fix by design — it pins retained
+            // rule-(a) behavior (raw-static stripping and empty-entry drop, which the old
+            // code also performed for already-static IDs); its value is mutation-kill on
+            // buildFilteredPerTest's empty-entry guard, not failing-first TDD. Do not
+            // 'strengthen' it into asserting promotion.
             const rawCoverage: MutantCoverage = {
-                'static': {},
+                'static': { '10': 1, '20': 1 },
                 perTest:  {
                     'tests/d.test.ts@@test-1': { '10': 1, '20': 1, '30': 1 },
                     'tests/d.test.ts@@test-2': { '10': 1, '20': 1 },
@@ -1425,8 +1432,8 @@ describe('mapCoverageToInspectorIds', () => {
 
             const { coverage: result } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
 
-            // '10' and '20' promoted to static; test-2 entry disappears — exactly 1 perTest entry remains
-            expect(result!.static).toMatchObject({ '10': expect.any(Number), '20': expect.any(Number) });
+            // '10' and '20' are already static; test-2 entry disappears — exactly 1 perTest entry remains
+            expect(result!.static).toEqual({ '10': 1, '20': 1 });
             // Only test-1 entry (which owns '30') should remain
             expect(Object.keys(result!.perTest)).toHaveLength(1);
             // '30' is unique to test-1 so test-1 entry still exists
@@ -1438,8 +1445,10 @@ describe('mapCoverageToInspectorIds', () => {
             }
         });
 
-        it('should produce empty perTest when every mutant is shared across 2+ tests', () => {
-            // Every mutant appears in both tests, so all are promoted to static
+        it('keeps every shared mutant in perTest when nothing is static', () => {
+            // Every mutant appears in both tests, but none has a raw static record — all
+            // must remain in perTest (this is the exact fixture that previously emptied
+            // perTest under the count>1 promotion bug). FAILS pre-fix.
             const rawCoverage: MutantCoverage = {
                 'static': {},
                 perTest:  {
@@ -1455,15 +1464,36 @@ describe('mapCoverageToInspectorIds', () => {
 
             const { coverage: result } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
 
-            // All mutants promoted to static; perTest must be an empty object, not undefined
+            expect(result!.static).toEqual({});
+            expect(Object.keys(result!.perTest)).toHaveLength(2);
+            for(const counts of Object.values(result!.perTest)) {
+                expect(counts).toEqual({ '100': 1, '200': 1, '300': 1 });
+            }
+        });
+
+        it('produces empty perTest when every covered mutant is already static', () => {
+            // NOTE: passes BOTH pre- and post-fix by design — pins retained rule-(a)
+            // behavior and the 'empty object, not undefined' output shape; its value is
+            // mutation-kill on the empty-entry guard (`>` → `>=` keeps empty entries so
+            // toEqual({}) fails). Not a failing-first test.
+            const rawCoverage: MutantCoverage = {
+                'static': { '100': 1, '200': 1, '300': 1 },
+                perTest:  {
+                    'tests/f.test.ts@@test-1': { '100': 1, '200': 1, '300': 1 },
+                    'tests/f.test.ts@@test-2': { '100': 1, '200': 1, '300': 1 },
+                },
+            };
+            const executionOrder = [1, 2];
+            const testHierarchy = new Map<number, TestInfo>([
+                [1, { id: 1, name: 'first', fullName: 'first', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/f.test.ts' }],
+                [2, { id: 2, name: 'second', fullName: 'second', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/f.test.ts' }],
+            ]);
+
+            const { coverage: result } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+
+            // All mutants already static; perTest must be an empty object, not undefined
             expect(result!.perTest).toEqual({});
-            expect(Object.keys(result!.perTest)).toHaveLength(0);
-            // All three mutants must be in the static bucket
-            expect(result!.static).toMatchObject({
-                '100': expect.any(Number),
-                '200': expect.any(Number),
-                '300': expect.any(Number),
-            });
+            expect(result!.static).toEqual({ '100': 1, '200': 1, '300': 1 });
         });
 
         it('should produce identical coverage regardless of which test first triggered module import (simulates drift)', () => {
@@ -1492,13 +1522,12 @@ describe('mapCoverageToInspectorIds', () => {
             const { coverage: resultA } = mapCoverageToInspectorIds(coverageRunA, executionOrder, testHierarchy);
             const { coverage: resultB } = mapCoverageToInspectorIds(coverageRunB, executionOrder, testHierarchy);
 
-            // '500' appears in only ONE test per run, so stabilizeCoverage alone won't
-            // deduplicate it — but both runs produce the same perTest assignment for it
-            // (test-1 in run A, test-2 in run B). However, when BOTH runs contribute,
-            // the UNION scenario is handled. For this test we verify that:
-            // (a) each run's result is internally consistent, and
-            // (b) '501' (unique to test-1 in both runs) stays in perTest[test-1] in both
-            // (c) '502' (unique to test-2 in both runs) stays in perTest[test-2] in both
+            // '500' is module-scope code. In production the eager-import preload
+            // (coverage-preload.ts Section 3) executes it during preload, recording it
+            // deterministically into the raw static bucket — the mapper itself performs
+            // NO cross-run dedup. This fixture (no static record) verifies each run's
+            // result is internally consistent and that uniquely-attributed mutants
+            // ('501','502') keep their perTest attribution.
 
             // Run A: '500' only in test-1 → stays in perTest[test-1]
             expect(Object.values(resultA!.perTest).some(c => '500' in c)).toBe(true);
@@ -1514,18 +1543,15 @@ describe('mapCoverageToInspectorIds', () => {
             expect(test1EntryB?.[0]).toBeDefined();
         });
 
-        it('stabilizes when some promotions are new and some already exist in static', () => {
-            // Kills MethodExpression mutant 593: some→every on hasNewPromotions check.
-            // With 'every': if promoteToStatic has BOTH an existing-static ID and a new one,
-            // every() would return false (existing-static fails the !has() test), so the
-            // rebuild is wrongly skipped and the newly-promoted mutant stays in perTest.
-            //
-            // Setup: mutant '99' is already in static; mutant '42' appears in 2 tests (new promotion).
-            // After rebuild: '42' must be in static; perTest must NOT contain '42'.
+        it('strips already-static mutants while preserving multi-test mutants (mixed case)', () => {
+            // Mixed scenario: '99' is already static and must be stripped from perTest;
+            // '42' is ordinary shared code hit by two tests and must be PRESERVED in both
+            // (not promoted) — exactly the shape eager-import produces for module-level
+            // helpers also called at test time. FAILS pre-fix ('42' gets promoted).
             const rawCoverage: MutantCoverage = {
                 'static': { '99': 1 },               // existing static entry
                 perTest:  {
-                    'tests/x.test.ts@@test-1': { '42': 1, '7': 1 },
+                    'tests/x.test.ts@@test-1': { '99': 1, '42': 1, '7': 1 },
                     'tests/x.test.ts@@test-2': { '42': 1, '8': 1 },
                 },
             };
@@ -1537,21 +1563,22 @@ describe('mapCoverageToInspectorIds', () => {
 
             const { coverage: result } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
 
-            // '42' must be promoted to static (it's in 2 tests)
-            expect(result!.static).toMatchObject({ '99': 1, '42': expect.any(Number) });
-            // '42' must NOT appear in any perTest entry
+            // '99' remains static; '42' must NOT be promoted
+            expect(result!.static).toEqual({ '99': 1 });
+            expect(Object.keys(result!.perTest)).toHaveLength(2);
+            // '99' must NOT appear in any perTest entry (already static); '42' stays with count 1
             for(const counts of Object.values(result!.perTest)) {
-                expect(Object.keys(counts)).not.toContain('42');
+                expect(Object.keys(counts)).not.toContain('99');
+                expect(counts['42']).toBe(1);
             }
             // '7' and '8' are unique per-test — they stay in perTest
             expect(Object.values(result!.perTest).some(c => '7' in c)).toBe(true);
             expect(Object.values(result!.perTest).some(c => '8' in c)).toBe(true);
         });
 
-        it('promotes to static but preserves existing hit counts (does not overwrite)', () => {
-            // Kills ConditionalExpression mutant 610: !(mutantId in newStatic) → true
-            // With always-true, the hit count 5 for '99' would be overwritten with 1.
-            // This test checks the original value is preserved.
+        it('preserves existing static hit counts (does not overwrite)', () => {
+            // Raw-static hit counts must survive stabilization unchanged — static is
+            // returned by reference, never rebuilt with default counts.
             const rawCoverage: MutantCoverage = {
                 'static': { '99': 5 },  // pre-existing hit count of 5
                 perTest:  {
@@ -1569,9 +1596,9 @@ describe('mapCoverageToInspectorIds', () => {
             expect(result!.static['99']).toBe(5);
         });
 
-        it('preserves original static map by spreading (not sharing reference)', () => {
-            // Kills ObjectLiteral mutant 607: { ...coverage!.static } → {}
-            // If newStatic starts as {}, existing static entries ('10': 1) would be lost.
+        it('preserves existing static entries when stripping perTest', () => {
+            // Static must be returned intact — existing static entries ('10': 1) must
+            // not be lost while stripping the corresponding perTest duplicates.
             const rawCoverage: MutantCoverage = {
                 'static': { '10': 1 },
                 perTest:  {
@@ -1594,12 +1621,16 @@ describe('mapCoverageToInspectorIds', () => {
             expect(Object.values(result!.perTest).some(c => '30' in c)).toBe(true);
         });
 
-        it('stabilizes coverage with legacy test-N keys as well', () => {
-            // Same promotion logic should apply when using legacy counter keys
+        it('keeps multi-test mutants in perTest and strips static ones with legacy test-N keys', () => {
+            // The mandated legacy-key-format regression test: shared '77' must stay in
+            // both perTest entries; raw-static '66' must be stripped from perTest and
+            // remain in static. Proves mapLegacyCounterKeys' shared stabilizeCoverage
+            // call (:656) exhibits both rules without duplicating the file-prefixed test.
+            // FAILS pre-fix (shared '77' gets promoted).
             const rawCoverage: MutantCoverage = {
-                'static': {},
+                'static': { '66': 1 },
                 perTest:  {
-                    'test-1': { '77': 1, '88': 1 },
+                    'test-1': { '77': 1, '88': 1, '66': 1 },
                     'test-2': { '77': 1, '99': 1 },
                 },
             };
@@ -1611,10 +1642,11 @@ describe('mapCoverageToInspectorIds', () => {
 
             const { coverage: result } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
 
-            // '77' appears in both tests → promoted to static
-            expect(result!.static).toMatchObject({ '77': expect.any(Number) });
+            expect(result!.static).toEqual({ '66': 1 });
+            expect(Object.keys(result!.perTest)).toHaveLength(2);
             for(const counts of Object.values(result!.perTest)) {
-                expect(Object.keys(counts)).not.toContain('77');
+                expect(counts['77']).toBe(1);
+                expect(Object.keys(counts)).not.toContain('66');
             }
             // '88' and '99' are unique → stay in perTest
             expect(Object.values(result!.perTest).some(c => '88' in c)).toBe(true);

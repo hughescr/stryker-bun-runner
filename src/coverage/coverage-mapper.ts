@@ -70,73 +70,18 @@ export function mapCoverageToInspectorIds(
 }
 
 /**
- * Promote ambiguously-attributed mutant IDs from perTest into static.
- *
- * Bun's module caching means that top-level code in a lazily-imported module
- * executes during whichever test first triggers the import.  Across two runs
- * the "first test" can differ, causing the same mutant to appear in
- * perTest[testA] in one run and perTest[testB] (or static) in another.
- *
- * This function eliminates that non-determinism with a simple rule:
- *   - Any mutant ID that appears in MORE than one test's perTest entry is
- *     promoted to static (it is effectively covered by all tests).
- *   - Any mutant ID that is already in static is removed from every perTest
- *     entry (static attribution wins — it is the more conservative claim).
- *
- * The promotion is semantically correct: "static" in Stryker means "covered
- * by every test run", which is exactly what top-level module code achieves
- * once the module is cached.  Keeping such mutants in perTest[someTest] is
- * both unstable AND inaccurate, because the mutant is not uniquely tied to
- * that one test.
- *
- * @param coverage - Fully-mapped MutantCoverage (perTest keys are test names)
- * @returns New MutantCoverage with stabilised static/perTest attribution
- */
-/**
- * Count how many perTest entries each mutant ID appears in.
- */
-function countPerTestAppearances(
-    perTestEntries: [string, Record<string, number>][]
-): Map<string, number> {
-    const appearances = new Map<string, number>();
-    for(const [, counts] of perTestEntries) {
-        for(const mutantId of Object.keys(counts)) {
-            appearances.set(mutantId, (appearances.get(mutantId) ?? 0) + 1);
-        }
-    }
-    return appearances;
-}
-
-/**
- * Build the set of mutant IDs that should be promoted to static.
- * Includes all already-static IDs plus any that appear in >1 perTest entry.
- */
-function buildPromoteToStaticSet(
-    existingStaticKeys: string[],
-    perTestAppearances: Map<string, number>
-): Set<string> {
-    const promoteToStatic = new Set<string>(existingStaticKeys);
-    for(const [mutantId, count] of perTestAppearances) {
-        // Stryker disable next-line EqualityOperator: > 1 is the correct threshold — 1 means uniquely attributed
-        if(count > 1) {
-            promoteToStatic.add(mutantId);
-        }
-    }
-    return promoteToStatic;
-}
-
-/**
- * Build the new perTest map, stripping mutants that have been promoted to static.
+ * Build the new perTest map, stripping mutants that are recorded in the static bucket.
+ * Test entries left empty after stripping are dropped.
  */
 function buildFilteredPerTest(
     perTestEntries: [string, Record<string, number>][],
-    promoteToStatic: Set<string>
+    staticIds: Set<string>
 ): Record<string, Record<string, number>> {
     const newPerTest: Record<string, Record<string, number>> = {};
     for(const [testId, counts] of perTestEntries) {
         const filteredCounts: Record<string, number> = {};
         for(const [mutantId, hitCount] of Object.entries(counts)) {
-            if(!promoteToStatic.has(mutantId)) {
+            if(!staticIds.has(mutantId)) {
                 filteredCounts[mutantId] = hitCount;
             }
         }
@@ -148,49 +93,44 @@ function buildFilteredPerTest(
     return newPerTest;
 }
 
+/**
+ * Enforce "static wins" attribution: strip from every perTest entry any
+ * mutant ID that is already recorded in the static bucket.
+ *
+ * Module-level (top-level) code executes eagerly during preload — see
+ * src/templates/coverage-preload.ts Section 3 (eager module imports) —
+ * while no test is active (currentTestId is undefined), so the instrumenter
+ * records module-init mutants deterministically into the raw static bucket
+ * before any test runs. When tests later call into the same code, those
+ * mutants can ALSO appear in perTest entries; static is the more
+ * conservative claim ("run all tests for this mutant"), so it wins and the
+ * perTest duplicates are stripped.
+ *
+ * Mutants that appear in multiple perTest entries WITHOUT a static record
+ * are left untouched: multi-test coverage is the normal shape for shared
+ * code paths, and preserving it is what lets Stryker plan targeted per-test
+ * mutant runs and lets the incremental differ detect newly-added covering
+ * tests.
+ *
+ * Degraded path: if a module's eager import throws during preload, the
+ * preload catches the error and warns (see src/templates/coverage-preload.ts
+ * Section 3) rather than crashing. That module's top-level code then runs
+ * instead at the first *lazy* import of the module — i.e. while a test is
+ * active — so its module-init mutants land in that single perTest entry
+ * rather than in static. This matches the pre-change behavior: the removed
+ * `count > 1` promotion rule never fired for single-entry mutants anyway,
+ * so no protection is lost here — attribution for this rare case simply
+ * isn't static.
+ *
+ * @param coverage - Fully-mapped MutantCoverage (perTest keys are test names)
+ * @returns New MutantCoverage with static-covered mutants stripped from perTest
+ */
 function stabilizeCoverage(coverage: MutantCoverage): MutantCoverage {
-    const perTestEntries = Object.entries(coverage.perTest);
-    // Stryker disable next-line ConditionalExpression,BlockStatement: equivalent mutant — empty perTest produces no promotions/contamination so second guard returns coverage unchanged
-    if(perTestEntries.length === 0) {
-        return coverage;
-    }
-
-    const existingStaticKeys = Object.keys(coverage.static);
-    const perTestAppearances = countPerTestAppearances(perTestEntries);
-
-    // A mutant belongs in static if:
-    //   (a) it is already in static, OR
-    //   (b) it appears in more than one test's perTest (ambiguous attribution)
-    const promoteToStatic = buildPromoteToStaticSet(existingStaticKeys, perTestAppearances);
-
-    // Nothing to change if there are no promotions AND no perTest entries contain
-    // any of the static IDs (i.e., nothing to strip from perTest either).
-    const existingStatic = new Set<string>(existingStaticKeys);
-    // Stryker disable next-line ArrayDeclaration,ArrowFunction,BooleanLiteral,MethodExpression: equivalent mutants — bogus spread/arrow/every changes force hasNewPromotions=true, but rebuild produces identical output when all promotions are already in static; .every vs .some only affects early-return optimization, not the final result
-    const hasNewPromotions = [...promoteToStatic].some(id => !existingStatic.has(id));
-    // Stryker disable next-line MethodExpression,ArrowFunction: equivalent mutant — perTestEntries.some false-positive only causes unnecessary rebuild; output is identical
-    const hasPerTestContamination = perTestEntries.some(
-        // Stryker disable next-line ConditionalExpression: equivalent mutant — inner some always-true forces unnecessary rebuild but output is identical
-        ([, counts]) => Object.keys(counts).some(id => promoteToStatic.has(id))
-    );
-    // Stryker disable next-line ConditionalExpression,BooleanLiteral,BlockStatement: equivalent mutants — skipping early return (or flipping condition) just forces rebuild that produces identical output; the rebuild produces the same static+perTest values
-    if(!hasNewPromotions && !hasPerTestContamination) {
-        return coverage;
-    }
-
-    // Build new static: union of original static hits and promoted mutant IDs.
-    // Use hit-count 1 for newly-promoted mutants (conservative default; the
-    // actual count is irrelevant for Stryker's coverage decision).
-    const newStatic: Record<string, number> = { ...coverage.static };
-    for(const mutantId of promoteToStatic) {
-        if(!(mutantId in newStatic)) {
-            newStatic[mutantId] = 1;
-        }
-    }
-
-    const newPerTest = buildFilteredPerTest(perTestEntries, promoteToStatic);
-
-    return { 'static': newStatic, perTest: newPerTest };
+    const staticIds = new Set(Object.keys(coverage.static));
+    return {
+        'static': coverage.static,
+        perTest:  buildFilteredPerTest(Object.entries(coverage.perTest), staticIds),
+    };
 }
 
 /**
@@ -652,7 +592,7 @@ function mapLegacyCounterKeys(
     }
 
     // Return new coverage with remapped perTest and original static, with
-    // ambiguously-attributed mutants promoted to static.
+    // static-covered mutants stripped from perTest (static wins).
     return stabilizeCoverage({
         'static': rawCoverage.static,
         perTest:  remappedPerTest,

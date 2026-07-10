@@ -2627,7 +2627,7 @@ tests/example.test.ts:
             );
         });
 
-        it('should enable bail for mutant runs', async () => {
+        it('should enable bail for mutant runs when disableBail is not set', async () => {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 // Call onInspectorReady immediately if provided
@@ -2657,6 +2657,76 @@ tests/example.test.ts:
             expect(mockRunBunTests).toHaveBeenCalledWith(
                 expect.objectContaining({
                     bail: true,
+                })
+            );
+        });
+
+        it('should enable bail for mutant runs when disableBail is false', async () => {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+            mockRunBunTests.mockImplementation((options: any) => {
+                // Call onInspectorReady immediately if provided
+
+                if(options.onInspectorReady) {
+                    options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                }
+                return Promise.resolve({
+                    exitCode: 0,
+                    stdout:   '✓ test [0.05ms]\n 1 pass',
+                    stderr:   '',
+                    timedOut: false,
+                });
+            });
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+
+            await runner.mutantRun({
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                activeMutant:    { id: '1' } as any,
+                testFilter:      [],
+                sandboxFileName: 'sandbox',
+                disableBail:     false,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+            } as any);
+
+            expect(mockRunBunTests).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    bail: true,
+                })
+            );
+        });
+
+        it('should disable bail for mutant runs when disableBail is true', async () => {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+            mockRunBunTests.mockImplementation((options: any) => {
+                // Call onInspectorReady immediately if provided
+
+                if(options.onInspectorReady) {
+                    options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                }
+                return Promise.resolve({
+                    exitCode: 0,
+                    stdout:   '✓ test [0.05ms]\n 1 pass',
+                    stderr:   '',
+                    timedOut: false,
+                });
+            });
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+
+            await runner.mutantRun({
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                activeMutant:    { id: '1' } as any,
+                testFilter:      [],
+                sandboxFileName: 'sandbox',
+                disableBail:     true,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+            } as any);
+
+            expect(mockRunBunTests).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    bail: false,
                 })
             );
         });

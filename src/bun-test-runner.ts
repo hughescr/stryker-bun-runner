@@ -859,7 +859,11 @@ export class BunTestRunner implements TestRunner {
         // we strip the file-path prefix (Bun's pattern matches the hierarchy without it)
         // and collapse duplicate-name tests (those with a " [N]" dedup suffix) to a single
         // alternative — Bun cannot distinguish them at runtime, but running both is correct.
-        // --bail is still applied so the first failure stops the run immediately.
+        // --bail is applied unless Stryker's disableBail option is set — without bail
+        // every covering test runs to completion, so killedBy can list all killing tests.
+        // When the covering set is too large to encode safely in a single argv entry
+        // (kernel argv limits are in UTF-8 bytes), buildTestNamePattern returns undefined
+        // and the full suite runs instead (see MAX_TEST_NAME_PATTERN_LENGTH).
         // Sequential mode (--concurrency=1) is required to match dryRun's serialized
         // execution semantics — parallel timing can cause mutants to escape detection.
         // IMPORTANT: Preload script IS needed to set globalThis.__stryker__.activeMutant
@@ -908,7 +912,7 @@ export class BunTestRunner implements TestRunner {
                 bunArgs:               this.bunArgs,
                 bunfigPath,
                 activeMutant:          options.activeMutant.id,
-                bail:                  true,            // Bail on first failure for mutant runs
+                bail:                  !options.disableBail, // Bail on first failure unless Stryker's disableBail is set
                 sequentialMode:        true,            // Match dryRun's serialized execution for deterministic results
                 preloadScript:         this.preloadScriptPath, // Needed to set globalThis.__stryker__.activeMutant
                 testNamePattern, // undefined → no filter → full suite (current behaviour)
