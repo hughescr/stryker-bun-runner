@@ -1735,4 +1735,225 @@ describe('runBunTests', () => {
             }
         });
     });
+
+    describe('bail is fully runner-managed — user bunArgs bail flags are stripped', () => {
+        it('strips a bare --bail from bunArgs when the runner\'s own bail is false (disableBail case)', async () => {
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+                bail:    false,
+                bunArgs: ['--bail'],
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const args: readonly string[] = mockSpawn.mock.calls[0][1];
+            expect(args).toEqual(['test']);
+        });
+
+        it('strips the dry-run construction path too — bunArgs bail is stripped even when options.bail is omitted entirely', async () => {
+            // dryRun never passes a `bail` option at all (undefined, not false) — this
+            // must be stripped just the same as the explicit disableBail case above.
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+                bunArgs: ['--bail'],
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const args: readonly string[] = mockSpawn.mock.calls[0][1];
+            expect(args).toEqual(['test']);
+        });
+
+        it('strips the equals form --bail=3 from bunArgs', async () => {
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+                bail:    false,
+                bunArgs: ['--bail=3'],
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const args: readonly string[] = mockSpawn.mock.calls[0][1];
+            expect(args).toEqual(['test']);
+        });
+
+        it('strips the space-separated --bail 5 form, dropping the trailing numeric token too', async () => {
+            // Bun itself does not accept this form (the number is left over as a
+            // positional test-file filter — see the regression guard test below), but
+            // if a user writes it anyway both tokens must be dropped so the leftover
+            // number doesn't survive as a stray positional filter.
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+                bail:    false,
+                bunArgs: ['--bail', '5'],
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const args: readonly string[] = mockSpawn.mock.calls[0][1];
+            expect(args).toEqual(['test']);
+        });
+
+        it('does not swallow a non-numeric token that happens to follow a bare --bail', async () => {
+            // Only a purely-numeric token immediately after a bare --bail is the
+            // space-separated bail form; anything else (e.g. a test-file filter the
+            // user genuinely intended) must survive.
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+                bail:    false,
+                bunArgs: ['--bail', 'not-a-number'],
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const args: readonly string[] = mockSpawn.mock.calls[0][1];
+            expect(args).toEqual(['test', 'not-a-number']);
+        });
+
+        it('does not swallow a trailing numeric token after the equals-form --bail=<N> (pairing only applies to the bare flag)', async () => {
+            // The "consume the next token" pairing exists only to handle bun's
+            // space-separated quirk for the *bare* `--bail` flag. A token that
+            // follows the *equals* form is an unrelated, independent argument
+            // (e.g. a positional test-file filter) and must survive untouched.
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+                bail:    false,
+                bunArgs: ['--bail=3', '5'],
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const args: readonly string[] = mockSpawn.mock.calls[0][1];
+            expect(args).toEqual(['test', '5']);
+        });
+
+        it('does not swallow a digit-prefixed but non-numeric token (e.g. "5x") after a bare --bail', async () => {
+            // Confirms the trailing $ anchor in /^\d+$/ matters: a token that
+            // merely starts with digits but has trailing non-digit characters
+            // is not the space-separated bail-threshold form and must be left
+            // alone rather than swallowed.
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+                bail:    false,
+                bunArgs: ['--bail', '5x'],
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const args: readonly string[] = mockSpawn.mock.calls[0][1];
+            expect(args).toEqual(['test', '5x']);
+        });
+
+        it('does not swallow a token with digits only at the end (e.g. "abc5") after a bare --bail', async () => {
+            // Confirms the leading ^ anchor in /^\d+$/ matters: a token that
+            // merely *ends* with digits but has non-digit characters before
+            // them is not purely numeric and must be left alone rather than
+            // swallowed.
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+                bail:    false,
+                bunArgs: ['--bail', 'abc5'],
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const args: readonly string[] = mockSpawn.mock.calls[0][1];
+            expect(args).toEqual(['test', 'abc5']);
+        });
+
+        it('swallows a multi-digit numeric token after a bare --bail, not just single digits', async () => {
+            // Confirms the `+` quantifier in /^\d+$/ matters: a multi-digit
+            // threshold like '42' must be recognised and stripped, not just
+            // single-digit thresholds like the '5' used in other tests here.
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+                bail:    false,
+                bunArgs: ['--bail', '42'],
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const args: readonly string[] = mockSpawn.mock.calls[0][1];
+            expect(args).toEqual(['test']);
+        });
+
+        it('does not strip look-alike flags such as --bailout', async () => {
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+                bail:    false,
+                bunArgs: ['--bailout'],
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const args: readonly string[] = mockSpawn.mock.calls[0][1];
+            expect(args).toEqual(['test', '--bailout']);
+        });
+
+        it('passes non-bail bunArgs entries through unchanged and in order, stripping only the bail entries', async () => {
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+                bail:    false,
+                bunArgs: ['--only', '--bail', '--verbose', '--bail=2'],
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const args: readonly string[] = mockSpawn.mock.calls[0][1];
+            expect(args).toEqual(['test', '--only', '--verbose']);
+        });
+
+        it('emits exactly one --bail (the runner\'s own) when the runner bails, even if bunArgs also requests bail', async () => {
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+                bail:    true,
+                bunArgs: ['--bail'],
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const args: readonly string[] = mockSpawn.mock.calls[0][1];
+            expect(args.filter(a => a === '--bail').length).toBe(1);
+            expect(args).toEqual(['test', '--bail']);
+        });
+
+        it('does not let a bunArgs --bail=<N> survive alongside the runner\'s own --bail', async () => {
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+                bail:    true,
+                bunArgs: ['--bail=9'],
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const args: readonly string[] = mockSpawn.mock.calls[0][1];
+            expect(args).toEqual(['test', '--bail']);
+        });
+    });
 });

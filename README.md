@@ -65,7 +65,7 @@ The plugin uses Bun's Inspector Protocol (WebSocket) to:
 2. **Track execution** - Listens for TestReporter events to correlate test runs with coverage
 3. **Sequential execution** - Uses `--concurrency=1` to ensure reliable coverage correlation
 4. **Build hierarchy** - Reconstructs test names from describe blocks for accurate reporting
-5. **Targeted mutant runs** - Runs only the tests that covered each mutant (via `--test-name-pattern`), honoring `disableBail`
+5. **Targeted mutant runs** - Runs only the tests that covered each mutant (via `--test-name-pattern`); bails after the first failure unless Stryker's `disableBail` option is set (dry runs never bail, since the full suite must run for coverage). Any bail flag in `bun.bunArgs` is ignored — bail is decided solely by the runner.
 
 Oversized covering-test patterns (over 100,000 UTF-8 bytes) fall back to running the full suite, to stay within OS argument-length limits. This approach provides reliable test-to-mutant correlation, even with multiple test files.
 
@@ -77,7 +77,7 @@ Oversized covering-test patterns (over 100,000 UTF-8 bytes) fall back to running
 | `bun.timeout` | `number` | `10000` | Timeout per test in milliseconds |
 | `bun.inspectorTimeout` | `number` | `5000` | Timeout for Inspector WebSocket connection in milliseconds |
 | `bun.env` | `object` | `undefined` | Additional environment variables to pass to bun test |
-| `bun.bunArgs` | `string[]` | `undefined` | Additional bun test flags (e.g., `['--bail']`). These flags are appended unconditionally to every run, so `['--bail']` overrides `disableBail: true` if both are set. |
+| `bun.bunArgs` | `string[]` | `undefined` | Additional bun test flags (e.g., `['--only']`). Bail flags (`--bail`, `--bail=<N>`, or a space-separated `--bail <N>`) are ignored here — bail is fully managed by the runner via Stryker's `disableBail` option (see [How It Works](#how-it-works)). |
 | `bun.testFiles` | `string[]` | `undefined` | Explicit list of test file paths (absolute or relative to cwd). When provided, skips auto-discovery and uses this list verbatim. Relative paths resolve against the bun subprocess's cwd. Useful for restricting mutation testing to a subset of test files. |
 | `bun.smol` | `boolean` | `false` | Pass Bun's `--smol` flag to every child: a smaller JavaScriptCore heap at some cost to speed. Recommended on memory-constrained machines — see [Memory model](#memory-model). |
 | `bun.maxChildRss` | `number` | `undefined` | Soft memory ceiling in bytes for each child's RSS. A child that exceeds it is killed and the run reported as a clean timeout for that mutant. See [Memory containment](#memory-containment). |
@@ -91,7 +91,7 @@ bun: {
   timeout: 30000,            // 30 second test timeout
   inspectorTimeout: 10000,   // 10 second connection timeout
   env: { DEBUG: 'true' },    // Extra environment variables
-  bunArgs: ['--bail'],       // Stop on first failure (appended unconditionally — overrides disableBail if set)
+  bunArgs: ['--only'],       // Extra bun test flags (bail flags here are ignored — see Options table)
   smol: true,                // Smaller JSC heap, some speed cost — see Memory model
   maxChildRss: 1_500_000_000, // Kill+report-timeout a child using more than ~1.5GB RSS
   rssCheckIntervalMs: 1000,  // How often to poll RSS when maxChildRss is set

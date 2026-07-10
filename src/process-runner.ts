@@ -156,6 +156,43 @@ export interface BunProcessResult {
 }
 
 /**
+ * Strip any bail flag the caller put in `bunArgs`, leaving every other entry
+ * untouched and in its original order.
+ *
+ * Bail is fully runner-managed (see {@link BunTestRunOptions.bail}): mutant
+ * runs bail unless Stryker's `disableBail` option is set, and dry runs never
+ * bail (the full suite must run for coverage). A bail flag the user configured
+ * in `bun.bunArgs` would silently re-enable or duplicate that decision if it
+ * were merged in as-is, so it must be stripped rather than appended.
+ *
+ * Strips the bail spellings a user might plausibly write:
+ *   - `--bail`     - bare flag (defaults to a threshold of 1)
+ *   - `--bail=<N>` - the equals form, the only way to pass an explicit threshold
+ *   - `--bail <N>` - a bare `--bail` followed by a purely-numeric token, as if
+ *     `<N>` were a space-separated value
+ *
+ * Bun itself accepts only the first two forms. Passed the third, `<N>` is not
+ * read as the flag's value but is misread as a stray positional test-file
+ * filter (confirmed empirically: `bun test --bail 2` reports "did not match
+ * any test files"), so if a user writes it anyway both tokens are dropped
+ * together rather than leaving the numeric token behind as a broken filter.
+ */
+function stripBailArgs(bunArgs: readonly string[]): string[] {
+    const sanitized: string[] = [];
+    for(let i = 0; i < bunArgs.length; i++) {
+        const arg = bunArgs[i];
+        if(arg === '--bail' || arg.startsWith('--bail=')) {
+            if(arg === '--bail' && /^\d+$/.test(bunArgs[i + 1])) {
+                i += 1;
+            }
+            continue;
+        }
+        sanitized.push(arg);
+    }
+    return sanitized;
+}
+
+/**
  * Send SIGTERM to a child process, escalating to SIGKILL after a grace period
  * if it hasn't exited by then. `isClosed` is checked right before the SIGKILL
  * so an already-exited process (e.g. one that responded to SIGTERM promptly)
@@ -225,10 +262,12 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
         args.push('--smol');
     }
 
-    // Add any additional bun args
+    // Add any additional bun args, with any user-supplied bail flag stripped out —
+    // bail is fully runner-managed (see stripBailArgs above and options.bail),
+    // so a bail flag configured here must never be merged into the spawned argv.
     // Stryker disable next-line EqualityOperator,ConditionalExpression: length >= 0 is equivalent to length > 0 for empty arrays (spreading [] is a no-op); ConditionalExpression would cause spread of undefined
     if(options.bunArgs && options.bunArgs.length > 0) {
-        args.push(...options.bunArgs);
+        args.push(...stripBailArgs(options.bunArgs));
     }
 
     // Append explicit test file paths as positional arguments.

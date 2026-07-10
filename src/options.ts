@@ -38,8 +38,14 @@ export interface BunTestRunnerOptions {
     env?: Record<string, string>
 
     /**
-   * Additional bun test flags to pass
-   * @example ['--bail', '--only']
+   * Additional bun test flags to pass.
+   *
+   * Bail flags (`--bail`, `--bail=<N>`, or a space-separated `--bail <N>`) are
+   * stripped if present — bail is fully managed by the runner based on
+   * Stryker's `disableBail` option, so a bail flag configured here would
+   * otherwise silently override that decision.
+   *
+   * @example ['--only', '--verbose']
    */
     bunArgs?: string[]
 
