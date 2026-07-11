@@ -21,10 +21,19 @@ import * as syncServerModule from '../../src/utils/sync-server.js';
 import * as testFileDiscovery from '../../src/utils/test-file-discovery.js';
 import { mockGetAvailablePort, mockRename, mockWriteFile, resetAllMocks } from '../test-preload.js';
 
+// Captured at module load time, BEFORE any `spyOn(coverageMapper, 'mapCoverageToInspectorIds')`
+// runs in a beforeEach below — a plain function-value snapshot, immune to the later spy's
+// mutation of the coverageMapper namespace export. Used only by the cross-module duplicate-
+// suffix reconciliation test, which needs the REAL
+// coverage-mapper implementation running alongside the real buildTestsFromInspector dedup
+// logic in the same dryRun() call, instead of the mocked pass-through used everywhere else.
+const realMapCoverageToInspectorIds = coverageMapper.mapCoverageToInspectorIds;
+
 describe('BunTestRunner', () => {
     let mockLogger: Logger;
     let mockRunBunTests: ReturnType<typeof mock>;
     let mockCollectCoverage: ReturnType<typeof mock>;
+    let mockCollectLateHits: ReturnType<typeof mock>;
     let mockCleanupCoverageFile: ReturnType<typeof mock>;
     let mockGeneratePreloadScript: ReturnType<typeof mock>;
     let mockCleanupPreloadScript: ReturnType<typeof mock>;
@@ -37,17 +46,21 @@ describe('BunTestRunner', () => {
         clientCount: number
     };
     let mockInspectorClient: {
-        connect:           ReturnType<typeof mock>
-        send:              ReturnType<typeof mock>
-        getTests:          ReturnType<typeof mock>
-        getExecutionOrder: ReturnType<typeof mock>
-        close:             ReturnType<typeof mock>
+        connect:               ReturnType<typeof mock>
+        send:                  ReturnType<typeof mock>
+        getTests:              ReturnType<typeof mock>
+        getExecutionOrder:     ReturnType<typeof mock>
+        close:                 ReturnType<typeof mock>
+        expectClose:           ReturnType<typeof mock>
+        waitForClose:          ReturnType<typeof mock>
+        wasClosedUnexpectedly: boolean
     };
     let mockMapCoverageToInspectorIds: ReturnType<typeof mock>;
 
     // Store spy instances for cleanup in afterEach
     let runBunTestsSpy: ReturnType<typeof spyOn>;
     let collectCoverageSpy: ReturnType<typeof spyOn>;
+    let collectLateHitsSpy: ReturnType<typeof spyOn>;
     let cleanupCoverageFileSpy: ReturnType<typeof spyOn>;
     let generatePreloadScriptSpy: ReturnType<typeof spyOn>;
     let cleanupPreloadScriptSpy: ReturnType<typeof spyOn>;
@@ -85,8 +98,10 @@ describe('BunTestRunner', () => {
 
         // Mock coverage collector
         mockCollectCoverage = mock();
+        mockCollectLateHits = mock().mockResolvedValue([]);
         mockCleanupCoverageFile = mock();
         collectCoverageSpy = spyOn(coverageCollector, 'collectCoverage').mockImplementation(mockCollectCoverage);
+        collectLateHitsSpy = spyOn(coverageCollector, 'collectLateHits').mockImplementation(mockCollectLateHits);
         cleanupCoverageFileSpy = spyOn(coverageCollector, 'cleanupCoverageFile').mockImplementation(mockCleanupCoverageFile);
 
         // Mock preload generator
@@ -116,11 +131,14 @@ describe('BunTestRunner', () => {
 
         // Mock inspector client
         mockInspectorClient = {
-            connect:           mock(),
-            send:              mock(),
-            getTests:          mock(),
-            getExecutionOrder: mock(),
-            close:             mock(),
+            connect:               mock(),
+            send:                  mock(),
+            getTests:              mock(),
+            getExecutionOrder:     mock(),
+            close:                 mock(),
+            expectClose:           mock(),
+            waitForClose:          mock(),
+            wasClosedUnexpectedly: false,
         };
         // @ts-expect-error - Mocking constructor, type system doesn't understand this pattern
         inspectorClientSpy = spyOn(inspectorModule, 'InspectorClient').mockImplementation(() => mockInspectorClient);
@@ -128,9 +146,9 @@ describe('BunTestRunner', () => {
         // Mock coverage mapper
         mockMapCoverageToInspectorIds = mock();
         mapCoverageToInspectorIdsSpy = spyOn(coverageMapper, 'mapCoverageToInspectorIds').mockImplementation(mockMapCoverageToInspectorIds);
-        // Default: wrap coverage in the new { coverage, inspectorIdToProjectFile } shape (tests can override if needed)
+        // Default: wrap coverage in the new { coverage, inspectorIdToProjectFile, counterKeyToTestName, rawKeyCount, orphanedKeyCount } shape (tests can override if needed)
         // eslint-disable-next-line @typescript-eslint/no-explicit-any -- intentional pass-through mock
-        mockMapCoverageToInspectorIds.mockImplementation((coverage: any) => ({ coverage, inspectorIdToProjectFile: new Map() }));
+        mockMapCoverageToInspectorIds.mockImplementation((coverage: any) => ({ coverage, inspectorIdToProjectFile: new Map(), counterKeyToTestName: new Map(), rawKeyCount: 0, orphanedKeyCount: 0 }));
 
         // Default mock implementations
         mockCleanupCoverageFile.mockResolvedValue(undefined);
@@ -147,6 +165,9 @@ describe('BunTestRunner', () => {
         mockInspectorClient.getTests.mockReturnValue([]);
         mockInspectorClient.getExecutionOrder.mockReturnValue([]);
         mockInspectorClient.close.mockResolvedValue(undefined);
+        mockInspectorClient.expectClose.mockReturnValue(undefined);
+        mockInspectorClient.waitForClose.mockResolvedValue(undefined);
+        mockInspectorClient.wasClosedUnexpectedly = false;
 
         // Suppress real filesystem writes from dryRun's registry persistence.
         // Without this, fake-timer tests that call dryRun() hang because Bun's
@@ -175,6 +196,8 @@ describe('BunTestRunner', () => {
         runBunTestsSpy.mockRestore();
 
         collectCoverageSpy.mockRestore();
+
+        collectLateHitsSpy.mockRestore();
 
         cleanupCoverageFileSpy.mockRestore();
 
@@ -2239,6 +2262,416 @@ tests/example.test.ts:
                 // into other tests.
                 releaseRunBunTests({ exitCode: null, stdout: '', stderr: '', timedOut: true });
                 await dryRunPromise;
+            });
+        });
+
+        describe('dry-run failure diagnostics (backlog item 1)', () => {
+            /**
+             * Configure mockRunBunTests to signal the inspector ready then resolve
+             * with the given process result (empty stdout by default — the "recap
+             * truncated/empty" scenario these tests exercise).
+             */
+            function mockProcessResult(overrides: { exitCode: number | null, stderr?: string, stdout?: string }): void {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({
+                        exitCode: overrides.exitCode,
+                        stdout:   overrides.stdout ?? '',
+                        stderr:   overrides.stderr ?? '',
+                        timedOut: false,
+                    });
+                });
+            }
+
+            it('ERROR branch: enriches the error message with the failed test\'s name, error message, and stack', async () => {
+                mockProcessResult({ exitCode: 1, stderr: '' });
+                const testHierarchy: TestInfo[] = [
+                    {
+                        id:       1,
+                        name:     'my test',
+                        fullName: 'Suite > my test',
+                        type:     'test',
+                        status:   'fail',
+                        error:    { message: 'expected true to be false', stack: 'Error: expected true to be false\n    at Suite (file.test.ts:10:1)' },
+                    },
+                ];
+                mockInspectorClient.getTests.mockReturnValue(testHierarchy);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([]);
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                const result = await runner.dryRun();
+
+                expect(result.status).toBe(DryRunStatus.Error);
+                if(result.status === DryRunStatus.Error) {
+                    expect(result.errorMessage).toContain('exit code 1');
+                    expect(result.errorMessage).toContain('Suite > my test');
+                    expect(result.errorMessage).toContain('expected true to be false');
+                    expect(result.errorMessage).toContain('at Suite (file.test.ts:10:1)');
+                }
+            });
+
+            it('ERROR branch: lists only failed tests, with the failed count as the prefix', async () => {
+                mockProcessResult({ exitCode: 1, stderr: '' });
+                const testHierarchy: TestInfo[] = [
+                    { id: 1, name: 'fails 1', fullName: 'Suite > fails 1', type: 'test', status: 'fail', error: { message: 'boom 1' } },
+                    { id: 2, name: 'passes', fullName: 'Suite > passes', type: 'test', status: 'pass' },
+                    { id: 3, name: 'fails 2', fullName: 'Suite > fails 2', type: 'test', status: 'fail', error: { message: 'boom 2' } },
+                    { id: 4, name: 'skipped', fullName: 'Suite > skipped', type: 'test', status: 'skip' },
+                ];
+                mockInspectorClient.getTests.mockReturnValue(testHierarchy);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([]);
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                const result = await runner.dryRun();
+
+                expect(result.status).toBe(DryRunStatus.Error);
+                if(result.status === DryRunStatus.Error) {
+                    expect(result.errorMessage).toContain('2 test(s) reported failed');
+                    expect(result.errorMessage).toContain('Suite > fails 1');
+                    expect(result.errorMessage).toContain('Suite > fails 2');
+                    expect(result.errorMessage).not.toContain('Suite > passes');
+                    expect(result.errorMessage).not.toContain('Suite > skipped');
+                }
+            });
+
+            it('ERROR branch: falls back to "no error message captured" without throwing when error is undefined', async () => {
+                mockProcessResult({ exitCode: 1, stderr: '' });
+                const testHierarchy: TestInfo[] = [
+                    { id: 1, name: 'fails', fullName: 'Suite > fails', type: 'test', status: 'fail' },
+                ];
+                mockInspectorClient.getTests.mockReturnValue(testHierarchy);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([]);
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                const result = await runner.dryRun();
+
+                expect(result.status).toBe(DryRunStatus.Error);
+                if(result.status === DryRunStatus.Error) {
+                    expect(result.errorMessage).toContain('Suite > fails');
+                    expect(result.errorMessage).toContain('no error message captured');
+                }
+            });
+
+            it('ERROR branch: excludes describe-type entries with status fail even alongside a real failed test', async () => {
+                mockProcessResult({ exitCode: 1, stderr: '' });
+                const testHierarchy: TestInfo[] = [
+                    { id: 1, name: 'Suite', fullName: 'Suite', type: 'describe', status: 'fail' },
+                    { id: 2, name: 'real failure', fullName: 'Suite > real failure', type: 'test', status: 'fail', error: { message: 'boom' } },
+                ];
+                mockInspectorClient.getTests.mockReturnValue(testHierarchy);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([]);
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                const result = await runner.dryRun();
+
+                expect(result.status).toBe(DryRunStatus.Error);
+                if(result.status === DryRunStatus.Error) {
+                    expect(result.errorMessage).toContain('1 test(s) reported failed');
+                    expect(result.errorMessage).toContain('Suite > real failure');
+                }
+            });
+
+            it('ERROR branch: caps the listed failures at 20 with a "...and N more" summary', async () => {
+                mockProcessResult({ exitCode: 1, stderr: '' });
+                const testHierarchy: TestInfo[] = Array.from({ length: 25 }, (_, i) => ({
+                    id:       i + 1,
+                    name:     `fails ${i}`,
+                    fullName: `Suite > fails ${i}`,
+                    type:     'test' as const,
+                    status:   'fail' as const,
+                    error:    { message: `boom ${i}` },
+                }));
+                mockInspectorClient.getTests.mockReturnValue(testHierarchy);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([]);
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                const result = await runner.dryRun();
+
+                expect(result.status).toBe(DryRunStatus.Error);
+                if(result.status === DryRunStatus.Error) {
+                    expect(result.errorMessage).toContain('25 test(s) reported failed');
+                    expect(result.errorMessage).toContain('Suite > fails 0');
+                    expect(result.errorMessage).toContain('Suite > fails 19');
+                    expect(result.errorMessage).not.toContain('Suite > fails 20');
+                    expect(result.errorMessage).toContain('...and 5 more');
+                }
+            });
+
+            it('ERROR branch regression: message is byte-identical to the pre-enrichment format when inspector has no failed tests', async () => {
+                mockProcessResult({ exitCode: 1, stderr: 'some error' });
+                mockInspectorClient.getTests.mockReturnValue([]);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([]);
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                const result = await runner.dryRun();
+
+                expect(result.status).toBe(DryRunStatus.Error);
+                if(result.status === DryRunStatus.Error) {
+                    expect(result.errorMessage).toBe('Bun test process failed with exit code 1\nsome error');
+                }
+            });
+
+            it('COMPLETE branch: appends the inspector error stack to a failed test\'s failureMessage', async () => {
+                mockProcessResult({ exitCode: 1, stdout: '✗ my test\n 1 fail' });
+                const testHierarchy: TestInfo[] = [
+                    {
+                        id:       1,
+                        name:     'my test',
+                        fullName: 'Suite > my test',
+                        type:     'test',
+                        status:   'fail',
+                        error:    { message: 'expected true to be false', stack: 'Error: expected true to be false\n    at Suite (file.test.ts:10:1)' },
+                    },
+                ];
+                mockInspectorClient.getTests.mockReturnValue(testHierarchy);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([1]);
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                const result = await runner.dryRun();
+
+                expect(result.status).toBe(DryRunStatus.Complete);
+                if(result.status === DryRunStatus.Complete) {
+                    const failed = result.tests.find(t => t.status === TestStatus.Failed);
+                    expect(failed).toBeDefined();
+                    if(failed) {
+                        expect(failed.failureMessage).toContain('expected true to be false');
+                        expect(failed.failureMessage).toContain('at Suite (file.test.ts:10:1)');
+                        // Stack must not be duplicated when appended
+                        const stackOccurrences = failed.failureMessage.split('at Suite (file.test.ts:10:1)').length - 1;
+                        expect(stackOccurrences).toBe(1);
+                    }
+                }
+            });
+
+            it('MISMATCH diagnostic: warns when bun reports a failure but no built test is Failed', async () => {
+                // parsed.failed must be > 0 here so checkDryRunProcessResult's ERROR
+                // early-return (exitCode !== 0 && parsed.failed === 0) does not fire —
+                // this exercises the Complete-path mismatch diagnostic instead, which
+                // is exactly the incident fingerprint: bun's summary says 1 failed, but
+                // nothing in the recap or inspector data says which test.
+                mockProcessResult({ exitCode: 1, stdout: '1 tests failed:\n 1 fail', stderr: 'x'.repeat(600) });
+                const testHierarchy: TestInfo[] = [
+                    { id: 1, name: 'test1', fullName: 'test1', type: 'test', status: 'pass' },
+                ];
+                mockInspectorClient.getTests.mockReturnValue(testHierarchy);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([1]);
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                const result = await runner.dryRun();
+
+                // Diagnostic only — the returned result is unaffected.
+                expect(result.status).toBe(DryRunStatus.Complete);
+                if(result.status === DryRunStatus.Complete) {
+                    expect(result.tests.every(t => t.status === TestStatus.Success)).toBe(true);
+                }
+
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect.stringContaining('no failing test could be identified'),
+                    expect.anything(),
+                    expect.anything(),
+                    expect.stringContaining('x'.repeat(500))
+                );
+            });
+
+            it('MISMATCH diagnostic: does not warn when everything passes with exit code 0', async () => {
+                mockProcessResult({ exitCode: 0, stdout: '1 pass' });
+                const testHierarchy: TestInfo[] = [
+                    { id: 1, name: 'test1', fullName: 'test1', type: 'test', status: 'pass' },
+                ];
+                mockInspectorClient.getTests.mockReturnValue(testHierarchy);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([1]);
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                const result = await runner.dryRun();
+
+                expect(result.status).toBe(DryRunStatus.Complete);
+                expect(mockLogger.warn).not.toHaveBeenCalledWith(
+                    expect.stringContaining('no failing test could be identified'),
+                    expect.anything(),
+                    expect.anything(),
+                    expect.anything()
+                );
+            });
+        });
+
+        describe('cross-test async coverage-bleed warnings (backlog item 2)', () => {
+            /**
+             * Configure mockRunBunTests to signal the inspector ready then resolve
+             * with a minimal passing single-test run.
+             */
+            function mockPassingRun(): void {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({
+                        exitCode: 0,
+                        stdout:   '\n 1 pass\n',
+                        stderr:   '',
+                        timedOut: false,
+                    });
+                });
+                mockCollectCoverage.mockResolvedValue({ perTest: {}, 'static': {} });
+                mockInspectorClient.getTests.mockReturnValue([
+                    { id: 1, name: 'my test', fullName: 'Suite > my test', type: 'test', status: 'pass' },
+                ]);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([1]);
+            }
+
+            it('emits one warning per lateHit entry, resolving the test name via counterKeyToTestName', async () => {
+                mockPassingRun();
+                mockCollectLateHits.mockResolvedValue([
+                    { testId: 'tests/foo.test.ts@@test-1', mutantIds: ['5', '6'] },
+                    { testId: 'tests/foo.test.ts@@test-2', mutantIds: ['7'] },
+                ]);
+                mockMapCoverageToInspectorIds.mockReturnValue({
+                    coverage:                 { perTest: {}, 'static': {} },
+                    inspectorIdToProjectFile: new Map(),
+                    counterKeyToTestName:     new Map([
+                        ['tests/foo.test.ts@@test-1', 'tests/foo.test.ts > Suite > my test'],
+                        ['tests/foo.test.ts@@test-2', 'tests/foo.test.ts > Suite > another test'],
+                    ]),
+                });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                const result = await runner.dryRun();
+
+                // Diagnostic only — the returned result is unaffected.
+                expect(result.status).toBe(DryRunStatus.Complete);
+
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect.stringContaining("after '%s' completed"),
+                    'tests/foo.test.ts > Suite > my test',
+                    2,
+                    '5, 6'
+                );
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect.stringContaining("after '%s' completed"),
+                    'tests/foo.test.ts > Suite > another test',
+                    1,
+                    '7'
+                );
+            });
+
+            it('falls back to the raw counter-key testId when it cannot be resolved to a test name', async () => {
+                mockPassingRun();
+                mockCollectLateHits.mockResolvedValue([
+                    { testId: 'tests/unresolved.test.ts@@test-9', mutantIds: ['1'] },
+                ]);
+                mockMapCoverageToInspectorIds.mockReturnValue({
+                    coverage:                 { perTest: {}, 'static': {} },
+                    inspectorIdToProjectFile: new Map(),
+                    counterKeyToTestName:     new Map(), // resolution failed — key absent
+                });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect.stringContaining("after '%s' completed"),
+                    'tests/unresolved.test.ts@@test-9',
+                    1,
+                    '1'
+                );
+            });
+
+            it('does not warn when no lateHits were recorded', async () => {
+                mockPassingRun();
+                mockCollectLateHits.mockResolvedValue([]);
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+
+                expect(mockLogger.warn).not.toHaveBeenCalledWith(
+                    expect.stringContaining('mutant coverage was recorded between tests'),
+                    expect.anything(),
+                    expect.anything(),
+                    expect.anything()
+                );
+            });
+
+            it('caps individual warnings at MAX_COVERAGE_BLEED_WARNINGS (25) and adds a suppressed-count summary', async () => {
+                mockPassingRun();
+                const manyLateHits = Array.from({ length: 30 }, (_, i) => ({
+                    testId:    `tests/foo.test.ts@@test-${i}`,
+                    mutantIds: [`${i}`],
+                }));
+                mockCollectLateHits.mockResolvedValue(manyLateHits);
+                mockMapCoverageToInspectorIds.mockReturnValue({
+                    coverage:                 { perTest: {}, 'static': {} },
+                    inspectorIdToProjectFile: new Map(),
+                    counterKeyToTestName:     new Map(),
+                });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+
+                const bleedWarnCalls = (mockLogger.warn as ReturnType<typeof mock>).mock.calls.filter(
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- inspecting mock call args
+                    (call: any) => typeof call[0] === 'string' && call[0].includes('mutant coverage was recorded between tests')
+                );
+                expect(bleedWarnCalls).toHaveLength(25);
+
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    '...and %d more coverage-bleed warning(s) suppressed',
+                    5
+                );
+            });
+
+            it('never triggers bleed warnings on the mutantRun path', async () => {
+                mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({
+                        exitCode: 0,
+                        stdout:   '\n 1 pass\n',
+                        stderr:   '',
+                        timedOut: false,
+                    });
+                });
+                mockCollectLateHits.mockResolvedValue([
+                    { testId: 'tests/foo.test.ts@@test-1', mutantIds: ['1'] },
+                ]);
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '1' } as any,
+                    testFilter:      [],
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+
+                // collectAndRemapCoverage (the only call site of collectLateHits) is never
+                // reached from mutantRun — collectLateHits must not have been called.
+                expect(mockCollectLateHits).not.toHaveBeenCalled();
+                expect(mockLogger.warn).not.toHaveBeenCalledWith(
+                    expect.stringContaining('mutant coverage was recorded between tests'),
+                    expect.anything(),
+                    expect.anything(),
+                    expect.anything()
+                );
             });
         });
     });
@@ -5478,7 +5911,7 @@ tests/example.test.ts:
         });
 
         describe('Lines 321, 451: ObjectLiteral handlers invocation', () => {
-            it('should pass empty handlers object to InspectorClient (no per-test relay needed)', async () => {
+            it('should pass only an onError handler to InspectorClient (no per-test relay needed; inspector errors must be logged, not swallowed)', async () => {
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
                     if(options.onInspectorReady) {
@@ -5512,9 +5945,17 @@ tests/example.test.ts:
 
                 await runner.dryRun();
 
-                // Coverage uses file-prefixed counter keys (Bun.main@@test-N), no per-test relay needed
+                // Coverage uses file-prefixed counter keys (Bun.main@@test-N), no per-test
+                // relay needed — but onError IS wired up (previously silently discarded
+                // every inspector error).
                 expect(capturedHandlers).toBeDefined();
-                expect(capturedHandlers).toEqual({});
+                expect(Object.keys(capturedHandlers!)).toEqual(['onError']);
+                expect(typeof capturedHandlers!.onError).toBe('function');
+
+                // The handler logs at warn level.
+                (mockLogger.warn as ReturnType<typeof mock>).mockClear();
+                (capturedHandlers!.onError as (error: Error) => void)(new Error('Test start event for unknown test ID: 999'));
+                expect(mockLogger.warn).toHaveBeenCalledWith('Inspector error: %s', 'Test start event for unknown test ID: 999');
             });
 
             it('should log exact debug message after enabling TestReporter (line 332)', async () => {
@@ -6451,6 +6892,522 @@ error: Third failure message
             });
         });
     });
+
+    // Covers the dry-run completeness gate + inspector-socket drain, guarding against a
+    // silently truncated inspector event stream, plus duplicate-suffix reconciliation.
+    describe('dry-run completeness gate', () => {
+        /** Build a healthy N-test hierarchy/executionOrder pair, all status 'pass'. */
+        function healthyHierarchy(n: number): TestInfo[] {
+            return Array.from({ length: n }, (_, i) => ({
+                id:       i + 1,
+                name:     `test ${i + 1}`,
+                fullName: `test ${i + 1}`,
+                type:     'test' as const,
+                status:   'pass' as const,
+                url:      '/project/tests/healthy.test.ts',
+            }));
+        }
+
+        it('calls inspector.expectClose() then inspector.waitForClose() strictly before getTests()/getExecutionOrder() are read', async () => {
+            const callOrder: string[] = [];
+            mockInspectorClient.expectClose.mockImplementation(() => {
+                callOrder.push('expectClose');
+            });
+            mockInspectorClient.waitForClose.mockImplementation(() => {
+                callOrder.push('waitForClose');
+                return Promise.resolve();
+            });
+            mockInspectorClient.getTests.mockImplementation(() => {
+                callOrder.push('getTests');
+                return [];
+            });
+            mockInspectorClient.getExecutionOrder.mockImplementation(() => {
+                callOrder.push('getExecutionOrder');
+                return [];
+            });
+
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+            mockRunBunTests.mockImplementation((options: any) => {
+                if(options.onInspectorReady) {
+                    options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                }
+                return Promise.resolve({ exitCode: 0, stdout: '0 pass', stderr: '', timedOut: false });
+            });
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            await runner.dryRun();
+
+            expect(callOrder.indexOf('expectClose')).toBe(0);
+            expect(callOrder.indexOf('waitForClose')).toBe(1);
+            expect(callOrder.indexOf('getTests')).toBeGreaterThan(callOrder.indexOf('waitForClose'));
+            expect(callOrder.indexOf('getExecutionOrder')).toBeGreaterThan(callOrder.indexOf('waitForClose'));
+        });
+
+        it('Signal A fires: executionOrder truncated ~35% vs console summary counts on an otherwise-green run', async () => {
+            // Reproduces the incident shape: 100 tests per bun's own summary, but only 65
+            // ids ever reached the inspector's executionOrder (a truncated stream) — all 65
+            // that DID arrive report status 'pass', so the run otherwise looks green.
+            mockRunBunTests.mockImplementation(
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                (options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({ exitCode: 0, stdout: ' 100 pass\n 0 fail\n', stderr: '', timedOut: false });
+                }
+            );
+            const hierarchy = healthyHierarchy(65);
+            mockInspectorClient.getTests.mockReturnValue(hierarchy);
+            mockInspectorClient.getExecutionOrder.mockReturnValue(hierarchy.map(t => t.id));
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            const result = await runner.dryRun();
+
+            expect(result.status).toBe(DryRunStatus.Error);
+            if(result.status === DryRunStatus.Error) {
+                // All counts named in the message.
+                expect(result.errorMessage).toContain('100'); // consoleTotal
+                expect(result.errorMessage).toContain('65');  // nonSkippedExecutionCount
+                expect(result.errorMessage).toContain('35');  // shortfall
+            }
+        });
+
+        it('gate fires reproducing the FULL incident shape: ~35% executionOrder truncation AND orphaned coverage keys above the floor, on an otherwise-green run', async () => {
+            // Reproduces the original production incident: bun's console summary
+            // reported the full 8,611-test suite, but executionOrder was truncated ~35% at a
+            // file boundary AND thousands of coverage keys for the dropped files were
+            // orphaned — both signals material simultaneously, on a run whose 65 arrived ids
+            // all report 'pass' (no Failed built test, so the gate is reachable at all).
+            mockRunBunTests.mockImplementation(
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                (options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({ exitCode: 0, stdout: ' 100 pass\n 0 fail\n', stderr: '', timedOut: false });
+                }
+            );
+            const hierarchy = healthyHierarchy(65);
+            mockInspectorClient.getTests.mockReturnValue(hierarchy);
+            mockInspectorClient.getExecutionOrder.mockReturnValue(hierarchy.map(t => t.id));
+            mockCollectCoverage.mockResolvedValue({ 'static': {}, perTest: { x: { '1': 1 } } });
+            mockMapCoverageToInspectorIds.mockReturnValue({
+                coverage: undefined, inspectorIdToProjectFile: new Map(), counterKeyToTestName: new Map(), rawKeyCount: 100, orphanedKeyCount: 35,
+            });
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            const result = await runner.dryRun();
+
+            expect(result.status).toBe(DryRunStatus.Error);
+            if(result.status === DryRunStatus.Error) {
+                // Signal A's counts.
+                expect(result.errorMessage).toContain('100'); // consoleTotal
+                expect(result.errorMessage).toContain('65');  // nonSkippedExecutionCount
+                expect(result.errorMessage).toContain('35');  // shortfall (also equals orphanedKeyCount here — both named regardless)
+                // Signal B's counts.
+                expect(result.errorMessage).toContain('orphaned');
+                // Both reasons present, not just whichever was checked first.
+                expect(result.errorMessage).toContain('execution order');
+                expect(result.errorMessage).toContain('coverage key');
+            }
+        });
+
+        it('gate does NOT evaluate when the built tests already contain a Failed entry (A1)', async () => {
+            // A huge apparent Signal-A shortfall (51 consoleTotal vs 10 executionOrder) that
+            // WOULD fire if evaluated — but one of the 10 built tests is genuinely Failed, so
+            // per A1 the gate must not evaluate at all, and the real test failure must be
+            // reported normally (Complete, with the Failed test in the results).
+            mockRunBunTests.mockImplementation(
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                (options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({
+                        exitCode: 1,
+                        stdout:   ' 50 pass\n 1 fail\n',
+                        stderr:   '',
+                        timedOut: false,
+                    });
+                }
+            );
+            const hierarchy = healthyHierarchy(9);
+            hierarchy.push({
+                id: 10, name: 'failing test', fullName: 'failing test', type: 'test', status: 'fail', url: '/project/tests/healthy.test.ts',
+            });
+            mockInspectorClient.getTests.mockReturnValue(hierarchy);
+            mockInspectorClient.getExecutionOrder.mockReturnValue(hierarchy.map(t => t.id));
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            const result = await runner.dryRun();
+
+            expect(result.status).toBe(DryRunStatus.Complete);
+            if(result.status === DryRunStatus.Complete) {
+                expect(result.tests.some(t => t.status === TestStatus.Failed)).toBe(true);
+            }
+        });
+
+        it('Signal A does not fire for a healthy run containing retried tests (retries fire multiple TestReporter.start for the SAME id)', async () => {
+            // Empirically verified (bun 1.3.14, live inspector probe): a { retry: 2 } test
+            // fires ONE TestReporter.start per ATTEMPT for the SAME inspector id, so
+            // executionOrder can contain the same id more than once — inflating the
+            // inspector side, never the console side. Two tests here: id 1 retried twice
+            // before passing (3 start events, one id), id 2 a plain pass.
+            mockRunBunTests.mockImplementation(
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                (options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    // bun's summary counts TESTS, not attempts.
+                    return Promise.resolve({ exitCode: 0, stdout: ' 2 pass\n 0 fail\n', stderr: '', timedOut: false });
+                }
+            );
+            mockInspectorClient.getTests.mockReturnValue([
+                { id: 1, name: 'flaky', fullName: 'flaky', type: 'test', status: 'pass', url: '/project/tests/retry.test.ts' },
+                { id: 2, name: 'plain', fullName: 'plain', type: 'test', status: 'pass', url: '/project/tests/retry.test.ts' },
+            ]);
+            mockInspectorClient.getExecutionOrder.mockReturnValue([1, 1, 1, 2]);
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            const result = await runner.dryRun();
+
+            expect(result.status).toBe(DryRunStatus.Complete);
+        });
+
+        it('Signal A does not fire for a healthy run with a not-yet-implemented placeholder test present (it never fires TestReporter.start)', async () => {
+            // Empirically verified (bun 1.3.14, live inspector probe): bun's not-yet-
+            // implemented placeholder test API never fires TestReporter.start at all (only a
+            // TestReporter.end with the placeholder status), so it is simply absent from
+            // executionOrder — not present-but-filtered. bun's console never counts it in
+            // its pass/fail summary either.
+            mockRunBunTests.mockImplementation(
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                (options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({ exitCode: 0, stdout: ' 1 pass\n 0 fail\n 1 todo\n', stderr: '', timedOut: false });
+                }
+            );
+            mockInspectorClient.getTests.mockReturnValue([
+                { id: 1, name: 'runs',    fullName: 'runs',    type: 'test', status: 'pass', url: '/project/tests/todo.test.ts' },
+                { id: 2, name: 'a todo',  fullName: 'a todo',  type: 'test', status: 'todo', url: '/project/tests/todo.test.ts' },
+            ]);
+            // Only the test that actually ran fires TestReporter.start.
+            mockInspectorClient.getExecutionOrder.mockReturnValue([1]);
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            const result = await runner.dryRun();
+
+            expect(result.status).toBe(DryRunStatus.Complete);
+        });
+
+        it('Signal A does not fire when a custom --reporter bunArg zeros out the console summary on an otherwise-healthy run', async () => {
+            // A non-default reporter (e.g. --reporter=junit) produces no ' N pass'/' N fail'
+            // textual summary at all, so parsed.summaryPassed/summaryFailed are legitimately 0
+            // even on a fully healthy run. consoleTotal===0 must never fire Signal A.
+            mockRunBunTests.mockImplementation(
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                (options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
+                }
+            );
+            const hierarchy = healthyHierarchy(50);
+            mockInspectorClient.getTests.mockReturnValue(hierarchy);
+            mockInspectorClient.getExecutionOrder.mockReturnValue(hierarchy.map(t => t.id));
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            const result = await runner.dryRun();
+
+            expect(result.status).toBe(DryRunStatus.Complete);
+        });
+
+        it('Signal A does not fire when console output is degraded to only \'Ran N tests\' on a healthy run with a meaningful skip count', async () => {
+            // Backlog item 5 fix (console-parser.ts): 100 executed + 20 skipped is a healthy
+            // run (>10 shortfall, >5% ratio if summaryPassed/summaryFailed were wrongly
+            // inferred from the 'Ran 120 tests' fallback: 120 vs 100 executed = a 20-test,
+            // ~17% shortfall — comfortably over both EXECUTION_SHORTFALL_ABS_FLOOR and
+            // EXECUTION_SHORTFALL_RATIO_THRESHOLD). Detailed ' N pass'/' N fail' summary lines
+            // are absent (degraded output, e.g. a custom reporter or truncated console
+            // capture) — only the 'Ran N tests' total-only fallback line is present. Because
+            // summaryPassed/summaryFailed must never be populated from that fallback, they
+            // stay 0, consoleTotal is 0, and Signal A's consoleTotal>0 guard keeps the gate
+            // from evaluating at all — the gate must NOT fire.
+            mockRunBunTests.mockImplementation(
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                (options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({ exitCode: 0, stdout: 'Ran 120 tests across 3 files. [500.00ms]', stderr: '', timedOut: false });
+                }
+            );
+            const hierarchy = healthyHierarchy(100);
+            for(let i = 0; i < 20; i++) {
+                hierarchy.push({
+                    id: 101 + i, name: `skipped ${i + 1}`, fullName: `skipped ${i + 1}`, type: 'test', status: 'skip', url: '/project/tests/healthy.test.ts',
+                });
+            }
+            mockInspectorClient.getTests.mockReturnValue(hierarchy);
+            mockInspectorClient.getExecutionOrder.mockReturnValue(hierarchy.map(t => t.id));
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            const result = await runner.dryRun();
+
+            expect(result.status).toBe(DryRunStatus.Complete);
+        });
+
+        it('Signal A does not fire when totals match despite an interior cross-file pairing gap (matched totals precondition)', async () => {
+            // The interior-gap diagnostic itself lives in coverage-mapper.ts (already covered
+            // there); this only confirms the completeness gate doesn't ALSO fire when the
+            // three top-level counts happen to already match, and doesn't interfere with that
+            // existing diagnostic firing independently.
+            mockRunBunTests.mockImplementation(
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                (options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({ exitCode: 0, stdout: ' 3 pass\n 0 fail\n', stderr: '', timedOut: false });
+                }
+            );
+            const hierarchy = healthyHierarchy(3);
+            mockInspectorClient.getTests.mockReturnValue(hierarchy);
+            mockInspectorClient.getExecutionOrder.mockReturnValue(hierarchy.map(t => t.id));
+            // orphanedKeyCount: 0 — a cross-file pairing gap resolves TO some inspector test
+            // (just the wrong file's), it doesn't orphan.
+            mockMapCoverageToInspectorIds.mockReturnValue({
+                coverage: undefined, inspectorIdToProjectFile: new Map(), counterKeyToTestName: new Map(), rawKeyCount: 3, orphanedKeyCount: 0,
+            });
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            const result = await runner.dryRun();
+
+            expect(result.status).toBe(DryRunStatus.Complete);
+        });
+
+        it('Signal A/B do not fire when the coverage file is wholly absent (rawKeyCount=0) on an otherwise-healthy run', async () => {
+            mockCollectCoverage.mockResolvedValue(undefined);
+            mockRunBunTests.mockImplementation(
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                (options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({ exitCode: 0, stdout: ' 10 pass\n 0 fail\n', stderr: '', timedOut: false });
+                }
+            );
+            const hierarchy = healthyHierarchy(10);
+            mockInspectorClient.getTests.mockReturnValue(hierarchy);
+            mockInspectorClient.getExecutionOrder.mockReturnValue(hierarchy.map(t => t.id));
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            const result = await runner.dryRun();
+
+            expect(result.status).toBe(DryRunStatus.Complete);
+        });
+
+        it('Signal B fires via orphaned-key count alone, even when Signal A is not material', async () => {
+            mockRunBunTests.mockImplementation(
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                (options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({ exitCode: 0, stdout: ' 20 pass\n 0 fail\n', stderr: '', timedOut: false });
+                }
+            );
+            const hierarchy = healthyHierarchy(20);
+            mockInspectorClient.getTests.mockReturnValue(hierarchy);
+            mockInspectorClient.getExecutionOrder.mockReturnValue(hierarchy.map(t => t.id));
+            // A non-empty raw coverage object so collectAndRemapCoverage reaches
+            // mapCoverageToInspectorIds instead of short-circuiting on a wholly-absent file.
+            mockCollectCoverage.mockResolvedValue({ 'static': {}, perTest: { x: { '1': 1 } } });
+            // consoleTotal (20) matches nonSkippedExecutionCount (20) exactly — Signal A inert.
+            mockMapCoverageToInspectorIds.mockReturnValue({
+                coverage: undefined, inspectorIdToProjectFile: new Map(), counterKeyToTestName: new Map(), rawKeyCount: 20, orphanedKeyCount: 6,
+            });
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            const result = await runner.dryRun();
+
+            expect(result.status).toBe(DryRunStatus.Error);
+            if(result.status === DryRunStatus.Error) {
+                expect(result.errorMessage).toContain('6');
+                expect(result.errorMessage).toContain('20');
+                expect(result.errorMessage).toContain('orphaned');
+            }
+        });
+
+        it('includes a "closed unexpectedly" context sentence in the Error message iff wasClosedUnexpectedly is true, without changing whether the gate fires', async () => {
+            const buildScenario = () => {
+                mockRunBunTests.mockImplementation(
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                    (options: any) => {
+                        if(options.onInspectorReady) {
+                            options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                        }
+                        return Promise.resolve({ exitCode: 0, stdout: ' 100 pass\n 0 fail\n', stderr: '', timedOut: false });
+                    }
+                );
+                const hierarchy = healthyHierarchy(65);
+                mockInspectorClient.getTests.mockReturnValue(hierarchy);
+                mockInspectorClient.getExecutionOrder.mockReturnValue(hierarchy.map(t => t.id));
+            };
+
+            buildScenario();
+            mockInspectorClient.wasClosedUnexpectedly = true;
+            const runner1 = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner1.init();
+            const result1 = await runner1.dryRun();
+            expect(result1.status).toBe(DryRunStatus.Error);
+            if(result1.status === DryRunStatus.Error) {
+                expect(result1.errorMessage).toContain('closed unexpectedly');
+            }
+
+            buildScenario();
+            mockInspectorClient.wasClosedUnexpectedly = false;
+            const runner2 = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner2.init();
+            const result2 = await runner2.dryRun();
+            expect(result2.status).toBe(DryRunStatus.Error);
+            if(result2.status === DryRunStatus.Error) {
+                expect(result2.errorMessage).not.toContain('closed unexpectedly');
+            }
+        });
+
+        it('a gated (Error) dry run does NOT persist the test registry file', async () => {
+            mockRunBunTests.mockImplementation(
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                (options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({ exitCode: 0, stdout: ' 100 pass\n 0 fail\n', stderr: '', timedOut: false });
+                }
+            );
+            const hierarchy = healthyHierarchy(65);
+            mockInspectorClient.getTests.mockReturnValue(hierarchy);
+            mockInspectorClient.getExecutionOrder.mockReturnValue(hierarchy.map(t => t.id));
+
+            mockWriteFile.mockClear();
+            mockRename.mockClear();
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            const result = await runner.dryRun();
+
+            expect(result.status).toBe(DryRunStatus.Error);
+            expect(mockWriteFile).not.toHaveBeenCalled();
+            expect(mockRename).not.toHaveBeenCalled();
+        });
+
+        it('does not double-message: when the gate fires, warnOnUnidentifiedDryRunFailure\'s warn does not also fire', async () => {
+            // Constructs the exact overlap case: exitCode!==0 AND parsed.failed>0 (so
+            // checkDryRunProcessResult's earlier exitCode!==0-with-zero-parsed-failures
+            // check does NOT short-circuit first), but the inspector shows no Failed test at
+            // all (so warnOnUnidentifiedDryRunFailure's own condition would ALSO be true) —
+            // and Signal A is independently material. The gate's Error must supersede; the
+            // "no failing test could be identified" warn must never fire.
+            mockRunBunTests.mockImplementation(
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                (options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({ exitCode: 1, stdout: ' 60 pass\n 1 fail\n', stderr: '', timedOut: false });
+                }
+            );
+            const hierarchy = healthyHierarchy(10); // all status 'pass' — no Failed entry
+            mockInspectorClient.getTests.mockReturnValue(hierarchy);
+            mockInspectorClient.getExecutionOrder.mockReturnValue(hierarchy.map(t => t.id));
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            const result = await runner.dryRun();
+
+            expect(result.status).toBe(DryRunStatus.Error);
+            expect(mockLogger.warn).not.toHaveBeenCalledWith(
+                expect.stringContaining('no failing test could be identified'),
+                expect.anything(),
+                expect.anything(),
+                expect.anything()
+            );
+        });
+
+        it('cross-module: the v2 registry (tests[].id) and mutantCoverage.perTest assign the IDENTICAL [N] suffix to the same physical duplicate-named test, regardless of execution-order shuffle', async () => {
+            // Real coverage-mapper.mapCoverageToInspectorIds runs alongside the real
+            // buildTestsFromInspector dedup logic in this one test — see the
+            // realMapCoverageToInspectorIds capture at module top.
+            mockMapCoverageToInspectorIds.mockImplementation(
+                (...args: Parameters<typeof realMapCoverageToInspectorIds>) => realMapCoverageToInspectorIds(...args)
+            );
+
+            mockRunBunTests.mockImplementation(
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                (options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({ exitCode: 0, stdout: ' 2 pass\n 0 fail\n', stderr: '', timedOut: false });
+                }
+            );
+
+            // Two duplicate-named tests, no line info, discovered in order [id 1, id 2] but
+            // EXECUTED (and thus coverage-key-inserted) in the SHUFFLED order [id 2, id 1].
+            mockInspectorClient.getTests.mockReturnValue([
+                { id: 1, name: 'dup', fullName: 'dup', type: 'test', status: 'pass', url: '/project/tests/dup.test.ts' },
+                { id: 2, name: 'dup', fullName: 'dup', type: 'test', status: 'pass', url: '/project/tests/dup.test.ts' },
+            ]);
+            mockInspectorClient.getExecutionOrder.mockReturnValue([2, 1]);
+
+            mockCollectCoverage.mockResolvedValue({
+                'static': {},
+                perTest:  {
+                    // Insertion (execution) order matches getExecutionOrder: id 2's key first.
+                    'tests/dup.test.ts@@test-1': { '100': 1 }, // → id 2 (executed first)
+                    'tests/dup.test.ts@@test-2': { '200': 1 }, // → id 1 (executed second)
+                },
+            });
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            const result = await runner.dryRun();
+
+            expect(result.status).toBe(DryRunStatus.Complete);
+            if(result.status !== DryRunStatus.Complete) {
+                return;
+            }
+
+            const registryNames = result.tests.map(t => t.name).toSorted((a, b) => a.localeCompare(b));
+            const coverageNames = Object.keys(result.mutantCoverage?.perTest ?? {}).toSorted((a, b) => a.localeCompare(b));
+
+            // Both the registry (v2 dedup) and the coverage map (buildDuplicateNameIndex)
+            // must agree on the exact same two suffixed names for the same physical tests —
+            // id 1 (discovered first) → [0], id 2 (discovered second) → [1] — regardless of
+            // id 2 having EXECUTED first.
+            expect(registryNames).toEqual(coverageNames);
+            expect(registryNames).toEqual([
+                'tests/dup.test.ts > dup [0]',
+                'tests/dup.test.ts > dup [1]',
+            ]);
+        });
+    });
 });
 
 // ── mutantRun testFilter integration tests ─────────────────────────────────
@@ -6469,11 +7426,14 @@ describe('mutantRun testFilter integration', () => {
         clientCount: number
     };
     let mockInspectorClient: {
-        connect:           ReturnType<typeof mock>
-        send:              ReturnType<typeof mock>
-        getTests:          ReturnType<typeof mock>
-        getExecutionOrder: ReturnType<typeof mock>
-        close:             ReturnType<typeof mock>
+        connect:               ReturnType<typeof mock>
+        send:                  ReturnType<typeof mock>
+        getTests:              ReturnType<typeof mock>
+        getExecutionOrder:     ReturnType<typeof mock>
+        close:                 ReturnType<typeof mock>
+        expectClose:           ReturnType<typeof mock>
+        waitForClose:          ReturnType<typeof mock>
+        wasClosedUnexpectedly: boolean
     };
 
     let runBunTestsSpy:                ReturnType<typeof spyOn>;
@@ -6532,11 +7492,14 @@ describe('mutantRun testFilter integration', () => {
         syncServerSpy = spyOn(syncServerModule, 'SyncServer').mockImplementation(() => mockSyncServer);
 
         mockInspectorClient = {
-            connect:           mock().mockResolvedValue(undefined),
-            send:              mock().mockResolvedValue(undefined),
-            getTests:          mock().mockReturnValue([]),
-            getExecutionOrder: mock().mockReturnValue([]),
-            close:             mock().mockResolvedValue(undefined),
+            connect:               mock().mockResolvedValue(undefined),
+            send:                  mock().mockResolvedValue(undefined),
+            getTests:              mock().mockReturnValue([]),
+            getExecutionOrder:     mock().mockReturnValue([]),
+            close:                 mock().mockResolvedValue(undefined),
+            expectClose:           mock().mockReturnValue(undefined),
+            waitForClose:          mock().mockResolvedValue(undefined),
+            wasClosedUnexpectedly: false,
         };
         // @ts-expect-error - Mocking constructor
         inspectorClientSpy = spyOn(inspectorModule, 'InspectorClient').mockImplementation(() => mockInspectorClient);

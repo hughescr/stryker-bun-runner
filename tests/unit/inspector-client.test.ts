@@ -118,6 +118,36 @@ describe('InspectorClient', () => {
             await connectPromise;
         });
 
+        // Regression test for the inspector bind/dial address mismatch: bun binds
+        // a bare `--inspect=<port>` to ::1 only, while a dial to "localhost"
+        // resolves via Node's net.connect fast path to 127.0.0.1, ignoring
+        // /etc/hosts — deterministic ECONNREFUSED on hosts with that v4/v6 split
+        // (e.g. Docker Desktop for Mac). The fix (process-runner.ts) pins bun's
+        // bind host to 127.0.0.1 so its echoed inspector URL, and therefore the
+        // URL passed here, is already 127.0.0.1. This client must dial that URL
+        // verbatim — no "localhost" normalization/substitution of its own — or a
+        // future edit here could silently reintroduce the mismatch.
+        it('should dial the exact url passed in options, with no host rewriting', async () => {
+            let dialedUrl: string | undefined;
+            const CapturingWebSocketConstructor = function(this: unknown, url: string) {
+                dialedUrl = url;
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock WebSocket constructor returns mock as any
+                return mockWs as any;
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock constructor needs flexible typing to stand in for the real WebSocket class
+            } as any;
+
+            const client = new InspectorClient({
+                url:            'ws://127.0.0.1:6499/abc123def456',
+                WebSocketClass: CapturingWebSocketConstructor,
+            });
+
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            expect(dialedUrl).toBe('ws://127.0.0.1:6499/abc123def456');
+        });
+
         it('should reject on connection timeout', async () => {
             jest.useFakeTimers();
             try {
@@ -2303,6 +2333,210 @@ describe('InspectorClient', () => {
                 expect((sendError as Error).message).toContain('Connection closed');
                 expect((sendError as Error).message).not.toContain('Connection closed unexpectedly');
             });
+        });
+    });
+
+    // expectClose()/waitForClose() let the runner drain the inspector socket before
+    // snapshotting; wasClosedUnexpectedly flags a close that wasn't preceded by
+    // expectClose(), which the runner's dry-run completeness gate treats as corroborating
+    // context for a possibly-truncated inspector event stream.
+    describe('expectClose / waitForClose / wasClosedUnexpectedly', () => {
+        it('does not set wasClosedUnexpectedly when expectClose() is called before any close event', async () => {
+            const client = new InspectorClient({
+                url: 'ws://localhost:6499',
+
+                WebSocketClass: MockWebSocketConstructor,
+            });
+
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            client.expectClose();
+            mockWs.close();
+
+            expect(client.wasClosedUnexpectedly).toBe(false);
+        });
+
+        it('sets wasClosedUnexpectedly when the socket closes with neither isClosing nor closeExpected set', async () => {
+            const client = new InspectorClient({
+                url: 'ws://localhost:6499',
+
+                WebSocketClass: MockWebSocketConstructor,
+            });
+
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            expect(client.wasClosedUnexpectedly).toBe(false);
+
+            // The incident shape: the WS dies mid-run before the runner has any idea
+            // the run is over (neither close() nor expectClose() has run yet).
+            mockWs.close();
+
+            expect(client.wasClosedUnexpectedly).toBe(true);
+        });
+
+        it('waitForClose() resolves immediately when the socket is already closed, with no timer left dangling', async () => {
+            jest.useFakeTimers();
+            try {
+                const client = new InspectorClient({
+                    url: 'ws://localhost:6499',
+
+                    WebSocketClass: MockWebSocketConstructor,
+                });
+
+                const connectPromise = client.connect();
+                mockWs.simulateOpen();
+                await connectPromise;
+
+                mockWs.close();
+
+                let resolved = false;
+                const waitPromise = client.waitForClose(1000).then(() => {
+                    resolved = true;
+                    return resolved;
+                });
+                // No fake-timer advance at all: if a timer were created, this would hang.
+                await waitPromise;
+                expect(resolved).toBe(true);
+                // No pending timers were ever scheduled by the immediate-resolve path.
+                expect(jest.getTimerCount()).toBe(0);
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('waitForClose(timeoutMs) resolves via the close event before the timeout fires, and clears the pending timer', async () => {
+            jest.useFakeTimers();
+            try {
+                const client = new InspectorClient({
+                    url: 'ws://localhost:6499',
+
+                    WebSocketClass: MockWebSocketConstructor,
+                });
+
+                const connectPromise = client.connect();
+                mockWs.simulateOpen();
+                await connectPromise;
+
+                let resolved = false;
+                const waitPromise = client.waitForClose(1000).then(() => {
+                    resolved = true;
+                    return resolved;
+                });
+
+                // Timer is pending until the close event arrives.
+                expect(jest.getTimerCount()).toBeGreaterThan(0);
+
+                mockWs.close();
+                await waitPromise;
+
+                expect(resolved).toBe(true);
+                // The timer scheduled for the timeout path must have been cleared —
+                // no leaked timer once the close event has already resolved us.
+                expect(jest.getTimerCount()).toBe(0);
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('waitForClose(timeoutMs) resolves via the timeout when no close event ever arrives', async () => {
+            jest.useFakeTimers();
+            try {
+                const client = new InspectorClient({
+                    url: 'ws://localhost:6499',
+
+                    WebSocketClass: MockWebSocketConstructor,
+                });
+
+                const connectPromise = client.connect();
+                mockWs.simulateOpen();
+                await connectPromise;
+
+                let resolved = false;
+                const waitPromise = client.waitForClose(1000).then(() => {
+                    resolved = true;
+                    return resolved;
+                });
+
+                expect(resolved).toBe(false);
+                jest.advanceTimersByTime(1000);
+                await waitPromise;
+                expect(resolved).toBe(true);
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+    });
+
+    describe('onError handler regression guard (inspector errors must be logged, not swallowed)', () => {
+        it('invokes a real onError handler for "Test start event for unknown test ID"', async () => {
+            const onError = mock((_e: Error) => {});
+            const client = new InspectorClient({
+                url:      'ws://localhost:6499',
+                handlers: { onError },
+
+                WebSocketClass: MockWebSocketConstructor,
+            });
+
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            mockWs.simulateMessage(
+                JSON.stringify({
+                    method: 'TestReporter.start',
+                    params: { id: 999 },
+                })
+            );
+
+            expect(onError).toHaveBeenCalledTimes(1);
+            expect(onError.mock.calls[0][0].message).toContain('Test start event for unknown test ID: 999');
+        });
+
+        it('invokes a real onError handler for a circular hierarchy reference', async () => {
+            const onError = mock((_e: Error) => {});
+            const client = new InspectorClient({
+                url:      'ws://localhost:6499',
+                handlers: { onError },
+
+                WebSocketClass: MockWebSocketConstructor,
+            });
+
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            mockWs.simulateMessage(
+                JSON.stringify({
+                    method: 'TestReporter.found',
+                    params: { id: 7, name: 'circular', type: 'test', parentId: 7 },
+                })
+            );
+
+            expect(onError).toHaveBeenCalledTimes(1);
+            expect(onError.mock.calls[0][0].message).toContain('Circular reference detected in test hierarchy:');
+        });
+
+        it('invokes a real onError handler for a WebSocket error event', async () => {
+            const onError = mock((_e: Error) => {});
+            const client = new InspectorClient({
+                url:      'ws://localhost:6499',
+                handlers: { onError },
+
+                WebSocketClass: MockWebSocketConstructor,
+            });
+
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            mockWs.simulateError();
+
+            expect(onError).toHaveBeenCalledTimes(1);
+            expect(onError.mock.calls[0][0].message).toContain('WebSocket connection failed');
         });
     });
 });

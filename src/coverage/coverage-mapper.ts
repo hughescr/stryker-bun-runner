@@ -6,6 +6,7 @@
 import type { MutantCoverage } from '@stryker-mutator/api/core';
 import type { Logger } from '@stryker-mutator/api/logging';
 import type { TestInfo } from '../inspector/types.js';
+import { buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery } from '../utils/duplicate-suffix.js';
 import { buildProjectFileTestName, buildUniqueTestName, normalizeTestFilePath } from '../utils/test-name.js';
 
 /**
@@ -15,10 +16,29 @@ import { buildProjectFileTestName, buildUniqueTestName, normalizeTestFilePath } 
  * - `inspectorIdToProjectFile`: inspector-ID → project-file mapping built during pairing.
  *   Only populated for the new file-prefixed format ("relativeFile@@test-N"); empty Map
  *   for legacy keys ("test-N") and passthrough paths (unknown format, empty, undefined).
+ * - `counterKeyToTestName`: raw counter key ("relativeFile@@test-N") → resolved full test
+ *   name, for keys whose testInfo was successfully resolved. Always present (empty Map
+ *   when not applicable), so callers (e.g. coverage-bleed warnings) can resolve a
+ *   pre-remap counter key to a human-readable test name without redoing the pairing work.
+ * - `rawKeyCount`: total number of coverage counter keys seen in `rawCoverage.perTest`
+ *   before any resolution. 0 for missing/empty input. For the legacy ("test-N") format
+ *   this is populated for context but `orphanedKeyCount` is always 0 for that format —
+ *   see `orphanedKeyCount` below.
+ * - `orphanedKeyCount`: number of counter keys whose entire FILE could not be paired
+ *   with any inspector test (i.e. `resolveCounterKeys` returned `testInfo: null` for
+ *   them) — the signature of a whole file dropped from the inspector stream, as opposed
+ *   to routine retry-overflow (which folds into the last paired test and never orphans).
+ *   Only populated for the new file-prefixed format; always 0 for the legacy format and
+ *   passthrough paths, which have no per-file pairing to orphan against — the dry-run
+ *   completeness gate's (bun-test-runner.ts) Signal B consumes this field and is
+ *   deliberately gate-blind for legacy coverage.
  */
 export interface CoverageMapResult {
     coverage:                 MutantCoverage | undefined
     inspectorIdToProjectFile: Map<number, string>
+    counterKeyToTestName:     Map<string, string>
+    rawKeyCount:              number
+    orphanedKeyCount:         number
 }
 
 /**
@@ -39,14 +59,20 @@ export function mapCoverageToInspectorIds(
     rawCoverage: MutantCoverage | undefined | null,
     executionOrder: number[],
     testHierarchy: Map<number, TestInfo>,
-    logger?: Pick<Logger, 'warn'>
+    logger?: Pick<Logger, 'warn' | 'debug'>
 ): CoverageMapResult {
     // Handle empty or missing coverage - return as-is.
     // rawCoverage can be undefined/null at runtime even though the primary overload
     // accepts only MutantCoverage — callers may pass partially-initialised global data.
     // Stryker disable next-line ConditionalExpression: equivalent mutation - empty perTest is also caught by firstKey check below
     if(!rawCoverage?.perTest || Object.keys(rawCoverage.perTest).length === 0) {
-        return { coverage: rawCoverage ?? undefined, inspectorIdToProjectFile: new Map() };
+        return {
+            coverage:                 rawCoverage ?? undefined,
+            inspectorIdToProjectFile: new Map(),
+            counterKeyToTestName:     new Map(),
+            rawKeyCount:              0,
+            orphanedKeyCount:         0,
+        };
     }
 
     const firstKey = Object.keys(rawCoverage.perTest)[0];
@@ -59,14 +85,27 @@ export function mapCoverageToInspectorIds(
     }
 
     // Legacy format: "test-N" (global counter keys, no file prefix).
-    // Fall back to global positional mapping via executionOrder.
+    // Fall back to global positional mapping via executionOrder. Kept gate-blind for
+    // Signal B (orphanedKeyCount always 0) — see the CoverageMapResult doc comment.
     // Stryker disable next-line Regex: anchors are defensive for pattern matching counter-based keys
     if(/^test-\d+$/.test(firstKey)) {
-        return { coverage: mapLegacyCounterKeys(rawCoverage, executionOrder, testHierarchy, logger), inspectorIdToProjectFile: new Map() };
+        return {
+            coverage:                 mapLegacyCounterKeys(rawCoverage, executionOrder, testHierarchy, logger),
+            inspectorIdToProjectFile: new Map(),
+            counterKeyToTestName:     new Map(),
+            rawKeyCount:              Object.keys(rawCoverage.perTest).length,
+            orphanedKeyCount:         0,
+        };
     }
 
     // Unknown format - assume already remapped and return unchanged.
-    return { coverage: rawCoverage, inspectorIdToProjectFile: new Map() };
+    return {
+        coverage:                 rawCoverage,
+        inspectorIdToProjectFile: new Map(),
+        counterKeyToTestName:     new Map(),
+        rawKeyCount:              Object.keys(rawCoverage.perTest).length,
+        orphanedKeyCount:         0,
+    };
 }
 
 /**
@@ -255,7 +294,7 @@ function resolveCounterKeys(
     counterIds: string[],
     fileToInspectorIds: Map<string, number[]>,
     testHierarchy: Map<number, TestInfo>,
-    logger?: Pick<Logger, 'warn'>
+    logger?: Pick<Logger, 'warn' | 'debug'>
 ): ResolvedCounterKey[] {
     return counterIds.map((key) => {
         const sepIdx = key.indexOf('@@');
@@ -281,15 +320,20 @@ function resolveCounterKeys(
             return { name: testName, testInfo, inspectorId };
         }
 
+        // Per-key detail is debug (not warn): a whole-file drop produces one of these
+        // PER KEY (potentially thousands, observed under CI runner contention when the
+        // inspector event stream is truncated), so the
+        // default-visible signal is the single aggregate warn in mapFilePrefixedCounterKeys;
+        // this stays available at debug level for anyone diagnosing a specific key.
         // Stryker disable StringLiteral: diagnostic logging message — format strings not functionally tested
-        logger?.warn(
+        logger?.debug(
             'Coverage key %s: no inspector test found for file "%s" at position %s '
             + '(file has %s tests in execution order). Skipping this test in coverage mapping.',
             // Stryker restore StringLiteral
             key,
             filePrefix,
             n,
-            // Stryker disable next-line LogicalOperator: equivalent mutant — fallback value only appears in the warn message, not in any mapping logic
+            // Stryker disable next-line LogicalOperator: equivalent mutant — fallback value only appears in the debug message, not in any mapping logic
             fileToInspectorIds.get(filePrefix)?.length ?? 0
         );
         // Stryker disable next-line StringLiteral: equivalent mutant — the unknown name is only used as a Map key that is immediately skipped (testInfo: null) in buildRemappedPerTest
@@ -331,48 +375,80 @@ function buildNameInspectorIds(resolved: ResolvedCounterKey[]): Map<string, Set<
 }
 
 /**
+ * Precompute the final ' [N]' suffix for every (inspectorId, baseName) pair
+ * across all duplicate-named groups, using the SAME (source line ascending,
+ * then discovery order) tie-break as bun-test-runner.ts's v2 registry dedup
+ * (buildTestsFromInspector) — see src/utils/duplicate-suffix.ts's doc comment
+ * for why this specific key is what makes the two call sites agree
+ * regardless of bun's per-run execution-order shuffle.
+ *
+ * @returns Map from `"${inspectorId}/${baseName}"` to its 0-based suffix index.
+ */
+function buildDuplicateNameIndex(
+    nameInspectorIds: Map<string, Set<number | undefined>>,
+    testHierarchy: Map<number, TestInfo>
+): Map<string, number> {
+    const discoveryOrderIndex = buildDiscoveryOrderIndex(testHierarchy.keys());
+    const indexByKey = new Map<string, number>();
+
+    for(const [baseName, ids] of nameInspectorIds) {
+        // Stryker disable next-line EqualityOperator: equivalent — undefined-size branch already excluded by Map value type (Set always has a numeric size); <= 1 vs < 1 both skip singleton groups, only <=1's boundary (size===1) matters and both reach the same "no suffix needed" outcome via the identical no-op (nothing added to indexByKey)
+        if(ids.size <= 1) {
+            continue;
+        }
+        const group = [...ids].filter((id): id is number => id !== undefined);
+        const sorted = sortDuplicateGroupByLineThenDiscovery(
+            group,
+            id => testHierarchy.get(id)?.line,
+            id => id,
+            discoveryOrderIndex
+        );
+        for(const [i, id] of sorted.entries()) {
+            indexByKey.set(`${id}/${baseName}`, i);
+        }
+    }
+
+    return indexByKey;
+}
+
+/**
  * Resolve a final (possibly suffixed) test name for the it.each deduplication case.
  *
  * When multiple DISTINCT inspector IDs share the same base name (it.each with a
- * template literal not yet interpolated), append `[0]`, `[1]`, … per inspector.
+ * template literal not yet interpolated), append `[0]`, `[1]`, … per inspector,
+ * assigned by {@link buildDuplicateNameIndex} — a pure lookup, no mutable state.
  * Retries (same inspector, same name) are detected by `distinctIds.size === 1`
  * and do NOT get a suffix.
  *
- * @param nameIndexes - Mutable map tracking the next available suffix index per name.
  * @returns The final (possibly suffixed) test name.
  */
 function resolveEachTestName(
     baseName: string,
     inspectorId: number | undefined,
     nameInspectorIds: Map<string, Set<number | undefined>>,
-    nameIndexes: Map<string, number>
+    duplicateNameIndex: Map<string, number>
 ): string {
     const distinctIds = nameInspectorIds.get(baseName);
     // Stryker disable next-line ConditionalExpression: equivalent — undefined distinctIds means count=1, no dedup
     if((distinctIds?.size ?? 1) <= 1) {
         return baseName;
     }
-    // it.each case: assign suffix the first time we see this inspectorId for this baseName.
     // Key format: "inspectorId/baseName" — inspectorId is always a number so the prefix is unambiguous.
     const key_ = `${inspectorId}/${baseName}`;
-    const existingIndex = nameIndexes.get(key_);
-    if(existingIndex === undefined) {
-        const nextIndex = nameIndexes.get(baseName) ?? 0;
-        nameIndexes.set(key_, nextIndex);
-        nameIndexes.set(baseName, nextIndex + 1);
-        return `${baseName} [${nextIndex}]`;
-    }
-    return `${baseName} [${existingIndex}]`;
+    // Stryker disable next-line LogicalOperator: equivalent — a key absent from duplicateNameIndex only happens for an inspectorId not in testHierarchy, which cannot occur here (resolveCounterKeys already filtered testInfo:null entries out before this is called); the ?? 0 fallback is unreachable in practice
+    const index = duplicateNameIndex.get(key_) ?? 0;
+    return `${baseName} [${index}]`;
 }
 
 function buildRemappedPerTest(
     counterIds: string[],
     resolved: ResolvedCounterKey[],
-    rawPerTest: MutantCoverage['perTest']
+    rawPerTest: MutantCoverage['perTest'],
+    testHierarchy: Map<number, TestInfo>
 ): Record<string, Record<string, number>> {
     const nameInspectorIds = buildNameInspectorIds(resolved);
+    const duplicateNameIndex = buildDuplicateNameIndex(nameInspectorIds, testHierarchy);
     const remappedPerTest: Partial<Record<string, Record<string, number>>> = {};
-    const nameIndexes = new Map<string, number>();
 
     for(const [i, key] of counterIds.entries()) {
         const { name: baseName, testInfo, inspectorId } = resolved[i];
@@ -381,7 +457,7 @@ function buildRemappedPerTest(
             continue;
         }
 
-        const finalName = resolveEachTestName(baseName, inspectorId, nameInspectorIds, nameIndexes);
+        const finalName = resolveEachTestName(baseName, inspectorId, nameInspectorIds, duplicateNameIndex);
 
         // Merge coverage data: if the entry already exists (retry of same test),
         // accumulate hit counts rather than overwriting.
@@ -440,11 +516,56 @@ function warnInteriorGapIfPresent(
     }
 }
 
+/**
+ * Aggregate orphan reporting: a key is
+ * "orphaned" when its entire FILE had no inspector pairing at all (resolveCounterKeys
+ * returned testInfo: null for it) — the signature of a whole file dropped from the
+ * inspector stream, as opposed to routine retry-overflow (which never orphans; it
+ * folds into the last paired test). Per-key detail is logger.debug (see
+ * resolveCounterKeys) — this single aggregate logger.warn is the default-visible
+ * signal.
+ *
+ * @returns The orphaned key count, for the caller to feed into the dry-run
+ *   completeness gate's Signal B (bun-test-runner.ts).
+ */
+function reportOrphanedKeys(
+    resolved:   readonly ResolvedCounterKey[],
+    counterIds: readonly string[],
+    logger?:    Pick<Logger, 'warn'>
+): number {
+    const orphanedIndexes: number[] = [];
+    for(const [i, r] of resolved.entries()) {
+        if(!r.testInfo) {
+            orphanedIndexes.push(i);
+        }
+    }
+    const orphanedKeyCount = orphanedIndexes.length;
+    if(orphanedKeyCount > 0) {
+        const orphanedFiles = new Set<string>();
+        for(const i of orphanedIndexes) {
+            const key = counterIds[i];
+            const sepIdx = key.indexOf('@@');
+            orphanedFiles.add(sepIdx === -1 ? key : key.slice(0, sepIdx));
+        }
+        // Stryker disable StringLiteral: diagnostic logging message
+        logger?.warn(
+            '%s of %s coverage key(s) across %s file(s) could not be paired with any inspector test '
+            + '(orphaned — see per-key detail at debug level). This can indicate the Bun inspector '
+            + 'stream was truncated mid-run.',
+            // Stryker restore StringLiteral
+            orphanedKeyCount,
+            counterIds.length,
+            orphanedFiles.size
+        );
+    }
+    return orphanedKeyCount;
+}
+
 function mapFilePrefixedCounterKeys(
     rawCoverage: MutantCoverage,
     executionOrder: number[],
     testHierarchy: Map<number, TestInfo>,
-    logger?: Pick<Logger, 'warn'>
+    logger?: Pick<Logger, 'warn' | 'debug'>
 ): CoverageMapResult {
     // Use Object.keys insertion order — this is the global chronological order
     // in which beforeEach fired, which matches executionOrder (minus skipped tests).
@@ -490,14 +611,35 @@ function mapFilePrefixedCounterKeys(
     // Stryker restore StringLiteral,LogicalOperator,ArithmeticOperator
 
     const resolved = resolveCounterKeys(counterIds, fileToInspectorIds, testHierarchy, logger);
-    const remappedPerTest = buildRemappedPerTest(counterIds, resolved, rawCoverage.perTest);
+    const remappedPerTest = buildRemappedPerTest(counterIds, resolved, rawCoverage.perTest, testHierarchy);
+
+    // Raw counter key -> resolved full test name, for keys whose testInfo resolved.
+    // Lets callers (e.g. coverage-bleed warnings) resolve a pre-remap counter key
+    // to a human-readable name without redoing the pairing/resolution work.
+    const counterKeyToTestName = new Map<string, string>();
+    for(const [i, key] of counterIds.entries()) {
+        if(resolved[i].testInfo) {
+            counterKeyToTestName.set(key, resolved[i].name);
+        }
+    }
+
+    // Aggregate orphan reporting — see
+    // reportOrphanedKeys' doc comment. The count feeds the dry-run completeness gate's
+    // Signal B (bun-test-runner.ts).
+    const orphanedKeyCount = reportOrphanedKeys(resolved, counterIds, logger);
 
     const coverage = stabilizeCoverage({
         'static': rawCoverage.static,
         perTest:  remappedPerTest,
     });
 
-    return { coverage, inspectorIdToProjectFile };
+    return {
+        coverage,
+        inspectorIdToProjectFile,
+        counterKeyToTestName,
+        rawKeyCount: counterIds.length,
+        orphanedKeyCount,
+    };
 }
 
 /**

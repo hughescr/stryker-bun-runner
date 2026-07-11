@@ -718,7 +718,14 @@ describe('runBunTests', () => {
             const spawnCall = mockSpawn.mock.calls[0];
 
             const args = spawnCall[1];
-            expect(args).toContain('--inspect=9229');
+            // Host is pinned to 127.0.0.1 (not left bare) so bun's bind address
+            // matches InspectorClient's dial address exactly. A bare --inspect=9229
+            // makes bun bind ::1 only, while a dial to "localhost" resolves via
+            // Node's fast path to 127.0.0.1 — deterministic ECONNREFUSED on any
+            // host with that v4/v6 split (e.g. Docker Desktop for Mac). This
+            // assertion is the regression test for that mismatch: it fails if the
+            // host prefix is ever dropped or changed.
+            expect(args).toContain('--inspect=127.0.0.1:9229');
         });
 
         it('should call onInspectorReady when inspector URL is found in stderr', async () => {
@@ -731,13 +738,17 @@ describe('runBunTests', () => {
                 onInspectorReady,
             });
 
-            // Simulate Bun's inspector URL output in stderr
-            mockChildProcess.stderrHandler?.(Buffer.from('Debugger listening on:\nListening:\n  ws://localhost:9229/abc123def456\n'));
+            // Simulate Bun's inspector URL output in stderr. Bun echoes back the
+            // host we passed to --inspect (verified live: `--inspect=127.0.0.1:P`
+            // produces "ws://127.0.0.1:P/..."), so the dial URL forwarded to
+            // onInspectorReady — and from there into InspectorClient — must be
+            // 127.0.0.1, matching the bind host pinned in runBunTests above.
+            mockChildProcess.stderrHandler?.(Buffer.from('Debugger listening on:\nListening:\n  ws://127.0.0.1:9229/abc123def456\n'));
 
             mockChildProcess.closeHandler?.(0);
             await resultPromise;
 
-            expect(onInspectorReady).toHaveBeenCalledWith('ws://localhost:9229/abc123def456');
+            expect(onInspectorReady).toHaveBeenCalledWith('ws://127.0.0.1:9229/abc123def456');
         });
 
         it('should only extract inspector URL once even with multiple stderr chunks', async () => {
@@ -752,7 +763,7 @@ describe('runBunTests', () => {
 
             // Simulate inspector URL in multiple chunks
             mockChildProcess.stderrHandler?.(Buffer.from('Debugger listening on:\n'));
-            mockChildProcess.stderrHandler?.(Buffer.from('Listening:\n  ws://localhost:9229/session1\n'));
+            mockChildProcess.stderrHandler?.(Buffer.from('Listening:\n  ws://127.0.0.1:9229/session1\n'));
             mockChildProcess.stderrHandler?.(Buffer.from('More stderr output\n'));
 
             mockChildProcess.closeHandler?.(0);
@@ -760,7 +771,7 @@ describe('runBunTests', () => {
 
             // Should be called exactly once
             expect(onInspectorReady).toHaveBeenCalledTimes(1);
-            expect(onInspectorReady).toHaveBeenCalledWith('ws://localhost:9229/session1');
+            expect(onInspectorReady).toHaveBeenCalledWith('ws://127.0.0.1:9229/session1');
         });
     });
 
@@ -917,7 +928,7 @@ describe('runBunTests', () => {
             });
 
             // Simulate inspector output
-            mockChildProcess.stderrHandler?.(Buffer.from('Listening:\n  ws://localhost:9229/abc123\n'));
+            mockChildProcess.stderrHandler?.(Buffer.from('Listening:\n  ws://127.0.0.1:9229/abc123\n'));
             mockChildProcess.closeHandler?.(0);
 
             // Should not crash despite onInspectorReady being undefined

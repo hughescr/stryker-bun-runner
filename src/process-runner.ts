@@ -67,7 +67,10 @@ export interface BunTestRunOptions {
 
     /**
    * Port for --inspect flag
-   * When provided, adds --inspect=<port> flag to enable debugging
+   * When provided, adds --inspect=127.0.0.1:<port> flag to enable debugging.
+   * The host is pinned to 127.0.0.1 (not left bare) so bun's bind address and
+   * InspectorClient's dial address are always the same literal string — see
+   * the comment at the call site in runBunTests for why this matters.
    */
     inspectWaitPort?: number
 
@@ -219,11 +222,21 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
     // Note: We use --inspect (not --inspect-wait) because Bun doesn't support
     // Runtime.runIfWaitingForDebugger to resume after connection.
     // This means tests start immediately, so we must connect quickly.
-    // Stryker disable ConditionalExpression,BlockStatement,StringLiteral: all mutations here remove required args, causing dryRun to never emit inspector URL → Timeout
+    // The host is pinned to 127.0.0.1 rather than left bare (`--inspect=<port>`):
+    // bun binds a bare --inspect=<port> to ::1 only, but InspectorClient dials
+    // whatever host bun echoes back in its "Listening:" banner (see the stderr
+    // handler below) through Node's `net.connect`, which resolves the literal
+    // string "localhost" to 127.0.0.1 via an internal fast path that ignores
+    // /etc/hosts and --dns-result-order. On any host with that v4/v6 split
+    // (observed in Docker Desktop for Mac) a bare port produces a deterministic
+    // ECONNREFUSED. Pinning bind and dial to the same explicit 127.0.0.1
+    // eliminates the mismatch. This is behavioral, not diagnostic, so unlike
+    // the disables below it is intentionally left un-disabled and is covered by
+    // the exact-arg assertion in process-runner.test.ts (inspector debugging).
+    // Stryker disable next-line ConditionalExpression,BlockStatement: all mutations here remove required args, causing dryRun to never emit inspector URL → Timeout
     if(options.inspectWaitPort) {
-        args.push(`--inspect=${options.inspectWaitPort}`);
+        args.push(`--inspect=127.0.0.1:${options.inspectWaitPort}`);
     }
-    // Stryker restore ConditionalExpression,BlockStatement,StringLiteral
 
     // Override the project bunfig with a sanitized copy to prevent coverage
     // thresholds and onlyFailures from interfering with mutation testing.
@@ -424,7 +437,13 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
                 // If inspector is enabled, parse stderr for WebSocket URL
                 if(options.inspectWaitPort && !inspectorUrlExtracted && options.onInspectorReady) {
                     const text = Buffer.concat(stderrChunks).toString();
-                    // Look for pattern: "Listening:\n  ws://localhost:PORT/SESSION_ID"
+                    // Look for pattern: "Listening:\n  ws://127.0.0.1:PORT/SESSION_ID"
+                    // Bun echoes back whatever host we passed to --inspect (verified: bare
+                    // port → "ws://localhost:...", "--inspect=127.0.0.1:P" → "ws://127.0.0.1:...").
+                    // The capture group below is host-agnostic and passed to onInspectorReady
+                    // (and from there straight into InspectorClient's dial URL) verbatim — so
+                    // pinning the bind host to 127.0.0.1 above is sufficient to keep bind and
+                    // dial identical; no host rewriting is needed here.
                     // Stryker disable next-line Regex: character classes are defensive for whitespace normalization
                     const match = /Listening:[\t\v\f\r \u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]*\n\s*(ws:\/\/\S+)/.exec(text);
                     if(match) {

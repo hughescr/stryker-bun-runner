@@ -8,7 +8,13 @@
 
 import { appendFileSync } from 'node:fs';
 import type { MutantCoverage } from '@stryker-mutator/api/core';
-import type { CoverageFileData } from './types.js';
+import type { CoverageFileData, LateHitEntry } from './types.js';
+
+// Re-exported so the coverage-preload template — which imports everything it
+// needs from this module via the `__PRELOAD_LOGIC_PATH__` placeholder — can
+// reference the type without a second relative import that wouldn't resolve
+// correctly once the template is copied to its temp-dir location.
+export type { LateHitEntry } from './types.js';
 
 export interface StrykerNamespace {
     mutantCoverage?: MutantCoverage
@@ -69,9 +75,46 @@ interface PartialMutantCoverage {
     perTest?:  MutantCoverage['perTest']
 }
 
+/**
+ * Detect cross-test async coverage bleed within a single gap window (the span
+ * between one test's afterEach and the next test's beforeEach).
+ *
+ * Compares the static bucket's per-key hit COUNTS at the start of the gap
+ * (`staticCountsAtLastBoundary`, snapshotted in afterEach) against the counts
+ * now (`staticCoverageNow`, read at the end of the gap). Any key whose count
+ * increased — or that is newly present — proves code executed while no test
+ * was active, i.e. after the previous test ended.
+ *
+ * Using count deltas rather than key presence is deliberate: a mutant that
+ * already bled once (and so already exists in the snapshot) must still be
+ * detected the next time it bleeds again.
+ *
+ * @param staticCountsAtLastBoundary - Static bucket counts snapshotted at the start of the gap window
+ * @param staticCoverageNow - Current static bucket counts (`strykerGlobal.mutantCoverage.static`), or undefined
+ * @returns Mutant ids whose static-bucket count increased during the gap window
+ */
+export function detectGapWindowBleed(
+    staticCountsAtLastBoundary: Map<string, number>,
+    staticCoverageNow: Record<string, number> | undefined
+): string[] {
+    if(!staticCoverageNow) {
+        return [];
+    }
+
+    const bledIds: string[] = [];
+    for(const [id, countNow] of Object.entries(staticCoverageNow)) {
+        const countAtBoundary = staticCountsAtLastBoundary.get(id) ?? 0;
+        if(countNow > countAtBoundary) {
+            bledIds.push(id);
+        }
+    }
+    return bledIds;
+}
+
 export function formatCoverageData(
     mutantCoverage: PartialMutantCoverage | undefined,
-    counterToName: Map<string, string>
+    counterToName: Map<string, string>,
+    lateHits: LateHitEntry[] = []
 ): CoverageFileData {
     if(!mutantCoverage) {
         return { perTest: {}, 'static': [] };
@@ -88,6 +131,8 @@ export function formatCoverageData(
     return {
         perTest,
         'static': staticCoverage,
+        // Copy so later mutation of the caller's accumulator array doesn't retroactively change already-written data.
+        ...(lateHits.length > 0 ? { lateHits: [...lateHits] } : {}),
     };
 }
 

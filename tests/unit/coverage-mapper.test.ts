@@ -9,7 +9,7 @@ import { mapCoverageToInspectorIds, buildInspectorIdToProjectFile } from '../../
 import type { TestInfo } from '../../src/inspector/types.js';
 
 describe('mapCoverageToInspectorIds', () => {
-    const makeLogger = () => ({ warn: mock(() => {}) });
+    const makeLogger = () => ({ warn: mock(() => {}), debug: mock(() => {}) });
 
     // ─────────────────────────────────────────────────────────────────────────
     // New format: "relativeFile@@test-N" keys (file-prefixed counter)
@@ -742,6 +742,54 @@ describe('mapCoverageToInspectorIds', () => {
             // No warning — node_modules URLs are skipped in the interior-gap check
             expect(logger.warn).not.toHaveBeenCalled();
         });
+
+        describe('counterKeyToTestName', () => {
+            it('maps each resolvable file-prefixed counter key to its resolved full test name', () => {
+                const rawCoverage: MutantCoverage = {
+                    'static': {},
+                    perTest:  {
+                        'tests/foo.test.ts@@test-1': { '1': 1 },
+                        'tests/foo.test.ts@@test-2': { '2': 1 },
+                    },
+                };
+
+                const executionOrder = [1, 2];
+                const testHierarchy = new Map<number, TestInfo>([
+                    [1, { id: 1, name: 'alpha', fullName: 'Suite > alpha', type: 'test', url: 'file:///.stryker-tmp/sandbox-A/tests/foo.test.ts', status: 'pass' }],
+                    [2, { id: 2, name: 'beta',  fullName: 'Suite > beta',  type: 'test', url: 'file:///.stryker-tmp/sandbox-A/tests/foo.test.ts', status: 'pass' }],
+                ]);
+
+                const { counterKeyToTestName } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+
+                expect(counterKeyToTestName.get('tests/foo.test.ts@@test-1')).toBe('tests/foo.test.ts > Suite > alpha');
+                expect(counterKeyToTestName.get('tests/foo.test.ts@@test-2')).toBe('tests/foo.test.ts > Suite > beta');
+                expect(counterKeyToTestName.size).toBe(2);
+            });
+
+            it('omits counter keys whose resolution failed (no matching inspector test)', () => {
+                // Only one inspector test exists, but two counter keys are present for
+                // the same file — the second key's resolution fails (per resolveCounterKeys'
+                // "no fileIds" / clamped-index behavior), so it must be absent from the map.
+                const rawCoverage: MutantCoverage = {
+                    'static': {},
+                    perTest:  {
+                        'tests/only.test.ts@@test-1':    { '1': 1 },
+                        'tests/missing.test.ts@@test-1': { '2': 1 },
+                    },
+                };
+
+                const executionOrder = [1];
+                const testHierarchy = new Map<number, TestInfo>([
+                    [1, { id: 1, name: 'solo', fullName: 'solo', type: 'test', url: 'file:///.stryker-tmp/sandbox-A/tests/only.test.ts', status: 'pass' }],
+                ]);
+
+                const logger = makeLogger();
+                const { counterKeyToTestName } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy, logger);
+
+                expect(counterKeyToTestName.get('tests/only.test.ts@@test-1')).toBe('tests/only.test.ts > solo');
+                expect(counterKeyToTestName.has('tests/missing.test.ts@@test-1')).toBe(false);
+            });
+        });
     });
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1141,6 +1189,54 @@ describe('mapCoverageToInspectorIds', () => {
                 'tests/x.test.ts > Mapped > test': { '1': 1 },
             });
             expect(logger.warn).not.toHaveBeenCalled();
+        });
+    });
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // counterKeyToTestName is always present, empty for legacy/unknown/empty formats
+    // ─────────────────────────────────────────────────────────────────────────
+    describe('counterKeyToTestName empty-map guarantee', () => {
+        it('is an empty Map for legacy test-N keys', () => {
+            const rawCoverage: MutantCoverage = {
+                'static': {},
+                perTest:  { 'test-1': { '1': 1 } },
+            };
+            const executionOrder = [42];
+            const testHierarchy = new Map<number, TestInfo>([
+                [42, { id: 42, name: 'test', fullName: 'Mapped > test', type: 'test' }],
+            ]);
+
+            const { counterKeyToTestName } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+
+            expect(counterKeyToTestName).toEqual(new Map());
+        });
+
+        it('is an empty Map for unknown-format keys (passthrough)', () => {
+            const rawCoverage: MutantCoverage = {
+                'static': { '1': 1 },
+                perTest:  { 'Suite > test1': { '2': 1 } },
+            };
+            const executionOrder = [42];
+            const testHierarchy = new Map<number, TestInfo>([
+                [42, { id: 42, name: 'test1', fullName: 'Different > test1', type: 'test' }],
+            ]);
+
+            const { counterKeyToTestName } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+
+            expect(counterKeyToTestName).toEqual(new Map());
+        });
+
+        it('is an empty Map when perTest is empty', () => {
+            const rawCoverage: MutantCoverage = { 'static': { '1': 1 }, perTest: {} };
+            const { counterKeyToTestName } = mapCoverageToInspectorIds(rawCoverage, [], new Map());
+
+            expect(counterKeyToTestName).toEqual(new Map());
+        });
+
+        it('is an empty Map when rawCoverage is undefined', () => {
+            const { counterKeyToTestName } = mapCoverageToInspectorIds(undefined, [], new Map());
+
+            expect(counterKeyToTestName).toEqual(new Map());
         });
     });
 
@@ -1776,5 +1872,189 @@ describe('buildInspectorIdToProjectFile', () => {
         expect(result.get(10)).toBe('tests/a.test.ts');
         // The malformed key uses the full key string as the prefix (not a truncated version)
         expect(result.get(11)).toBe('malformed-key');
+    });
+});
+
+// Aggregate orphaned-key warning + rawKeyCount/orphanedKeyCount.
+describe('orphaned-key reporting', () => {
+    const makeLogger = () => ({ warn: mock(() => {}), debug: mock(() => {}) });
+
+    it('emits exactly ONE aggregate warn when a whole file is orphaned, with per-key detail at debug', () => {
+        // File a.test.ts (2 tests) pairs fine; file b.test.ts (3 tests) is entirely absent
+        // from testHierarchy — the incident shape (a whole file dropped from the inspector
+        // stream). executionOrder still lists file b's ids (their TestReporter.start events
+        // fired) but testHierarchy never got a 'found' event for them.
+        const rawCoverage: MutantCoverage = {
+            'static': {},
+            perTest:  {
+                'a.test.ts@@test-1': { '1': 1 },
+                'a.test.ts@@test-2': { '2': 1 },
+                'b.test.ts@@test-1': { '3': 1 },
+                'b.test.ts@@test-2': { '4': 1 },
+                'b.test.ts@@test-3': { '5': 1 },
+            },
+        };
+        const executionOrder = [10, 11, 20, 21, 22];
+        const testHierarchy = new Map<number, TestInfo>([
+            [10, { id: 10, name: 'a1', fullName: 'a1', type: 'test', status: 'pass' }],
+            [11, { id: 11, name: 'a2', fullName: 'a2', type: 'test', status: 'pass' }],
+            // 20, 21, 22 (file b's tests) are MISSING — whole file dropped.
+        ]);
+
+        const logger = makeLogger();
+        const { coverage: result, rawKeyCount, orphanedKeyCount } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy, logger);
+
+        expect(rawKeyCount).toBe(5);
+        expect(orphanedKeyCount).toBe(3);
+
+        // Only file a's 2 tests resolved.
+        expect(result!.perTest).toEqual({
+            'a.test.ts > a1': { '1': 1 },
+            'a.test.ts > a2': { '2': 1 },
+        });
+
+        // Exactly ONE aggregate warn (not one per orphaned key).
+        expect(logger.warn).toHaveBeenCalledTimes(1);
+        expect(logger.warn).toHaveBeenCalledWith(
+            expect.stringContaining('coverage key(s)'),
+            3, // orphaned
+            5, // total
+            1  // distinct affected files
+        );
+
+        // Per-key detail is now debug, not warn — one per orphaned key.
+        expect(logger.debug).toHaveBeenCalledTimes(3);
+        expect(logger.debug).toHaveBeenCalledWith(
+            expect.stringContaining('no inspector test found'),
+            expect.stringContaining('b.test.ts@@test-'),
+            'b.test.ts',
+            expect.any(Number),
+            3 // 3 tests in b.test.ts's fileToInspectorIds bucket
+        );
+    });
+
+    it('does not emit the aggregate warn when there are no orphaned keys', () => {
+        const rawCoverage: MutantCoverage = {
+            'static': {},
+            perTest:  { 'a.test.ts@@test-1': { '1': 1 } },
+        };
+        const executionOrder = [10];
+        const testHierarchy = new Map<number, TestInfo>([
+            [10, { id: 10, name: 'a1', fullName: 'a1', type: 'test', status: 'pass' }],
+        ]);
+
+        const logger = makeLogger();
+        const { rawKeyCount, orphanedKeyCount } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy, logger);
+
+        expect(rawKeyCount).toBe(1);
+        expect(orphanedKeyCount).toBe(0);
+        expect(logger.warn).not.toHaveBeenCalled();
+        expect(logger.debug).not.toHaveBeenCalled();
+    });
+
+    it('rawKeyCount/orphanedKeyCount are 0 for missing/empty coverage input', () => {
+        expect(mapCoverageToInspectorIds(undefined, [], new Map())).toMatchObject({ rawKeyCount: 0, orphanedKeyCount: 0 });
+        expect(mapCoverageToInspectorIds({ 'static': {}, perTest: {} }, [], new Map())).toMatchObject({ rawKeyCount: 0, orphanedKeyCount: 0 });
+    });
+
+    it('legacy ("test-N") format populates rawKeyCount but stays gate-blind: orphanedKeyCount is always 0', () => {
+        // Legacy format has no per-file pairing to orphan against — Signal A (which does not
+        // depend on coverage format) is the only protection for this path; see A6.
+        const rawCoverage: MutantCoverage = {
+            'static': {},
+            perTest:  {
+                'test-1': { '1': 1 },
+                // test-2 missing — a genuine mismatch, but still not counted as "orphaned"
+                // for this format.
+            },
+        };
+        const executionOrder = [10, 11];
+        const testHierarchy = new Map<number, TestInfo>([
+            [10, { id: 10, name: 'first', fullName: 'first', type: 'test' }],
+            [11, { id: 11, name: 'second', fullName: 'second', type: 'test' }],
+        ]);
+
+        const { rawKeyCount, orphanedKeyCount } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+
+        expect(rawKeyCount).toBe(1);
+        expect(orphanedKeyCount).toBe(0);
+    });
+
+    it('unknown-format passthrough populates rawKeyCount, orphanedKeyCount always 0', () => {
+        const rawCoverage: MutantCoverage = {
+            'static': {},
+            perTest:  { 'already-remapped-name': { '1': 1 } },
+        };
+
+        const { rawKeyCount, orphanedKeyCount } = mapCoverageToInspectorIds(rawCoverage, [], new Map());
+
+        expect(rawKeyCount).toBe(1);
+        expect(orphanedKeyCount).toBe(0);
+    });
+});
+
+// Duplicate-suffix reconciliation between the v2 registry and the coverage mapper.
+describe('duplicate-suffix reconciliation (buildDuplicateNameIndex / resolveEachTestName)', () => {
+    it('assigns [N] suffixes by SOURCE LINE even when execution order visits the later-line test first', () => {
+        // Two duplicate-named tests: 'dup' at line 20 (declared/discovered SECOND) and
+        // 'dup' at line 10 (declared/discovered FIRST) — but EXECUTION order (and thus the
+        // raw coverage key insertion order) visits the line-20 test before the line-10 test
+        // (bun's --seed shuffle can reorder execution independent of declaration order).
+        const rawCoverage: MutantCoverage = {
+            'static': {},
+            perTest:  {
+                // Execution/insertion order: id 2 (line 20) first, then id 1 (line 10).
+                'a.test.ts@@test-1': { '100': 1 }, // → id 2 (line 20), executed first
+                'a.test.ts@@test-2': { '200': 1 }, // → id 1 (line 10), executed second
+            },
+        };
+        // executionOrder reflects the SAME (shuffled) execution order: id 2 then id 1.
+        const executionOrder = [2, 1];
+        // testHierarchy (discovery order) lists id 1 (line 10, discovered first) BEFORE
+        // id 2 (line 20, discovered second) — declaration order, independent of the shuffle.
+        const testHierarchy = new Map<number, TestInfo>([
+            [1, { id: 1, name: 'dup', fullName: 'dup', type: 'test', line: 10, status: 'pass' }],
+            [2, { id: 2, name: 'dup', fullName: 'dup', type: 'test', line: 20, status: 'pass' }],
+        ]);
+
+        const { coverage: result } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+
+        // [0] must go to the EARLIER-LINE test (id 1, line 10) regardless of it having
+        // executed (and thus produced its coverage key) second.
+        expect(result!.perTest).toEqual({
+            'a.test.ts > dup [0]': { '200': 1 }, // id 1, line 10
+            'a.test.ts > dup [1]': { '100': 1 }, // id 2, line 20
+        });
+    });
+
+    it('tie-breaks identical/undefined line numbers by discovery order, deterministically regardless of Set-iteration order', () => {
+        // Three duplicate-named tests with NO line info (undefined) — line-based sort can't
+        // distinguish them, so the discovery-order tie-break must decide, and must do so the
+        // same way regardless of which order the underlying Set happens to iterate ids in
+        // (Set iteration is insertion-order in JS, but this guards against relying on that
+        // accidentally lining up with discovery order rather than using it explicitly).
+        const rawCoverage: MutantCoverage = {
+            'static': {},
+            perTest:  {
+                'a.test.ts@@test-1': { '100': 1 }, // → id 30 (discovered 3rd)
+                'a.test.ts@@test-2': { '200': 1 }, // → id 10 (discovered 1st)
+                'a.test.ts@@test-3': { '300': 1 }, // → id 20 (discovered 2nd)
+            },
+        };
+        const executionOrder = [30, 10, 20];
+        // Discovery order (Map insertion order): 10, then 20, then 30.
+        const testHierarchy = new Map<number, TestInfo>([
+            [10, { id: 10, name: 'dup', fullName: 'dup', type: 'test', status: 'pass' }],
+            [20, { id: 20, name: 'dup', fullName: 'dup', type: 'test', status: 'pass' }],
+            [30, { id: 30, name: 'dup', fullName: 'dup', type: 'test', status: 'pass' }],
+        ]);
+
+        const { coverage: result } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+
+        expect(result!.perTest).toEqual({
+            'a.test.ts > dup [0]': { '200': 1 }, // id 10, discovered 1st
+            'a.test.ts > dup [1]': { '300': 1 }, // id 20, discovered 2nd
+            'a.test.ts > dup [2]': { '100': 1 }, // id 30, discovered 3rd
+        });
     });
 });

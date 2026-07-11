@@ -33,7 +33,15 @@ export interface InspectorEventHandlers {
  * Options for creating an InspectorClient
  */
 export interface InspectorClientOptions {
-    /** WebSocket URL to connect to */
+    /**
+     * WebSocket URL to connect to. Dialed verbatim (no host rewriting) — callers
+     * must pass a host that matches what the inspector actually bound to. In
+     * particular, do not assume "localhost" resolves the way the bound address
+     * was specified: Node's net.connect resolves the literal string "localhost"
+     * to 127.0.0.1 via an internal fast path that ignores /etc/hosts, so a bind
+     * on ::1 (bun's default for `--inspect=<port>` with no host) and a dial to
+     * "localhost" can silently target different addresses and fail to connect.
+     */
     url:                string
     /** Event handlers for inspector events */
     handlers?:          InspectorEventHandlers
@@ -96,7 +104,7 @@ export class InspectorConnectionError extends Error {
  * @example
  * ```typescript
  * const client = new InspectorClient({
- *   url: 'ws://localhost:6499',
+ *   url: 'ws://127.0.0.1:6499',
  *   handlers: {
  *     onTestFound: (test) => console.log('Found:', test.fullName),
  *     onTestEnd: (test) => console.log('Completed:', test.fullName, test.status),
@@ -119,6 +127,32 @@ export class InspectorClient {
     private state:                   InspectorClientState;
     private isClosing = false;
     private readonly WebSocketClass: typeof WebSocket;
+
+    /**
+   * Set by {@link expectClose} the instant a caller knows the run is over —
+   * BEFORE awaiting any drain — so it always wins the race against the
+   * WebSocket's own OS-driven 'close' event (a same-tick synchronous set beats
+   * a queued event-listener callback). Orthogonal to `isClosing` (which tracks
+   * OUR OWN explicit {@link close} call): `closeExpected` lets `handleClose`
+   * distinguish "we knew this was coming" from "this happened while we still
+   * thought the run was in progress" without touching `close()`'s own semantics.
+   */
+    private closeExpected = false;
+
+    /** True once the underlying WebSocket has actually fired its 'close' event. */
+    private wsClosed = false;
+
+    /**
+   * True iff the WebSocket closed while neither {@link close} nor
+   * {@link expectClose} had run yet — i.e. the connection died out from under
+   * the runner before it had any idea the test run was over. Auxiliary
+   * context only; see bun-test-runner.ts's completeness gate for how this is
+   * used (never a standalone Error trigger).
+   */
+    private _wasClosedUnexpectedly = false;
+
+    /** Resolvers for in-flight {@link waitForClose} calls, drained by handleClose. */
+    private closeWaiters: (() => void)[] = [];
 
     constructor(options: InspectorClientOptions) {
         this.handlers = options.handlers ?? {};
@@ -238,6 +272,74 @@ export class InspectorClient {
         }
 
         this.ws = null;
+    }
+
+    /**
+   * Tell the client the caller knows the test run is over and any subsequent
+   * WebSocket 'close' event (or one that already raced ahead of this call) is
+   * expected, not a sign of data loss.
+   *
+   * Callers must invoke this the instant they know the run is over — BEFORE
+   * awaiting any drain via {@link waitForClose} — so the synchronous, same-tick
+   * flag set here always wins the race against the socket's own OS-driven
+   * teardown, which can only ever run as a later queued event-listener callback.
+   */
+    expectClose(): void {
+        this.closeExpected = true;
+    }
+
+    /**
+   * True iff the WebSocket closed before the caller had marked the run as over
+   * (neither {@link close} nor {@link expectClose} had run yet). Auxiliary
+   * context only — see bun-test-runner.ts's completeness gate.
+   */
+    get wasClosedUnexpectedly(): boolean {
+        return this._wasClosedUnexpectedly;
+    }
+
+    /**
+   * Wait for the underlying WebSocket to actually finish closing, up to
+   * `timeoutMs`. Resolves immediately if it has already closed (or was never
+   * opened). Always bounded by a timeout so a caller can never hang waiting
+   * for a 'close' event that — for whatever reason — never arrives.
+   */
+    async waitForClose(timeoutMs: number): Promise<void> {
+        // Stryker disable next-line ConditionalExpression,LogicalOperator: equivalent mutants only affect the fast-path skip — the slow path (falling through to the Promise below) still resolves correctly, just after an unnecessary timer; covered by 'resolves immediately when already closed'
+        if(this.wsClosed || !this.ws) {
+            return;
+        }
+        // Stryker disable next-line BlockStatement: removing the Promise body means resolve is never called → waitForClose never resolves → Timeout
+        return new Promise((resolve) => {
+            let settled = false;
+            // `finish` and `timer` mutually reference each other (finish clears timer;
+            // timer's callback calls finish), so one of the two must be declared before its
+            // value is known. Declared here (before `finish`, which closes over it) so
+            // `timer` is assigned by the time `finish` could possibly run — `setTimeout`'s
+            // callback can never fire synchronously, so this ordering is always safe despite
+            // the forward reference. Can't be `const`: the circular dependency means it can
+            // only be assigned after `finish` already exists.
+            // eslint-disable-next-line prefer-const -- see comment above; genuinely can't be const due to the finish/timer circular closure reference
+            let timer: ReturnType<typeof setTimeout>;
+            const finish = (): void => {
+                // Stryker disable next-line ConditionalExpression,BlockStatement: idempotency guard — without it, both the timer and handleClose calling finish() would double-clear/resolve; harmless in practice (Promise.resolve and clearTimeout are both no-ops on repeat) but the splice below would remove the wrong element on a second call, so this guard is defensive and not itself behaviorally observable
+                if(settled) {
+                    return;
+                }
+                settled = true;
+                clearTimeout(timer);
+                const idx = this.closeWaiters.indexOf(finish);
+                // Stryker disable next-line ConditionalExpression,EqualityOperator,BlockStatement: defensive — finish is always still in closeWaiters when called via the timer path (handleClose hasn't run), and already removed by handleClose's own drain when called via that path; the splice is a no-op either way, not independently tested
+                if(idx !== -1) {
+                    this.closeWaiters.splice(idx, 1);
+                }
+                resolve();
+            };
+            // Stryker disable next-line BlockStatement: removing setTimeout body means the timeout path never resolves; a close event still resolves via finish(), so this mutant is caught only by the dedicated 'resolves via timeout' test, not by every other waitForClose test
+            timer = setTimeout(() => {
+                finish();
+            }, timeoutMs);
+            this.closeWaiters.push(finish);
+        });
     }
 
     /**
@@ -416,10 +518,23 @@ export class InspectorClient {
    * Handle connection close
    */
     private handleClose(): void {
-        // Stryker disable next-line all: early return when intentionally closing prevents duplicate error handling, tested with expected vs unexpected close scenarios
-        if(this.isClosing) {
+        // Always runs first, regardless of isClosing/closeExpected, so any pending
+        // waitForClose() callers see the socket's actual closure as soon as it happens.
+        this.wsClosed = true;
+        const waiters = this.closeWaiters;
+        this.closeWaiters = [];
+        for(const finish of waiters) {
+            finish();
+        }
+
+        // Stryker disable next-line all: early return when intentionally closing (or when
+        // the caller already called expectClose()) prevents duplicate error handling,
+        // tested with expected vs unexpected close scenarios
+        if(this.isClosing || this.closeExpected) {
             return;
         }
+
+        this._wasClosedUnexpectedly = true;
 
         // Reject all pending requests
         const error = new InspectorConnectionError('Connection closed unexpectedly');

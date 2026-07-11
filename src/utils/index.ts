@@ -6,3 +6,4 @@ export { normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildPro
 export { buildTestNamePattern } from './test-name-pattern.js';
 export { discoverTestFiles } from './test-file-discovery.js';
 export { getProcessRssBytes, parseVmRss, parsePsRssOutput } from './process-rss.js';
+export { buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery } from './duplicate-suffix.js';

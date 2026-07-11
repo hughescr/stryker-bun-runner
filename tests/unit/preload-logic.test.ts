@@ -7,11 +7,13 @@ import {
     initializeStrykerNamespace,
     setActiveMutant,
     formatCoverageData,
+    detectGapWindowBleed,
     writeCoverageToFile,
     startOrphanWatchdog,
     type PreloadConfig,
     type StrykerNamespace
 } from '../../src/coverage/preload-logic';
+import type { LateHitEntry } from '../../src/coverage/types';
 
 describe('preload-logic', () => {
     describe('getPreloadConfig', () => {
@@ -292,6 +294,59 @@ describe('preload-logic', () => {
         });
     });
 
+    describe('detectGapWindowBleed', () => {
+        it('returns [] when the static bucket is unchanged', () => {
+            const snapshot = new Map([['1', 1], ['2', 3]]);
+            const result = detectGapWindowBleed(snapshot, { '1': 1, '2': 3 });
+            expect(result).toEqual([]);
+        });
+
+        it('reports a key that is newly present (not in the snapshot at all)', () => {
+            const snapshot = new Map([['1', 1]]);
+            const result = detectGapWindowBleed(snapshot, { '1': 1, '2': 1 });
+            expect(result).toEqual(['2']);
+        });
+
+        it('reports a key whose count increased even though it already existed in the snapshot', () => {
+            // This is the case a key-presence check would miss: '1' was already in the
+            // snapshot (it bled once before), and it bleeds AGAIN — the count increases.
+            const snapshot = new Map([['1', 1]]);
+            const result = detectGapWindowBleed(snapshot, { '1': 2 });
+            expect(result).toEqual(['1']);
+        });
+
+        it('does not report a key whose count decreased', () => {
+            // Not expected in practice (counts are monotonic), but the comparison must
+            // not misreport a decrease as a bleed.
+            const snapshot = new Map([['1', 5]]);
+            const result = detectGapWindowBleed(snapshot, { '1': 3 });
+            expect(result).toEqual([]);
+        });
+
+        it('does not report a key whose count is unchanged', () => {
+            const snapshot = new Map([['1', 2]]);
+            const result = detectGapWindowBleed(snapshot, { '1': 2 });
+            expect(result).toEqual([]);
+        });
+
+        it('returns [] when staticCoverageNow is undefined', () => {
+            const snapshot = new Map([['1', 1]]);
+            const result = detectGapWindowBleed(snapshot, undefined);
+            expect(result).toEqual([]);
+        });
+
+        it('returns [] for an empty snapshot and empty current counts', () => {
+            const result = detectGapWindowBleed(new Map(), {});
+            expect(result).toEqual([]);
+        });
+
+        it('reports multiple bled keys in the same gap window', () => {
+            const snapshot = new Map([['1', 1], ['2', 1]]);
+            const result = detectGapWindowBleed(snapshot, { '1': 2, '2': 1, '3': 1 });
+            expect(result.toSorted((a, b) => a.localeCompare(b))).toEqual(['1', '3']);
+        });
+    });
+
     describe('formatCoverageData', () => {
         it('returns empty data for undefined coverage', () => {
             const result = formatCoverageData(undefined, new Map());
@@ -419,6 +474,46 @@ describe('preload-logic', () => {
             // Only keys are returned, not values
             expect(result.static).toEqual(['1', '2']);
             expect(result.perTest['test-1']).toEqual(['3', '4']);
+        });
+
+        describe('lateHits (3rd arg)', () => {
+            const coverage: MutantCoverage = {
+                'static': { '1': 1 },
+                perTest:  {},
+            };
+
+            it('omitted 3rd arg leaves lateHits undefined', () => {
+                const result = formatCoverageData(coverage, new Map());
+                expect(result.lateHits).toBeUndefined();
+            });
+
+            it('empty lateHits array leaves lateHits undefined', () => {
+                const result = formatCoverageData(coverage, new Map(), []);
+                expect(result.lateHits).toBeUndefined();
+            });
+
+            it('non-empty lateHits is included verbatim in the returned data', () => {
+                const lateHits: LateHitEntry[] = [
+                    { testId: 'tests/foo.test.ts@@test-1', mutantIds: ['5', '6'] },
+                ];
+                const result = formatCoverageData(coverage, new Map(), lateHits);
+                expect(result.lateHits).toEqual(lateHits);
+            });
+
+            it('returns a copy — mutating the caller array afterward does not change the returned data', () => {
+                const lateHits: LateHitEntry[] = [
+                    { testId: 'tests/foo.test.ts@@test-1', mutantIds: ['5'] },
+                ];
+                const result = formatCoverageData(coverage, new Map(), lateHits);
+
+                // Mutate the caller's array after the call
+                lateHits.push({ testId: 'tests/foo.test.ts@@test-2', mutantIds: ['7'] });
+                lateHits.length = 0;
+
+                expect(result.lateHits).toEqual([
+                    { testId: 'tests/foo.test.ts@@test-1', mutantIds: ['5'] },
+                ]);
+            });
         });
     });
 

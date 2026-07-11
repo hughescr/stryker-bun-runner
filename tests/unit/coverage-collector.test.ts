@@ -6,7 +6,7 @@
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
-import { collectCoverage, cleanupCoverageFile } from '../../src/coverage/collector.js';
+import { collectCoverage, collectLateHits, cleanupCoverageFile } from '../../src/coverage/collector.js';
 import { mockReadFile, mockUnlink, resetFsMocks } from '../test-preload.js';
 
 describe('collectCoverage', () => {
@@ -668,6 +668,101 @@ describe('collectCoverage', () => {
             expect(result?.perTest).toHaveProperty('should handle spaces');
             expect(result?.perTest).toHaveProperty('should-handle-dashes');
         });
+    });
+});
+
+describe('collectLateHits', () => {
+    let tempCoverageFile: string;
+
+    const makeLogger = () => ({ warn: mock(() => {}) });
+
+    beforeEach(() => {
+        tempCoverageFile = path.join(tmpdir(), `test-coverage-${Date.now()}.json`);
+        mockReadFile.mockClear();
+    });
+
+    afterEach(() => {
+        resetFsMocks();
+    });
+
+    it('should return [] when no line has lateHits', async () => {
+        const jsonLines = `${JSON.stringify({
+            perTest:  { 'test-1': ['1'] },
+            'static': [],
+        })}\n`;
+
+        mockReadFile.mockResolvedValue(jsonLines);
+
+        const result = await collectLateHits(tempCoverageFile);
+
+        expect(result).toEqual([]);
+    });
+
+    it('should return [] when the coverage file does not exist', async () => {
+        mockReadFile.mockRejectedValue(new Error('ENOENT: no such file or directory'));
+
+        const result = await collectLateHits('/nonexistent/coverage.json');
+
+        expect(result).toEqual([]);
+    });
+
+    it('should concatenate lateHits across multiple JSON lines', async () => {
+        const jsonLines
+            = `${JSON.stringify({
+                perTest:  {},
+                'static': ['1'],
+                lateHits: [{ testId: 'tests/a.test.ts@@test-1', mutantIds: ['1'] }],
+            })}\n${
+                JSON.stringify({
+                    perTest:  {},
+                    'static': ['2'],
+                    lateHits: [{ testId: 'tests/b.test.ts@@test-3', mutantIds: ['2', '3'] }],
+                })}\n`;
+
+        mockReadFile.mockResolvedValue(jsonLines);
+
+        const result = await collectLateHits(tempCoverageFile);
+
+        expect(result).toEqual([
+            { testId: 'tests/a.test.ts@@test-1', mutantIds: ['1'] },
+            { testId: 'tests/b.test.ts@@test-3', mutantIds: ['2', '3'] },
+        ]);
+    });
+
+    it('should treat a line with no lateHits field as contributing none', async () => {
+        const jsonLines
+            = `${JSON.stringify({
+                perTest:  {},
+                'static': ['1'],
+                lateHits: [{ testId: 'tests/a.test.ts@@test-1', mutantIds: ['1'] }],
+            })}\n${
+                JSON.stringify({ perTest: {}, 'static': [] })}\n`;
+
+        mockReadFile.mockResolvedValue(jsonLines);
+
+        const result = await collectLateHits(tempCoverageFile);
+
+        expect(result).toEqual([{ testId: 'tests/a.test.ts@@test-1', mutantIds: ['1'] }]);
+    });
+
+    it('should skip malformed lines and log a warning, but still collect lateHits from valid lines', async () => {
+        const logger = makeLogger();
+        const jsonLines
+            = `${JSON.stringify({
+                perTest:  {},
+                'static': ['1'],
+                lateHits: [{ testId: 'tests/a.test.ts@@test-1', mutantIds: ['1'] }],
+            })}\n{ not valid json }\n`;
+
+        mockReadFile.mockResolvedValue(jsonLines);
+
+        const result = await collectLateHits(tempCoverageFile, logger);
+
+        expect(result).toEqual([{ testId: 'tests/a.test.ts@@test-1', mutantIds: ['1'] }]);
+        expect(logger.warn).toHaveBeenCalledWith(
+            expect.stringContaining('[Stryker Coverage] Failed to parse coverage line:'),
+            expect.any(String)
+        );
     });
 });
 

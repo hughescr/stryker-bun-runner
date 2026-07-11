@@ -26,16 +26,18 @@ import {
     generatePreloadScript,
     cleanupPreloadScript,
     collectCoverage,
+    collectLateHits,
     cleanupCoverageFile,
     resolveEagerModulesFromGlobs,
-    mapCoverageToInspectorIds
+    mapCoverageToInspectorIds,
+    type LateHitEntry
 } from './coverage/index.js';
 import { InspectorClient } from './inspector/index.js';
 import type { TestInfo } from './inspector/types.js';
 import type { StrykerBunOptions } from './options.js';
 import { parseBunTestOutput, type ParsedTestResults } from './parsers/console-parser.js';
 import { runBunTests } from './process-runner.js';
-import { getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, discoverTestFiles } from './utils/index.js';
+import { getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, discoverTestFiles, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery } from './utils/index.js';
 
 /**
  * Sleep for the given number of milliseconds.
@@ -103,6 +105,54 @@ function buildTestNameIndex(
  */
 // Stryker disable next-line Regex: version-coupled to bun's exact wording; see the doc comment above and mutantRun/checkRuntimeError's behavioral tests
 const ZERO_MATCH_TEST_PATTERN_RE = /matched 0 tests\./;
+
+/**
+ * Cap on how many failed-test entries formatInspectorFailureDetails lists
+ * individually before collapsing the remainder into a "...and N more" line.
+ * Keeps the dry-run error message bounded when a whole suite fails.
+ */
+const MAX_DRY_RUN_FAILURE_TESTS_LISTED = 20;
+
+/**
+ * Cap on how many coverage-bleed warnings emitCoverageBleedWarnings logs
+ * individually before collapsing the remainder into a "...and N more" line.
+ * Keeps dry-run log output bounded when many tests leak fire-and-forget work.
+ */
+const MAX_COVERAGE_BLEED_WARNINGS = 25;
+
+/**
+ * Dry-run completeness gate thresholds, guarding against a silently truncated
+ * inspector event stream (e.g. a whole test file dropped under CI runner
+ * contention) — see {@link BunTestRunner.checkCompletenessGate}. Conservative relative to the
+ * incident magnitude (executionOrder truncated ~35%, thousands of orphaned
+ * coverage keys) but not validated against production-scale healthy runs; a
+ * quick pass over real CI dry-run logs is worth doing before relying on these
+ * in a very high-volume environment. Signal A (execution/console shortfall):
+ * a shortfall must clear BOTH the absolute floor and the ratio floor to fire —
+ * this two-part rule protects small suites (where a handful of tests is a
+ * huge ratio) and huge suites (where a huge ratio would take a huge absolute
+ * count) symmetrically.
+ */
+const EXECUTION_SHORTFALL_ABS_FLOOR = 10;
+/** See {@link EXECUTION_SHORTFALL_ABS_FLOOR}. */
+const EXECUTION_SHORTFALL_RATIO_THRESHOLD = 0.05;
+/**
+ * Signal B (orphaned coverage keys) threshold — see
+ * {@link BunTestRunner.checkCompletenessGate}. A whole file dropped from the
+ * inspector stream orphans every one of that file's coverage keys at once, so
+ * this floor is deliberately much lower than Signal A's: even a small file
+ * (more than a handful of tests) dropped entirely should trip the gate.
+ */
+const ORPHANED_KEY_ABS_FLOOR = 5;
+
+/**
+ * How long the completeness gate waits, after {@link InspectorClient.expectClose}
+ * is called, for the WebSocket to actually finish closing before snapshotting
+ * inspector data — see the drain step in {@link BunTestRunner.dryRun}. This only
+ * needs to cover the gap between child-process exit and the WS's own teardown
+ * of an already-idle socket (not a real network round-trip), so it is kept short.
+ */
+const INSPECTOR_DRAIN_TIMEOUT_MS = 1000;
 
 /**
  * Bun test runner for Stryker mutation testing
@@ -433,6 +483,32 @@ export class BunTestRunner implements TestRunner {
     }
 
     /**
+   * Build the failureMessage for a single failed test in the Complete-path result.
+   *
+   * Base message prefers the parsed-console failure message, then the inspector's
+   * error.message, then falls back to a generic string. Stryker core's
+   * logFailedTestsInInitialRun prints exactly name+failureMessage for each failed
+   * test in the ConfigError initial-run path, so the inspector's error.stack (when
+   * present and not already part of the base message) is appended — that's what
+   * makes that path actionable instead of a bare one-liner.
+   *
+   * NOTE this is a genuine, intentional change to the content of the returned
+   * DryRunResult (a failed test's failureMessage is longer / carries a stack it
+   * didn't before) — not a diagnostic-only, log-line-only change like the two
+   * warn helpers below. Test statuses, ids, coverage, and mutantRun behavior
+   * are all unaffected; only failureMessage content is enriched.
+   */
+    private buildFailureMessage(testInfo: TestInfo, parsed: ParsedTestResults): string {
+        const parsedTest = parsed.tests.find(t => t.name.includes(testInfo.name));
+        // Stryker disable next-line StringLiteral: fallback error message has no behavioral impact
+        const baseFailureMessage = parsedTest?.failureMessage ?? testInfo.error?.message ?? 'Test failed';
+        const stack = testInfo.error?.stack;
+        return stack && !baseFailureMessage.includes(stack)
+            ? `${baseFailureMessage}\n${stack}`
+            : baseFailureMessage;
+    }
+
+    /**
    * Build test results from inspector data.
    *
    * Also returns a testNameIndex mapping each FINAL test id (dedup ' [N]'
@@ -530,16 +606,13 @@ export class BunTestRunner implements TestRunner {
             const startPosition = testInfo.line === undefined ? undefined : { line: testInfo.line, column: 0 };
 
             if(status === 'fail') {
-                // Find failure message from parsed output
-                const parsedTest = parsed.tests.find(t => t.name.includes(testInfo.name));
                 return {
                     id:             uniqueName,
                     name:           uniqueName,
                     fileName,
                     startPosition,
                     status:         TestStatus.Failed,
-                    // Stryker disable next-line StringLiteral: fallback error message has no behavioral impact
-                    failureMessage: parsedTest?.failureMessage ?? testInfo.error?.message ?? 'Test failed',
+                    failureMessage: this.buildFailureMessage(testInfo, parsed),
                     timeSpentMs:    elapsed,
                 } satisfies FailedTestResult;
             }
@@ -572,40 +645,44 @@ export class BunTestRunner implements TestRunner {
         // machinery is retained for genuinely-duplicate titles and older Bun.
         //
         // IMPORTANT: index assignment must be deterministic regardless of WebSocket
-        // message arrival order.  We sort each group of duplicate-named tests by their
-        // source line number BEFORE assigning [0], [1], … so the index is driven by
-        // the test's position in the source file, not by the order the inspector
-        // delivered its start/end events (which can vary run-to-run due to buffering).
+        // message arrival order, AND must agree with coverage-mapper.ts's
+        // buildDuplicateNameIndex (same physical test → same '[N]' suffix in both the
+        // registry and mutantCoverage.perTest). Both sites sort each group of duplicate-named tests by
+        // (source line ascending, then TestReporter.found discovery order) BEFORE
+        // assigning [0], [1], … — see src/utils/duplicate-suffix.ts for why discovery
+        // order (not execution/start order, which bun's --seed can shuffle) is the
+        // tie-break that keeps the two call sites in agreement.
+        const discoveryOrderIndex = buildDiscoveryOrderIndex(testHierarchy.map(t => t.id));
         const nameCounts = new Map<string, number>();
         for(const test of tests) {
             nameCounts.set(test.name, (nameCounts.get(test.name) ?? 0) + 1);
         }
 
-        // For names that appear multiple times, collect the group, sort by source line,
-        // then assign suffixes in line order so [0] always refers to the earliest
-        // occurrence in the file.
-        const nameGroups = new Map<string, typeof tests>();
-        for(const test of tests) {
+        // For names that appear multiple times, collect the group (test result paired
+        // with its inspector id for the discovery-order tie-break), sort, then assign
+        // suffixes in that order so [0] always refers to the earliest occurrence.
+        interface DupEntry { test: RunnerTestResult, inspectorId: number }
+        const nameGroups = new Map<string, DupEntry[]>();
+        for(const [i, test] of tests.entries()) {
             if((nameCounts.get(test.name) ?? 1) > 1) {
+                const entry: DupEntry = { test, inspectorId: executionOrder[i] };
                 const group = nameGroups.get(test.name);
                 if(group) {
-                    group.push(test);
+                    group.push(entry);
                 } else {
-                    nameGroups.set(test.name, [test]);
+                    nameGroups.set(test.name, [entry]);
                 }
             }
         }
         for(const [, group] of nameGroups) {
-            // Sort by source line ascending; tests without a line go last (stable secondary
-            // key: original position in `tests` via indexOf — already stable in V8/Bun).
-            group.sort((a, b) => {
-                // Stryker disable next-line StringLiteral: equivalent mutant — mutating 'startPosition' to '' makes the check `'' in a`, which is always false because test result objects never have an empty-string key; lineA resolves to Infinity either way
-                const lineA = 'startPosition' in a && a.startPosition ? a.startPosition.line : Infinity;
-                // Stryker disable next-line StringLiteral: equivalent mutant — mutating 'startPosition' to '' makes the check `'' in b`, which is always false because test result objects never have an empty-string key; lineB resolves to Infinity either way
-                const lineB = 'startPosition' in b && b.startPosition ? b.startPosition.line : Infinity;
-                return lineA - lineB;
-            });
-            for(const [i, test] of group.entries()) {
+            const sorted = sortDuplicateGroupByLineThenDiscovery(
+                group,
+                // Stryker disable next-line StringLiteral: equivalent mutant — mutating 'startPosition' to '' makes the check `'' in e.test`, which is always false because test result objects never have an empty-string key; the extracted line resolves to undefined (→ Infinity in the shared sort helper) either way
+                e => (('startPosition' in e.test && e.test.startPosition) ? e.test.startPosition.line : undefined),
+                e => e.inspectorId,
+                discoveryOrderIndex
+            );
+            for(const [i, { test }] of sorted.entries()) {
                 const uniqueName = `${test.name} [${i}]`;
                 test.id = uniqueName;
                 test.name = uniqueName;
@@ -758,7 +835,19 @@ export class BunTestRunner implements TestRunner {
                 url:               inspectorUrl,
                 connectionTimeout: this.inspectorTimeout,
                 requestTimeout:    this.inspectorTimeout,
-                handlers:          {},  // No per-test relay needed - coverage uses file-prefixed counter keys
+                // No per-test relay needed - coverage uses file-prefixed counter keys.
+                // onError IS wired up — previously
+                // `handlers: {}` silently discarded every inspector error (malformed
+                // messages, "Test start/end event for unknown test ID", circular hierarchy
+                // references, WS error events); a live-suite baseline check (16 files, 925
+                // tests, 2 runs) found zero such events on a healthy run, so nothing here
+                // warrants a quieter log level.
+                handlers:          {
+                    onError: (error: Error) => {
+                        // Stryker disable next-line StringLiteral: logging message only
+                        this.logger.warn('Inspector error: %s', error.message);
+                    },
+                },
             });
 
             // 6. Connect inspector client and enable test reporting
@@ -790,9 +879,18 @@ export class BunTestRunner implements TestRunner {
             const result = await testProcess;
             const totalElapsedMs = Date.now() - startTime;
 
-            // 9. Get inspector data before closing
+            // 9. Drain the inspector socket, then get inspector data before closing.
+            // expectClose() is called the instant we know the run is over — same tick,
+            // before any await — so it always wins the race against the WebSocket's own
+            // OS-driven 'close' event (a same-tick synchronous set beats a queued
+            // event-listener callback). waitForClose() then gives an already-idle socket
+            // a bounded window to actually finish closing before we snapshot, closing the
+            // race that let a truncated inspector stream go undetected in production.
+            inspector.expectClose();
+            await inspector.waitForClose(INSPECTOR_DRAIN_TIMEOUT_MS);
             const testHierarchy = inspector.getTests();
             const executionOrder = inspector.getExecutionOrder();
+            const wasClosedUnexpectedly = inspector.wasClosedUnexpectedly;
 
             await inspector.close();
 
@@ -802,30 +900,15 @@ export class BunTestRunner implements TestRunner {
 
             // 10–12. Handle timeout and process errors; parse output
             const parsed = parseBunTestOutput(result.stdout, result.stderr);
-            const earlyResult = this.checkDryRunProcessResult(result, parsed);
+            const earlyResult = this.checkDryRunProcessResult(result, parsed, testHierarchy);
             if(earlyResult) {
                 return earlyResult;
             }
 
-            // 13. Collect and remap coverage data
-            const { coverage: mutantCoverage, inspectorIdToProjectFile } = await this.collectAndRemapCoverage(testHierarchy, executionOrder);
-
-            // 14. Build test results from inspector data
-            const { tests, testNameIndex } = this.buildTestsFromInspector(testHierarchy, executionOrder, parsed, totalElapsedMs, inspectorIdToProjectFile);
-
-            // Sort tests by name to ensure consistent order across runs
-            // This is critical for Stryker's incremental mode - test IDs are assigned
-            // based on order, so inconsistent order breaks coveredBy correlation
-            tests.sort((a, b) => a.name.localeCompare(b.name));
-
-            // Cache test names and persist registry for killedBy resolution in mutantRun
-            await this.buildAndPersistTestRegistry(tests, testNameIndex);
-
-            return {
-                status: DryRunStatus.Complete,
-                tests,
-                mutantCoverage,
-            };
+            // 13–16. Collect/remap coverage, build tests, run the completeness gate, and
+            // (if it passes) persist the registry — extracted to keep dryRun()'s own
+            // complexity under the lint threshold; see buildGatedDryRunResult's doc comment.
+            return await this.buildGatedDryRunResult(result, parsed, testHierarchy, executionOrder, totalElapsedMs, wasClosedUnexpectedly);
         } finally {
             // Abort the child process if it is still running.  This is idempotent —
             // if the process already exited normally, the signal fires to a dead process
@@ -838,6 +921,57 @@ export class BunTestRunner implements TestRunner {
             // 10 (always). Close sync server — idempotent, safe even after early-return paths
             await syncServer.close();
         }
+    }
+
+    /**
+   * Post-child-exit dry-run pipeline: collect/remap coverage, build tests
+   * from inspector data, sort them for incremental-mode determinism, run the
+   * completeness gate, and — only if the gate passes — persist the test
+   * registry. Returns the gate's Error result when it fires, otherwise the
+   * Complete result.
+   *
+   * Extracted from dryRun() purely to keep dryRun()'s own cyclomatic
+   * complexity under the lint threshold; this is a pure code move — same call
+   * order and same early-return-on-gate-failure semantics as before.
+   */
+    private async buildGatedDryRunResult(
+        result:                { exitCode: number | null, stderr: string },
+        parsed:                ParsedTestResults,
+        testHierarchy:         TestInfo[],
+        executionOrder:        number[],
+        totalElapsedMs:        number,
+        wasClosedUnexpectedly: boolean
+    ): Promise<DryRunResult> {
+        // 13. Collect and remap coverage data
+        const { coverage: mutantCoverage, inspectorIdToProjectFile, rawKeyCount, orphanedKeyCount } = await this.collectAndRemapCoverage(testHierarchy, executionOrder);
+
+        // 14. Build test results from inspector data
+        const { tests, testNameIndex } = this.buildTestsFromInspector(testHierarchy, executionOrder, parsed, totalElapsedMs, inspectorIdToProjectFile);
+
+        // Sort tests by name to ensure consistent order across runs
+        // This is critical for Stryker's incremental mode - test IDs are assigned
+        // based on order, so inconsistent order breaks coveredBy correlation
+        tests.sort((a, b) => a.name.localeCompare(b.name));
+
+        // Completeness gate, guarding against a silently truncated inspector event
+        // stream — run AFTER tests are built (so it can see whether the run otherwise looks GREEN)
+        // but BEFORE persisting the registry below: a gated run must never let other
+        // Stryker workers load a corrupted/partial registry via loadRegistryFile().
+        const gateResult = this.checkCompletenessGate(executionOrder, testHierarchy, parsed, rawKeyCount, orphanedKeyCount, wasClosedUnexpectedly, tests);
+        if(gateResult) {
+            return gateResult;
+        }
+
+        // Cache test names and persist registry for killedBy resolution in mutantRun
+        await this.buildAndPersistTestRegistry(tests, testNameIndex);
+
+        this.warnOnUnidentifiedDryRunFailure(result, parsed, tests);
+
+        return {
+            status: DryRunStatus.Complete,
+            tests,
+            mutantCoverage,
+        };
     }
 
     /**
@@ -1248,8 +1382,9 @@ export class BunTestRunner implements TestRunner {
    * Returns a DryRunResult to short-circuit if the process failed, or null to proceed.
    */
     private checkDryRunProcessResult(
-        result: { timedOut: boolean, exitCode: number | null, stderr: string },
-        parsed: { failed: number }
+        result:        { timedOut: boolean, exitCode: number | null, stderr: string },
+        parsed:        { failed: number },
+        testHierarchy: TestInfo[]
     ): DryRunResult | null {
         if(result.timedOut) {
             // Stryker disable next-line StringLiteral: logging message only
@@ -1262,39 +1397,299 @@ export class BunTestRunner implements TestRunner {
         // Non-zero exit WITH parsed failures means real tests failed; fall through
         // so the caller can build a Complete result with the failed test details.
         if(result.exitCode !== 0 && parsed.failed === 0) {
+            // Structured data first: it's built from inspector data that survives even
+            // when bun's own stdout/stderr recap is truncated or missing (the incident
+            // this addresses), so it goes ahead of the raw stderr that may be useless.
+            const failureDetails = this.formatInspectorFailureDetails(testHierarchy);
+            const messageParts = [`Bun test process failed with exit code ${result.exitCode}`];
+            if(failureDetails) {
+                messageParts.push(failureDetails);
+            }
+            messageParts.push(result.stderr);
             return {
                 status:       DryRunStatus.Error,
-                errorMessage: `Bun test process failed with exit code ${result.exitCode}\n${result.stderr}`,
+                errorMessage: messageParts.join('\n'),
             };
         }
         return null;
     }
 
     /**
+   * Build a structured summary of failed tests observed via the inspector, for
+   * inclusion in checkDryRunProcessResult's error message. Bun's own stdout/stderr
+   * recap can be truncated or entirely empty on process failure, so this pulls
+   * failure detail straight from the inspector's TestReporter data instead —
+   * the same data buildTestsFromInspector would otherwise turn into per-test
+   * results, had the process not short-circuited into the error branch first.
+   *
+   * Returns '' when there are no failed tests in the hierarchy so callers can
+   * keep the plain exit-code+stderr message unchanged in that case. Only
+   * type === 'test' entries are considered — describe blocks can also carry
+   * status 'fail' (propagated from a failing child) and must not masquerade
+   * as failed tests here.
+   */
+    private formatInspectorFailureDetails(testHierarchy: TestInfo[]): string {
+        const failedTests = testHierarchy.filter(t => t.type === 'test' && t.status === 'fail');
+        if(failedTests.length === 0) {
+            return '';
+        }
+
+        const listed = failedTests.slice(0, MAX_DRY_RUN_FAILURE_TESTS_LISTED);
+        const lines = listed.map((t) => {
+            // Stryker disable next-line ConditionalExpression,LogicalOperator,StringLiteral: fallback message text has no behavioral impact
+            const message = t.error?.message ?? 'no error message captured';
+            let line = `  - ${t.fullName}: ${message}`;
+            if(t.error?.stack) {
+                const indentedStack = t.error.stack.split('\n').map(stackLine => `    ${stackLine}`).join('\n');
+                line += `\n${indentedStack}`;
+            }
+            return line;
+        });
+
+        const remaining = failedTests.length - listed.length;
+        if(remaining > 0) {
+            lines.push(`  ...and ${remaining} more`);
+        }
+
+        // Stryker disable next-line StringLiteral: diagnostic header text has no behavioral impact
+        return `${failedTests.length} test(s) reported failed via Bun's inspector (stdout/stderr recap may be truncated or missing):\n${lines.join('\n')}`;
+    }
+
+    /**
+   * Diagnostic-only check for the Complete dry-run path: bun reported a failure
+   * (non-zero exit, or a failed count in its console recap) but nothing in the
+   * built test results identifies which test failed. This is the observed
+   * incident fingerprint — bun prints e.g. "1 tests failed:" with an empty
+   * recap, the inspector shows no TestStatus.Failed entry, and nothing points
+   * at a culprit. An unhandled error firing between tests (e.g. a rejected
+   * fire-and-forget promise) rather than inside any single test body is a
+   * likely cause. Logs a warning only; this check itself never alters test
+   * statuses, ids, coverage, or the returned DryRunResult — contrast with
+   * buildFailureMessage above, which (elsewhere in this same dry-run path)
+   * DOES intentionally change a failed test's failureMessage content.
+   */
+    private warnOnUnidentifiedDryRunFailure(
+        result: { exitCode: number | null, stderr: string },
+        parsed: { failed: number },
+        tests:  readonly RunnerTestResult[]
+    ): void {
+        if((result.exitCode !== 0 || parsed.failed > 0) && !tests.some(t => t.status === TestStatus.Failed)) {
+            // Stryker disable next-line StringLiteral: diagnostic logging message only
+            this.logger.warn(
+                'Bun exited with code %s and its console output reported %d failed test(s), '
+                + 'but no failing test could be identified from inspector or console data. '
+                + 'An unhandled error firing between tests (e.g. a rejected fire-and-forget '
+                + 'promise) is a likely cause. Last 500 chars of stderr:\n%s',
+                String(result.exitCode),
+                parsed.failed,
+                result.stderr.slice(-500)
+            );
+        }
+    }
+
+    /**
+   * Dry-run data-completeness gate.
+   *
+   * Guards against the inspector event stream silently truncating mid-run
+   * (observed under CI runner contention): bun's own child-side coverage file
+   * can be complete while the inspector-derived `executionOrder` is cut off at
+   * a file boundary, and everything downstream of that (test results, coverage
+   * attribution) accepted the truncated data silently — a plausible-looking
+   * but corrupted score, not a loud failure.
+   *
+   * ONLY evaluated when the run otherwise looks GREEN (zero Failed entries in
+   * the already-built `tests`): an already-failing dry run is handled by
+   * {@link checkDryRunProcessResult} / {@link warnOnUnidentifiedDryRunFailure},
+   * and this precondition structurally prevents a failing beforeAll (which
+   * marks the rest of its describe/file Failed) from ever reaching Signal A —
+   * the incident's own signature was a run that looked completely healthy.
+   *
+   * Fires (returns a DryRunStatus.Error result) iff EITHER signal is material:
+   *
+   * - Signal A (execution/console shortfall): `consoleTotal` (bun's SUMMARY
+   *   pass+fail counts — deliberately NOT the parser's max(per-line, summary)
+   *   fields, so per-ATTEMPT retry output can never inflate it — see
+   *   ParsedTestResults.summaryPassed/summaryFailed) compared against the
+   *   count of ids in `executionOrder` whose status is neither 'skip' nor
+   *   bun's not-yet-implemented placeholder-test status. Retries do not
+   *   create a shortfall in this direction: empirically (bun 1.3.14), a
+   *   retried test fires ONE TestReporter.start per ATTEMPT for the SAME
+   *   inspector id — so executionOrder, if anything, grows on retries, and
+   *   bun's summary line counts tests, not attempts, either way. A material
+   *   shortfall must clear both an absolute floor and a ratio floor.
+   *
+   * - Signal B (orphaned coverage keys): `orphanedKeyCount` (a whole file's
+   *   coverage keys unpaired with any inspector test — see coverage-mapper.ts)
+   *   exceeding a small absolute floor. Deliberately gate-blind for the legacy
+   *   ("test-N") coverage format, which never populates this count — Signal A
+   *   still covers that path since it does not depend on coverage format.
+   *
+   * `wasClosedUnexpectedly` is NEVER a standalone trigger — the WS-vs-child-exit
+   * close race can plausibly be true on a nontrivial fraction of healthy runs —
+   * it is folded into the Error message only as corroborating context once the
+   * gate has already fired via Signal A or B.
+   *
+   * @returns A DryRunStatus.Error result if the gate fires, otherwise null.
+   */
+    private checkCompletenessGate(
+        executionOrder:        number[],
+        testHierarchy:         TestInfo[],
+        parsed:                Pick<ParsedTestResults, 'summaryPassed' | 'summaryFailed'>,
+        rawKeyCount:            number,
+        orphanedKeyCount:       number,
+        wasClosedUnexpectedly:  boolean,
+        tests:                  readonly RunnerTestResult[]
+    ): DryRunResult | null {
+        // Stryker disable next-line MethodExpression,EqualityOperator: equivalent — .some() vs .find()!==undefined would produce the same boolean; the guard itself (skip the gate when any built test already Failed) is covered by 'gate does not evaluate when built tests contain failures'
+        if(tests.some(t => t.status === TestStatus.Failed)) {
+            return null;
+        }
+
+        const testMap = new Map(testHierarchy.map(t => [t.id, t]));
+        const nonSkippedExecutionCount = executionOrder.filter((id) => {
+            const status = testMap.get(id)?.status;
+            // Stryker disable next-line EqualityOperator: both conditions needed — 'skip' and the placeholder-test status both mean "never fired beforeEach"; mirrors coverage-mapper.ts's own nonSkipped filter so the two can't drift
+            return status !== 'skip' && status !== 'todo';
+        }).length;
+
+        const consoleTotal = parsed.summaryPassed + parsed.summaryFailed;
+        const shortfall = consoleTotal - nonSkippedExecutionCount;
+        // Stryker disable next-line ConditionalExpression,EqualityOperator,LogicalOperator,ArithmeticOperator: threshold predicate — behaviorally tested via the dedicated gate-fires/gate-does-not-fire tests below; consoleTotal>0 guard prevents a division-by-zero-shaped false fire on an empty/zeroed-out console recap
+        const signalA = consoleTotal > 0
+          && shortfall > EXECUTION_SHORTFALL_ABS_FLOOR
+          && shortfall / consoleTotal > EXECUTION_SHORTFALL_RATIO_THRESHOLD;
+
+        // Stryker disable next-line EqualityOperator: threshold predicate — behaviorally tested via the dedicated gate-fires/gate-does-not-fire tests below
+        const signalB = orphanedKeyCount > ORPHANED_KEY_ABS_FLOOR;
+
+        // Stryker disable next-line LogicalOperator: equivalent mutants only affect the fast-path skip below; the message-building code that follows is unreachable (and untested as unreachable) when neither signal is material, so && vs || here is caught by the same gate-fires/gate-does-not-fire tests
+        if(!signalA && !signalB) {
+            return null;
+        }
+
+        const reasons: string[] = [];
+        if(signalA) {
+            reasons.push(
+                `console reported ${consoleTotal} test(s) (pass+fail) but the inspector's execution order `
+                + `contains only ${nonSkippedExecutionCount} non-skipped test(s) (shortfall ${shortfall})`
+            );
+        }
+        if(signalB) {
+            reasons.push(`${orphanedKeyCount} of ${rawKeyCount} coverage key(s) could not be paired with any inspector test (orphaned)`);
+        }
+        if(wasClosedUnexpectedly) {
+            reasons.push('the inspector WebSocket closed unexpectedly before this data could be fully drained');
+        }
+
+        const errorMessage
+            = 'stryker-bun-runner: dry run data-completeness check failed — '
+              + `${reasons.join('; ')}. This indicates the Bun inspector event stream may have been `
+              + 'truncated mid-run; proceeding would risk silently '
+              + 'corrupted coverage attribution, so this dry run is being reported as an error instead of '
+              + 'Complete, and the test registry has NOT been persisted.';
+
+        // Stryker disable next-line StringLiteral: logging message only
+        this.logger.error('%s', errorMessage);
+
+        return {
+            status: DryRunStatus.Error,
+            errorMessage,
+        };
+    }
+
+    /**
    * Collect coverage from the coverage file and remap counter-based IDs to
    * full test names using the inspector's execution order.
+   *
+   * Also collects any cross-test async coverage-bleed observations recorded
+   * by the preload (see {@link emitCoverageBleedWarnings}) and warns about
+   * them. This method's sole call site is dryRun, so bleed detection is
+   * dry-run-only by construction — mutant runs never reach this code.
    */
     private async collectAndRemapCoverage(
         testHierarchy:  TestInfo[],
         executionOrder: number[]
-    ): Promise<{ coverage: MutantCoverage | undefined, inspectorIdToProjectFile: Map<number, string> }> {
+    ): Promise<{
+        coverage:                 MutantCoverage | undefined
+        inspectorIdToProjectFile: Map<number, string>
+        rawKeyCount:              number
+        orphanedKeyCount:         number
+    }> {
         const testMap = new Map(testHierarchy.map(t => [t.id, t]));
 
+        // A wholly-absent coverage file (no path configured, or the child crashed before
+        // its afterAll write) is a distinct, already-tolerated degraded mode — Stryker
+        // degrades gracefully to running the full suite per mutant when mutantCoverage is
+        // undefined — and must NOT itself be gate-material, so both counts default to 0.
         if(!this.coverageFilePath) {
-            return { coverage: undefined, inspectorIdToProjectFile: new Map() };
+            return { coverage: undefined, inspectorIdToProjectFile: new Map(), rawKeyCount: 0, orphanedKeyCount: 0 };
         }
-        const rawCoverage = await collectCoverage(this.coverageFilePath, this.logger);
+        // Read coverage and lateHits together, before cleanup deletes the file.
+        // Two reads of the same (small, dry-run-only) file — see collectLateHits'
+        // doc comment for why this doesn't share a read with collectCoverage.
+        const [rawCoverage, lateHits] = await Promise.all([
+            collectCoverage(this.coverageFilePath, this.logger),
+            collectLateHits(this.coverageFilePath, this.logger),
+        ]);
         await cleanupCoverageFile(this.coverageFilePath);
         if(!rawCoverage) {
-            return { coverage: undefined, inspectorIdToProjectFile: new Map() };
+            return { coverage: undefined, inspectorIdToProjectFile: new Map(), rawKeyCount: 0, orphanedKeyCount: 0 };
         }
 
         // Map coverage counter keys to full test names and extract the inspector-ID → project-file
         // mapping in a single pass. The new file-prefixed format ("relativeFile@@test-N") produces
         // a populated inspectorIdToProjectFile; legacy keys ("test-N") and unknown formats return
         // an empty map so the runner falls back to testInfo.url-based naming.
-        const { coverage, inspectorIdToProjectFile } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testMap, this.logger);
-        return { coverage, inspectorIdToProjectFile };
+        const { coverage, inspectorIdToProjectFile, counterKeyToTestName, rawKeyCount, orphanedKeyCount } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testMap, this.logger);
+
+        if(lateHits.length > 0) {
+            this.emitCoverageBleedWarnings(lateHits, counterKeyToTestName);
+        }
+
+        return { coverage, inspectorIdToProjectFile, rawKeyCount, orphanedKeyCount };
+    }
+
+    /**
+   * Warn about cross-test async coverage bleed: mutant coverage that was
+   * recorded in the gap between one test's afterEach and the next test's
+   * beforeEach, most likely because a fire-and-forget promise chain from the
+   * ended test kept running past the test boundary.
+   *
+   * Diagnostic only: never alters dryRun/mutantRun results or coverage
+   * attribution (stabilizeCoverage's "static wins" rule already governs
+   * attribution independently of this warning).
+   *
+   * A known benign trigger this deliberately does NOT try to suppress: a
+   * same-file describe-level beforeAll running in the gap looks identical to
+   * genuine bleed from this vantage point (both execute while
+   * currentTestId is undefined, between two tests). Filtering it out would
+   * require tracking beforeAll boundaries explicitly, which is out of scope
+   * here — the warning text calls the false-positive out instead.
+   *
+   * Capped at {@link MAX_COVERAGE_BLEED_WARNINGS} individual warnings, plus a
+   * final summary line for the rest, so a suite with many leaking tests
+   * doesn't flood the log.
+   */
+    private emitCoverageBleedWarnings(lateHits: LateHitEntry[], counterKeyToTestName: Map<string, string>): void {
+        const listed = lateHits.slice(0, MAX_COVERAGE_BLEED_WARNINGS);
+        for(const { testId, mutantIds } of listed) {
+            const testName = counterKeyToTestName.get(testId) ?? testId;
+            // Stryker disable next-line StringLiteral: diagnostic warning text has no behavioral impact
+            this.logger.warn(
+                'mutant coverage was recorded between tests, after \'%s\' completed — likely fire-and-forget async work '
+                + 'leaking past the test boundary (or beforeAll/fixture code running between tests); attribution for %d '
+                + 'mutant(s) may be wrong (mutant IDs: %s)',
+                testName,
+                mutantIds.length,
+                mutantIds.join(', ')
+            );
+        }
+
+        const remaining = lateHits.length - listed.length;
+        if(remaining > 0) {
+            // Stryker disable next-line StringLiteral: diagnostic warning text has no behavioral impact
+            this.logger.warn('...and %d more coverage-bleed warning(s) suppressed', remaining);
+        }
     }
 
     /**

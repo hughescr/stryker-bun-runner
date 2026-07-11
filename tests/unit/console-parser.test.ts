@@ -647,6 +647,27 @@ Ran 5 tests across 2 files. [123.00ms]
             expect(result.totalTests).toBe(5);
         });
 
+        it('degraded output with only "Ran N tests" must not populate summaryPassed/summaryFailed (gate-safety)', () => {
+            // Backlog item 5 fix: on degraded output (detailed ' N pass'/' N fail' summary
+            // lines absent), the inferred passed=120 from the 'Ran 120 tests' fallback must
+            // NOT flow into summaryPassed/summaryFailed — those are consumed by the dry-run
+            // completeness gate's Signal A, which would otherwise be able to false-fire on a
+            // healthy run with a meaningful skip count whenever the console output is this
+            // degraded. summaryPassed/summaryFailed must stay 0 while the existing `passed`
+            // fallback behavior (120) is unchanged.
+            const output = `
+bun test v1.1.0
+
+Ran 120 tests across 4 files. [500.00ms]
+`;
+            const result = parseBunTestOutput(output, '');
+
+            expect(result.passed).toBe(120);
+            expect(result.failed).toBe(0);
+            expect(result.summaryPassed).toBe(0);
+            expect(result.summaryFailed).toBe(0);
+        });
+
         it('should not override existing counts from Ran N tests', () => {
             const output = `
 bun test v1.1.0
@@ -3340,6 +3361,144 @@ tests/example.test.ts:
             expect(result.tests[0].failureMessage).toBeUndefined();
             expect(result.tests[1].failureMessage).toBeUndefined();
             expect(result.passed).toBe(2);
+        });
+    });
+
+    // Feeds the dry-run completeness gate's Signal A: summary-only counts must count
+    // TESTS, never per-ATTEMPT retry output. Fixtures below are byte-shapes captured from
+    // real `bun test { retry: 2 }` runs (bun 1.3.14): a retried test that eventually passes
+    // prints one error block per FAILED attempt (no ✗/✓/(fail) line at all for that test —
+    // only the summary line reflects its final outcome), and a retried test that exhausts
+    // all attempts prints one final "(fail) name (attempt N) [ms]" line, not one per attempt.
+    describe('summaryPassed/summaryFailed/summarySkipped (retry-safe summary-only counts)', () => {
+        it('counts a test that eventually passes after failed retry attempts as ONE pass, not one per attempt', () => {
+            // Real bun 1.3.14 output shape for `test('flaky', () => {...}, { retry: 2 })`
+            // that fails twice then passes, alongside one ordinary passing test.
+            const output = `bun test v1.3.14 (0d9b296a)
+
+retry.test.ts:
+2 |
+3 | let attempts = 0;
+4 | test('flaky test retried', () => {
+5 |   attempts++;
+6 |   if (attempts < 3) {
+7 |     throw new Error(\`fail attempt \${attempts}\`);
+                                                  ^
+error: fail attempt 1
+      at <anonymous> (retry.test.ts:7:47)
+2 |
+3 | let attempts = 0;
+4 | test('flaky test retried', () => {
+5 |   attempts++;
+6 |   if (attempts < 3) {
+7 |     throw new Error(\`fail attempt \${attempts}\`);
+                                                  ^
+error: fail attempt 2
+      at <anonymous> (retry.test.ts:7:47)
+
+ 2 pass
+ 0 fail
+ 2 expect() calls
+Ran 2 tests across 1 file. [6.00ms]
+`;
+            const result = parseBunTestOutput(output, '');
+
+            // Two per-attempt error blocks are present in the output, but summary-only
+            // counts must reflect TWO TESTS (the retried one + the plain one), not attempts.
+            expect(result.summaryPassed).toBe(2);
+            expect(result.summaryFailed).toBe(0);
+            expect(result.summarySkipped).toBe(0);
+            // Existing max(perLine, summary) fields are untouched by this addition.
+            expect(result.passed).toBe(2);
+            expect(result.failed).toBe(0);
+        });
+
+        it('counts a test that exhausts all retry attempts as ONE fail, not one per attempt', () => {
+            // Real bun 1.3.14 output shape for a retry:2 test that always fails, alongside
+            // one ordinary passing test — bun prints THREE error blocks (one per attempt)
+            // but only the FINAL attempt gets a "(fail) ... (attempt 3)" line.
+            const output = `bun test v1.3.14 (0d9b296a)
+
+always-fail-retry.test.ts:
+1 | import { test, expect } from 'bun:test';
+2 | let n = 0;
+3 | test('always fails retried', () => {
+4 |   n++;
+5 |   expect(1).toBe(2);
+                ^
+error: expect(received).toBe(expected)
+
+Expected: 2
+Received: 1
+
+      at <anonymous> (always-fail-retry.test.ts:5:13)
+1 | import { test, expect } from 'bun:test';
+2 | let n = 0;
+3 | test('always fails retried', () => {
+4 |   n++;
+5 |   expect(1).toBe(2);
+                ^
+error: expect(received).toBe(expected)
+
+Expected: 2
+Received: 1
+
+      at <anonymous> (always-fail-retry.test.ts:5:13)
+1 | import { test, expect } from 'bun:test';
+2 | let n = 0;
+3 | test('always fails retried', () => {
+4 |   n++;
+5 |   expect(1).toBe(2);
+                ^
+error: expect(received).toBe(expected)
+
+Expected: 2
+Received: 1
+
+      at <anonymous> (always-fail-retry.test.ts:5:13)
+(fail) always fails retried (attempt 3) [0.02ms]
+
+ 1 pass
+ 1 fail
+ 2 expect() calls
+Ran 2 tests across 1 file. [6.00ms]
+`;
+            const result = parseBunTestOutput(output, '');
+
+            expect(result.summaryPassed).toBe(1);
+            expect(result.summaryFailed).toBe(1);
+            expect(result.summarySkipped).toBe(0);
+        });
+
+        it('summary fields come from the summary line even when it disagrees with per-line counts', () => {
+            // Directly pins that summaryPassed/summaryFailed/summarySkipped are sourced from
+            // the ' N pass'/' N fail'/' N skip' lines ONLY — never from per-line ✓/✗/⏭ counts,
+            // unlike passed/failed/skipped which take Math.max(perLine, summary).
+            const output = `bun test v1.1.0
+
+tests/example.test.ts:
+✓ only one per-line pass [0.05ms]
+
+ 5 pass
+ 3 fail
+ 2 skip
+`;
+            const result = parseBunTestOutput(output, '');
+
+            expect(result.summaryPassed).toBe(5);
+            expect(result.summaryFailed).toBe(3);
+            expect(result.summarySkipped).toBe(2);
+            // The existing max()-based fields take the LARGER summary-line values here.
+            expect(result.passed).toBe(5);
+            expect(result.failed).toBe(3);
+            expect(result.skipped).toBe(2);
+        });
+
+        it('summary fields default to 0 when no summary line is present', () => {
+            const result = parseBunTestOutput('no recognizable output at all', '');
+            expect(result.summaryPassed).toBe(0);
+            expect(result.summaryFailed).toBe(0);
+            expect(result.summarySkipped).toBe(0);
         });
     });
 });

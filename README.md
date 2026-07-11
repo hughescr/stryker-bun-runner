@@ -201,9 +201,95 @@ don't — exits 0 with no error text at all. These two warns are the only signal
 that a partial silent drop was possible for a given mutant run, so seeing either
 of them in a clean run's logs is worth investigating before trusting the score.
 
+### Dry-run failure diagnostics (dry run only)
+
+- **`Bun exited with code <N> and its console output reported <N> failed test(s), but no failing test could be identified...`**
+  — the dry run's process-level signals (a non-zero exit code, or a `>0` failed
+  count parsed from Bun's console recap) say a test failed, but neither the
+  inspector's per-test data nor the parsed console output identifies which one
+  — the "empty recap" incident fingerprint: Bun prints e.g. `1 tests failed:`
+  with no `(fail)` line naming a test. The most likely cause is an unhandled
+  error firing *between* tests (e.g. a rejected fire-and-forget promise) rather
+  than inside any single test body, so nothing in bun's own per-test
+  bookkeeping ever marked a test as failed. What to do: check the trailing
+  stderr included in the warning for a stack, and look for fire-and-forget
+  async work (unawaited promises, orphaned timers) anywhere in the suite —
+  especially in the file that was running when the process exited. This
+  warning is purely diagnostic and never alters the returned `DryRunResult`
+  by itself; it's a separate, related change that failed tests' `failureMessage`
+  in a *Complete* result now has the inspector's `error.stack` appended (when
+  available) — Stryker core only prints name+failureMessage for initial-run
+  failures, so that's the only channel this stack reaches the CI log through.
+
+### Dry-run completeness gate (dry run only)
+
+- **`stryker-bun-runner: dry run data-completeness check failed — ...`** — the dry
+  run otherwise looked healthy (no failed tests) but the runner detected that Bun's
+  inspector event stream may have been silently truncated mid-run: either the
+  inspector's execution order fell materially short of what Bun's own console
+  summary reported (`console reported <N> test(s) ... but the inspector's execution
+  order contains only <M> non-skipped test(s)`), or a meaningful number of coverage
+  keys couldn't be paired with any inspector test (`<N> of <M> coverage key(s) ...
+  could not be paired with any inspector test (orphaned)`) — the signature of one or
+  more whole test files being dropped from the stream, most often under CI runner
+  resource contention. When both are present, or the socket also closed
+  unexpectedly before the runner could finish reading it, the message names all of
+  them. This is a genuine `DryRunStatus.Error`, not a warning: proceeding on
+  truncated data would risk silently corrupted coverage attribution (mutants losing
+  their true killers), so the runner reports the error and does **not** persist the
+  test registry, rather than let other Stryker workers load a corrupted one. If you
+  see this, it usually means the CI runner was under heavier contention than usual;
+  retrying the run (with less concurrent load, or fewer parallel Stryker workers) is
+  the first thing to try.
+
+  The gate's thresholds — `EXECUTION_SHORTFALL_ABS_FLOOR`, `EXECUTION_SHORTFALL_RATIO_THRESHOLD`,
+  `ORPHANED_KEY_ABS_FLOOR`, and the drain wait `INSPECTOR_DRAIN_TIMEOUT_MS` it depends on —
+  are fixed module-level constants in `src/bun-test-runner.ts`. There is currently no config
+  option to override them; if these defaults produce false positives in your environment
+  (e.g. a CI runner with very different contention characteristics than the ones this gate
+  was tuned against), a config knob is a possible follow-up — please open an issue rather
+  than patching the constants locally.
+
+### Coverage-bleed warning (dry run only)
+
+- **`mutant coverage was recorded between tests, after '<testName>' completed`**
+  — during the dry run's coverage collection, mutant coverage was recorded in the
+  gap between one test's `afterEach` and the next test's `beforeEach`, i.e. while
+  no test was active. The most likely cause is a fire-and-forget promise chain
+  (or other async work) started by `<testName>` that kept running past that
+  test's own completion; the warning names the coverage attribution for the
+  listed mutant IDs as possibly wrong as a result.
+
+  This is diagnostic only — it never changes a dry-run or mutant-run result, and
+  the runner's normal "static wins" coverage attribution is unaffected. A known
+  **benign** trigger this warning does not try to filter out: a same-file
+  describe-level `beforeAll` (or other fixture setup) legitimately running in
+  that same gap looks identical from this vantage point. If the named test has
+  no fire-and-forget async work of its own, check for a `beforeAll`/fixture in
+  the same file before assuming a real leak.
+
+  The real fix, when it is a genuine leak, is in the test itself — `await` the
+  fire-and-forget work (or otherwise ensure it settles) before the test ends,
+  rather than in this runner. Warnings are capped at 25 individually, with a
+  final `...and N more coverage-bleed warning(s) suppressed` line for the rest.
+
 ## Known Limitations
 
 - **Sequential execution required** - Tests run with `--concurrency=1` to ensure accurate coverage tracking. This is slower than parallel execution but necessary for correct test-to-mutant correlation.
+
+**Upgrade note: duplicate-name test suffixes**
+
+The runner reconciles how it assigns the `' [N]'` disambiguating suffix to
+duplicate-named tests (e.g. two `it('same name')` calls in one `describe`, or
+`it.each` on older Bun versions) so that the test registry and mutant coverage
+always agree on the same suffix for the same physical test, regardless of Bun's
+per-run `--seed` execution-order shuffle. If your suite has duplicate test titles,
+upgrading across this change can change which test a given `' [N]'` suffix refers
+to, which invalidates
+Stryker's incremental-cache correlation for mutants covered by those specific tests.
+This is fail-safe, not silently wrong: affected mutants simply re-run once on your
+next incremental `stryker mutate` and the cache self-heals from there — no action
+needed on your part.
 
 **Eager-import and `mock.module()` compatibility**
 

@@ -12,12 +12,37 @@ export interface TestResult {
 }
 
 export interface ParsedTestResults {
-    tests:      TestResult[]
-    totalTests: number
-    passed:     number
-    failed:     number
-    skipped:    number
-    duration?:  number
+    tests:          TestResult[]
+    totalTests:     number
+    passed:         number
+    failed:         number
+    skipped:        number
+    duration?:      number
+    /**
+   * `summaryPassed`/`summaryFailed` are sourced EXCLUSIVELY from bun's genuine
+   * ' N pass' / ' N fail' summary lines (plus the 'Bailed out after N
+   * failures' bail variant) — never from per-line ✓/✗ matches, and, just as
+   * importantly, never from the 'Ran N tests' fallback that {@link
+   * parseSummaryLines} uses to backfill `passed`/`failed`/`skipped` below. The
+   * 'Ran N tests' line counts skipped and not-yet-implemented tests too, while the dry-run
+   * completeness gate's inspector-side count deliberately excludes them —
+   * letting that fallback flow into these fields could false-fire the gate on
+   * a healthy run with a meaningful skip count whenever detailed pass/fail
+   * lines are absent from degraded console output. When only the fallback is
+   * available, summaryPassed/summaryFailed stay 0 (and `summarySkipped` is
+   * unaffected, since it's never touched by that fallback either) —
+   * structurally disarming the gate's Signal A, which is the safe direction.
+   * Unlike `passed`/`failed`/`skipped` above (which are `Math.max(perLine,
+   * summary)`), these are summary-only so that per-ATTEMPT output from
+   * retried tests (bun prints one error block per failed retry attempt, but
+   * only ever one summary-counted outcome per test) can never inflate them.
+   * Added for the dry-run completeness gate's Signal A (see
+   * bun-test-runner.ts); existing consumers of passed/failed/skipped are
+   * untouched.
+   */
+    summaryPassed:  number
+    summaryFailed:  number
+    summarySkipped: number
 }
 
 /**
@@ -156,9 +181,17 @@ function updateCounters(test: TestResult, counters: TestCounters, parseResult: T
 }
 
 interface SummaryCounts {
-    passed:  number
-    failed:  number
-    skipped: number
+    passed:        number
+    failed:        number
+    skipped:       number
+    /**
+   * `passed`/`failed` as populated ONLY by genuine ' N pass' / ' N fail' (and
+   * 'Bailed out after N failures') summary lines — never by the 'Ran N tests'
+   * fallback below. See {@link ParsedTestResults.summaryPassed} for why this
+   * distinction matters for the dry-run completeness gate.
+   */
+    genuinePassed: number
+    genuineFailed: number
 }
 
 /**
@@ -195,6 +228,15 @@ function parseSummaryLines(output: string): SummaryCounts {
         counts.failed = Math.max(counts.failed, Number.parseInt(bailSummary[1], 10));
     }
 
+    // Snapshot the genuine-only counts NOW, before the 'Ran N tests' fallback below can
+    // inflate `counts.passed`. 'Ran N tests' includes skipped and not-yet-implemented tests, while the
+    // dry-run completeness gate's inspector-side count (nonSkippedExecutionCount)
+    // excludes them — letting the fallback flow into summaryPassed/summaryFailed could
+    // false-fire the gate (DryRunStatus.Error) on a healthy run with a meaningful skip
+    // count whenever the detailed pass/fail summary lines are absent from degraded output.
+    const genuinePassed = counts.passed;
+    const genuineFailed = counts.failed;
+
     // Also try to parse from "Ran N tests" line as ultimate fallback
     // Stryker disable next-line Regex: character classes are defensive for optional plural
     const ranTestsSummary = /Ran\s+(\d+)\s+tests?/.exec(output);
@@ -209,7 +251,7 @@ function parseSummaryLines(output: string): SummaryCounts {
         }
     }
 
-    return counts;
+    return { ...counts, genuinePassed, genuineFailed };
 }
 
 /**
@@ -291,9 +333,12 @@ export function parseBunTestOutput(stdout: string, stderr: string): ParsedTestRe
 
     return {
         tests,
-        totalTests: counters.passed + counters.failed + counters.skipped,
-        passed:     counters.passed,
-        failed:     counters.failed,
-        skipped:    counters.skipped
+        totalTests:     counters.passed + counters.failed + counters.skipped,
+        passed:         counters.passed,
+        failed:         counters.failed,
+        skipped:        counters.skipped,
+        summaryPassed:  summaryCounts.genuinePassed,
+        summaryFailed:  summaryCounts.genuineFailed,
+        summarySkipped: summaryCounts.skipped
     };
 }
