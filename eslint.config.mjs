@@ -1,7 +1,5 @@
 import config from '@hughescr/eslint-config-default';
 import { defineConfig } from 'eslint/config';
-import importX from 'eslint-plugin-import-x';
-import pluginN from 'eslint-plugin-n';
 
 export default defineConfig([
     ...config,
@@ -32,8 +30,7 @@ export default defineConfig([
         }
     },
     {
-        plugins: { n: pluginN },
-        rules:   {
+        rules: {
             'n/no-missing-import':                     'off',
             'n/no-unpublished-import':                 'off',
             'lodash/prefer-lodash-method':             'off',
@@ -45,9 +42,8 @@ export default defineConfig([
     },
     {
         // Config files legitimately import devDependencies
-        files:   ['*.mjs', '*.cjs', '*.config.*'],
-        plugins: { 'import-x': importX },
-        rules:   {
+        files: ['*.mjs', '*.cjs', '*.config.*'],
+        rules: {
             'import-x/no-extraneous-dependencies': ['error', { devDependencies: true }]
         }
     },
@@ -66,6 +62,9 @@ export default defineConfig([
             // Allow warn/error but flag log/info to keep tests clean
             'no-console': ['warn', { allow: ['warn', 'error'] }],
 
+            // This project's bunfig-registered preload/setup file is tests/test-preload.ts,
+            // not the rule's default tests/setup.ts
+            '@hughescr/test-hygiene/no-mock-module-in-test-body': ['error', { setupFiles: ['tests/test-preload.ts'] }],
         }
     },
 ]);

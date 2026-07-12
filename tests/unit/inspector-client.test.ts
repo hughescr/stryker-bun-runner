@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, mock, jest } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, mock, jest } from 'bun:test';
 import {
     InspectorClient,
     InspectorTimeoutError,
@@ -69,6 +69,11 @@ describe('InspectorClient', () => {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- returning mock as WebSocket
             return mockWs as any;
         };
+    });
+
+    afterEach(() => {
+        // Safety net for fake timers used in nested test bodies below
+        jest.useRealTimers();
     });
 
     describe('constructor', () => {

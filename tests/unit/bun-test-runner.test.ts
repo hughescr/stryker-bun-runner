@@ -219,6 +219,9 @@ describe('BunTestRunner', () => {
 
         resolveEagerModulesFromGlobsSpy.mockRestore();
 
+        // Safety net for ad-hoc spies created inline within individual test bodies
+        jest.restoreAllMocks();
+
         // Reset preload mocks and timers
         resetAllMocks();
         jest.useRealTimers();

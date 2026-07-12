@@ -93,4 +93,4 @@ export const strykerValidationSchema = {
  * Re-export public API
  */
 export { BunTestRunner } from './bun-test-runner.js';
-export * from './options.js';
+export type { BunTestRunnerOptions, StrykerBunOptions } from './options.js';
