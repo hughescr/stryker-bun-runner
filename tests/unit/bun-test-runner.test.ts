@@ -3,7 +3,9 @@
  * Integration-level tests for the main TestRunner implementation
  */
 
+import { createHash } from 'node:crypto';
 import * as fsPromises from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { StrykerOptions } from '@stryker-mutator/api/core';
 import type { Logger } from '@stryker-mutator/api/logging';
@@ -28,6 +30,32 @@ import { mockGetAvailablePort, mockRename, mockWriteFile, resetAllMocks } from '
 // coverage-mapper implementation running alongside the real buildTestsFromInspector dedup
 // logic in the same dryRun() call, instead of the mocked pass-through used everywhere else.
 const realMapCoverageToInspectorIds = coverageMapper.mapCoverageToInspectorIds;
+
+/**
+ * Mirrors BunTestRunner's private `registryPath` getter formula exactly, so tests
+ * can assert against the real file the runner reads/writes without hard-coding a
+ * path the production code doesn't actually derive. Keep in sync with
+ * src/bun-test-runner.ts's registryPath getter.
+ */
+function expectedRegistryPath(cwd: string = process.cwd(), ppid: number = process.ppid): string {
+    const hash = createHash('sha256').update(`${cwd}:${ppid}`).digest('hex').slice(0, 16);
+    return path.join(tmpdir(), 'stryker-bun-runner', `registry-${hash}.json`);
+}
+
+/**
+ * Overrides process.ppid for tests exercising the registry path formula.
+ * Node's type declarations mark `process.ppid` readonly, but Bun's runtime exposes
+ * it as a get/set accessor pair — the cast is only to satisfy the (Node-derived)
+ * type, not to work around an actual runtime restriction.
+ */
+function setPpid(value: number): void {
+    (process as unknown as { ppid: number }).ppid = value;
+}
+
+/** Matches any (cwd, ppid) registry file name — used where the exact hash doesn't matter. */
+const REGISTRY_FILE_RE = /registry-[0-9a-f]{16}\.json$/;
+/** Matches any (cwd, ppid) registry .tmp file name — used where the exact hash doesn't matter. */
+const REGISTRY_TMP_FILE_RE = /registry-[0-9a-f]{16}\.json\.tmp$/;
 
 describe('BunTestRunner', () => {
     let mockLogger: Logger;
@@ -226,9 +254,11 @@ describe('BunTestRunner', () => {
         resetAllMocks();
         jest.useRealTimers();
 
-        // Clean up the registry file that dryRun writes to the project root.
+        // Clean up the registry file that dryRun writes to the OS temp directory.
         // This is scoped to this file's afterEach so it doesn't pollute other test files.
-        const registryPath = path.join(process.cwd(), '.stryker-bun-runner-registry.json');
+        // Uses the real process.cwd()/process.ppid — same as the production getter — so
+        // this cleans up even for tests that don't override either.
+        const registryPath = expectedRegistryPath();
         await fsPromises.rm(registryPath, { force: true });
         await fsPromises.rm(`${registryPath}.tmp`, { force: true });
     });
@@ -4076,7 +4106,7 @@ tests/example.test.ts:
                 expect(writeFileSpy).toHaveBeenCalled();
                 const writeCall = writeFileSpy.mock.calls.find(
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dynamic arg
-                    (args: any) => String(args[0]).endsWith('.stryker-bun-runner-registry.json.tmp')
+                    (args: any) => REGISTRY_TMP_FILE_RE.test(String(args[0]))
                 );
                 expect(writeCall).toBeDefined();
 
@@ -4152,14 +4182,14 @@ tests/example.test.ts:
                 // writeFile must have been called with the .tmp path
                 const tmpWriteCall = writeFileSpy.mock.calls.find(
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dynamic arg
-                    (args: any) => String(args[0]).endsWith('.stryker-bun-runner-registry.json.tmp')
+                    (args: any) => REGISTRY_TMP_FILE_RE.test(String(args[0]))
                 );
                 expect(tmpWriteCall).toBeDefined();
 
                 // rename must have been called from .tmp → final path
                 expect(renameSpy).toHaveBeenCalledWith(
-                    expect.stringMatching(/\.stryker-bun-runner-registry\.json\.tmp$/),
-                    expect.stringMatching(/\.stryker-bun-runner-registry\.json$/)
+                    expect.stringMatching(REGISTRY_TMP_FILE_RE),
+                    expect.stringMatching(REGISTRY_FILE_RE)
                 );
 
                 // writeFile must precede rename in the call order
@@ -4219,7 +4249,7 @@ tests/example.test.ts:
 
                 const writeCall = writeFileSpy.mock.calls.find(
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dynamic arg
-                    (args: any) => String(args[0]).endsWith('.stryker-bun-runner-registry.json.tmp')
+                    (args: any) => REGISTRY_TMP_FILE_RE.test(String(args[0]))
                 );
                 expect(writeCall).toBeDefined();
 
@@ -4265,7 +4295,7 @@ tests/example.test.ts:
 
                 const writeCall = writeFileSpy.mock.calls.find(
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dynamic arg
-                    (args: any) => String(args[0]).endsWith('.stryker-bun-runner-registry.json.tmp')
+                    (args: any) => REGISTRY_TMP_FILE_RE.test(String(args[0]))
                 );
                 expect(writeCall).toBeDefined();
 
@@ -4298,7 +4328,7 @@ tests/example.test.ts:
 
                 const writeCall = writeFileSpy.mock.calls.find(
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dynamic arg
-                    (args: any) => String(args[0]).endsWith('.stryker-bun-runner-registry.json.tmp')
+                    (args: any) => REGISTRY_TMP_FILE_RE.test(String(args[0]))
                 );
                 expect(writeCall).toBeDefined();
 
@@ -4334,7 +4364,7 @@ tests/example.test.ts:
 
                 const writeCall = writeFileSpy.mock.calls.find(
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dynamic arg
-                    (args: any) => String(args[0]).endsWith('.stryker-bun-runner-registry.json.tmp')
+                    (args: any) => REGISTRY_TMP_FILE_RE.test(String(args[0]))
                 );
                 expect(writeCall).toBeDefined();
 
@@ -4349,6 +4379,124 @@ tests/example.test.ts:
                 // The placeholder test itself still exists in the registry names
 
                 expect(written.cachedTestNames).toContain('unknown-99');
+            });
+        });
+
+        // ── Registry path derivation (tmpdir + sha256(cwd, ppid) scheme) ────────────
+        //
+        // The registry path is the entire cross-worker sharing contract: every worker
+        // process of one Stryker run is a direct child of that run's single Stryker
+        // main process, so they all share process.cwd() (the sandbox dir) AND
+        // process.ppid (the main process's pid) — and must independently derive the
+        // SAME file with no coordination. These tests pin that formula down directly
+        // so a mutation to the hash input, the tmpdir()/'stryker-bun-runner' join, or
+        // the mkdir call is caught rather than only incidentally covered by the
+        // shape/content tests above.
+        describe('registry path derivation', () => {
+            let writeFileSpy:  ReturnType<typeof spyOn>;
+            let renameSpy:     ReturnType<typeof spyOn>;
+            let mkdirSpy:      ReturnType<typeof spyOn>;
+            let originalPpid:  number;
+
+            beforeEach(() => {
+                mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+                writeFileSpy = spyOn(fsPromises, 'writeFile').mockResolvedValue(undefined);
+                renameSpy    = spyOn(fsPromises, 'rename').mockResolvedValue(undefined);
+                mkdirSpy     = spyOn(fsPromises, 'mkdir').mockResolvedValue(undefined);
+                originalPpid = process.ppid;
+
+                mockInspectorClient.getTests.mockReturnValue([
+                    { id: 1, name: 'path test', fullName: 'path test', type: 'test' as const, url: 'file:///proj/.stryker-tmp/sandbox-ABC/tests/path.test.ts', status: 'pass' },
+                ]);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([1]);
+                mockCollectCoverage.mockResolvedValue(undefined);
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
+                });
+            });
+
+            afterEach(() => {
+                writeFileSpy.mockRestore();
+
+                renameSpy.mockRestore();
+
+                mkdirSpy.mockRestore();
+                // Restore process.ppid unconditionally — several tests below reassign it,
+                // and a leaked override would corrupt every other test file's registry
+                // path (including this file's own afterEach cleanup).
+                setPpid(originalPpid);
+            });
+
+            /** Runs a full dryRun and returns the final (non-.tmp) registry path fsPromises.rename was called with. */
+            async function runDryRunAndGetRegistryPath(): Promise<string> {
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+                const renameCall = renameSpy.mock.calls.find(
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dynamic arg
+                    (args: any) => REGISTRY_FILE_RE.test(String(args[1]))
+                );
+                expect(renameCall).toBeDefined();
+                return renameCall![1] as string;
+            }
+
+            it('derives the same path formula as sha256(cwd + ":" + ppid), sliced to 16 hex chars, under tmpdir()/stryker-bun-runner', async () => {
+                const actual = await runDryRunAndGetRegistryPath();
+                expect(actual).toBe(expectedRegistryPath());
+            });
+
+            it('derives an identical path across two separate runner instances sharing (cwd, ppid) — the cross-worker sharing contract', async () => {
+                const first = await runDryRunAndGetRegistryPath();
+                writeFileSpy.mockClear();
+                renameSpy.mockClear();
+                const second = await runDryRunAndGetRegistryPath();
+                expect(second).toBe(first);
+            });
+
+            it('derives a DIFFERENT path when ppid differs — dogfooding inner test processes (child of the worker) cannot collide with the outer run (child of the Stryker main process)', async () => {
+                const outer = await runDryRunAndGetRegistryPath();
+                setPpid(originalPpid + 1);
+                writeFileSpy.mockClear();
+                renameSpy.mockClear();
+                const inner = await runDryRunAndGetRegistryPath();
+
+                expect(inner).not.toBe(outer);
+                expect(inner).toBe(expectedRegistryPath(process.cwd(), originalPpid + 1));
+            });
+
+            it('derives a DIFFERENT path when cwd differs', async () => {
+                const cwdSpy = spyOn(process, 'cwd').mockReturnValue('/some/other/sandbox');
+                let other: string;
+                try {
+                    other = await runDryRunAndGetRegistryPath();
+                } finally {
+                    cwdSpy.mockRestore();
+                }
+
+                expect(other).toBe(expectedRegistryPath('/some/other/sandbox', process.ppid));
+                expect(other).not.toBe(expectedRegistryPath());
+            });
+
+            it('never writes under process.cwd() — only under the OS tmp directory', async () => {
+                const actual = await runDryRunAndGetRegistryPath();
+
+                expect(actual.startsWith(process.cwd())).toBe(false);
+                expect(actual.startsWith(path.join(tmpdir(), 'stryker-bun-runner'))).toBe(true);
+            });
+
+            it('creates the registry directory with recursive mkdir before writing the tmp file', async () => {
+                await runDryRunAndGetRegistryPath();
+
+                expect(mkdirSpy).toHaveBeenCalledWith(
+                    path.join(tmpdir(), 'stryker-bun-runner'),
+                    { recursive: true }
+                );
+                // mkdir must precede the write, not follow it
+                expect(mkdirSpy.mock.invocationCallOrder[0]).toBeLessThan(writeFileSpy.mock.invocationCallOrder[0]);
             });
         });
 
@@ -4530,7 +4678,7 @@ tests/example.test.ts:
                 // ENOENT is expected on non-dryRun workers; the log is debug not warn
                 expect(mockLogger.debug).toHaveBeenCalledWith(
                     expect.stringContaining('dryRun registry file not found'),
-                    expect.stringContaining('.stryker-bun-runner-registry.json')
+                    expect.stringMatching(REGISTRY_FILE_RE)
                 );
             });
 
@@ -4568,7 +4716,7 @@ tests/example.test.ts:
                 // Non-ENOENT error must log a warn with the exact format string (kills StringLiteral mutant 79)
                 expect(mockLogger.warn).toHaveBeenCalledWith(
                     'Failed to load dryRun registry from %s: %s',
-                    expect.stringContaining('.stryker-bun-runner-registry.json'),
+                    expect.stringMatching(REGISTRY_FILE_RE),
                     'EACCES: permission denied'
                 );
 
@@ -5355,7 +5503,7 @@ tests/example.test.ts:
             // No dryRun → lastRegistryTmpPath is unset → unlink must NOT be called
             const tmpCall = unlinkSpy.mock.calls.find(
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dynamic arg check
-                (args: any) => String(args[0]).endsWith('.stryker-bun-runner-registry.json.tmp')
+                (args: any) => REGISTRY_TMP_FILE_RE.test(String(args[0]))
             );
             expect(tmpCall).toBeUndefined();
 
@@ -5404,7 +5552,7 @@ tests/example.test.ts:
                 // After successful rename, lastRegistryTmpPath is cleared → no unlink for .tmp
                 const tmpCall = unlinkSpy.mock.calls.find(
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dynamic arg check
-                    (args: any) => String(args[0]).endsWith('.stryker-bun-runner-registry.json.tmp')
+                    (args: any) => REGISTRY_TMP_FILE_RE.test(String(args[0]))
                 );
                 expect(tmpCall).toBeUndefined();
 
@@ -5427,7 +5575,7 @@ tests/example.test.ts:
                 // lastRegistryTmpPath was NOT cleared (rename failed) → dispose() should unlink
                 const tmpCall = unlinkSpy.mock.calls.find(
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dynamic arg check
-                    (args: any) => String(args[0]).endsWith('.stryker-bun-runner-registry.json.tmp')
+                    (args: any) => REGISTRY_TMP_FILE_RE.test(String(args[0]))
                 );
                 expect(tmpCall).toBeDefined();
 

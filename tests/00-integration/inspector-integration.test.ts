@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import * as fsPromises from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -211,10 +212,12 @@ describe('Inspector Integration', () => {
         }
 
         await fsPromises.rm(tempDir, { recursive: true, force: true });
-        // Clean up the dryRun registry file that BunTestRunner writes to process.cwd().
-        // This prevents leaving .stryker-bun-runner-registry.json as an untracked file
-        // after the integration test run.
-        const registryPath = path.join(process.cwd(), '.stryker-bun-runner-registry.json');
+        // Clean up the dryRun registry file that BunTestRunner writes to the OS temp
+        // directory, keyed by sha256(cwd + ':' + ppid) — mirrors the production
+        // registryPath getter in src/bun-test-runner.ts so this cleans up the exact
+        // file this integration run would have written.
+        const registryHash = createHash('sha256').update(`${process.cwd()}:${process.ppid}`).digest('hex').slice(0, 16);
+        const registryPath = path.join(tmpdir(), 'stryker-bun-runner', `registry-${registryHash}.json`);
         await fsPromises.rm(registryPath, { force: true });
         await fsPromises.rm(`${registryPath}.tmp`, { force: true });
     });

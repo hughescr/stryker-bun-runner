@@ -153,7 +153,7 @@ Stryker core's own [`maxTestRunnerReuse`](https://stryker-mutator.io/docs/stryke
 This plugin is designed to tolerate that recycling cleanly:
 
 - `dispose()` cleans up its preload script, coverage file, sanitized bunfig, and registry temp file, and aborts any run still in flight (see [Orphan prevention](#orphan-prevention)).
-- A fresh `BunTestRunner` instance that never ran its own `dryRun` (as happens after a recycle) still resolves `killedBy` names correctly: it lazily loads the shared, file-backed dry-run test registry written by whichever instance *did* run `dryRun`, exactly as it already does for any other multi-worker Stryker run.
+- A fresh `BunTestRunner` instance that never ran its own `dryRun` (as happens after a recycle) still resolves `killedBy` names correctly: it lazily loads the shared, file-backed dry-run test registry written by whichever instance *did* run `dryRun`, exactly as it already does for any other multi-worker Stryker run. The registry lives in the OS temp directory, not the project directory, keyed to this Stryker run so it can't collide with another run's registry or a different project's — a recycled instance is still a child of the same Stryker main process, so it derives the same key and finds the same file.
 
 ```javascript
 // stryker.conf.mjs

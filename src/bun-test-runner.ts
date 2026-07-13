@@ -3,6 +3,7 @@
  * Implements the Stryker TestRunner API
  */
 
+import { createHash } from 'node:crypto';
 import * as fsPromises from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -255,12 +256,52 @@ export class BunTestRunner implements TestRunner {
 
     /**
      * Single source of truth for the registry file name.
-     * Using getters that read process.cwd() at call time ensures the path
-     * resolves to Stryker's sandbox directory — which is set by the time these
-     * are invoked — rather than the orchestrator's cwd at module-load time.
+     *
+     * Lives in the OS temp directory, not cwd: under Stryker's --inPlace mode
+     * cwd IS the user's real project root, and writing there would both
+     * pollute the user's project and never get cleaned up (dispose()
+     * deliberately never unlinks the registry itself — see its doc comment).
+     * The temp directory is OS-managed instead.
+     *
+     * Keyed by sha256(cwd + ':' + ppid): every worker process Stryker spawns
+     * for one run is a direct child of that run's single Stryker main
+     * process, so all of them share BOTH process.cwd() (the sandbox
+     * directory) AND process.ppid (the main process's pid) — and therefore
+     * independently derive this SAME path with no coordination required. A
+     * worker recycled mid-run is still a child of the same main process, so
+     * it re-derives the same path too (README documents recycled instances
+     * lazily loading the registry). This is the entire sharing contract:
+     * writer (buildAndPersistTestRegistry) and reader (loadRegistryFile) both
+     * go through this one getter rather than reimplementing the formula, so
+     * they can never disagree by construction.
+     *
+     * process.ppid is what makes this safe for this repo's own dogfooding:
+     * this plugin's own unit/integration tests run INSIDE a Stryker sandbox as
+     * the system under test, as children of the sandbox WORKER process, not
+     * of the Stryker main process — so those inner test processes hash a
+     * different ppid and land on a different file, and can never clobber the
+     * outer run's registry. A worker-unique key (e.g. the STRYKER_MUTATOR_WORKER
+     * env var Stryker injects per forked worker) was considered and rejected
+     * for the same reason it would break the cross-worker sharing above: it
+     * uniquely identifies each worker, not the run.
+     *
+     * process.cwd() is read directly (not resolved via fs.realpathSync):
+     * Stryker's child-process-proxy-worker computes every worker's chdir
+     * target via a pure path.resolve() of an identical IPC string, so all
+     * workers of a run already get a byte-identical process.cwd() with no
+     * symlink divergence to guard against — realpath would only add a
+     * syscall (and a new ENOENT failure mode if the sandbox dir is mid-
+     * teardown) for no benefit.
+     *
+     * Using a getter that reads process.cwd()/process.ppid at call time
+     * (rather than caching at construction) ensures the path resolves against
+     * Stryker's sandbox directory — which is set by the time these are
+     * invoked — rather than the orchestrator's cwd at module-load time.
      */
     private get registryPath(): string {
-        return path.join(process.cwd(), '.stryker-bun-runner-registry.json');
+        const key = `${process.cwd()}:${process.ppid}`;
+        const hash = createHash('sha256').update(key).digest('hex').slice(0, 16);
+        return path.join(tmpdir(), 'stryker-bun-runner', `registry-${hash}.json`);
     }
 
     private get registryTmpPath(): string {
@@ -1050,6 +1091,11 @@ export class BunTestRunner implements TestRunner {
                 baseNameIndex:   [...this.baseNameIndex.entries()],
                 testNameIndex:   [...testNameIndex.entries()],
             });
+            // registryPath now lives under tmpdir()/stryker-bun-runner/, which may not
+            // exist yet on a fresh machine/CI runner — create it before writing.
+            // Safe to call unconditionally/concurrently: recursive mkdir is a no-op
+            // (not an EEXIST throw) when the directory is already there.
+            await fsPromises.mkdir(path.dirname(registryPath), { recursive: true });
             await fsPromises.writeFile(tmpPath, registryData, 'utf8');
             this.lastRegistryTmpPath = tmpPath;
             await fsPromises.rename(tmpPath, registryPath);
