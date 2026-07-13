@@ -67,7 +67,11 @@ export class SyncServer {
 
     /**
    * Optional callback registered via {@link setDrainHandler}, invoked when a
-   * client sends the string 'drain-request' — see INSPECTOR-DRAIN-RACE.md.
+   * client sends the string 'drain-request'. This is the mechanism that
+   * proves the inspector WebSocket stream has been fully drained before the
+   * test child process is allowed to exit — without it, the child could
+   * exit before the parent has processed the last inspector events under
+   * CPU contention, truncating the stream.
    */
     private drainHandler: (() => Promise<void>) | null = null;
 
@@ -178,14 +182,17 @@ export class SyncServer {
     }
 
     /**
-   * Register the async callback that proves inspector-stream drain — see
-   * INSPECTOR-DRAIN-RACE.md. When a connected client sends the string
-   * 'drain-request', the handler is invoked; once its returned promise
-   * resolves, the string 'drained' is sent back on that same client socket.
-   * If the handler rejects (including a caller-imposed timeout inside the
-   * handler itself), nothing is sent back — the preload's own bounded wait
-   * is the fallback, so a broken/slow handler degrades to today's behavior
-   * rather than hanging.
+   * Register the async callback that proves the inspector stream has
+   * drained. This handshake exists so the test child process is only
+   * allowed to exit once the parent has confirmed it has fully processed
+   * every inspector event, preventing a truncation/data-loss race where the
+   * child exits first under CPU contention. When a connected client sends
+   * the string 'drain-request', the handler is invoked; once its returned
+   * promise resolves, the string 'drained' is sent back on that same client
+   * socket. If the handler rejects (including a caller-imposed timeout
+   * inside the handler itself), nothing is sent back — the preload's own
+   * bounded wait is the fallback, so a broken/slow handler degrades to
+   * today's behavior rather than hanging.
    */
     setDrainHandler(handler: () => Promise<void>): void {
         this.drainHandler = handler;

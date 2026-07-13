@@ -183,7 +183,7 @@ const INSPECTOR_DRAIN_TIMEOUT_MS = 1000;
 /**
  * Bound on the inspector-protocol round-trip performed by the drain handler
  * registered with {@link SyncServer.setDrainHandler} (see the drain handshake
- * in {@link BunTestRunner.dryRun}, step 6.5, and INSPECTOR-DRAIN-RACE.md).
+ * in {@link BunTestRunner.dryRun}, step 6.5).
  * Deliberately BELOW the preload's own {@code DRAIN_ACK_TIMEOUT_MS} (5000ms,
  * `src/templates/coverage-preload.ts`) so a stuck round-trip is still bounded
  * by this shorter ceiling first — the preload's own ceiling is the ultimate
@@ -948,9 +948,9 @@ export class BunTestRunner implements TestRunner {
                 };
             }
 
-            // 6.5 Register a drain handler (see INSPECTOR-DRAIN-RACE.md): the preload's
-            // final afterAll blocks on a 'drained' acknowledgment from the runner before
-            // closing its sync socket and exiting. This handler is what PROVES drain —
+            // 6.5 Register a drain handler: the preload's final afterAll blocks on a
+            // 'drained' acknowledgment from the runner before closing its sync socket
+            // and exiting. This handler is what PROVES drain —
             // an inspector-protocol round-trip on the SAME ordered connection that
             // TestReporter events arrive on. Because InspectorClient.handleMessage
             // processes every frame synchronously and in order (no internal queue), and

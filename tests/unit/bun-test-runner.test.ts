@@ -1917,7 +1917,7 @@ tests/example.test.ts:
                 1, 1);
         });
 
-        describe('drain handshake (INSPECTOR-DRAIN-RACE.md)', () => {
+        describe('drain handshake', () => {
             /**
        * Shared setup so runner.dryRun() completes normally in these tests —
        * mirrors the boilerplate used by every other dryRun() test in this file
@@ -2016,12 +2016,11 @@ tests/example.test.ts:
             });
 
             it('clears the drain round-trip timer once the inspector round-trip resolves, so it does not linger', async () => {
-                // Regression test for the uncleared-timer bug described in
-                // INSPECTOR-DRAIN-RACE.md: when inspector.send() wins the race, the
-                // DRAIN_ACK_ROUND_TRIP_TIMEOUT_MS timer must be cancelled rather than
-                // left pending — an uncleared timer keeps the event loop (and the
-                // real process) alive for the remainder of its 4000ms bound even
-                // after a successful drain handshake.
+                // Regression test for an uncleared-timer bug: when inspector.send()
+                // wins the race, the DRAIN_ACK_ROUND_TRIP_TIMEOUT_MS timer must be
+                // cancelled rather than left pending — an uncleared timer keeps the
+                // event loop (and the real process) alive for the remainder of its
+                // 4000ms bound even after a successful drain handshake.
                 mockSuccessfulBunTestRun();
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
                 await runner.init();

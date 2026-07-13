@@ -447,9 +447,9 @@ describe('Inspector Integration', () => {
         expect(logs.some(line => line.includes('mutant coverage was recorded between tests'))).toBe(false);
     }, 60_000);
 
-    // See INSPECTOR-DRAIN-RACE.md: a large, fast synthetic suite (thousands of
-    // trivial tests, mirroring the isambard incident's shape of ~8671 tests
-    // across ~224 files) exercises the inspector-stream drain handshake
+    // A large, fast synthetic suite (thousands of trivial tests, mirroring
+    // the isambard incident's shape of ~8671 tests across ~224 files)
+    // exercises the inspector-stream drain handshake
     // (coverage-preload.ts's final afterAll <-> SyncServer.setDrainHandler <->
     // BunTestRunner's registered drain handler) at a realistic event volume.
     // This is a permanent regression guard for the common (healthy, fast)

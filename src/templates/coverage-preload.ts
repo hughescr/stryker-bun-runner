@@ -81,7 +81,7 @@ let ws: WebSocket | null = null;
 
 // Bound on how long the final afterAll (below) waits for the runner's drain
 // acknowledgment before giving up and proceeding as if drained — see
-// "Inspector-stream drain handshake" further down and INSPECTOR-DRAIN-RACE.md.
+// "Inspector-stream drain handshake" further down.
 // Deliberately ABOVE the runner-side inspector round-trip timeout
 // (DRAIN_ACK_ROUND_TRIP_TIMEOUT_MS in bun-test-runner.ts) so a stuck
 // round-trip is governed by that shorter ceiling first; this is the outer
@@ -362,7 +362,7 @@ if(shouldCollectCoverage) {
         lateHits.length = 0;
 
         // ====================================================================
-        // Inspector-stream drain handshake (see INSPECTOR-DRAIN-RACE.md)
+        // Inspector-stream drain handshake
         // ====================================================================
         // Block (bounded) on a drain acknowledgment from the runner BEFORE
         // closing this socket / allowing this process to exit. Without this,
