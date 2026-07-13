@@ -446,4 +446,66 @@ describe('Inspector Integration', () => {
         expect(result.status).toBe(DryRunStatus.Complete);
         expect(logs.some(line => line.includes('mutant coverage was recorded between tests'))).toBe(false);
     }, 60_000);
+
+    // See INSPECTOR-DRAIN-RACE.md: a large, fast synthetic suite (thousands of
+    // trivial tests, mirroring the isambard incident's shape of ~8671 tests
+    // across ~224 files) exercises the inspector-stream drain handshake
+    // (coverage-preload.ts's final afterAll <-> SyncServer.setDrainHandler <->
+    // BunTestRunner's registered drain handler) at a realistic event volume.
+    // This is a permanent regression guard for the common (healthy, fast)
+    // case — it does NOT itself force the CPU-starved-consumer race that
+    // originally caused the incident (this sandbox has no reliable way to
+    // reproduce real 2-core CI contention; see the PR notes for the
+    // artificial-consumer-throttle harness that WAS used to empirically
+    // reproduce the pre-fix truncation and confirm the post-fix clean pass).
+    test('large synthetic suite (thousands of tests) completes with no completeness-gate shortfall', async () => {
+        const { logger: mockLogger, logs } = createCapturingLogger();
+
+        const largeSuiteDir = path.join(tempDir, 'large-suite');
+        await fsPromises.mkdir(largeSuiteDir, { recursive: true });
+
+        const numTests = 5000;
+        const testsPerFile = 39; // mirrors isambard's ~8671 tests / ~224 files ratio
+        const numFiles = Math.ceil(numTests / testsPerFile);
+        const largeSuiteFiles: string[] = [];
+        let remaining = numTests;
+        for(let f = 0; f < numFiles; f++) {
+            const count = Math.min(testsPerFile, remaining);
+            remaining -= count;
+            const lines = ["import { test, expect } from 'bun:test';"];
+            for(let i = 0; i < count; i++) {
+                lines.push(`test('synthetic large-suite file ${f} case ${i}', () => { expect(1 + 1).toBe(2); });`);
+            }
+            const filePath = path.join(largeSuiteDir, `large-${f}.test.ts`);
+            // eslint-disable-next-line no-await-in-loop -- sequential fixture generation; only runs once per test
+            await fsPromises.writeFile(filePath, lines.join('\n'));
+            largeSuiteFiles.push(filePath);
+        }
+
+        const runner = new BunTestRunner(mockLogger, {
+            bun: {
+                bunPath:          'bun',
+                timeout:          60_000,
+                inspectorTimeout: 30_000,
+                testFiles:        largeSuiteFiles,
+            },
+            testRunner: { name: 'bun' },
+        } as unknown as StrykerOptions);
+
+        await runner.init();
+        const result = await runner.dryRun();
+        await runner.dispose();
+
+        if(result.status !== DryRunStatus.Complete) {
+            console.error('DryRun failed with result:', JSON.stringify(result, null, 2));
+            console.error('Logs:', logs.join('\n'));
+        }
+        expect(result.status).toBe(DryRunStatus.Complete);
+        if(result.status === DryRunStatus.Complete) {
+            expect(result.tests.length).toBe(numTests);
+        }
+        // The completeness gate (checkCompletenessGate) never had cause to fire.
+        expect(logs.some(line => line.includes('data-completeness check failed'))).toBe(false);
+        expect(logs.some(line => line.includes('closed unexpectedly'))).toBe(false);
+    }, 60_000);
 });

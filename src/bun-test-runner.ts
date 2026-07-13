@@ -53,6 +53,31 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
+ * A promise that rejects after `ms` milliseconds, paired with a `cancel`
+ * function that clears the underlying timer — used to race against
+ * {@link InspectorClient.send} in the drain handler (see
+ * {@link DRAIN_ACK_ROUND_TRIP_TIMEOUT_MS}) so a stuck inspector round-trip
+ * cannot hang the drain handshake beyond this bound.
+ *
+ * The timer is created with `setTimeout` and, left uncleared, would keep the
+ * event loop alive for the full `ms` even after `Promise.race` already
+ * settled via the OTHER branch (e.g. `inspector.send` resolving first) — the
+ * timer callback is still scheduled and Node won't exit until it fires.
+ * Callers MUST call `cancel()` once the race is decided (a `finally` block
+ * around the `Promise.race` is the natural place) so the timer never
+ * outlives the race it was created for.
+ */
+function rejectAfterMs(ms: number, message: string): { promise: Promise<never>, cancel: () => void } {
+    let timer: ReturnType<typeof setTimeout>;
+    const promise = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+            reject(new Error(message));
+        }, ms);
+    });
+    return { promise, cancel: () => clearTimeout(timer) };
+}
+
+/**
  * Shape of the persisted dryRun registry file (version 2).
  * Version 2 adds testNameIndex: the FINAL test id (dedup ' [N]' suffix
  * included) → Bun's exact internal matching name (TestInfo.bunName), used by
@@ -154,6 +179,18 @@ const ORPHANED_KEY_ABS_FLOOR = 5;
  * of an already-idle socket (not a real network round-trip), so it is kept short.
  */
 const INSPECTOR_DRAIN_TIMEOUT_MS = 1000;
+
+/**
+ * Bound on the inspector-protocol round-trip performed by the drain handler
+ * registered with {@link SyncServer.setDrainHandler} (see the drain handshake
+ * in {@link BunTestRunner.dryRun}, step 6.5, and INSPECTOR-DRAIN-RACE.md).
+ * Deliberately BELOW the preload's own {@code DRAIN_ACK_TIMEOUT_MS} (5000ms,
+ * `src/templates/coverage-preload.ts`) so a stuck round-trip is still bounded
+ * by this shorter ceiling first — the preload's own ceiling is the ultimate
+ * backstop if this one is somehow bypassed. {@link InspectorClient.send} also
+ * carries its own `requestTimeout`, so this is a second, independent bound.
+ */
+const DRAIN_ACK_ROUND_TRIP_TIMEOUT_MS = 4000;
 
 /**
  * Bun test runner for Stryker mutation testing
@@ -910,6 +947,37 @@ export class BunTestRunner implements TestRunner {
                     errorMessage: `Failed to connect to Bun inspector: ${errorMsg}`,
                 };
             }
+
+            // 6.5 Register a drain handler (see INSPECTOR-DRAIN-RACE.md): the preload's
+            // final afterAll blocks on a 'drained' acknowledgment from the runner before
+            // closing its sync socket and exiting. This handler is what PROVES drain —
+            // an inspector-protocol round-trip on the SAME ordered connection that
+            // TestReporter events arrive on. Because InspectorClient.handleMessage
+            // processes every frame synchronously and in order (no internal queue), and
+            // TCP preserves per-connection ordering, receiving this round-trip's reply
+            // guarantees every TestReporter frame sent before it has already been
+            // received AND processed. TestReporter.enable is idempotent and already
+            // proven responsive (it just succeeded above), making it a safe no-op ping.
+            // Bounded independently of both the preload's own ceiling (longer, so this
+            // one governs first) and InspectorClient's own requestTimeout.
+            syncServer.setDrainHandler(async () => {
+                const { promise: timeoutPromise, cancel: cancelTimeout } = rejectAfterMs(
+                    DRAIN_ACK_ROUND_TRIP_TIMEOUT_MS,
+                    'Inspector drain round-trip timed out'
+                );
+                try {
+                    await Promise.race([
+                        inspector.send('TestReporter.enable', {}),
+                        timeoutPromise,
+                    ]);
+                } finally {
+                    // Whichever branch of the race settled, the timer must not linger —
+                    // an uncleared setTimeout keeps the event loop (and this dry run's
+                    // child-process lifetime) alive for the full DRAIN_ACK_ROUND_TRIP_TIMEOUT_MS
+                    // even after a successful drain handshake. See rejectAfterMs's doc comment.
+                    cancelTimeout();
+                }
+            });
 
             // 7. Signal preload script to proceed with tests
             syncServer.signalReady();

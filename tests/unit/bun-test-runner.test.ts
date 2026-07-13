@@ -68,10 +68,11 @@ describe('BunTestRunner', () => {
     let mockGenerateSanitizedBunfig: ReturnType<typeof mock>;
     let mockCleanupSanitizedBunfig: ReturnType<typeof mock>;
     let mockSyncServer: {
-        start:       ReturnType<typeof mock>
-        signalReady: ReturnType<typeof mock>
-        close:       ReturnType<typeof mock>
-        clientCount: number
+        start:           ReturnType<typeof mock>
+        signalReady:     ReturnType<typeof mock>
+        setDrainHandler: ReturnType<typeof mock>
+        close:           ReturnType<typeof mock>
+        clientCount:     number
     };
     let mockInspectorClient: {
         connect:               ReturnType<typeof mock>
@@ -149,10 +150,11 @@ describe('BunTestRunner', () => {
 
         // Mock sync server
         mockSyncServer = {
-            start:       mock(),
-            signalReady: mock(),
-            close:       mock(),
-            clientCount: 0,
+            start:           mock(),
+            signalReady:     mock(),
+            setDrainHandler: mock(),
+            close:           mock(),
+            clientCount:     0,
         };
         // @ts-expect-error - Mocking constructor, type system doesn't understand this pattern
         syncServerSpy = spyOn(syncServerModule, 'SyncServer').mockImplementation(() => mockSyncServer);
@@ -1915,6 +1917,137 @@ tests/example.test.ts:
                 1, 1);
         });
 
+        describe('drain handshake (INSPECTOR-DRAIN-RACE.md)', () => {
+            /**
+       * Shared setup so runner.dryRun() completes normally in these tests —
+       * mirrors the boilerplate used by every other dryRun() test in this file
+       * (see e.g. 'should log exact debug messages' above): without calling
+       * onInspectorReady, dryRun() would stall waiting for the inspector URL.
+       */
+            function mockSuccessfulBunTestRun(): void {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({
+                        exitCode: 0,
+                        stdout:   '✓ test [0.12ms]\n 1 pass',
+                        stderr:   '',
+                        timedOut: false,
+                    });
+                });
+                mockCollectCoverage.mockResolvedValue(undefined);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([1]);
+                mockInspectorClient.getTests.mockReturnValue([{
+                    id:       1,
+                    name:     'test',
+                    fullName: 'test',
+                    status:   'pass',
+                    url:      '/project/tests/test.ts',
+                }]);
+            }
+
+            it('registers a drain handler on the sync server before signaling ready', async () => {
+                mockSuccessfulBunTestRun();
+                const callOrder: string[] = [];
+                mockSyncServer.setDrainHandler.mockImplementation(() => {
+                    callOrder.push('setDrainHandler');
+                });
+                mockSyncServer.signalReady.mockImplementation(() => {
+                    callOrder.push('signalReady');
+                });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+
+                expect(callOrder).toEqual(['setDrainHandler', 'signalReady']);
+            });
+
+            it('the registered drain handler performs an inspector TestReporter.enable round-trip', async () => {
+                mockSuccessfulBunTestRun();
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+
+                expect(mockSyncServer.setDrainHandler).toHaveBeenCalledWith(expect.any(Function));
+                const drainHandler = mockSyncServer.setDrainHandler.mock.calls[0][0] as () => Promise<void>;
+
+                mockInspectorClient.send.mockClear();
+                mockInspectorClient.send.mockResolvedValue(undefined);
+
+                await drainHandler();
+
+                expect(mockInspectorClient.send).toHaveBeenCalledWith('TestReporter.enable', {});
+            });
+
+            it('the drain handler rejects when the inspector round-trip does not resolve within its bound', async () => {
+                mockSuccessfulBunTestRun();
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                // First dryRun() completes normally (step 6's TestReporter.enable call
+                // uses the default resolved mock) — this is only to capture the
+                // registered drain handler for direct invocation below.
+                await runner.dryRun();
+
+                const drainHandler = mockSyncServer.setDrainHandler.mock.calls[0][0] as () => Promise<void>;
+
+                jest.useFakeTimers();
+                try {
+                    // Simulate a stuck inspector round-trip: send() never resolves.
+                    mockInspectorClient.send.mockImplementation(() => new Promise(() => {}));
+
+                    const drainPromise = drainHandler();
+                    // Attach a rejection observer immediately so advancing fake timers
+                    // below cannot produce an unhandled-rejection warning.
+                    const settled = drainPromise.catch((error: unknown) => error);
+
+                    jest.advanceTimersByTime(4000);
+                    await Promise.resolve();
+                    await Promise.resolve();
+
+                    const error = await settled;
+                    expect(error).toBeInstanceOf(Error);
+                    expect((error as Error).message).toBe('Inspector drain round-trip timed out');
+                } finally {
+                    jest.useRealTimers();
+                }
+            });
+
+            it('clears the drain round-trip timer once the inspector round-trip resolves, so it does not linger', async () => {
+                // Regression test for the uncleared-timer bug described in
+                // INSPECTOR-DRAIN-RACE.md: when inspector.send() wins the race, the
+                // DRAIN_ACK_ROUND_TRIP_TIMEOUT_MS timer must be cancelled rather than
+                // left pending — an uncleared timer keeps the event loop (and the
+                // real process) alive for the remainder of its 4000ms bound even
+                // after a successful drain handshake.
+                mockSuccessfulBunTestRun();
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+
+                const drainHandler = mockSyncServer.setDrainHandler.mock.calls[0][0] as () => Promise<void>;
+
+                jest.useFakeTimers();
+                try {
+                    mockInspectorClient.send.mockClear();
+                    mockInspectorClient.send.mockResolvedValue(undefined);
+
+                    const timerCountBefore = jest.getTimerCount();
+                    await drainHandler();
+
+                    // The handler scheduled exactly one new timer (the timeout race
+                    // partner) and must have cleared it again once inspector.send()
+                    // resolved — net pending-timer count returns to its prior value,
+                    // not left one higher by a lingering, uncleared setTimeout.
+                    expect(jest.getTimerCount()).toBe(timerCountBefore);
+                } finally {
+                    jest.useRealTimers();
+                }
+            });
+        });
+
         it('should deduplicate test names by appending index suffix', async () => {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
@@ -2050,6 +2183,88 @@ tests/example.test.ts:
                 expect(test0?.startPosition?.line).toBe(10);
                 expect(test1?.startPosition?.line).toBe(20);
                 expect(test2?.startPosition?.line).toBe(30);
+            }
+        });
+
+        it('assigns [N] dedup suffixes by source line even when discovery order is the exact reverse of line order', async () => {
+            // Distinguishes the real getLine extractor (`startPosition.line`) passed into
+            // sortDuplicateGroupByLineThenDiscovery from a mutant that always returns
+            // undefined: if getLine always returned undefined, every entry would tie on
+            // line and fall through to the discovery-order tie-break instead. Discovery
+            // order here (the order testHierarchy/getTests() returns entries in) is
+            // deliberately the EXACT REVERSE of line order, so the two extractors produce
+            // different final suffix assignments and only the real line-based sort matches
+            // the expected order below.
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+            mockRunBunTests.mockImplementation((options: any) => {
+                if(options.onInspectorReady) {
+                    options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                }
+                return Promise.resolve({ exitCode: 0, stdout: '3 pass', stderr: '', timedOut: false });
+            });
+            mockCollectCoverage.mockResolvedValue(undefined);
+
+            mockInspectorClient.getExecutionOrder.mockReturnValue([1, 2, 3]);
+            mockInspectorClient.getTests.mockReturnValue([
+                // Discovery order: id 1 first, id 2 second, id 3 third — the REVERSE of line order.
+                { id: 1, name: 'dup', fullName: 'Suite > dup', status: 'pass', url: 'file:///project/tests/test.ts', line: 30 },
+                { id: 2, name: 'dup', fullName: 'Suite > dup', status: 'pass', url: 'file:///project/tests/test.ts', line: 20 },
+                { id: 3, name: 'dup', fullName: 'Suite > dup', status: 'pass', url: 'file:///project/tests/test.ts', line: 10 },
+            ]);
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            const result = await runner.dryRun();
+
+            expect(result.status).toBe(DryRunStatus.Complete);
+            if(result.status === DryRunStatus.Complete) {
+                expect(result.tests).toHaveLength(3);
+                const byLine = new Map(result.tests.map(t => ['startPosition' in t ? t.startPosition?.line : undefined, t.name]));
+                // [0] must go to the EARLIEST line (10), NOT the earliest-discovered (line 30).
+                expect(byLine.get(10)).toBe('file:///project/tests/test.ts > Suite > dup [0]');
+                expect(byLine.get(20)).toBe('file:///project/tests/test.ts > Suite > dup [1]');
+                expect(byLine.get(30)).toBe('file:///project/tests/test.ts > Suite > dup [2]');
+            }
+        });
+
+        it('assigns [N] dedup suffixes by discovery order (not input/execution order) when lines are absent', async () => {
+            // Distinguishes the real getInspectorId extractor (`e.inspectorId`) from a mutant
+            // that always returns undefined: with no line info at all (both entries tie on
+            // line), the discovery-order tie-break is the ONLY thing that can decide the
+            // final order. If getInspectorId always returned undefined, both entries would
+            // tie on discovery too and the comparator would fall back to (stable) input
+            // order — which here is deliberately the REVERSE of discovery order, so the two
+            // behaviors disagree. `elapsed` (ns) tags each physical test so the assertions
+            // below can tell which one ended up with which suffix.
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+            mockRunBunTests.mockImplementation((options: any) => {
+                if(options.onInspectorReady) {
+                    options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                }
+                return Promise.resolve({ exitCode: 0, stdout: '2 pass', stderr: '', timedOut: false });
+            });
+            mockCollectCoverage.mockResolvedValue(undefined);
+
+            // Input/execution order visits id 1 first, id 2 second.
+            mockInspectorClient.getExecutionOrder.mockReturnValue([1, 2]);
+            // Discovery order (array order from getTests()) is the REVERSE: id 2 first, id 1 second.
+            mockInspectorClient.getTests.mockReturnValue([
+                { id: 2, name: 'dup', fullName: 'Suite > dup', status: 'pass', url: 'file:///project/tests/test.ts', elapsed: 9_000_000 },
+                { id: 1, name: 'dup', fullName: 'Suite > dup', status: 'pass', url: 'file:///project/tests/test.ts', elapsed: 5_000_000 },
+            ]);
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            const result = await runner.dryRun();
+
+            expect(result.status).toBe(DryRunStatus.Complete);
+            if(result.status === DryRunStatus.Complete) {
+                expect(result.tests).toHaveLength(2);
+                const byElapsed = new Map(result.tests.map(t => [t.timeSpentMs, t.name]));
+                // id 2 (elapsed 9ms) was discovered FIRST, so it must get [0]; id 1 (elapsed
+                // 5ms), discovered second, must get [1] — the reverse of input/execution order.
+                expect(byElapsed.get(9)).toBe('file:///project/tests/test.ts > Suite > dup [0]');
+                expect(byElapsed.get(5)).toBe('file:///project/tests/test.ts > Suite > dup [1]');
             }
         });
 
@@ -2482,6 +2697,41 @@ tests/example.test.ts:
                         // Stack must not be duplicated when appended
                         const stackOccurrences = failed.failureMessage.split('at Suite (file.test.ts:10:1)').length - 1;
                         expect(stackOccurrences).toBe(1);
+                    }
+                }
+            });
+
+            it('COMPLETE branch: does NOT append anything when the inspector error has no stack', async () => {
+                // Distinguishes the real `stack && !baseFailureMessage.includes(stack)` guard
+                // from a mutant that forces this to always-true: with no `stack` at all,
+                // buildFailureMessage must return the base message completely unchanged —
+                // an always-true mutant would instead evaluate `${baseFailureMessage}\n${stack}`
+                // with stack === undefined, appending the literal string "undefined".
+                mockProcessResult({ exitCode: 1, stdout: '✗ my test\n 1 fail' });
+                const testHierarchy: TestInfo[] = [
+                    {
+                        id:       1,
+                        name:     'my test',
+                        fullName: 'Suite > my test',
+                        type:     'test',
+                        status:   'fail',
+                        error:    { message: 'expected true to be false' }, // no stack property
+                    },
+                ];
+                mockInspectorClient.getTests.mockReturnValue(testHierarchy);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([1]);
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                const result = await runner.dryRun();
+
+                expect(result.status).toBe(DryRunStatus.Complete);
+                if(result.status === DryRunStatus.Complete) {
+                    const failed = result.tests.find(t => t.status === TestStatus.Failed);
+                    expect(failed).toBeDefined();
+                    if(failed) {
+                        expect(failed.failureMessage).toBe('expected true to be false');
+                        expect(failed.failureMessage).not.toContain('undefined');
                     }
                 }
             });
@@ -7571,10 +7821,11 @@ describe('mutantRun testFilter integration', () => {
     let mockCollectCoverage: ReturnType<typeof mock>;
     let mockCleanupCoverageFile: ReturnType<typeof mock>;
     let mockSyncServer: {
-        start:       ReturnType<typeof mock>
-        signalReady: ReturnType<typeof mock>
-        close:       ReturnType<typeof mock>
-        clientCount: number
+        start:           ReturnType<typeof mock>
+        signalReady:     ReturnType<typeof mock>
+        setDrainHandler: ReturnType<typeof mock>
+        close:           ReturnType<typeof mock>
+        clientCount:     number
     };
     let mockInspectorClient: {
         connect:               ReturnType<typeof mock>
@@ -7634,10 +7885,11 @@ describe('mutantRun testFilter integration', () => {
         mockGetAvailablePort.mockImplementation(() => Promise.resolve(7000));
 
         mockSyncServer = {
-            start:       mock().mockResolvedValue(undefined),
-            signalReady: mock().mockReturnValue(undefined),
-            close:       mock().mockResolvedValue(undefined),
-            clientCount: 0,
+            start:           mock().mockResolvedValue(undefined),
+            signalReady:     mock().mockReturnValue(undefined),
+            setDrainHandler: mock(),
+            close:           mock().mockResolvedValue(undefined),
+            clientCount:     0,
         };
         // @ts-expect-error - Mocking constructor
         syncServerSpy = spyOn(syncServerModule, 'SyncServer').mockImplementation(() => mockSyncServer);

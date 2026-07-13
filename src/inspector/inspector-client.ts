@@ -325,10 +325,11 @@ export class InspectorClient {
                 if(settled) {
                     return;
                 }
+                // Stryker disable next-line BooleanLiteral: this flag guards against finish() running twice. On every path this single-threaded design can currently take, that's already prevented (clearTimeout below cancels a still-pending timer before it can fire, and waitForClose's own `wsClosed` early-return blocks any new waiter being pushed after handleClose has already drained closeWaiters), so flipping this assignment to `false` doesn't change behavior on those paths. The guard is kept defensively in case a stale callback/timeout somehow still fires a second time in some retained-reference edge case we haven't enumerated — this line isn't independently tested for that scenario
                 settled = true;
                 clearTimeout(timer);
                 const idx = this.closeWaiters.indexOf(finish);
-                // Stryker disable next-line ConditionalExpression,EqualityOperator,BlockStatement: defensive — finish is always still in closeWaiters when called via the timer path (handleClose hasn't run), and already removed by handleClose's own drain when called via that path; the splice is a no-op either way, not independently tested
+                // Stryker disable next-line ConditionalExpression,EqualityOperator,UnaryOperator,BlockStatement: defensive — on every path this design can currently take, finish is always still in closeWaiters when called via the timer path (handleClose hasn't run), and already removed by handleClose's own drain when called via that path, so the splice is a no-op either way and not independently tested. Kept as a guard in case a stale callback/timeout still invokes finish() a second time in some retained-reference edge case, which would otherwise splice the wrong element
                 if(idx !== -1) {
                     this.closeWaiters.splice(idx, 1);
                 }

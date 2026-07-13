@@ -396,6 +396,17 @@ function buildDuplicateNameIndex(
         if(ids.size <= 1) {
             continue;
         }
+        // Stryker disable next-line ConditionalExpression: only the always-true variant is
+        // equivalent — ids only ever holds defined numbers here. buildNameInspectorIds only calls
+        // `ids.add(inspectorId)` after its own `if(!testInfo) continue` guard, and
+        // resolveCounterKeys only ever produces a truthy testInfo when inspectorId is a defined
+        // number (testInfo is explicitly set to undefined whenever inspectorId is undefined, and
+        // testHierarchy.get(inspectorId) is only called when inspectorId is defined) — so
+        // `id !== undefined` mutated to `true` filters out exactly as many (zero) elements as the
+        // real predicate. The always-false variant is NOT equivalent — it would empty every
+        // `group`, wrongly collapsing all duplicate-name groups into "no suffix needed" — but is
+        // already killed by 'should handle deduplication for tests with same name from same file
+        // (it.each)' and the SOURCE LINE / discovery-order suffix tests below it.
         const group = [...ids].filter((id): id is number => id !== undefined);
         const sorted = sortDuplicateGroupByLineThenDiscovery(
             group,

@@ -79,6 +79,15 @@ const shouldCollectCoverage = shouldCollect(config);
 // ============================================================================
 let ws: WebSocket | null = null;
 
+// Bound on how long the final afterAll (below) waits for the runner's drain
+// acknowledgment before giving up and proceeding as if drained — see
+// "Inspector-stream drain handshake" further down and INSPECTOR-DRAIN-RACE.md.
+// Deliberately ABOVE the runner-side inspector round-trip timeout
+// (DRAIN_ACK_ROUND_TRIP_TIMEOUT_MS in bun-test-runner.ts) so a stuck
+// round-trip is governed by that shorter ceiling first; this is the outer
+// backstop if the sync channel itself is unresponsive.
+const DRAIN_ACK_TIMEOUT_MS = 5000;
+
 // Per-file test counters for per-test coverage tracking.
 //
 // Bun runs multiple test files sequentially inside the same worker process,
@@ -314,7 +323,7 @@ if(shouldCollectCoverage) {
         strykerGlobal.currentTestId = undefined;
     });
 
-    afterAll(() => {
+    afterAll(async () => {
         // Final gap check, best-effort: catches bleed that has already recorded a
         // counter delta by the time afterAll runs, with no following beforeEach
         // left to catch it any other way. This preload's afterAll fires once per
@@ -339,9 +348,76 @@ if(shouldCollectCoverage) {
             }
         }
 
-        ws?.close();
+        // Coverage must be finalized — gap check above, then the write itself —
+        // BEFORE the drain-ack wait below, not after. The wait yields this
+        // process's event loop for up to DRAIN_ACK_TIMEOUT_MS; if it ran first,
+        // any stray timer or promise continuation left behind by the last test
+        // could fire during that yield, touch mutantCoverage.static, and leak
+        // into the persisted snapshot — reintroducing exactly the class of risk
+        // the gap-window bleed check above exists to catch. Writing first means
+        // the snapshot is already on disk before that window even opens, so
+        // nothing that runs during the wait can affect what was persisted.
         writeCoverageData();
         // Clear the accumulator now that it has been written out.
         lateHits.length = 0;
+
+        // ====================================================================
+        // Inspector-stream drain handshake (see INSPECTOR-DRAIN-RACE.md)
+        // ====================================================================
+        // Block (bounded) on a drain acknowledgment from the runner BEFORE
+        // closing this socket / allowing this process to exit. Without this,
+        // nothing synchronizes "the runner has received and processed every
+        // inspector event" with "this child process is allowed to exit" — a
+        // contended CPU (e.g. a 2-core CI box) can leave the runner's
+        // InspectorClient with an unprocessed backlog at the moment this
+        // process exits, silently truncating the inspector stream that dry
+        // run's completeness gate depends on.
+        //
+        // This IS a single bounded `await`, and an `await` genuinely yields
+        // this process's event loop for up to DRAIN_ACK_TIMEOUT_MS — it is not
+        // a no-op with respect to timer/microtask starvation, and does not
+        // pretend to be. What makes it safe here is ordering, not avoidance:
+        // writeCoverageData() above already ran and the coverage snapshot is
+        // already on disk by the time this wait starts, so anything that
+        // executes during the wait cannot alter what was persisted. This must
+        // stay the LAST coverage-adjacent step before ws.close() — no
+        // coverage-relevant work should be added after it starts. Separately,
+        // it does NOT drain THIS process's own microtask/timer queue on
+        // purpose (that risk is documented in the LIMITATION comment above); it
+        // only waits on a message sent FROM the parent runner process.
+        if(ws && ws.readyState === WebSocket.OPEN) {
+            try {
+                await new Promise<void>((resolve) => {
+                    const wsForDrain = ws!;
+                    const timeout = setTimeout(() => {
+                        console.warn('[Stryker] Timeout waiting for drain acknowledgment');
+                        resolve();
+                    }, DRAIN_ACK_TIMEOUT_MS);
+
+                    wsForDrain.onmessage = (event) => {
+                        if(event.data === 'drained') {
+                            clearTimeout(timeout);
+                            resolve();
+                        }
+                    };
+
+                    wsForDrain.onerror = () => {
+                        clearTimeout(timeout);
+                        resolve();
+                    };
+
+                    try {
+                        wsForDrain.send('drain-request');
+                    } catch {
+                        clearTimeout(timeout);
+                        resolve();
+                    }
+                });
+            } catch (error) {
+                console.warn('[Stryker] Error during drain handshake:', error);
+            }
+        }
+
+        ws?.close();
     });
 }

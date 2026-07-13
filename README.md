@@ -242,13 +242,36 @@ of them in a clean run's logs is worth investigating before trusting the score.
   retrying the run (with less concurrent load, or fewer parallel Stryker workers) is
   the first thing to try.
 
+  Before this check runs, the bun test child process (during `dryRun` only) holds
+  itself open past its own natural exit and waits for the runner to prove — via an
+  inspector-protocol round-trip over the same ordered connection the test events
+  arrive on — that it has actually received and processed everything the child
+  sent, before letting the child close its coverage socket and exit. This closes
+  the specific race that used to cause this gate to fire under CPU-contended CI
+  runners: previously, nothing synchronized "the runner has drained the inspector
+  stream" with "the child process is allowed to exit," so a consumer that couldn't
+  keep up with the event stream under contention would lose whatever hadn't been
+  processed by the time the child exited. The handshake is bounded on both sides
+  (the child gives up and proceeds after a few seconds if it hears nothing back,
+  and the runner's own round-trip is bounded independently and more tightly) — if
+  either bound is hit, today's original behavior (including this gate) applies
+  exactly as before, so the handshake can only reduce how often this gate fires,
+  never mask a real truncation from it.
+
   The gate's thresholds — `EXECUTION_SHORTFALL_ABS_FLOOR`, `EXECUTION_SHORTFALL_RATIO_THRESHOLD`,
-  `ORPHANED_KEY_ABS_FLOOR`, and the drain wait `INSPECTOR_DRAIN_TIMEOUT_MS` it depends on —
-  are fixed module-level constants in `src/bun-test-runner.ts`. There is currently no config
-  option to override them; if these defaults produce false positives in your environment
-  (e.g. a CI runner with very different contention characteristics than the ones this gate
-  was tuned against), a config knob is a possible follow-up — please open an issue rather
-  than patching the constants locally.
+  `ORPHANED_KEY_ABS_FLOOR`, the drain wait `INSPECTOR_DRAIN_TIMEOUT_MS`, and the drain-handshake
+  bounds (`DRAIN_ACK_ROUND_TRIP_TIMEOUT_MS` in `src/bun-test-runner.ts`, and the matching preload-side
+  ceiling in `src/templates/coverage-preload.ts`) — are fixed module-level constants. There is
+  currently no config option to override them; if these defaults produce false positives in your
+  environment (e.g. a CI runner with very different contention characteristics than the ones this
+  gate was tuned against), a config knob is a possible follow-up — please open an issue rather than
+  patching the constants locally.
+
+  This handshake only covers the `dryRun` path (where coverage collection and the
+  completeness gate apply) — individual mutant runs are not held open the same way,
+  since they run small, `--test-name-pattern`-filtered subsets where the same
+  backlog-under-contention risk is negligible and the completeness gate does not
+  apply to them.
 
 ### Coverage-bleed warning (dry run only)
 
@@ -276,6 +299,13 @@ of them in a clean run's logs is worth investigating before trusting the score.
 ## Known Limitations
 
 - **Sequential execution required** - Tests run with `--concurrency=1` to ensure accurate coverage tracking. This is slower than parallel execution but necessary for correct test-to-mutant correlation.
+
+- **Inspector-stream drain handshake covers `dryRun` only** — the hold-open-until-drained
+  handshake described under "Dry-run completeness gate" above only runs for the dry run
+  (where a `SyncServer` and coverage collection are set up). Individual mutant runs are not
+  held open the same way: they run small, filtered test subsets where the backlog-under-CPU-
+  contention risk that motivated the handshake is negligible, and the completeness gate does
+  not apply to mutant runs in the first place.
 
 **Upgrade note: duplicate-name test suffixes**
 

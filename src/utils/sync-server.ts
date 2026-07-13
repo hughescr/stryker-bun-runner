@@ -4,7 +4,21 @@
  */
 
 import { createServer, type Server as HTTPServer } from 'node:http';
-import { WebSocketServer, WebSocket } from 'ws';
+import { WebSocketServer, WebSocket, type RawData } from 'ws';
+
+/**
+ * Decode a 'ws' message payload as UTF-8 text. RawData is a union of
+ * Buffer | ArrayBuffer | Buffer[] (the last for fragmented messages) — calling
+ * `.toString()` directly on the union risks the default Object stringification
+ * ('[object ArrayBuffer]') for the ArrayBuffer case, so each case is decoded
+ * explicitly instead.
+ */
+function rawDataToString(data: RawData): string {
+    if(Array.isArray(data)) {
+        return Buffer.concat(data).toString('utf8');
+    }
+    return Buffer.isBuffer(data) ? data.toString('utf8') : Buffer.from(data).toString('utf8');
+}
 
 export interface SyncServerOptions {
     /**
@@ -50,6 +64,20 @@ export class SyncServer {
     private readonly createHttpServer:     typeof createServer;
     private readonly WebSocketServerClass: typeof WebSocketServer;
     private readonly webSocketOpenState:   number;
+
+    /**
+   * Optional callback registered via {@link setDrainHandler}, invoked when a
+   * client sends the string 'drain-request' — see INSPECTOR-DRAIN-RACE.md.
+   */
+    private drainHandler: (() => Promise<void>) | null = null;
+
+    /**
+   * The in-flight promise from the current/most-recent drain handler
+   * invocation. Shared across re-entrant 'drain-request' messages so a
+   * retried request never re-invokes the handler — see
+   * {@link handleDrainRequest}.
+   */
+    private drainInFlight: Promise<void> | null = null;
 
     constructor(options: SyncServerOptions) {
         this.port = options.port;
@@ -103,9 +131,13 @@ export class SyncServer {
                         this.clients.delete(ws);
                     });
 
-                    // Ignore messages from clients - this is a one-way signal server
-                    ws.on('message', () => {
-                        // No-op
+                    // Only one inbound message type is understood: 'drain-request' (see
+                    // setDrainHandler / handleDrainRequest). Anything else is ignored —
+                    // this remains otherwise a one-way (server-to-client) signal server.
+                    ws.on('message', (data) => {
+                        if(rawDataToString(data) === 'drain-request') {
+                            this.handleDrainRequest(ws);
+                        }
                     });
                 });
 
@@ -146,11 +178,60 @@ export class SyncServer {
     }
 
     /**
+   * Register the async callback that proves inspector-stream drain — see
+   * INSPECTOR-DRAIN-RACE.md. When a connected client sends the string
+   * 'drain-request', the handler is invoked; once its returned promise
+   * resolves, the string 'drained' is sent back on that same client socket.
+   * If the handler rejects (including a caller-imposed timeout inside the
+   * handler itself), nothing is sent back — the preload's own bounded wait
+   * is the fallback, so a broken/slow handler degrades to today's behavior
+   * rather than hanging.
+   */
+    setDrainHandler(handler: () => Promise<void>): void {
+        this.drainHandler = handler;
+    }
+
+    /**
+   * Handle an inbound 'drain-request' message from a client. Re-entrant: a
+   * second 'drain-request' (e.g. a retry) while one is already in flight
+   * shares the same in-flight promise rather than invoking the handler
+   * again.
+   */
+    private handleDrainRequest(ws: WebSocket): void {
+        if(!this.drainHandler) {
+            return;
+        }
+
+        this.drainInFlight ??= this.drainHandler();
+        const inFlight = this.drainInFlight;
+
+        void (async () => {
+            try {
+                await inFlight;
+            } catch{
+                // Drain handler rejected (or its own timeout fired) — send nothing;
+                // the preload's bounded wait falls through to today's behavior.
+                return;
+            }
+
+            try {
+                if(ws.readyState === this.webSocketOpenState) {
+                    ws.send('drained');
+                }
+            } catch{
+                // Ignore send errors - client may have disconnected
+            }
+        })();
+    }
+
+    /**
    * Close the server and all client connections
    */
     async close(): Promise<void> {
         // Reset the ready latch so the instance can be reused across runs
         this.readyLatched = false;
+        this.drainHandler = null;
+        this.drainInFlight = null;
 
         // Close all client connections
         for(const client of this.clients) {

@@ -24,6 +24,21 @@ const createMockClient = (readyState = 1): MockClient => ({
     on: mock(() => {}),
 });
 
+/**
+ * Captures the handler registered via `client.on(event, handler)` for the
+ * given event name, so tests can trigger it directly — mirrors the
+ * `closeHandler` capture pattern already used below for the 'close' event.
+ */
+function captureHandler(client: MockClient, event: string): (...args: unknown[]) => void {
+    let captured: (...args: unknown[]) => void = () => {};
+    client.on = mock((evt: string, handler: (...args: unknown[]) => void) => {
+        if(evt === event) {
+            captured = handler;
+        }
+    });
+    return (...args: unknown[]) => captured(...args);
+}
+
 // Mock WebSocketServer
 interface MockWss {
     on:                ReturnType<typeof mock>
@@ -457,6 +472,271 @@ describe('SyncServer', () => {
                 server.signalReady();
                 server.signalReady();
             }).not.toThrow();
+        });
+    });
+
+    describe('drain handshake', () => {
+        it('registers message handler on client (drain-request listener)', async () => {
+            const server = createServer();
+            await server.start();
+
+            const client = createMockClient();
+            mockWss.triggerConnection(client);
+
+            expect(client.on).toHaveBeenCalledWith('message', expect.any(Function));
+        });
+
+        it('ignores drain-request when no handler is registered', async () => {
+            const server = createServer();
+            await server.start();
+
+            const client = createMockClient(1);
+            const messageHandler = captureHandler(client, 'message');
+            mockWss.triggerConnection(client);
+
+            expect(() => messageHandler(Buffer.from('drain-request'))).not.toThrow();
+            // Flush microtasks: nothing should have been scheduled, but this proves
+            // no crash and no stray reply either.
+            await Promise.resolve();
+            expect(client.send).not.toHaveBeenCalledWith('drained');
+        });
+
+        it('ignores messages other than drain-request', async () => {
+            const server = createServer();
+            await server.start();
+
+            const client = createMockClient(1);
+            const messageHandler = captureHandler(client, 'message');
+            mockWss.triggerConnection(client);
+
+            const drainHandler = mock(() => Promise.resolve());
+            server.setDrainHandler(drainHandler);
+
+            messageHandler(Buffer.from('something-else'));
+            await Promise.resolve();
+            await Promise.resolve();
+
+            expect(drainHandler).not.toHaveBeenCalled();
+        });
+
+        it('invokes the drain handler and replies drained on resolve', async () => {
+            const server = createServer();
+            await server.start();
+
+            const client = createMockClient(1);
+            const messageHandler = captureHandler(client, 'message');
+            mockWss.triggerConnection(client);
+
+            const drainHandler = mock(() => Promise.resolve());
+            server.setDrainHandler(drainHandler);
+
+            messageHandler(Buffer.from('drain-request'));
+            // Flush microtasks so the async IIFE inside handleDrainRequest settles.
+            await Promise.resolve();
+            await Promise.resolve();
+            await Promise.resolve();
+
+            expect(drainHandler).toHaveBeenCalledTimes(1);
+            expect(client.send).toHaveBeenCalledWith('drained');
+        });
+
+        it('recognizes drain-request delivered as an ArrayBuffer payload', async () => {
+            // Exercises rawDataToString's ArrayBuffer branch specifically — a plain
+            // Buffer (used elsewhere in this file) would never take this path, since
+            // Buffer.isBuffer() is true for Buffers but not for a bare ArrayBuffer.
+            const server = createServer();
+            await server.start();
+
+            const client = createMockClient(1);
+            const messageHandler = captureHandler(client, 'message');
+            mockWss.triggerConnection(client);
+
+            const drainHandler = mock(() => Promise.resolve());
+            server.setDrainHandler(drainHandler);
+
+            const arrayBuffer = Uint8Array.from(Buffer.from('drain-request')).buffer;
+            messageHandler(arrayBuffer);
+            await Promise.resolve();
+            await Promise.resolve();
+            await Promise.resolve();
+
+            expect(drainHandler).toHaveBeenCalledTimes(1);
+            expect(client.send).toHaveBeenCalledWith('drained');
+        });
+
+        it('recognizes drain-request delivered as a fragmented Buffer[] payload', async () => {
+            // Exercises rawDataToString's Buffer[] branch specifically — 'ws' delivers
+            // a fragmented message this way; Buffer.concat must reassemble it correctly
+            // before the 'drain-request' string comparison.
+            const server = createServer();
+            await server.start();
+
+            const client = createMockClient(1);
+            const messageHandler = captureHandler(client, 'message');
+            mockWss.triggerConnection(client);
+
+            const drainHandler = mock(() => Promise.resolve());
+            server.setDrainHandler(drainHandler);
+
+            const fragments = [Buffer.from('drain-'), Buffer.from('request')];
+            messageHandler(fragments);
+            await Promise.resolve();
+            await Promise.resolve();
+            await Promise.resolve();
+
+            expect(drainHandler).toHaveBeenCalledTimes(1);
+            expect(client.send).toHaveBeenCalledWith('drained');
+        });
+
+        it('does not reply when the drain handler rejects', async () => {
+            const server = createServer();
+            await server.start();
+
+            const client = createMockClient(1);
+            const messageHandler = captureHandler(client, 'message');
+            mockWss.triggerConnection(client);
+
+            const drainHandler = mock(() => Promise.reject(new Error('inspector round-trip timed out')));
+            server.setDrainHandler(drainHandler);
+
+            messageHandler(Buffer.from('drain-request'));
+            await Promise.resolve();
+            await Promise.resolve();
+            await Promise.resolve();
+
+            expect(drainHandler).toHaveBeenCalledTimes(1);
+            expect(client.send).not.toHaveBeenCalledWith('drained');
+        });
+
+        it('does not throw when replying drained on a client that errors on send', async () => {
+            const server = createServer();
+            await server.start();
+
+            const client = createMockClient(1);
+            const messageHandler = captureHandler(client, 'message');
+            mockWss.triggerConnection(client);
+            client.send = mock(() => {
+                throw new Error('Send failed');
+            });
+
+            server.setDrainHandler(mock(() => Promise.resolve()));
+
+            messageHandler(Buffer.from('drain-request'));
+            await Promise.resolve();
+            await Promise.resolve();
+            await Promise.resolve();
+
+            expect(client.send).toHaveBeenCalledWith('drained');
+        });
+
+        it('does not reply drained to a client that is no longer in OPEN state', async () => {
+            const server = createServer();
+            await server.start();
+
+            const client = createMockClient(1);
+            const messageHandler = captureHandler(client, 'message');
+            mockWss.triggerConnection(client);
+
+            server.setDrainHandler(mock(() => {
+                // Simulate the client disconnecting while the drain handler is in flight.
+                client.readyState = 3; // CLOSED
+                return Promise.resolve();
+            }));
+
+            messageHandler(Buffer.from('drain-request'));
+            await Promise.resolve();
+            await Promise.resolve();
+            await Promise.resolve();
+
+            expect(client.send).not.toHaveBeenCalledWith('drained');
+        });
+
+        it('shares the same in-flight promise across re-entrant drain-request messages', async () => {
+            const server = createServer();
+            await server.start();
+
+            const client = createMockClient(1);
+            const messageHandler = captureHandler(client, 'message');
+            mockWss.triggerConnection(client);
+
+            let resolveDrain: () => void = () => {};
+            const drainHandler = mock(() => new Promise<void>((resolve) => {
+                resolveDrain = resolve;
+            }));
+            server.setDrainHandler(drainHandler);
+
+            // Two 'drain-request' messages arrive before the handler has resolved.
+            messageHandler(Buffer.from('drain-request'));
+            messageHandler(Buffer.from('drain-request'));
+            await Promise.resolve();
+
+            expect(drainHandler).toHaveBeenCalledTimes(1);
+
+            resolveDrain();
+            await Promise.resolve();
+            await Promise.resolve();
+            await Promise.resolve();
+
+            expect(client.send).toHaveBeenCalledWith('drained');
+        });
+
+        it('does not re-invoke the drain handler for a repeat request after a prior one resolved (until close() resets state)', async () => {
+            const server = createServer();
+            await server.start();
+
+            const client = createMockClient(1);
+            const messageHandler = captureHandler(client, 'message');
+            mockWss.triggerConnection(client);
+
+            const drainHandler = mock(() => Promise.resolve());
+            server.setDrainHandler(drainHandler);
+
+            messageHandler(Buffer.from('drain-request'));
+            await Promise.resolve();
+            await Promise.resolve();
+            await Promise.resolve();
+            expect(drainHandler).toHaveBeenCalledTimes(1);
+
+            // NOTE: without a close() in between, drainInFlight is only reset by
+            // close() — see 'resets drain handler/in-flight state on close' below.
+            // A second request while no NEW in-flight promise has been created
+            // reuses the (already-resolved) prior one rather than re-invoking.
+            messageHandler(Buffer.from('drain-request'));
+            await Promise.resolve();
+            await Promise.resolve();
+
+            expect(drainHandler).toHaveBeenCalledTimes(1);
+        });
+
+        it('resets drain handler and in-flight state on close, so a reused server does not auto-reply on the next request', async () => {
+            const server = createServer();
+            await server.start();
+
+            const client = createMockClient(1);
+            const messageHandler = captureHandler(client, 'message');
+            mockWss.triggerConnection(client);
+
+            const drainHandler = mock(() => Promise.resolve());
+            server.setDrainHandler(drainHandler);
+
+            messageHandler(Buffer.from('drain-request'));
+            await Promise.resolve();
+            await Promise.resolve();
+            await Promise.resolve();
+            expect(drainHandler).toHaveBeenCalledTimes(1);
+
+            await server.close();
+            await server.start();
+
+            const freshClient = createMockClient(1);
+            const freshMessageHandler = captureHandler(freshClient, 'message');
+            mockWss.triggerConnection(freshClient);
+
+            // No handler registered on the fresh server instance state — a
+            // drain-request must not throw and must not reply.
+            expect(() => freshMessageHandler(Buffer.from('drain-request'))).not.toThrow();
+            await Promise.resolve();
+            expect(freshClient.send).not.toHaveBeenCalledWith('drained');
         });
     });
 

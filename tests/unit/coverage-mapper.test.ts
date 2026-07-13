@@ -1933,6 +1933,41 @@ describe('orphaned-key reporting', () => {
         );
     });
 
+    it('counts distinct orphaned "files" correctly when orphaned keys have no @@ separator (malformed keys)', () => {
+        // Distinguishes reportOrphanedKeys's `sepIdx === -1 ? key : key.slice(0, sepIdx)`
+        // from mutants that force the slice branch (or change what '@@'/-1 mean): three
+        // malformed orphaned keys differing only in their last character all resolve to
+        // the SAME truncated value if the whole-key branch is bypassed and slice(0, -1) (or
+        // slice(0, 0)) runs instead, collapsing the real distinct-file count of 3 down to 1.
+        // The first (well-formed) key exists only so the batch is detected as the new
+        // file-prefixed format — its own resolution is irrelevant here.
+        const rawCoverage: MutantCoverage = {
+            'static': {},
+            perTest:  {
+                'a.test.ts@@test-1': { '1': 1 }, // resolves fine, not orphaned
+                keyA:                { '2': 1 }, // orphaned, no @@ separator
+                keyB:                { '3': 1 }, // orphaned, no @@ separator
+                keyC:                { '4': 1 }, // orphaned, no @@ separator
+            },
+        };
+        const executionOrder = [10];
+        const testHierarchy = new Map<number, TestInfo>([
+            [10, { id: 10, name: 'a1', fullName: 'a1', type: 'test', status: 'pass' }],
+        ]);
+
+        const logger = makeLogger();
+        const { rawKeyCount, orphanedKeyCount } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy, logger);
+
+        expect(rawKeyCount).toBe(4);
+        expect(orphanedKeyCount).toBe(3);
+        expect(logger.warn).toHaveBeenCalledWith(
+            expect.stringContaining('coverage key(s)'),
+            3, // orphaned
+            4, // total
+            3  // distinct affected "files" — keyA, keyB, keyC each stand alone
+        );
+    });
+
     it('does not emit the aggregate warn when there are no orphaned keys', () => {
         const rawCoverage: MutantCoverage = {
             'static': {},
@@ -2055,6 +2090,40 @@ describe('duplicate-suffix reconciliation (buildDuplicateNameIndex / resolveEach
             'a.test.ts > dup [0]': { '200': 1 }, // id 10, discovered 1st
             'a.test.ts > dup [1]': { '300': 1 }, // id 20, discovered 2nd
             'a.test.ts > dup [2]': { '100': 1 }, // id 30, discovered 3rd
+        });
+    });
+
+    it('assigns [N] suffixes by SOURCE LINE even when discovery order is the exact reverse of line order', () => {
+        // Distinguishes the real getLine extractor (`testHierarchy.get(id)?.line`) passed
+        // into sortDuplicateGroupByLineThenDiscovery (buildDuplicateNameIndex) from a mutant
+        // that always returns undefined: if getLine always returned undefined, every entry
+        // would tie on line and fall through to the discovery-order tie-break instead.
+        // Discovery order (Map insertion order) here is deliberately the EXACT REVERSE of
+        // line order, so the two extractors produce different final suffix assignments and
+        // only the real line-based sort matches the expected order below.
+        const rawCoverage: MutantCoverage = {
+            'static': {},
+            perTest:  {
+                'a.test.ts@@test-1': { '100': 1 }, // → id 1 (line 30)
+                'a.test.ts@@test-2': { '200': 1 }, // → id 2 (line 20)
+                'a.test.ts@@test-3': { '300': 1 }, // → id 3 (line 10)
+            },
+        };
+        const executionOrder = [1, 2, 3];
+        // Discovery (Map insertion) order: id 1, then id 2, then id 3 — the REVERSE of line order.
+        const testHierarchy = new Map<number, TestInfo>([
+            [1, { id: 1, name: 'dup', fullName: 'dup', type: 'test', line: 30, status: 'pass' }],
+            [2, { id: 2, name: 'dup', fullName: 'dup', type: 'test', line: 20, status: 'pass' }],
+            [3, { id: 3, name: 'dup', fullName: 'dup', type: 'test', line: 10, status: 'pass' }],
+        ]);
+
+        const { coverage: result } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+
+        // [0] must go to the EARLIEST line (id 3, line 10), NOT the earliest-discovered (id 1, line 30).
+        expect(result!.perTest).toEqual({
+            'a.test.ts > dup [0]': { '300': 1 }, // id 3, line 10
+            'a.test.ts > dup [1]': { '200': 1 }, // id 2, line 20
+            'a.test.ts > dup [2]': { '100': 1 }, // id 1, line 30
         });
     });
 });
