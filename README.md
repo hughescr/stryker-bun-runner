@@ -251,27 +251,65 @@ of them in a clean run's logs is worth investigating before trusting the score.
   runners: previously, nothing synchronized "the runner has drained the inspector
   stream" with "the child process is allowed to exit," so a consumer that couldn't
   keep up with the event stream under contention would lose whatever hadn't been
-  processed by the time the child exited. The handshake is bounded on both sides
-  (the child gives up and proceeds after a few seconds if it hears nothing back,
-  and the runner's own round-trip is bounded independently and more tightly) — if
-  either bound is hit, today's original behavior (including this gate) applies
-  exactly as before, so the handshake can only reduce how often this gate fires,
-  never mask a real truncation from it.
+  processed by the time the child exited.
+
+  The runner's side of this wait is progress-based, not a fixed timer: it keeps
+  extending as long as the inspector connection is still receiving frames of any
+  kind, since continued arrivals are proof a backlog is actively draining, and
+  only gives up once a period of true silence — no frames at all — has elapsed. A
+  separate, much larger absolute ceiling also exists, but purely as hang
+  prevention for a connection that never goes silent (or never acks) at all; it
+  is not the normal way this wait ends. Either way, once the runner gives up (via
+  silence or the ceiling), it still releases the child immediately rather than
+  leaving it to time out on its own — the child-side timeout only governs the
+  case where the sync channel itself is dead or unresponsive. Hitting any of
+  these bounds still reverts to the original pre-handshake behavior (including
+  this gate) exactly as before, so the handshake can only reduce how often this
+  gate fires, never mask a real truncation from it.
 
   The gate's thresholds — `EXECUTION_SHORTFALL_ABS_FLOOR`, `EXECUTION_SHORTFALL_RATIO_THRESHOLD`,
   `ORPHANED_KEY_ABS_FLOOR`, the drain wait `INSPECTOR_DRAIN_TIMEOUT_MS`, and the drain-handshake
-  bounds (`DRAIN_ACK_ROUND_TRIP_TIMEOUT_MS` in `src/bun-test-runner.ts`, and the matching preload-side
-  ceiling in `src/templates/coverage-preload.ts`) — are fixed module-level constants. There is
-  currently no config option to override them; if these defaults produce false positives in your
-  environment (e.g. a CI runner with very different contention characteristics than the ones this
-  gate was tuned against), a config knob is a possible follow-up — please open an issue rather than
-  patching the constants locally.
+  bounds (`DRAIN_ACK_SILENCE_TIMEOUT_MS` and `DRAIN_ACK_ABSOLUTE_CEILING_MS`, both in
+  `src/bun-test-runner.ts`) — are fixed module-level constants. The matching preload-side
+  ceiling in `src/templates/coverage-preload.ts` is kept above the runner's absolute ceiling,
+  so it remains the true outermost backstop even though it should now rarely if ever be the
+  one that actually fires. There is currently no config option to override any of these; if
+  the defaults produce false positives in your environment (e.g. a CI runner with very
+  different contention characteristics than the ones this gate was tuned against), a config
+  knob is a possible follow-up — please open an issue rather than patching the constants
+  locally. Separately, the dry-run child process's own kill timeout is automatically extended
+  by the drain ceiling on top of `bun.timeout`, so the drain handshake itself never gets cut
+  short by that watchdog. That watchdog covers the child's whole lifetime rather than being
+  phase-specific, though, so as a side effect a dry run whose tests themselves hang (rather
+  than the drain handshake) is also only detected after `bun.timeout` plus the ceiling — a
+  one-time cost on the single dry-run child, not the per-mutant hot loop. Mutant runs are
+  unaffected by any of this and use `bun.timeout` unchanged.
 
   This handshake only covers the `dryRun` path (where coverage collection and the
   completeness gate apply) — individual mutant runs are not held open the same way,
   since they run small, `--test-name-pattern`-filtered subsets where the same
   backlog-under-contention risk is negligible and the completeness gate does not
   apply to them.
+
+  At the default (WARN) log level, dry runs also emit a few lines tracing this
+  handshake: `Drain-request received`, `Drain handler settled via ...`, and
+  `Post-drain inspector snapshot`, reporting the round-trip's outcome (`ack`,
+  `silence`, `ceiling`, or `send-rejected`), the found/start/end event-count
+  deltas observed during the wait, and any found-id gaps. A separate DEBUG-level
+  line notes if the inspector socket closed while the run was still thought to
+  be in progress — this is logged at DEBUG rather than WARN because the child
+  closing its own socket right after receiving `'drained'` routinely wins the
+  race against the runner's own close-expectation on a clean run, so on its own
+  it is not evidence of anything wrong (it is folded into the completeness
+  gate's error message as corroborating context only if that gate has already
+  fired for another reason). Together the WARN-level lines are useful for
+  telling apart two different failure shapes: residual loss caused by a
+  runner-side bound being hit (a give-up
+  outcome — `silence` or `ceiling`) versus loss happening inside Bun's own
+  inspector agent (found-id gaps persisting even though the round-trip `ack`
+  succeeded). One caveat: gap detection assumes Bun assigns test-discovery ids
+  densely, which has been observed but is not a guaranteed contract, so treat
+  gap reports as diagnostic rather than definitive.
 
 ### Coverage-bleed warning (dry run only)
 

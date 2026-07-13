@@ -11,7 +11,8 @@ export {
 
 export type {
     InspectorClientOptions,
-    InspectorEventHandlers
+    InspectorEventHandlers,
+    UnexpectedCloseContext
 } from './inspector-client.js';
 
 export type {

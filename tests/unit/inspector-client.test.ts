@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, mock, jest } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, mock, jest, spyOn } from 'bun:test';
 import {
     InspectorClient,
     InspectorTimeoutError,
@@ -258,6 +258,72 @@ describe('InspectorClient', () => {
                 const sendError = await sendPromise.catch((e: unknown) => e);
                 expect(sendError).toBeInstanceOf(InspectorTimeoutError);
                 expect((sendError as InspectorTimeoutError).message).toContain('Request timeout after 100ms: TestReporter.enable');
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('should honor a per-call timeout override, not the constructor requestTimeout', async () => {
+            jest.useFakeTimers();
+            try {
+                const client = new InspectorClient({
+                    url:            'ws://localhost:6499',
+                    requestTimeout: 5000,
+
+                    WebSocketClass: MockWebSocketConstructor,
+                });
+
+                const connectPromise = client.connect();
+                mockWs.simulateOpen();
+                await connectPromise;
+
+                const sendPromise = client.send('m', {}, 10_000);
+                let rejected = false;
+                const settled = sendPromise.catch((e: unknown) => {
+                    rejected = true;
+                    return e;
+                });
+
+                jest.advanceTimersByTime(5000);
+                await Promise.resolve();
+                await Promise.resolve();
+                expect(rejected).toBe(false);
+
+                jest.advanceTimersByTime(5000);
+                await Promise.resolve();
+                await Promise.resolve();
+
+                const sendError = await settled;
+                expect(rejected).toBe(true);
+                expect(sendError).toBeInstanceOf(InspectorTimeoutError);
+                expect((sendError as InspectorTimeoutError).message).toContain('Request timeout after 10000ms');
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('should still use the constructor requestTimeout when no per-call override is passed', async () => {
+            jest.useFakeTimers();
+            try {
+                const client = new InspectorClient({
+                    url:            'ws://localhost:6499',
+                    requestTimeout: 5000,
+
+                    WebSocketClass: MockWebSocketConstructor,
+                });
+
+                const connectPromise = client.connect();
+                mockWs.simulateOpen();
+                await connectPromise;
+
+                const sendPromise = client.send('m', {});
+
+                jest.advanceTimersByTime(5000);
+                await Promise.resolve();
+
+                const sendError = await sendPromise.catch((e: unknown) => e);
+                expect(sendError).toBeInstanceOf(InspectorTimeoutError);
+                expect((sendError as InspectorTimeoutError).message).toContain('Request timeout after 5000ms');
             } finally {
                 jest.useRealTimers();
             }
@@ -1764,6 +1830,78 @@ describe('InspectorClient', () => {
 
             // Should not throw
         });
+
+        it('calls onUnexpectedClose exactly once with the expected context when the socket closes with no prior close()/expectClose()', async () => {
+            const onUnexpectedClose = mock((_ctx: { wsClosed: boolean, closeExpected: boolean, isClosing: boolean }) => {});
+            const client = new InspectorClient({
+                url:      'ws://localhost:6499',
+                handlers: { onUnexpectedClose },
+
+                WebSocketClass: MockWebSocketConstructor,
+            });
+
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            mockWs.close();
+
+            expect(onUnexpectedClose).toHaveBeenCalledTimes(1);
+            expect(onUnexpectedClose).toHaveBeenCalledWith({ wsClosed: true, closeExpected: false, isClosing: false });
+        });
+
+        it('does NOT call onUnexpectedClose after an explicit close()', async () => {
+            const onUnexpectedClose = mock((_ctx: { wsClosed: boolean, closeExpected: boolean, isClosing: boolean }) => {});
+            const client = new InspectorClient({
+                url:      'ws://localhost:6499',
+                handlers: { onUnexpectedClose },
+
+                WebSocketClass: MockWebSocketConstructor,
+            });
+
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            const closePromise = client.close();
+            mockWs.close();
+            await closePromise;
+
+            expect(onUnexpectedClose).not.toHaveBeenCalled();
+        });
+
+        it('does NOT call onUnexpectedClose after expectClose()', async () => {
+            const onUnexpectedClose = mock((_ctx: { wsClosed: boolean, closeExpected: boolean, isClosing: boolean }) => {});
+            const client = new InspectorClient({
+                url:      'ws://localhost:6499',
+                handlers: { onUnexpectedClose },
+
+                WebSocketClass: MockWebSocketConstructor,
+            });
+
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            client.expectClose();
+            mockWs.close();
+
+            expect(onUnexpectedClose).not.toHaveBeenCalled();
+        });
+
+        it('does not throw when no onUnexpectedClose handler is registered and the socket closes unexpectedly', async () => {
+            const client = new InspectorClient({
+                url: 'ws://localhost:6499',
+
+                WebSocketClass: MockWebSocketConstructor,
+            });
+
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            expect(() => mockWs.close()).not.toThrow();
+        });
     });
 
     describe('send error handling', () => {
@@ -2542,6 +2680,199 @@ describe('InspectorClient', () => {
 
             expect(onError).toHaveBeenCalledTimes(1);
             expect(onError.mock.calls[0][0].message).toContain('WebSocket connection failed');
+        });
+    });
+
+    describe('getMsSinceLastFrame', () => {
+        it('tracks elapsed time since open, since the last valid message, and since a malformed message (stamped before parse)', async () => {
+            let fakeNow = 1000;
+            const dateNowSpy = spyOn(Date, 'now').mockImplementation(() => fakeNow);
+            try {
+                const onError = mock((_e: Error) => {});
+                const client = new InspectorClient({
+                    url:      'ws://localhost:6499',
+                    handlers: { onError },
+
+                    WebSocketClass: MockWebSocketConstructor,
+                });
+
+                const connectPromise = client.connect();
+                mockWs.simulateOpen();
+                await connectPromise;
+
+                fakeNow = 1500;
+                expect(client.getMsSinceLastFrame()).toBe(500);
+
+                fakeNow = 1600;
+                mockWs.simulateMessage(
+                    JSON.stringify({
+                        method: 'TestReporter.found',
+                        params: { id: 1, name: 'test1', type: 'test' },
+                    })
+                );
+                fakeNow = 1700;
+                expect(client.getMsSinceLastFrame()).toBe(100);
+
+                fakeNow = 2000;
+                mockWs.simulateMessage('{ this is not valid JSON');
+                expect(onError).toHaveBeenCalledTimes(1);
+
+                fakeNow = 2050;
+                expect(client.getMsSinceLastFrame()).toBe(50);
+            } finally {
+                dateNowSpy.mockRestore();
+            }
+        });
+    });
+
+    describe('getFoundIdGaps', () => {
+        const found = (id: number): void => {
+            mockWs.simulateMessage(
+                JSON.stringify({
+                    method: 'TestReporter.found',
+                    params: { id, name: `test${id}`, type: 'test' },
+                })
+            );
+        };
+
+        const makeClient = (): InspectorClient => new InspectorClient({
+            url: 'ws://localhost:6499',
+
+            WebSocketClass: MockWebSocketConstructor,
+        });
+
+        it('returns [] when no found events have been received', async () => {
+            const client = makeClient();
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            expect(client.getFoundIdGaps()).toEqual([]);
+        });
+
+        it('returns [] for a contiguous run of ids', async () => {
+            const client = makeClient();
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            found(1);
+            found(2);
+            found(3);
+            expect(client.getFoundIdGaps()).toEqual([]);
+        });
+
+        it('returns the missing id in the middle of the range', async () => {
+            const client = makeClient();
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            found(1);
+            found(3);
+            expect(client.getFoundIdGaps()).toEqual([2]);
+        });
+
+        it('returns [] when only a single id has been found (window starts at min, not 1)', async () => {
+            const client = makeClient();
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            found(5);
+            expect(client.getFoundIdGaps()).toEqual([]);
+        });
+
+        it('returns all missing ids between a non-1 min and max', async () => {
+            const client = makeClient();
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            found(5);
+            found(9);
+            expect(client.getFoundIdGaps()).toEqual([6, 7, 8]);
+        });
+
+        it('returns the single gap regardless of delivery order', async () => {
+            const client = makeClient();
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            found(2);
+            found(4);
+            expect(client.getFoundIdGaps()).toEqual([3]);
+        });
+
+        it('handles out-of-order delivery correctly (min/max loop boundary)', async () => {
+            const client = makeClient();
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            found(3);
+            found(1);
+            found(2);
+            expect(client.getFoundIdGaps()).toEqual([]);
+        });
+    });
+
+    describe('getEventCounts', () => {
+        it('starts at zero and increments per-kind, including counting a start for an unknown id (counter precedes the early return)', async () => {
+            const client = new InspectorClient({
+                url: 'ws://localhost:6499',
+
+                WebSocketClass: MockWebSocketConstructor,
+            });
+
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            expect(client.getEventCounts()).toEqual({ found: 0, start: 0, end: 0 });
+
+            mockWs.simulateMessage(
+                JSON.stringify({
+                    method: 'TestReporter.found',
+                    params: { id: 1, name: 'test1', type: 'test' },
+                })
+            );
+            expect(client.getEventCounts()).toEqual({ found: 1, start: 0, end: 0 });
+
+            mockWs.simulateMessage(
+                JSON.stringify({
+                    method: 'TestReporter.start',
+                    params: { id: 1 },
+                })
+            );
+            expect(client.getEventCounts()).toEqual({ found: 1, start: 1, end: 0 });
+
+            mockWs.simulateMessage(
+                JSON.stringify({
+                    method: 'TestReporter.end',
+                    params: { id: 1, status: 'pass', elapsed: 10 },
+                })
+            );
+            expect(client.getEventCounts()).toEqual({ found: 1, start: 1, end: 1 });
+
+            mockWs.simulateMessage(
+                JSON.stringify({
+                    method: 'TestReporter.found',
+                    params: { id: 2, name: 'test2', type: 'test' },
+                })
+            );
+            expect(client.getEventCounts()).toEqual({ found: 2, start: 1, end: 1 });
+
+            // Start for an unknown id: still increments startCount even though
+            // handleTestStart early-returns after the counter bump.
+            mockWs.simulateMessage(
+                JSON.stringify({
+                    method: 'TestReporter.start',
+                    params: { id: 999 },
+                })
+            );
+            expect(client.getEventCounts()).toEqual({ found: 2, start: 2, end: 1 });
         });
     });
 });

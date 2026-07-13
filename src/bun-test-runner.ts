@@ -53,28 +53,103 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * A promise that rejects after `ms` milliseconds, paired with a `cancel`
- * function that clears the underlying timer — used to race against
- * {@link InspectorClient.send} in the drain handler (see
- * {@link DRAIN_ACK_ROUND_TRIP_TIMEOUT_MS}) so a stuck inspector round-trip
- * cannot hang the drain handshake beyond this bound.
- *
- * The timer is created with `setTimeout` and, left uncleared, would keep the
- * event loop alive for the full `ms` even after `Promise.race` already
- * settled via the OTHER branch (e.g. `inspector.send` resolving first) — the
- * timer callback is still scheduled and Node won't exit until it fires.
- * Callers MUST call `cancel()` once the race is decided (a `finally` block
- * around the `Promise.race` is the natural place) so the timer never
- * outlives the race it was created for.
+ * Give up the drain handler's wait after this much TRUE silence — no frames of
+ * any kind received on the inspector connection (see
+ * InspectorClient.getMsSinceLastFrame). Deliberately equal to the old fixed
+ * round-trip bound this replaces: a genuinely dead stream never waits longer
+ * than it did before, while a stream still making progress is not bounded by
+ * this value at all, only by DRAIN_ACK_ABSOLUTE_CEILING_MS.
  */
-function rejectAfterMs(ms: number, message: string): { promise: Promise<never>, cancel: () => void } {
-    let timer: ReturnType<typeof setTimeout>;
+const DRAIN_ACK_SILENCE_TIMEOUT_MS = 4000;
+/**
+ * Hard backstop on the drain handler's TOTAL wait regardless of ongoing
+ * progress — pure hang prevention, not the primary bound. Must stay BELOW the
+ * preload's DRAIN_ACK_TIMEOUT_MS (40000ms, src/templates/coverage-preload.ts),
+ * which is the true outermost backstop, and is added to the dry-run child's
+ * kill timeout (see the runBunTests call in dryRun) so the whole-process kill
+ * timer cannot fire before this ceiling can matter.
+ */
+const DRAIN_ACK_ABSOLUTE_CEILING_MS = 30_000;
+/** Poll cadence of raceAgainstSilence's progress check. */
+const DRAIN_SILENCE_POLL_INTERVAL_MS = 250;
+/** Cap on individually listed found-id gaps in drain diagnostic log lines. */
+const MAX_GAP_IDS_LISTED = 20;
+
+/** Rejection type for raceAgainstSilence, carrying WHICH bound fired. */
+class DrainWaitTimeoutError extends Error {
+    readonly reason: 'silence' | 'ceiling';
+    constructor(message: string, reason: 'silence' | 'ceiling') {
+        super(message);
+        this.name = 'DrainWaitTimeoutError';
+        this.reason = reason;
+    }
+}
+
+/**
+ * A promise that rejects once EITHER `absoluteCeilingMs` total has elapsed
+ * since the call, OR at least `silenceMs` has elapsed since the call AND the
+ * inspector connection has received no frames at all for `silenceMs` —
+ * whichever a poll tick observes first. Polls on an interval instead of a
+ * fixed timer so ongoing frame arrival (proof a backlog is still draining)
+ * keeps deferring the give-up — §3a.
+ *
+ * The silence check is deliberately anchored to THIS CALL's elapsed time, not
+ * only to {@link InspectorClient.getMsSinceLastFrame}'s connection-wide clock:
+ * that clock can already be stale the instant this function is invoked (e.g.
+ * the final test ran for several seconds with no inspector traffic in
+ * flight), and using it alone would let the very first poll tick give up
+ * before the ack this call is racing against ever got a real window to
+ * arrive — silently reproducing the race this replaces `rejectAfterMs` to
+ * fix. Requiring elapsed-since-call to also clear `silenceMs` guarantees this
+ * call always waits at least `silenceMs` from its own start before silence
+ * can be the reason it gives up, matching the old fixed-timeout's minimum
+ * wait. The ceiling is checked first so that if both bounds are satisfied on
+ * the same tick (e.g. the event loop stalls and resumes well past the
+ * ceiling), the more severe bound is the one reported.
+ *
+ * `cancel()` MUST be called once the caller's race is decided: an uncleared
+ * interval keeps the event loop alive indefinitely.
+ */
+function raceAgainstSilence(
+    inspector: InspectorClient,
+    silenceMs: number,
+    absoluteCeilingMs: number,
+    message: string
+): { promise: Promise<never>, cancel: () => void } {
+    const startedAt = Date.now();
+    let timer: ReturnType<typeof setInterval>;
     const promise = new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => {
-            reject(new Error(message));
-        }, ms);
+        timer = setInterval(() => {
+            const sinceLastFrame = inspector.getMsSinceLastFrame();
+            const totalElapsed = Date.now() - startedAt;
+            if(totalElapsed >= absoluteCeilingMs) {
+                clearInterval(timer);
+                reject(new DrainWaitTimeoutError(`${message}: ${absoluteCeilingMs}ms absolute ceiling reached`, 'ceiling'));
+            } else if(totalElapsed >= silenceMs && sinceLastFrame >= silenceMs) {
+                clearInterval(timer);
+                reject(new DrainWaitTimeoutError(`${message}: ${sinceLastFrame}ms of inspector silence (limit ${silenceMs}ms)`, 'silence'));
+            }
+        }, DRAIN_SILENCE_POLL_INTERVAL_MS);
     });
-    return { promise, cancel: () => clearTimeout(timer) };
+    return { promise, cancel: () => clearInterval(timer) };
+}
+
+/** ' [1,2,3]' / ' [first 20,…]' suffix for gap log lines; '' when no gaps. */
+function formatGapIdList(gaps: readonly number[]): string {
+    if(gaps.length === 0) {
+        return '';
+    }
+    const shown = gaps.slice(0, MAX_GAP_IDS_LISTED).join(',');
+    return gaps.length > MAX_GAP_IDS_LISTED ? ` [${shown},…]` : ` [${shown}]`;
+}
+
+/**
+ * 'never requested' / 'settled via <reason>' for the step-9 post-drain summary
+ * log — extracted (rather than an inline ternary in {@link BunTestRunner.dryRun})
+ * purely to keep dryRun's own cyclomatic complexity under the lint threshold.
+ */
+function formatDrainSettleReason(reason: 'ack' | 'silence' | 'ceiling' | 'send-rejected' | undefined): string {
+    return reason === undefined ? 'never requested' : `settled via ${reason}`;
 }
 
 /**
@@ -179,18 +254,6 @@ const ORPHANED_KEY_ABS_FLOOR = 5;
  * of an already-idle socket (not a real network round-trip), so it is kept short.
  */
 const INSPECTOR_DRAIN_TIMEOUT_MS = 1000;
-
-/**
- * Bound on the inspector-protocol round-trip performed by the drain handler
- * registered with {@link SyncServer.setDrainHandler} (see the drain handshake
- * in {@link BunTestRunner.dryRun}, step 6.5).
- * Deliberately BELOW the preload's own {@code DRAIN_ACK_TIMEOUT_MS} (5000ms,
- * `src/templates/coverage-preload.ts`) so a stuck round-trip is still bounded
- * by this shorter ceiling first — the preload's own ceiling is the ultimate
- * backstop if this one is somehow bypassed. {@link InspectorClient.send} also
- * carries its own `requestTimeout`, so this is a second, independent bound.
- */
-const DRAIN_ACK_ROUND_TRIP_TIMEOUT_MS = 4000;
 
 /**
  * Bun test runner for Stryker mutation testing
@@ -838,7 +901,19 @@ export class BunTestRunner implements TestRunner {
             // Start test process with callback to get inspector URL
             const testProcess = runBunTests({
                 bunPath:               this.bunPath,
-                timeout:               this.timeout,
+                // The dry-run child's lifetime legitimately includes the post-test drain
+                // handshake; without this headroom the whole-process kill timer
+                // (process-runner.ts, default bun.timeout=10000) would SIGTERM the child
+                // before the drain ceiling could ever matter. This is a single watchdog
+                // covering the child's ENTIRE lifetime, test execution included — it is
+                // NOT phase-specific, so a dry run whose tests themselves hang (never
+                // reaching the drain phase at all) is also, as a side effect, only
+                // detected/killed after this.timeout + the ceiling rather than
+                // this.timeout alone. Accepted: this only affects the single dry-run
+                // child (not the per-mutant hot loop below, which still uses
+                // this.timeout unmodified), and a genuinely hung dry run is already a
+                // rare, one-time cost.
+                timeout:               this.timeout + DRAIN_ACK_ABSOLUTE_CEILING_MS,
                 env:                   this.env,
                 bunArgs:               this.bunArgs,
                 bunfigPath,
@@ -925,6 +1000,21 @@ export class BunTestRunner implements TestRunner {
                         // Stryker disable next-line StringLiteral: logging message only
                         this.logger.warn('Inspector error: %s', error.message);
                     },
+                    // debug, not warn: on the healthy path the child closes its own
+                    // inspector socket right after receiving 'drained', which routinely
+                    // wins the race against our own expectClose() call (only reached
+                    // after `await testProcess` resolves, i.e. after OS-level process
+                    // exit) — see the integration test covering this exact scenario. So
+                    // this fires on a nontrivial fraction of clean runs and is NOT itself
+                    // evidence of anything wrong; it is diagnostic context only, folded
+                    // into the completeness gate's error message (never a standalone
+                    // trigger — see checkCompletenessGate's doc comment).
+                    onUnexpectedClose: (context) => {
+                        this.logger.debug(
+                            'Inspector WebSocket closed while the run was still thought to be in progress (wsClosed=%s closeExpected=%s isClosing=%s) — often benign; see checkCompletenessGate',
+                            context.wsClosed, context.closeExpected, context.isClosing
+                        );
+                    },
                 },
             });
 
@@ -948,6 +1038,9 @@ export class BunTestRunner implements TestRunner {
                 };
             }
 
+            // undefined = drain-request never arrived (step 9 reports this distinctly).
+            let drainSettleReason: 'ack' | 'silence' | 'ceiling' | 'send-rejected' | undefined;
+
             // 6.5 Register a drain handler: the preload's final afterAll blocks on a
             // 'drained' acknowledgment from the runner before closing its sync socket
             // and exiting. This handler is what PROVES drain —
@@ -958,24 +1051,67 @@ export class BunTestRunner implements TestRunner {
             // guarantees every TestReporter frame sent before it has already been
             // received AND processed. TestReporter.enable is idempotent and already
             // proven responsive (it just succeeded above), making it a safe no-op ping.
-            // Bounded independently of both the preload's own ceiling (longer, so this
-            // one governs first) and InspectorClient's own requestTimeout.
+            //
+            // The wait is now progress-based rather than a fixed deadline: it gives up
+            // only after DRAIN_ACK_SILENCE_TIMEOUT_MS of TRUE inspector silence (no
+            // frames of any kind — proof the backlog has stopped draining), with a hard
+            // DRAIN_ACK_ABSOLUTE_CEILING_MS backstop regardless of ongoing progress. The
+            // inspector.send() call itself carries a per-call timeout set ABOVE the
+            // absolute ceiling so the silence/ceiling race always governs, never send()'s
+            // own internal timer. Giving up now RESOLVES (never rejects) so the drain
+            // handler ALWAYS results in 'drained' being sent once it settles — this
+            // releases the child immediately instead of letting it idle out its own
+            // (now 40s) backstop in the preload.
             syncServer.setDrainHandler(async () => {
-                const { promise: timeoutPromise, cancel: cancelTimeout } = rejectAfterMs(
-                    DRAIN_ACK_ROUND_TRIP_TIMEOUT_MS,
-                    'Inspector drain round-trip timed out'
+                const drainRequestReceivedAt = Date.now();
+                const countsAtRequest = inspector.getEventCounts();
+                const gapsAtRequest = inspector.getFoundIdGaps();
+                this.logger.warn(
+                    'Drain-request received: %d/%d/%d found/start/end events received so far; %d found-id gap(s)%s',
+                    countsAtRequest.found, countsAtRequest.start, countsAtRequest.end,
+                    gapsAtRequest.length, formatGapIdList(gapsAtRequest)
+                );
+
+                const { promise: silencePromise, cancel: cancelSilence } = raceAgainstSilence(
+                    inspector, DRAIN_ACK_SILENCE_TIMEOUT_MS, DRAIN_ACK_ABSOLUTE_CEILING_MS,
+                    'Inspector drain wait gave up'
                 );
                 try {
+                    // silencePromise is Promise<never> — it only ever rejects, so a
+                    // non-throwing race can only mean inspector.send() resolved first.
                     await Promise.race([
-                        inspector.send('TestReporter.enable', {}),
-                        timeoutPromise,
+                        // Per-call timeout deliberately ABOVE the absolute ceiling so the
+                        // silence/ceiling race always governs this wait, never send()'s own
+                        // fixed per-request timer (default 5000ms).
+                        inspector.send('TestReporter.enable', {}, DRAIN_ACK_ABSOLUTE_CEILING_MS + 1000),
+                        silencePromise,
                     ]);
+                    drainSettleReason = 'ack';
+                } catch (error) {
+                    drainSettleReason = error instanceof DrainWaitTimeoutError ? error.reason : 'send-rejected';
+                    if(drainSettleReason === 'send-rejected') {
+                        this.logger.warn('Inspector drain round-trip rejected before any wait bound was hit: %s',
+                            error instanceof Error ? error.message : String(error));
+                    }
+                    // Swallowed on purpose: resolving makes SyncServer send 'drained' even on
+                    // give-up, releasing the child immediately — otherwise the child would
+                    // idle out its own (now 40s) backstop on every failed handshake.
                 } finally {
-                    // Whichever branch of the race settled, the timer must not linger —
-                    // an uncleared setTimeout keeps the event loop (and this dry run's
-                    // child-process lifetime) alive for the full DRAIN_ACK_ROUND_TRIP_TIMEOUT_MS
-                    // even after a successful drain handshake. See rejectAfterMs's doc comment.
-                    cancelTimeout();
+                    cancelSilence();
+                    const elapsedMs = Date.now() - drainRequestReceivedAt;
+                    const countsAtSettle = inspector.getEventCounts();
+                    const gapsAtSettle = inspector.getFoundIdGaps();
+                    this.logger.warn(
+                        'Drain handler settled via %s after %dms; events during wait +%d/+%d/+%d found/start/end; found-id gaps %d -> %d%s',
+                        drainSettleReason, elapsedMs,
+                        countsAtSettle.found - countsAtRequest.found,
+                        countsAtSettle.start - countsAtRequest.start,
+                        countsAtSettle.end - countsAtRequest.end,
+                        gapsAtRequest.length, gapsAtSettle.length,
+                        drainSettleReason === 'ack' && gapsAtSettle.length > 0
+                            ? ' — ack resolved but gaps remain: the ack may under-prove drain'
+                            : ''
+                    );
                 }
             });
 
@@ -1006,6 +1142,13 @@ export class BunTestRunner implements TestRunner {
             // Stryker disable next-line StringLiteral: logging message only
             this.logger.debug('Inspector collected %d tests in hierarchy, %d in execution order',
                 testHierarchy.length, executionOrder.length);
+
+            const finalGaps = inspector.getFoundIdGaps();
+            this.logger.warn(
+                'Post-drain inspector snapshot: %d found-id gap(s) remaining%s; drain handshake %s',
+                finalGaps.length, formatGapIdList(finalGaps),
+                formatDrainSettleReason(drainSettleReason)
+            );
 
             // 10–12. Handle timeout and process errors; parse output
             const parsed = parseBunTestOutput(result.stdout, result.stderr);

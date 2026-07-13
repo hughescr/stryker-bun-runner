@@ -82,11 +82,13 @@ let ws: WebSocket | null = null;
 // Bound on how long the final afterAll (below) waits for the runner's drain
 // acknowledgment before giving up and proceeding as if drained — see
 // "Inspector-stream drain handshake" further down.
-// Deliberately ABOVE the runner-side inspector round-trip timeout
-// (DRAIN_ACK_ROUND_TRIP_TIMEOUT_MS in bun-test-runner.ts) so a stuck
-// round-trip is governed by that shorter ceiling first; this is the outer
-// backstop if the sync channel itself is unresponsive.
-const DRAIN_ACK_TIMEOUT_MS = 5000;
+// The runner now sends 'drained' once its own wait settles — INCLUDING when
+// it gave up (silence or absolute ceiling) — so this timer only ever governs
+// if the sync channel itself is dead or unresponsive. Deliberately ABOVE the
+// runner-side absolute ceiling (DRAIN_ACK_ABSOLUTE_CEILING_MS in
+// bun-test-runner.ts) so a stuck wait is always governed by that shorter
+// ceiling first.
+const DRAIN_ACK_TIMEOUT_MS = 40_000;
 
 // Per-file test counters for per-test coverage tracking.
 //

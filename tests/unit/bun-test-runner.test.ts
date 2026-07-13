@@ -83,6 +83,9 @@ describe('BunTestRunner', () => {
         expectClose:           ReturnType<typeof mock>
         waitForClose:          ReturnType<typeof mock>
         wasClosedUnexpectedly: boolean
+        getMsSinceLastFrame:   ReturnType<typeof mock>
+        getFoundIdGaps:        ReturnType<typeof mock>
+        getEventCounts:        ReturnType<typeof mock>
     };
     let mockMapCoverageToInspectorIds: ReturnType<typeof mock>;
 
@@ -169,6 +172,9 @@ describe('BunTestRunner', () => {
             expectClose:           mock(),
             waitForClose:          mock(),
             wasClosedUnexpectedly: false,
+            getMsSinceLastFrame:   mock().mockReturnValue(0),
+            getFoundIdGaps:        mock().mockReturnValue([]),
+            getEventCounts:        mock().mockReturnValue({ found: 0, start: 0, end: 0 }),
         };
         // @ts-expect-error - Mocking constructor, type system doesn't understand this pattern
         inspectorClientSpy = spyOn(inspectorModule, 'InspectorClient').mockImplementation(() => mockInspectorClient);
@@ -368,13 +374,15 @@ describe('BunTestRunner', () => {
                 })
             );
 
-            // Verify the option is actually used when running tests
+            // Verify the option is actually used when running tests. dryRun()'s child
+            // gets bun.timeout PLUS the drain absolute ceiling (30_000) as headroom for
+            // the post-test drain handshake — see the runBunTests call in dryRun().
             await runner.init();
             await runner.dryRun();
 
             expect(mockRunBunTests).toHaveBeenCalledWith(
                 expect.objectContaining({
-                    timeout: 20_000,
+                    timeout: 50_000,
                 })
             );
         });
@@ -1917,37 +1925,192 @@ tests/example.test.ts:
                 1, 1);
         });
 
-        describe('drain handshake', () => {
+        /**
+         * Shared setup so runner.dryRun() completes normally in these tests —
+         * mirrors the boilerplate used by every other dryRun() test in this file
+         * (see e.g. 'should log exact debug messages' above): without calling
+         * onInspectorReady, dryRun() would stall waiting for the inspector URL.
+         * Hoisted to this scope (rather than duplicated per-describe) so the
+         * 'step 9 post-drain inspector snapshot log' and 'drain handshake'
+         * describes below share one definition.
+         */
+        function mockSuccessfulBunTestRun(): void {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+            mockRunBunTests.mockImplementation((options: any) => {
+                if(options.onInspectorReady) {
+                    options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                }
+                return Promise.resolve({
+                    exitCode: 0,
+                    stdout:   '✓ test [0.12ms]\n 1 pass',
+                    stderr:   '',
+                    timedOut: false,
+                });
+            });
+            mockCollectCoverage.mockResolvedValue(undefined);
+            mockInspectorClient.getExecutionOrder.mockReturnValue([1]);
+            mockInspectorClient.getTests.mockReturnValue([{
+                id:       1,
+                name:     'test',
+                fullName: 'test',
+                status:   'pass',
+                url:      '/project/tests/test.ts',
+            }]);
+        }
+
+        describe('step 9 post-drain inspector snapshot log', () => {
+            it('reports "never requested" when no drain-request was simulated', async () => {
+                mockSuccessfulBunTestRun();
+                mockInspectorClient.getFoundIdGaps.mockReturnValue([3]);
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    'Post-drain inspector snapshot: %d found-id gap(s) remaining%s; drain handshake %s',
+                    1, ' [3]', 'never requested'
+                );
+            });
+
             /**
-       * Shared setup so runner.dryRun() completes normally in these tests —
-       * mirrors the boilerplate used by every other dryRun() test in this file
-       * (see e.g. 'should log exact debug messages' above): without calling
-       * onInspectorReady, dryRun() would stall waiting for the inspector URL.
-       */
-            function mockSuccessfulBunTestRun(): void {
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
-                mockRunBunTests.mockImplementation((options: any) => {
+             * Both cases below need the SAME dryRun() call's drain handler invoked
+             * (and settled) BEFORE step 9 runs — a handler invoked after dryRun()
+             * already returned can never affect that call's own (already-logged)
+             * step 9 line, since drainSettleReason is a local variable scoped fresh
+             * to each dryRun() call. Deferring on a "handler registered" promise lets
+             * the mocked child process (mockRunBunTests) invoke the SAME handler
+             * dryRun() just registered, mirroring the real preload's
+             * drain-request → 'drained' handshake happening before process exit.
+             */
+            function deferHandlerRegistration(): { handlerRegistered: Promise<() => Promise<void>> } {
+                let resolveRegistered!: (handler: () => Promise<void>) => void;
+                const handlerRegistered = new Promise<() => Promise<void>>((resolve) => {
+                    resolveRegistered = resolve;
+                });
+                mockSyncServer.setDrainHandler.mockImplementation((fn: () => Promise<void>) => {
+                    resolveRegistered(fn);
+                });
+                return { handlerRegistered };
+            }
+
+            it('reports "settled via ack" after the drain handler resolves via a successful round-trip', async () => {
+                mockSuccessfulBunTestRun();
+                mockInspectorClient.getFoundIdGaps.mockReturnValue([]);
+                const { handlerRegistered } = deferHandlerRegistration();
+
+                mockRunBunTests.mockImplementation((options: { onInspectorReady?: (url: string) => void }) => {
                     if(options.onInspectorReady) {
                         options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                     }
-                    return Promise.resolve({
-                        exitCode: 0,
-                        stdout:   '✓ test [0.12ms]\n 1 pass',
-                        stderr:   '',
-                        timedOut: false,
-                    });
+                    return (async () => {
+                        const handler = await handlerRegistered;
+                        await handler();
+                        return {
+                            exitCode: 0,
+                            stdout:   '✓ test [0.12ms]\n 1 pass',
+                            stderr:   '',
+                            timedOut: false,
+                        };
+                    })();
                 });
-                mockCollectCoverage.mockResolvedValue(undefined);
-                mockInspectorClient.getExecutionOrder.mockReturnValue([1]);
-                mockInspectorClient.getTests.mockReturnValue([{
-                    id:       1,
-                    name:     'test',
-                    fullName: 'test',
-                    status:   'pass',
-                    url:      '/project/tests/test.ts',
-                }]);
-            }
 
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    'Post-drain inspector snapshot: %d found-id gap(s) remaining%s; drain handshake %s',
+                    0, '', 'settled via ack'
+                );
+            });
+
+            it('reports "settled via silence" after the drain handler gives up on inspector silence', async () => {
+                mockSuccessfulBunTestRun();
+                mockInspectorClient.getFoundIdGaps.mockReturnValue([]);
+                // Step 6's initial TestReporter.enable call must still resolve (it
+                // happens BEFORE the drain handler is even registered) — only the
+                // drain handler's OWN send() call (made after this one-shot value is
+                // consumed) should hang, forcing the silence give-up.
+                mockInspectorClient.send.mockResolvedValueOnce(undefined).mockImplementation(() => new Promise(() => {}));
+                mockInspectorClient.getMsSinceLastFrame.mockReturnValue(4000);
+                const { handlerRegistered } = deferHandlerRegistration();
+
+                // The silence bound now also requires elapsed-since-request to clear
+                // silenceMs (not just sinceLastFrame), so Date.now() must be advanced
+                // alongside the fake-timer tick — otherwise a single 250ms tick can never
+                // satisfy the 4000ms elapsed-time half of the bound.
+                const realDateNow = Date.now.bind(Date);
+                let fakeNow = realDateNow();
+                const dateNowSpy = spyOn(Date, 'now').mockImplementation(() => fakeNow);
+
+                mockRunBunTests.mockImplementation((options: { onInspectorReady?: (url: string) => void }) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return (async () => {
+                        const handler = await handlerRegistered;
+                        const handlerPromise = handler();
+                        fakeNow += 4000;
+                        jest.advanceTimersByTime(250);
+                        await Promise.resolve();
+                        await Promise.resolve();
+                        await handlerPromise;
+                        return {
+                            exitCode: 0,
+                            stdout:   '✓ test [0.12ms]\n 1 pass',
+                            stderr:   '',
+                            timedOut: false,
+                        };
+                    })();
+                });
+
+                jest.useFakeTimers();
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                try {
+                    await runner.init();
+                    await runner.dryRun();
+                } finally {
+                    dateNowSpy.mockRestore();
+                    jest.useRealTimers();
+                }
+
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    'Post-drain inspector snapshot: %d found-id gap(s) remaining%s; drain handshake %s',
+                    0, '', 'settled via silence'
+                );
+            });
+        });
+
+        it('gives the dry-run child kill timeout headroom equal to the drain absolute ceiling on top of bun.timeout', async () => {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+            mockRunBunTests.mockImplementation((options: any) => {
+                if(options.onInspectorReady) {
+                    options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                }
+                return Promise.resolve({
+                    exitCode: 0,
+                    stdout:   '✓ test [0.12ms]\n 1 pass',
+                    stderr:   '',
+                    timedOut: false,
+                });
+            });
+            mockCollectCoverage.mockResolvedValue(undefined);
+            mockInspectorClient.getExecutionOrder.mockReturnValue([1]);
+            mockInspectorClient.getTests.mockReturnValue([{
+                id: 1, name: 'test', fullName: 'test', status: 'pass', url: '/project/tests/test.ts',
+            }]);
+
+            const runner = new BunTestRunner(mockLogger, { bun: { timeout: 10_000 } } as unknown as StrykerOptions);
+            await runner.init();
+            await runner.dryRun();
+
+            expect(mockRunBunTests).toHaveBeenCalledWith(
+                expect.objectContaining({ timeout: 40_000 })
+            );
+        });
+
+        describe('drain handshake', () => {
             it('registers a drain handler on the sync server before signaling ready', async () => {
                 mockSuccessfulBunTestRun();
                 const callOrder: string[] = [];
@@ -1979,48 +2142,441 @@ tests/example.test.ts:
 
                 await drainHandler();
 
-                expect(mockInspectorClient.send).toHaveBeenCalledWith('TestReporter.enable', {});
+                // Per-call timeout pinned ABOVE the 30_000ms absolute ceiling (31_000) —
+                // regression test for reintroducing send()'s own shorter default timer
+                // as the effective bound instead of the silence/ceiling race.
+                expect(mockInspectorClient.send).toHaveBeenCalledWith('TestReporter.enable', {}, 31_000);
             });
 
-            it('the drain handler rejects when the inspector round-trip does not resolve within its bound', async () => {
+            it('progress (frames still arriving) extends the wait past the old fixed 4000ms bound', async () => {
+                // THE §3a regression test: this fails against the old fixed-race code,
+                // which would have given up (rejected) at exactly 4000ms regardless of
+                // ongoing inspector activity.
                 mockSuccessfulBunTestRun();
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
                 await runner.init();
-                // First dryRun() completes normally (step 6's TestReporter.enable call
-                // uses the default resolved mock) — this is only to capture the
-                // registered drain handler for direct invocation below.
                 await runner.dryRun();
 
                 const drainHandler = mockSyncServer.setDrainHandler.mock.calls[0][0] as () => Promise<void>;
 
                 jest.useFakeTimers();
                 try {
-                    // Simulate a stuck inspector round-trip: send() never resolves.
-                    mockInspectorClient.send.mockImplementation(() => new Promise(() => {}));
+                    // Inspector is always "recently active" — never crosses the silence bound.
+                    mockInspectorClient.getMsSinceLastFrame.mockReturnValue(50);
+                    // send() never resolves on its own — only manual resolution below ends the wait.
+                    let resolveSend!: () => void;
+                    mockInspectorClient.send.mockImplementation(() => new Promise<void>((resolve) => {
+                        resolveSend = resolve;
+                    }));
 
                     const drainPromise = drainHandler();
-                    // Attach a rejection observer immediately so advancing fake timers
-                    // below cannot produce an unhandled-rejection warning.
-                    const settled = drainPromise.catch((error: unknown) => error);
+                    let settled = false;
+                    const trackSettled = async (): Promise<void> => {
+                        await drainPromise;
+                        settled = true;
+                    };
+                    void trackSettled();
 
-                    jest.advanceTimersByTime(4000);
-                    await Promise.resolve();
-                    await Promise.resolve();
+                    for(let elapsed = 0; elapsed < 6000; elapsed += 250) {
+                        jest.advanceTimersByTime(250);
+                        // eslint-disable-next-line no-await-in-loop -- sequential fake-timer flush required
+                        await Promise.resolve();
+                        // eslint-disable-next-line no-await-in-loop -- sequential fake-timer flush required
+                        await Promise.resolve();
+                    }
+                    expect(settled).toBe(false);
 
-                    const error = await settled;
-                    expect(error).toBeInstanceOf(Error);
-                    expect((error as Error).message).toBe('Inspector drain round-trip timed out');
+                    resolveSend();
+                    await drainPromise;
+
+                    expect(mockLogger.warn).toHaveBeenCalledWith(
+                        expect.stringContaining('Drain handler settled via %s'),
+                        'ack', expect.any(Number),
+                        expect.any(Number), expect.any(Number), expect.any(Number),
+                        expect.any(Number), expect.any(Number),
+                        expect.any(String)
+                    );
                 } finally {
                     jest.useRealTimers();
                 }
             });
 
-            it('clears the drain round-trip timer once the inspector round-trip resolves, so it does not linger', async () => {
+            it('silence give-up RESOLVES (not rejects) and releases the child', async () => {
+                mockSuccessfulBunTestRun();
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+
+                const drainHandler = mockSyncServer.setDrainHandler.mock.calls[0][0] as () => Promise<void>;
+
+                jest.useFakeTimers();
+                // The silence bound now also requires elapsed-since-request to clear
+                // silenceMs, so Date.now() must advance in lockstep with the fake-timer
+                // ticks below (see raceAgainstSilence's doc comment).
+                const realDateNow = Date.now.bind(Date);
+                let fakeNow = realDateNow();
+                const dateNowSpy = spyOn(Date, 'now').mockImplementation(() => fakeNow);
+                try {
+                    mockInspectorClient.send.mockImplementation(() => new Promise(() => {}));
+
+                    // Boundary companion: 3999ms of silence must NOT yet trip the bound
+                    // (kills a >=→> mutant on the silence comparison).
+                    mockInspectorClient.getMsSinceLastFrame.mockReturnValue(3999);
+                    const start = fakeNow;
+                    const drainPromise = drainHandler();
+                    const settled = drainPromise.then(() => 'resolved').catch(() => 'rejected');
+
+                    fakeNow = start + 3999;
+                    jest.advanceTimersByTime(250);
+                    await Promise.resolve();
+                    await Promise.resolve();
+
+                    mockInspectorClient.getMsSinceLastFrame.mockReturnValue(4000);
+                    // eslint-disable-next-line require-atomic-updates -- single-threaded fake-timer test; no concurrent writer can race this assignment
+                    fakeNow = start + 4250;
+                    jest.advanceTimersByTime(250);
+                    await Promise.resolve();
+                    await Promise.resolve();
+
+                    await expect(settled).resolves.toBe('resolved');
+
+                    expect(mockLogger.warn).toHaveBeenCalledWith(
+                        expect.stringContaining('Drain handler settled via %s'),
+                        'silence', expect.any(Number),
+                        expect.any(Number), expect.any(Number), expect.any(Number),
+                        expect.any(Number), expect.any(Number),
+                        expect.any(String)
+                    );
+                } finally {
+                    dateNowSpy.mockRestore();
+                    jest.useRealTimers();
+                }
+            });
+
+            it('absolute ceiling fires even under perpetual progress', async () => {
+                mockSuccessfulBunTestRun();
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+
+                const drainHandler = mockSyncServer.setDrainHandler.mock.calls[0][0] as () => Promise<void>;
+
+                jest.useFakeTimers();
+                const realDateNow = Date.now.bind(Date);
+                let fakeNow = realDateNow();
+                const dateNowSpy = spyOn(Date, 'now').mockImplementation(() => fakeNow);
+                try {
+                    mockInspectorClient.getMsSinceLastFrame.mockReturnValue(0);
+                    mockInspectorClient.send.mockImplementation(() => new Promise(() => {}));
+
+                    const start = fakeNow;
+                    const drainPromise = drainHandler();
+                    const settled = drainPromise.then(() => 'resolved').catch(() => 'rejected');
+
+                    fakeNow = start + 29_999;
+                    jest.advanceTimersByTime(250);
+                    await Promise.resolve();
+                    await Promise.resolve();
+
+                    // eslint-disable-next-line require-atomic-updates -- single-threaded fake-timer test; no concurrent writer can race this assignment
+                    fakeNow = start + 30_000;
+                    jest.advanceTimersByTime(250);
+                    await Promise.resolve();
+                    await Promise.resolve();
+
+                    await expect(settled).resolves.toBe('resolved');
+
+                    expect(mockLogger.warn).toHaveBeenCalledWith(
+                        expect.stringContaining('Drain handler settled via %s'),
+                        'ceiling', expect.any(Number),
+                        expect.any(Number), expect.any(Number), expect.any(Number),
+                        expect.any(Number), expect.any(Number),
+                        expect.any(String)
+                    );
+                } finally {
+                    dateNowSpy.mockRestore();
+                    jest.useRealTimers();
+                }
+            });
+
+            it('classifies a rejected send() as send-rejected and logs the round-trip rejection', async () => {
+                mockSuccessfulBunTestRun();
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+
+                const drainHandler = mockSyncServer.setDrainHandler.mock.calls[0][0] as () => Promise<void>;
+
+                mockInspectorClient.send.mockClear();
+                mockInspectorClient.send.mockRejectedValue(new Error('Connection closed unexpectedly'));
+
+                // Handler must resolve (swallowed), never reject, even on a genuine
+                // socket-death rejection — otherwise SyncServer would never send 'drained'.
+                await expect(drainHandler()).resolves.toBeUndefined();
+
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    'Inspector drain round-trip rejected before any wait bound was hit: %s',
+                    'Connection closed unexpectedly'
+                );
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect.stringContaining('Drain handler settled via %s'),
+                    'send-rejected', expect.any(Number),
+                    expect.any(Number), expect.any(Number), expect.any(Number),
+                    expect.any(Number), expect.any(Number),
+                    expect.any(String)
+                );
+            });
+
+            it('poll-granularity: silence detection lags at most one 250ms tick', async () => {
+                // Kills interval-cadence mutants — a 4000ms-interval mutant would not
+                // settle until 8000ms of fake-timer advancement instead of ~4250ms.
+                mockSuccessfulBunTestRun();
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+
+                const drainHandler = mockSyncServer.setDrainHandler.mock.calls[0][0] as () => Promise<void>;
+
+                jest.useFakeTimers();
+                // The silence bound now also requires elapsed-since-request to clear
+                // silenceMs, so Date.now() tracks the same `elapsed` virtual clock used
+                // for getMsSinceLastFrame below (see raceAgainstSilence's doc comment).
+                const realDateNow = Date.now.bind(Date);
+                const start = realDateNow();
+                let elapsed = 0;
+                const dateNowSpy = spyOn(Date, 'now').mockImplementation(() => start + elapsed);
+                try {
+                    mockInspectorClient.send.mockImplementation(() => new Promise(() => {}));
+                    // Frames stop arriving at t=100: silence grows from there.
+                    mockInspectorClient.getMsSinceLastFrame.mockImplementation(() => Math.max(0, elapsed - 100));
+
+                    const drainPromise = drainHandler();
+                    const settled = drainPromise.then(() => 'resolved').catch(() => 'rejected');
+
+                    elapsed = 4000;
+                    jest.advanceTimersByTime(4000);
+                    await Promise.resolve();
+                    await Promise.resolve();
+                    // At t=4000, since-last-frame is 3900 — still below the 4000ms bound.
+                    expect(await Promise.race([settled, Promise.resolve('pending')])).toBe('pending');
+
+                    elapsed = 4250;
+                    jest.advanceTimersByTime(250);
+                    await Promise.resolve();
+                    await Promise.resolve();
+
+                    await expect(settled).resolves.toBe('resolved');
+                } finally {
+                    dateNowSpy.mockRestore();
+                    jest.useRealTimers();
+                }
+            });
+
+            it('a connection that was ALREADY silent before the drain request does not give up on the very first poll tick', async () => {
+                // P1 regression: getMsSinceLastFrame is a connection-wide clock that can
+                // already be stale the instant the drain request arrives (e.g. the final
+                // test ran long with no inspector traffic in flight). Giving up on
+                // sinceLastFrame alone would let the very first 250ms tick release the
+                // child without the ack ever getting a real window to arrive — silently
+                // reproducing the race this mechanism exists to fix. The wait must still
+                // last at least DRAIN_ACK_SILENCE_TIMEOUT_MS from the CALL itself before
+                // silence can be the reason it gives up.
+                mockSuccessfulBunTestRun();
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+
+                const drainHandler = mockSyncServer.setDrainHandler.mock.calls[0][0] as () => Promise<void>;
+
+                jest.useFakeTimers();
+                const realDateNow = Date.now.bind(Date);
+                let fakeNow = realDateNow();
+                const dateNowSpy = spyOn(Date, 'now').mockImplementation(() => fakeNow);
+                try {
+                    // Already 9000ms stale — far past the 4000ms silence bound — BEFORE
+                    // the drain handler is even invoked.
+                    mockInspectorClient.getMsSinceLastFrame.mockReturnValue(9000);
+                    mockInspectorClient.send.mockImplementation(() => new Promise(() => {}));
+
+                    const start = fakeNow;
+                    const drainPromise = drainHandler();
+                    const settled = drainPromise.then(() => 'resolved').catch(() => 'rejected');
+
+                    // First tick: only 250ms have elapsed since the call itself, even
+                    // though sinceLastFrame has been >=4000 the whole time.
+                    fakeNow = start + 250;
+                    jest.advanceTimersByTime(250);
+                    await Promise.resolve();
+                    await Promise.resolve();
+                    expect(await Promise.race([settled, Promise.resolve('pending')])).toBe('pending');
+
+                    // Only once elapsed-since-call ALSO clears the silence bound does it settle.
+                    // eslint-disable-next-line require-atomic-updates -- single-threaded fake-timer test; no concurrent writer can race this assignment
+                    fakeNow = start + 4000;
+                    jest.advanceTimersByTime(3750);
+                    await Promise.resolve();
+                    await Promise.resolve();
+
+                    await expect(settled).resolves.toBe('resolved');
+                    expect(mockLogger.warn).toHaveBeenCalledWith(
+                        expect.stringContaining('Drain handler settled via %s'),
+                        'silence', expect.any(Number),
+                        expect.any(Number), expect.any(Number), expect.any(Number),
+                        expect.any(Number), expect.any(Number),
+                        expect.any(String)
+                    );
+                } finally {
+                    dateNowSpy.mockRestore();
+                    jest.useRealTimers();
+                }
+            });
+
+            it('reports "ceiling", not "silence", when both bounds are satisfied on the same poll tick', async () => {
+                // P3 regression: the ceiling must be checked before silence so a tick that
+                // observes BOTH bounds simultaneously (e.g. the event loop stalls and
+                // resumes well past the ceiling) reports the more severe bound, not
+                // whichever happened to be listed first in the branch.
+                mockSuccessfulBunTestRun();
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+
+                const drainHandler = mockSyncServer.setDrainHandler.mock.calls[0][0] as () => Promise<void>;
+
+                jest.useFakeTimers();
+                const realDateNow = Date.now.bind(Date);
+                let fakeNow = realDateNow();
+                const dateNowSpy = spyOn(Date, 'now').mockImplementation(() => fakeNow);
+                try {
+                    // Silent for well over the 4000ms silence bound AND the tick lands
+                    // past the 30_000ms absolute ceiling too.
+                    mockInspectorClient.getMsSinceLastFrame.mockReturnValue(30_000);
+                    mockInspectorClient.send.mockImplementation(() => new Promise(() => {}));
+
+                    const start = fakeNow;
+                    const drainPromise = drainHandler();
+                    const settled = drainPromise.then(() => 'resolved').catch(() => 'rejected');
+
+                    fakeNow = start + 30_000;
+                    jest.advanceTimersByTime(250);
+                    await Promise.resolve();
+                    await Promise.resolve();
+
+                    await expect(settled).resolves.toBe('resolved');
+                    expect(mockLogger.warn).toHaveBeenCalledWith(
+                        expect.stringContaining('Drain handler settled via %s'),
+                        'ceiling', expect.any(Number),
+                        expect.any(Number), expect.any(Number), expect.any(Number),
+                        expect.any(Number), expect.any(Number),
+                        expect.any(String)
+                    );
+                } finally {
+                    dateNowSpy.mockRestore();
+                    jest.useRealTimers();
+                }
+            });
+
+            it('logs the drain-request line with event counts and the found-id gap list', async () => {
+                mockSuccessfulBunTestRun();
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+
+                const drainHandler = mockSyncServer.setDrainHandler.mock.calls[0][0] as () => Promise<void>;
+
+                mockInspectorClient.getFoundIdGaps.mockReturnValueOnce([2, 5]);
+                mockInspectorClient.getEventCounts.mockReturnValueOnce({ found: 7, start: 6, end: 6 });
+                mockInspectorClient.send.mockClear();
+                mockInspectorClient.send.mockResolvedValue(undefined);
+
+                await drainHandler();
+
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect.stringContaining('Drain-request received'),
+                    7, 6, 6, 2, ' [2,5]'
+                );
+            });
+
+            it('logs the settle line with event-count deltas, gap-count transition, and the §3c ack-with-gaps suffix', async () => {
+                mockSuccessfulBunTestRun();
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+
+                const drainHandler = mockSyncServer.setDrainHandler.mock.calls[0][0] as () => Promise<void>;
+
+                mockInspectorClient.getEventCounts
+                    .mockReturnValueOnce({ found: 7, start: 6, end: 6 })
+                    .mockReturnValueOnce({ found: 10, start: 9, end: 9 });
+                mockInspectorClient.getFoundIdGaps
+                    .mockReturnValueOnce([2, 5])
+                    .mockReturnValueOnce([5]);
+                mockInspectorClient.send.mockClear();
+                mockInspectorClient.send.mockResolvedValue(undefined);
+
+                await drainHandler();
+
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect.stringContaining('Drain handler settled via %s'),
+                    'ack', expect.any(Number),
+                    3, 3, 3,
+                    2, 1,
+                    ' — ack resolved but gaps remain: the ack may under-prove drain'
+                );
+            });
+
+            it('omits the §3c suffix when the ack resolves with no gaps remaining', async () => {
+                mockSuccessfulBunTestRun();
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+
+                const drainHandler = mockSyncServer.setDrainHandler.mock.calls[0][0] as () => Promise<void>;
+
+                mockInspectorClient.getFoundIdGaps.mockReturnValue([]);
+                mockInspectorClient.send.mockClear();
+                mockInspectorClient.send.mockResolvedValue(undefined);
+
+                await drainHandler();
+
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect.stringContaining('Drain handler settled via %s'),
+                    'ack', expect.any(Number),
+                    expect.any(Number), expect.any(Number), expect.any(Number),
+                    0, 0,
+                    ''
+                );
+            });
+
+            it('caps the request-line gap-id list at 20 entries with a trailing ellipsis', async () => {
+                mockSuccessfulBunTestRun();
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+
+                const drainHandler = mockSyncServer.setDrainHandler.mock.calls[0][0] as () => Promise<void>;
+
+                const manyGaps = Array.from({ length: 25 }, (_, i) => i + 1);
+                mockInspectorClient.getFoundIdGaps.mockReturnValueOnce(manyGaps);
+                mockInspectorClient.send.mockClear();
+                mockInspectorClient.send.mockResolvedValue(undefined);
+
+                await drainHandler();
+
+                const expectedList = ` [${Array.from({ length: 20 }, (_, i) => i + 1).join(',')},…]`;
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect.stringContaining('Drain-request received'),
+                    expect.any(Number), expect.any(Number), expect.any(Number),
+                    25, expectedList
+                );
+            });
+
+            it('clears the drain-wait interval once the inspector round-trip resolves, so it does not linger', async () => {
                 // Regression test for an uncleared-timer bug: when inspector.send()
-                // wins the race, the DRAIN_ACK_ROUND_TRIP_TIMEOUT_MS timer must be
-                // cancelled rather than left pending — an uncleared timer keeps the
-                // event loop (and the real process) alive for the remainder of its
-                // 4000ms bound even after a successful drain handshake.
+                // wins the race, the raceAgainstSilence poll interval must be cancelled
+                // rather than left pending — an uncleared interval keeps the event loop
+                // (and the real process) alive indefinitely even after a successful
+                // drain handshake.
                 mockSuccessfulBunTestRun();
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
                 await runner.init();
@@ -2036,10 +2592,10 @@ tests/example.test.ts:
                     const timerCountBefore = jest.getTimerCount();
                     await drainHandler();
 
-                    // The handler scheduled exactly one new timer (the timeout race
-                    // partner) and must have cleared it again once inspector.send()
+                    // The handler scheduled exactly one new timer (the silence-poll
+                    // interval) and must have cleared it again once inspector.send()
                     // resolved — net pending-timer count returns to its prior value,
-                    // not left one higher by a lingering, uncleared setTimeout.
+                    // not left one higher by a lingering, uncleared setInterval.
                     expect(jest.getTimerCount()).toBe(timerCountBefore);
                 } finally {
                     jest.useRealTimers();
@@ -6311,7 +6867,7 @@ tests/example.test.ts:
         });
 
         describe('Lines 321, 451: ObjectLiteral handlers invocation', () => {
-            it('should pass only an onError handler to InspectorClient (no per-test relay needed; inspector errors must be logged, not swallowed)', async () => {
+            it('should pass onError and onUnexpectedClose handlers to InspectorClient (no per-test relay needed; inspector errors must be logged, not swallowed)', async () => {
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
                     if(options.onInspectorReady) {
@@ -6346,16 +6902,53 @@ tests/example.test.ts:
                 await runner.dryRun();
 
                 // Coverage uses file-prefixed counter keys (Bun.main@@test-N), no per-test
-                // relay needed — but onError IS wired up (previously silently discarded
-                // every inspector error).
+                // relay needed — but onError and onUnexpectedClose ARE wired up (previously
+                // onError silently discarded every inspector error, and there was zero
+                // visibility into an unexpected WebSocket close).
                 expect(capturedHandlers).toBeDefined();
-                expect(Object.keys(capturedHandlers!)).toEqual(['onError']);
+                expect(Object.keys(capturedHandlers!)).toEqual(['onError', 'onUnexpectedClose']);
                 expect(typeof capturedHandlers!.onError).toBe('function');
+                expect(typeof capturedHandlers!.onUnexpectedClose).toBe('function');
 
-                // The handler logs at warn level.
+                // The onError handler logs at warn level.
                 (mockLogger.warn as ReturnType<typeof mock>).mockClear();
                 (capturedHandlers!.onError as (error: Error) => void)(new Error('Test start event for unknown test ID: 999'));
                 expect(mockLogger.warn).toHaveBeenCalledWith('Inspector error: %s', 'Test start event for unknown test ID: 999');
+            });
+
+            it('onUnexpectedClose logs a debug-level line with the close context booleans (not warn — expected on many healthy runs)', async () => {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({
+                        exitCode: 0,
+                        stdout:   '1 passed',
+                        stderr:   '',
+                        timedOut: false,
+                    });
+                });
+
+                mockInspectorClient.getTests.mockReturnValue([
+                    { id: 1, name: 'test', fullName: 'test', status: 'pass', url: 'test.ts' },
+                ]);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([1]);
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+
+                expect(inspectorClientSpy).toHaveBeenCalled();
+                const handlers = (inspectorClientSpy.mock.calls[0][0] as { handlers: { onUnexpectedClose: (context: { wsClosed: boolean, closeExpected: boolean, isClosing: boolean }) => void } }).handlers;
+
+                (mockLogger.debug as ReturnType<typeof mock>).mockClear();
+                handlers.onUnexpectedClose({ wsClosed: true, closeExpected: false, isClosing: false });
+
+                expect(mockLogger.debug).toHaveBeenCalledWith(
+                    expect.stringContaining('closed while the run was still thought to be in progress'),
+                    true, false, false
+                );
             });
 
             it('should log exact debug message after enabling TestReporter (line 332)', async () => {

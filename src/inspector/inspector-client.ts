@@ -20,13 +20,27 @@ import {
  */
 export interface InspectorEventHandlers {
     /** Called when a test or describe block is discovered */
-    onTestFound?: (test: TestInfo) => void
+    onTestFound?:       (test: TestInfo) => void
     /** Called when a test begins execution */
-    onTestStart?: (test: TestInfo) => void
+    onTestStart?:       (test: TestInfo) => void
     /** Called when a test completes execution */
-    onTestEnd?:   (test: TestInfo) => void
+    onTestEnd?:         (test: TestInfo) => void
     /** Called when an error occurs */
-    onError?:     (error: Error) => void
+    onError?:           (error: Error) => void
+    /** Called when the WebSocket closes while neither {@link InspectorClient.close} nor {@link InspectorClient.expectClose} had run yet */
+    onUnexpectedClose?: (context: UnexpectedCloseContext) => void
+}
+
+/**
+ * Snapshot of the flags governing close-handling, passed to
+ * {@link InspectorEventHandlers.onUnexpectedClose} so a logger can explain
+ * why a given close was treated as unexpected without re-deriving the state
+ * from InspectorClient internals.
+ */
+export interface UnexpectedCloseContext {
+    wsClosed:      boolean
+    closeExpected: boolean
+    isClosing:     boolean
 }
 
 /**
@@ -154,6 +168,22 @@ export class InspectorClient {
     /** Resolvers for in-flight {@link waitForClose} calls, drained by handleClose. */
     private closeWaiters: (() => void)[] = [];
 
+    /**
+   * Timestamp (ms, {@link Date.now}) of the last frame of ANY kind received on
+   * this connection. Initialized at construction and refreshed on 'open' and
+   * on every inbound message (including malformed ones) — proves the read
+   * side of the socket is alive and making progress. See
+   * {@link getMsSinceLastFrame}.
+   */
+    private lastFrameReceivedAt = Date.now();
+
+    /** Running total of TestReporter.found events received. See {@link getEventCounts}. */
+    private foundCount = 0;
+    /** Running total of TestReporter.start events received. See {@link getEventCounts}. */
+    private startCount = 0;
+    /** Running total of TestReporter.end events received. See {@link getEventCounts}. */
+    private endCount = 0;
+
     constructor(options: InspectorClientOptions) {
         this.handlers = options.handlers ?? {};
         this.WebSocketClass = options.WebSocketClass ?? WebSocket;
@@ -189,6 +219,7 @@ export class InspectorClient {
 
             ws.addEventListener('open', () => {
                 clearTimeout(timeoutTimer);
+                this.lastFrameReceivedAt = Date.now();
                 resolve();
             });
 
@@ -213,10 +244,13 @@ export class InspectorClient {
    * Send a request and wait for response
    * @param method Method name to invoke
    * @param params Parameters for the method
+   * @param timeoutMs Optional per-call override of the constructor-level requestTimeout — used by the
+   * drain handshake, whose progress-extended wait must not be cut short by the fixed per-request timer
+   * (see bun-test-runner.ts DRAIN_ACK_ABSOLUTE_CEILING_MS).
    * @returns Promise that resolves with the response result
    * @throws {InspectorTimeoutError} if request times out
    */
-    async send(method: string, params?: unknown): Promise<unknown> {
+    async send(method: string, params?: unknown, timeoutMs?: number): Promise<unknown> {
         // eslint-disable-next-line @typescript-eslint/prefer-optional-chain -- optional chain doesn't work here because null?.readyState === undefined, not !== OPEN
         if(!this.ws || this.ws.readyState !== WebSocket.OPEN) {
             throw new InspectorConnectionError('WebSocket not connected');
@@ -227,11 +261,12 @@ export class InspectorClient {
 
         // Stryker disable next-line BlockStatement: removing Promise body means resolve/reject never called → request hangs forever → Timeout
         return new Promise((resolve, reject) => {
+            const effectiveTimeoutMs = timeoutMs ?? this.state.requestTimeout;
             // Stryker disable next-line BlockStatement: removing setTimeout body means requests never timeout → Promise waits forever → Timeout
             const timer = setTimeout(() => {
                 this.pendingRequests.delete(id);
-                reject(new InspectorTimeoutError(`Request timeout after ${this.state.requestTimeout}ms: ${method}`));
-            }, this.state.requestTimeout);
+                reject(new InspectorTimeoutError(`Request timeout after ${effectiveTimeoutMs}ms: ${method}`));
+            }, effectiveTimeoutMs);
 
             this.pendingRequests.set(id, { resolve, reject, timer });
 
@@ -365,9 +400,56 @@ export class InspectorClient {
     }
 
     /**
+   * Milliseconds since the last frame of ANY kind was received on this
+   * connection (or since connect()/construction if none yet). Proves the
+   * socket's read side is alive and making progress — consumed by the drain
+   * handler's silence-based wait (bun-test-runner.ts step 6.5).
+   */
+    getMsSinceLastFrame(): number {
+        return Date.now() - this.lastFrameReceivedAt;
+    }
+
+    /** Running totals of TestReporter.* events received, for computing backlog deltas around the drain handshake. */
+    getEventCounts(): { found: number, start: number, end: number } {
+        return { found: this.foundCount, start: this.startCount, end: this.endCount };
+    }
+
+    /**
+   * Ids strictly between the lowest and highest TestReporter.found ids received
+   * that were themselves never received. ASSUMES Bun's inspector agent assigns
+   * ids densely in discovery order — plausible from observed traces but NOT
+   * verified against Bun internals, so treat a non-empty result as a diagnostic
+   * signal (possible producer-side event drop), not ground truth. Derives
+   * purely from testHierarchy; O(maxId-minId), no spread.
+   */
+    getFoundIdGaps(): number[] {
+        if(this.testHierarchy.size === 0) {
+            return [];
+        }
+        let min = Infinity;
+        let max = -Infinity;
+        for(const id of this.testHierarchy.keys()) {
+            if(id < min) {
+                min = id;
+            }
+            if(id > max) {
+                max = id;
+            }
+        }
+        const gaps: number[] = [];
+        for(let id = min + 1; id < max; id++) {
+            if(!this.testHierarchy.has(id)) {
+                gaps.push(id);
+            }
+        }
+        return gaps;
+    }
+
+    /**
    * Handle incoming WebSocket message
    */
     private handleMessage(data: string | Buffer): void {
+        this.lastFrameReceivedAt = Date.now();
         try {
             const message = JSON.parse(data.toString()) as InspectorMessage;
 
@@ -411,6 +493,7 @@ export class InspectorClient {
    * Handle TestReporter.found event
    */
     private handleTestFound(params: TestReporterFoundEvent): void {
+        this.foundCount++;
         const { fullName, bunName } = this.buildFullName(params.id, params.name, params.parentId);
 
         const testInfo: TestInfo = {
@@ -435,6 +518,7 @@ export class InspectorClient {
    * Handle TestReporter.start event
    */
     private handleTestStart(params: TestReporterStartEvent): void {
+        this.startCount++;
         const testInfo = this.testHierarchy.get(params.id);
         if(!testInfo) {
             this.handleError(new Error(`Test start event for unknown test ID: ${params.id}`));
@@ -455,6 +539,7 @@ export class InspectorClient {
    * Handle TestReporter.end event
    */
     private handleTestEnd(params: TestReporterEndEvent): void {
+        this.endCount++;
         const testInfo = this.testHierarchy.get(params.id);
         if(!testInfo) {
             this.handleError(new Error(`Test end event for unknown test ID: ${params.id}`));
@@ -536,6 +621,13 @@ export class InspectorClient {
         }
 
         this._wasClosedUnexpectedly = true;
+
+        if(this.handlers.onUnexpectedClose) {
+            // At this call site wsClosed is always true and closeExpected/isClosing
+            // always false (the guard above just failed) — passed anyway so the log is
+            // self-explanatory and cannot silently go stale if the guard is refactored.
+            this.handlers.onUnexpectedClose({ wsClosed: this.wsClosed, closeExpected: this.closeExpected, isClosing: this.isClosing });
+        }
 
         // Reject all pending requests
         const error = new InspectorConnectionError('Connection closed unexpectedly');
