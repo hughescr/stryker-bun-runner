@@ -29,18 +29,75 @@ export interface InspectorEventHandlers {
     onError?:           (error: Error) => void
     /** Called when the WebSocket closes while neither {@link InspectorClient.close} nor {@link InspectorClient.expectClose} had run yet */
     onUnexpectedClose?: (context: UnexpectedCloseContext) => void
+    /**
+     * Called when a specific request (e.g. TestReporter.enable) has gone
+     * unanswered for {@link REQUEST_STALL_WARN_MS} while OTHER frames are still
+     * arriving on the connection — a protocol-level stall distinct from total
+     * silence (see {@link InspectorClient.getMsSinceLastFrame}): the read side
+     * is alive and receiving something, just not a reply to this specific
+     * request. Opt-in — scheduling the watchdog timer this requires is skipped
+     * entirely for callers that never set this handler.
+     */
+    onRequestStall?:    (info: RequestStallInfo) => void
 }
 
 /**
  * Snapshot of the flags governing close-handling, passed to
  * {@link InspectorEventHandlers.onUnexpectedClose} so a logger can explain
  * why a given close was treated as unexpected without re-deriving the state
- * from InspectorClient internals.
+ * from InspectorClient internals. Also carries the raw WebSocket close
+ * code/reason/wasClean and the close-relative-to-last-frame gap (see
+ * {@link InspectorClient.getCloseInfo}) so an unexpected close can be
+ * correlated against a confirmed Bun bug where idleTimeout:0 websockets are
+ * force-closed on a ~252s ping cycle (ERR_WEBSOCKET_TIMEOUT) — see
+ * INSPECTOR-PRODUCER-LOSS.md.
  */
 export interface UnexpectedCloseContext {
-    wsClosed:      boolean
-    closeExpected: boolean
-    isClosing:     boolean
+    wsClosed:               boolean
+    closeExpected:          boolean
+    isClosing:              boolean
+    /** WebSocket close code from the same close event that triggered this callback. */
+    closeCode:              number | undefined
+    /** WebSocket close reason from the same close event. */
+    closeReason:            string | undefined
+    /** WebSocket wasClean flag from the same close event. */
+    closeWasClean:          boolean | undefined
+    /** ms between the last received frame and this close event — see {@link InspectorClient.getCloseInfo}. */
+    msFromLastFrameToClose: number | undefined
+}
+
+/**
+ * WebSocket close code/reason/wasClean, and the gap between the last
+ * received frame and the close event — see {@link InspectorClient.getCloseInfo}.
+ * All fields undefined until the socket has actually closed.
+ */
+export interface InspectorCloseInfo {
+    code:                   number | undefined
+    reason:                 string | undefined
+    wasClean:               boolean | undefined
+    msFromLastFrameToClose: number | undefined
+}
+
+/**
+ * Raw TestReporter.found event count vs. unique ids assigned, plus the
+ * derived duplicate count — see {@link InspectorClient.getFoundIdCollisionStats}.
+ */
+export interface FoundIdCollisionStats {
+    rawFoundCount:         number
+    uniqueFoundIdCount:    number
+    duplicateFoundIdCount: number
+}
+
+/** Payload for {@link InspectorEventHandlers.onRequestStall}. */
+export interface RequestStallInfo {
+    /** The inspector protocol method that has gone unanswered (e.g. 'TestReporter.enable'). */
+    method:           string
+    /** The request's correlation id. */
+    id:               number
+    /** How long the request had gone unanswered when this fired — always {@link REQUEST_STALL_WARN_MS}. */
+    msUnanswered:     number
+    /** {@link InspectorClient.getMsSinceLastFrame} at the moment this fired — proves other traffic was still arriving. */
+    msSinceLastFrame: number
 }
 
 /**
@@ -77,12 +134,23 @@ interface InspectorClientState {
 }
 
 /**
+ * How long a request may go unanswered, while other frames are still
+ * arriving, before {@link InspectorEventHandlers.onRequestStall} fires. Not
+ * related to {@link InspectorClientOptions.requestTimeout} — this is an
+ * early diagnostic signal, not a give-up bound; the request keeps waiting for
+ * its own (usually much longer) timeout regardless of whether this fires.
+ */
+const REQUEST_STALL_WARN_MS = 2000;
+
+/**
  * Pending request tracking
  */
 interface PendingRequest {
-    resolve: (result: unknown) => void
-    reject:  (error: Error) => void
-    timer:   ReturnType<typeof setTimeout>
+    resolve:    (result: unknown) => void
+    reject:     (error: Error) => void
+    timer:      ReturnType<typeof setTimeout>
+    /** Diagnostic watchdog timer for {@link InspectorEventHandlers.onRequestStall} — undefined when no such handler is registered. */
+    stallTimer: ReturnType<typeof setTimeout> | undefined
 }
 
 /**
@@ -184,6 +252,17 @@ export class InspectorClient {
     /** Running total of TestReporter.end events received. See {@link getEventCounts}. */
     private endCount = 0;
 
+    /**
+   * WebSocket close code/reason/wasClean and the ms gap between the last
+   * received frame and the close event, captured unconditionally the instant
+   * {@link handleClose} runs (regardless of expected/unexpected) — see
+   * {@link getCloseInfo}. Undefined until the socket has actually closed.
+   */
+    private closeCode:              number | undefined = undefined;
+    private closeReason:            string | undefined = undefined;
+    private closeWasClean:          boolean | undefined = undefined;
+    private msFromLastFrameToClose: number | undefined = undefined;
+
     constructor(options: InspectorClientOptions) {
         this.handlers = options.handlers ?? {};
         this.WebSocketClass = options.WebSocketClass ?? WebSocket;
@@ -230,8 +309,8 @@ export class InspectorClient {
                 reject(error);
             });
 
-            ws.addEventListener('close', () => {
-                this.handleClose();
+            ws.addEventListener('close', (event) => {
+                this.handleClose(event.code, event.reason, event.wasClean);
             });
 
             ws.addEventListener('message', (event) => {
@@ -262,22 +341,64 @@ export class InspectorClient {
         // Stryker disable next-line BlockStatement: removing Promise body means resolve/reject never called → request hangs forever → Timeout
         return new Promise((resolve, reject) => {
             const effectiveTimeoutMs = timeoutMs ?? this.state.requestTimeout;
+
+            // Diagnostic-only watchdog (see onRequestStall's doc comment) — strictly
+            // opt-in, so this schedules nothing extra for any caller that hasn't
+            // registered the handler. Declared before `timer` (which references it)
+            // purely for definition order — `timer`'s callback is asynchronous and
+            // cannot possibly run before this synchronous assignment completes.
+            const stallTimer = this.handlers.onRequestStall
+                ? setTimeout(() => {
+                    // Guard: an already-settled request must not fire a stall warning —
+                    // see 'does not fire onRequestStall once the request has already resolved'.
+                    if(this.pendingRequests.has(id)) {
+                        const msSinceLastFrame = this.getMsSinceLastFrame();
+                        // Distinguishes "other traffic still arriving" (this signal) from total
+                        // silence (a DIFFERENT signal, already covered by raceAgainstSilence in
+                        // bun-test-runner.ts) — see 'does not fire onRequestStall when no frames
+                        // have arrived at all'.
+                        if(msSinceLastFrame < REQUEST_STALL_WARN_MS) {
+                            this.handlers.onRequestStall!({ method, id, msUnanswered: REQUEST_STALL_WARN_MS, msSinceLastFrame });
+                        }
+                    }
+                }, REQUEST_STALL_WARN_MS)
+                : undefined;
+
             // Stryker disable next-line BlockStatement: removing setTimeout body means requests never timeout → Promise waits forever → Timeout
             const timer = setTimeout(() => {
                 this.pendingRequests.delete(id);
+                if(stallTimer) {
+                    clearTimeout(stallTimer);
+                }
                 reject(new InspectorTimeoutError(`Request timeout after ${effectiveTimeoutMs}ms: ${method}`));
             }, effectiveTimeoutMs);
 
-            this.pendingRequests.set(id, { resolve, reject, timer });
+            this.pendingRequests.set(id, { resolve, reject, timer, stallTimer });
 
             try {
                 this.ws!.send(JSON.stringify(message));
             } catch (error) {
                 this.pendingRequests.delete(id);
                 clearTimeout(timer);
+                if(stallTimer) {
+                    clearTimeout(stallTimer);
+                }
                 reject(error instanceof Error ? error : new Error(String(error)));
             }
         });
+    }
+
+    /**
+   * Clear both timers associated with a pending request — the request
+   * timeout and, if scheduled, the {@link InspectorEventHandlers.onRequestStall}
+   * watchdog. Extracted so every settlement path (response received,
+   * explicit close, unexpected close) shares identical cleanup.
+   */
+    private clearPendingTimers(pending: PendingRequest): void {
+        clearTimeout(pending.timer);
+        if(pending.stallTimer) {
+            clearTimeout(pending.stallTimer);
+        }
     }
 
     /**
@@ -295,7 +416,7 @@ export class InspectorClient {
         // Reject all pending requests
         const error = new InspectorConnectionError('Connection closed');
         for(const pending of this.pendingRequests.values()) {
-            clearTimeout(pending.timer);
+            this.clearPendingTimers(pending);
             pending.reject(error);
         }
         this.pendingRequests.clear();
@@ -415,6 +536,45 @@ export class InspectorClient {
     }
 
     /**
+   * WebSocket close code/reason/wasClean, and the ms gap between the last
+   * received frame and the close event. All fields undefined until the
+   * socket has actually closed. Recorded unconditionally — both expected and
+   * unexpected closes — so a healthy close's code/reason establishes a
+   * baseline to compare an unexpected one against. Exists to confirm or rule
+   * out a confirmed Bun bug where idleTimeout:0 websockets are force-closed
+   * on a ~252s ping cycle (ERR_WEBSOCKET_TIMEOUT) — see
+   * INSPECTOR-PRODUCER-LOSS.md.
+   */
+    getCloseInfo(): InspectorCloseInfo {
+        return {
+            code:                   this.closeCode,
+            reason:                 this.closeReason,
+            wasClean:               this.closeWasClean,
+            msFromLastFrameToClose: this.msFromLastFrameToClose,
+        };
+    }
+
+    /**
+   * Raw TestReporter.found event count vs. unique ids assigned. testHierarchy
+   * is keyed by id, so a REPEATED id overwrites rather than growing the map —
+   * the delta between raw and unique is exactly the count of found events
+   * whose id had already been seen. A nonzero duplicate count is direct
+   * in-the-wild evidence of Bun's confirmed TestReporter id-collision bug
+   * (two interleaved 1..N id sequences when TestReporter.enable lands
+   * mid-collection) — a DIFFERENT signal from {@link getFoundIdGaps}: a
+   * collision keeps ids dense (it silently merges two tests under one shared
+   * id), so density alone cannot detect it.
+   */
+    getFoundIdCollisionStats(): FoundIdCollisionStats {
+        const uniqueFoundIdCount = this.testHierarchy.size;
+        return {
+            rawFoundCount:         this.foundCount,
+            uniqueFoundIdCount,
+            duplicateFoundIdCount: this.foundCount - uniqueFoundIdCount,
+        };
+    }
+
+    /**
    * Ids strictly between the lowest and highest TestReporter.found ids received
    * that were themselves never received. ASSUMES Bun's inspector agent assigns
    * ids densely in discovery order — plausible from observed traces but NOT
@@ -459,7 +619,7 @@ export class InspectorClient {
                 // Stryker disable next-line BlockStatement: removing this body means pending requests never resolve/reject → all inspector calls hang → Timeout
                 if(pending) {
                     this.pendingRequests.delete(message.id);
-                    clearTimeout(pending.timer);
+                    this.clearPendingTimers(pending);
 
                     // Stryker disable BlockStatement: removing either branch means pending request never resolves or rejects → all inspector calls hang → Timeout
                     if(message.error) {
@@ -603,10 +763,20 @@ export class InspectorClient {
     /**
    * Handle connection close
    */
-    private handleClose(): void {
+    private handleClose(code?: number, reason?: string, wasClean?: boolean): void {
         // Always runs first, regardless of isClosing/closeExpected, so any pending
         // waitForClose() callers see the socket's actual closure as soon as it happens.
         this.wsClosed = true;
+
+        // Recorded unconditionally (both expected and unexpected closes) — see
+        // getCloseInfo's doc comment for why a healthy close's code/reason still matters
+        // as a baseline. Computed here, before anything else can run, so it reflects the
+        // gap between the close and the actual last frame, not any later activity.
+        this.closeCode = code;
+        this.closeReason = reason;
+        this.closeWasClean = wasClean;
+        this.msFromLastFrameToClose = Date.now() - this.lastFrameReceivedAt;
+
         const waiters = this.closeWaiters;
         this.closeWaiters = [];
         for(const finish of waiters) {
@@ -626,13 +796,21 @@ export class InspectorClient {
             // At this call site wsClosed is always true and closeExpected/isClosing
             // always false (the guard above just failed) — passed anyway so the log is
             // self-explanatory and cannot silently go stale if the guard is refactored.
-            this.handlers.onUnexpectedClose({ wsClosed: this.wsClosed, closeExpected: this.closeExpected, isClosing: this.isClosing });
+            this.handlers.onUnexpectedClose({
+                wsClosed:               this.wsClosed,
+                closeExpected:          this.closeExpected,
+                isClosing:              this.isClosing,
+                closeCode:              this.closeCode,
+                closeReason:            this.closeReason,
+                closeWasClean:          this.closeWasClean,
+                msFromLastFrameToClose: this.msFromLastFrameToClose,
+            });
         }
 
         // Reject all pending requests
         const error = new InspectorConnectionError('Connection closed unexpectedly');
         for(const pending of this.pendingRequests.values()) {
-            clearTimeout(pending.timer);
+            this.clearPendingTimers(pending);
             pending.reject(error);
         }
         this.pendingRequests.clear();

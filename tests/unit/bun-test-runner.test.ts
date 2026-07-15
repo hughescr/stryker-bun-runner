@@ -16,6 +16,7 @@ import * as coverageCollector from '../../src/coverage/collector.js';
 import * as coverageMapper from '../../src/coverage/coverage-mapper.js';
 import * as preloadGenerator from '../../src/coverage/preload-generator.js';
 import * as inspectorModule from '../../src/inspector/inspector-client.js';
+import type { UnexpectedCloseContext, RequestStallInfo } from '../../src/inspector/inspector-client.js';
 import type { TestInfo } from '../../src/inspector/types.js';
 import * as processRunner from '../../src/process-runner.js';
 import * as bunfigSanitizer from '../../src/utils/bunfig-sanitizer.js';
@@ -75,17 +76,19 @@ describe('BunTestRunner', () => {
         clientCount:     number
     };
     let mockInspectorClient: {
-        connect:               ReturnType<typeof mock>
-        send:                  ReturnType<typeof mock>
-        getTests:              ReturnType<typeof mock>
-        getExecutionOrder:     ReturnType<typeof mock>
-        close:                 ReturnType<typeof mock>
-        expectClose:           ReturnType<typeof mock>
-        waitForClose:          ReturnType<typeof mock>
-        wasClosedUnexpectedly: boolean
-        getMsSinceLastFrame:   ReturnType<typeof mock>
-        getFoundIdGaps:        ReturnType<typeof mock>
-        getEventCounts:        ReturnType<typeof mock>
+        connect:                  ReturnType<typeof mock>
+        send:                     ReturnType<typeof mock>
+        getTests:                 ReturnType<typeof mock>
+        getExecutionOrder:        ReturnType<typeof mock>
+        close:                    ReturnType<typeof mock>
+        expectClose:              ReturnType<typeof mock>
+        waitForClose:             ReturnType<typeof mock>
+        wasClosedUnexpectedly:    boolean
+        getMsSinceLastFrame:      ReturnType<typeof mock>
+        getFoundIdGaps:           ReturnType<typeof mock>
+        getEventCounts:           ReturnType<typeof mock>
+        getCloseInfo:             ReturnType<typeof mock>
+        getFoundIdCollisionStats: ReturnType<typeof mock>
     };
     let mockMapCoverageToInspectorIds: ReturnType<typeof mock>;
 
@@ -164,17 +167,19 @@ describe('BunTestRunner', () => {
 
         // Mock inspector client
         mockInspectorClient = {
-            connect:               mock(),
-            send:                  mock(),
-            getTests:              mock(),
-            getExecutionOrder:     mock(),
-            close:                 mock(),
-            expectClose:           mock(),
-            waitForClose:          mock(),
-            wasClosedUnexpectedly: false,
-            getMsSinceLastFrame:   mock().mockReturnValue(0),
-            getFoundIdGaps:        mock().mockReturnValue([]),
-            getEventCounts:        mock().mockReturnValue({ found: 0, start: 0, end: 0 }),
+            connect:                  mock(),
+            send:                     mock(),
+            getTests:                 mock(),
+            getExecutionOrder:        mock(),
+            close:                    mock(),
+            expectClose:              mock(),
+            waitForClose:             mock(),
+            wasClosedUnexpectedly:    false,
+            getMsSinceLastFrame:      mock().mockReturnValue(0),
+            getFoundIdGaps:           mock().mockReturnValue([]),
+            getEventCounts:           mock().mockReturnValue({ found: 0, start: 0, end: 0 }),
+            getCloseInfo:             mock().mockReturnValue({ code: undefined, reason: undefined, wasClean: undefined, msFromLastFrameToClose: undefined }),
+            getFoundIdCollisionStats: mock().mockReturnValue({ rawFoundCount: 0, uniqueFoundIdCount: 0, duplicateFoundIdCount: 0 }),
         };
         // @ts-expect-error - Mocking constructor, type system doesn't understand this pattern
         inspectorClientSpy = spyOn(inspectorModule, 'InspectorClient').mockImplementation(() => mockInspectorClient);
@@ -2431,6 +2436,57 @@ tests/example.test.ts:
                 }
             });
 
+            it('does not even LOG a settle at the first poll tick when already-stale silence has not yet cleared the elapsed-since-call bound', async () => {
+                // Same P1 regression scenario as the test above, but asserts directly on the
+                // synchronous side effect (the "Drain handler settled" warn call) instead of
+                // through drainPromise's own .then()/.catch() chain: a spurious settle inside
+                // the catch/finally block logs synchronously as soon as the async function is
+                // resumed, so this is observable after far fewer microtask ticks than
+                // drainPromise's OWN eventual resolution — a tighter, more direct proof that
+                // the silence branch genuinely did not fire early, independent of how many
+                // microtask hops drainPromise itself needs to settle.
+                mockSuccessfulBunTestRun();
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+
+                const drainHandler = mockSyncServer.setDrainHandler.mock.calls[0][0] as () => Promise<void>;
+
+                jest.useFakeTimers();
+                const realDateNow = Date.now.bind(Date);
+                let fakeNow = realDateNow();
+                const dateNowSpy = spyOn(Date, 'now').mockImplementation(() => fakeNow);
+                try {
+                    mockInspectorClient.getMsSinceLastFrame.mockReturnValue(9000);
+                    mockInspectorClient.send.mockImplementation(() => new Promise(() => {}));
+
+                    const start = fakeNow;
+                    void drainHandler();
+
+                    fakeNow = start + 250;
+                    jest.advanceTimersByTime(250);
+                    // Generously flush the microtask queue — deep enough to surface a
+                    // synchronous log side effect even several await-hops deep, unlike the
+                    // 2-tick flush above (which only proves drainPromise's OWN settlement,
+                    // several hops further down the chain, hasn't observably resolved yet).
+                    for(let i = 0; i < 20; i++) {
+                        // eslint-disable-next-line no-await-in-loop -- deliberately sequential microtask-queue flush, not parallelizable
+                        await Promise.resolve();
+                    }
+
+                    expect(mockLogger.warn).not.toHaveBeenCalledWith(
+                        expect.stringContaining('Drain handler settled via %s'),
+                        expect.anything(), expect.anything(),
+                        expect.anything(), expect.anything(), expect.anything(),
+                        expect.anything(), expect.anything(),
+                        expect.anything()
+                    );
+                } finally {
+                    dateNowSpy.mockRestore();
+                    jest.useRealTimers();
+                }
+            });
+
             it('reports "ceiling", not "silence", when both bounds are satisfied on the same poll tick', async () => {
                 // P3 regression: the ceiling must be checked before silence so a tick that
                 // observes BOTH bounds simultaneously (e.g. the event loop stalls and
@@ -2469,6 +2525,42 @@ tests/example.test.ts:
                         expect.any(Number), expect.any(Number), expect.any(Number),
                         expect.any(Number), expect.any(Number),
                         expect.any(String)
+                    );
+                } finally {
+                    dateNowSpy.mockRestore();
+                    jest.useRealTimers();
+                }
+            });
+
+            it('does NOT log the send-rejected round-trip warning when the drain settles via ceiling (that warning is exclusive to a genuine send() rejection)', async () => {
+                mockSuccessfulBunTestRun();
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+
+                const drainHandler = mockSyncServer.setDrainHandler.mock.calls[0][0] as () => Promise<void>;
+
+                jest.useFakeTimers();
+                const realDateNow = Date.now.bind(Date);
+                let fakeNow = realDateNow();
+                const dateNowSpy = spyOn(Date, 'now').mockImplementation(() => fakeNow);
+                try {
+                    mockInspectorClient.getMsSinceLastFrame.mockReturnValue(30_000);
+                    mockInspectorClient.send.mockImplementation(() => new Promise(() => {}));
+
+                    const start = fakeNow;
+                    const drainPromise = drainHandler();
+                    const settled = drainPromise.then(() => 'resolved').catch(() => 'rejected');
+
+                    fakeNow = start + 30_000;
+                    jest.advanceTimersByTime(250);
+                    await Promise.resolve();
+                    await Promise.resolve();
+
+                    await expect(settled).resolves.toBe('resolved');
+                    expect(mockLogger.warn).not.toHaveBeenCalledWith(
+                        'Inspector drain round-trip rejected before any wait bound was hit: %s',
+                        expect.anything()
                     );
                 } finally {
                     dateNowSpy.mockRestore();
@@ -2568,6 +2660,32 @@ tests/example.test.ts:
                     expect.stringContaining('Drain-request received'),
                     expect.any(Number), expect.any(Number), expect.any(Number),
                     25, expectedList
+                );
+            });
+
+            it('does NOT show a trailing ellipsis when the gap-id list is exactly 20 entries (the cap boundary)', async () => {
+                mockSuccessfulBunTestRun();
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+
+                const drainHandler = mockSyncServer.setDrainHandler.mock.calls[0][0] as () => Promise<void>;
+
+                const exactlyTwentyGaps = Array.from({ length: 20 }, (_, i) => i + 1);
+                mockInspectorClient.getFoundIdGaps.mockReturnValueOnce(exactlyTwentyGaps);
+                mockInspectorClient.send.mockClear();
+                mockInspectorClient.send.mockResolvedValue(undefined);
+
+                await drainHandler();
+
+                // At exactly the cap, every gap id is shown and there is NO ellipsis — only a
+                // list one entry LONGER than the cap collapses the remainder. Distinguishes
+                // formatGapIdList's `gaps.length > MAX_GAP_IDS_LISTED` from `>=`.
+                const expectedList = ` [${exactlyTwentyGaps.join(',')}]`;
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect.stringContaining('Drain-request received'),
+                    expect.any(Number), expect.any(Number), expect.any(Number),
+                    20, expectedList
                 );
             });
 
@@ -6902,13 +7020,14 @@ tests/example.test.ts:
                 await runner.dryRun();
 
                 // Coverage uses file-prefixed counter keys (Bun.main@@test-N), no per-test
-                // relay needed — but onError and onUnexpectedClose ARE wired up (previously
-                // onError silently discarded every inspector error, and there was zero
-                // visibility into an unexpected WebSocket close).
+                // relay needed — but onError, onUnexpectedClose, and onRequestStall ARE wired
+                // up (previously onError silently discarded every inspector error, and there
+                // was zero visibility into an unexpected WebSocket close or a stalled request).
                 expect(capturedHandlers).toBeDefined();
-                expect(Object.keys(capturedHandlers!)).toEqual(['onError', 'onUnexpectedClose']);
+                expect(Object.keys(capturedHandlers!)).toEqual(['onError', 'onUnexpectedClose', 'onRequestStall']);
                 expect(typeof capturedHandlers!.onError).toBe('function');
                 expect(typeof capturedHandlers!.onUnexpectedClose).toBe('function');
+                expect(typeof capturedHandlers!.onRequestStall).toBe('function');
 
                 // The onError handler logs at warn level.
                 (mockLogger.warn as ReturnType<typeof mock>).mockClear();
@@ -6940,14 +7059,55 @@ tests/example.test.ts:
                 await runner.dryRun();
 
                 expect(inspectorClientSpy).toHaveBeenCalled();
-                const handlers = (inspectorClientSpy.mock.calls[0][0] as { handlers: { onUnexpectedClose: (context: { wsClosed: boolean, closeExpected: boolean, isClosing: boolean }) => void } }).handlers;
+                const handlers = (inspectorClientSpy.mock.calls[0][0] as { handlers: { onUnexpectedClose: (context: UnexpectedCloseContext) => void } }).handlers;
 
                 (mockLogger.debug as ReturnType<typeof mock>).mockClear();
-                handlers.onUnexpectedClose({ wsClosed: true, closeExpected: false, isClosing: false });
+                handlers.onUnexpectedClose({
+                    wsClosed:               true, closeExpected:          false, isClosing:              false,
+                    closeCode:              1006, closeReason:            'abnormal', closeWasClean:          false, msFromLastFrameToClose: 42,
+                });
 
                 expect(mockLogger.debug).toHaveBeenCalledWith(
                     expect.stringContaining('closed while the run was still thought to be in progress'),
-                    true, false, false
+                    true, false, false,
+                    '1006', 'abnormal', 'false', '42'
+                );
+            });
+
+            it('onRequestStall logs a warn-level line distinguishing a protocol-level stall from total silence', async () => {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({
+                        exitCode: 0,
+                        stdout:   '1 passed',
+                        stderr:   '',
+                        timedOut: false,
+                    });
+                });
+
+                mockInspectorClient.getTests.mockReturnValue([
+                    { id: 1, name: 'test', fullName: 'test', status: 'pass', url: 'test.ts' },
+                ]);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([1]);
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+
+                expect(inspectorClientSpy).toHaveBeenCalled();
+                const handlers = (inspectorClientSpy.mock.calls[0][0] as { handlers: { onRequestStall: (info: RequestStallInfo) => void } }).handlers;
+
+                (mockLogger.warn as ReturnType<typeof mock>).mockClear();
+                handlers.onRequestStall({
+                    method: 'TestReporter.enable', id: 1, msUnanswered: 2000, msSinceLastFrame: 1000,
+                });
+
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect.stringContaining('possible protocol-level stall distinct from total silence'),
+                    2000, 1000, 'TestReporter.enable', 1
                 );
             });
 

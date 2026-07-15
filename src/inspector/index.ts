@@ -12,7 +12,10 @@ export {
 export type {
     InspectorClientOptions,
     InspectorEventHandlers,
-    UnexpectedCloseContext
+    UnexpectedCloseContext,
+    InspectorCloseInfo,
+    FoundIdCollisionStats,
+    RequestStallInfo
 } from './inspector-client.js';
 
 export type {

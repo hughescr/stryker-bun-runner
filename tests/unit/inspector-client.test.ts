@@ -4,7 +4,9 @@ import {
     InspectorTimeoutError,
     InspectorConnectionError,
     type InspectorEventHandlers,
-    type TestInfo
+    type TestInfo,
+    type UnexpectedCloseContext,
+    type RequestStallInfo
 } from '../../src/inspector/index.js';
 
 // Mock WebSocket server for testing
@@ -1832,7 +1834,7 @@ describe('InspectorClient', () => {
         });
 
         it('calls onUnexpectedClose exactly once with the expected context when the socket closes with no prior close()/expectClose()', async () => {
-            const onUnexpectedClose = mock((_ctx: { wsClosed: boolean, closeExpected: boolean, isClosing: boolean }) => {});
+            const onUnexpectedClose = mock((_ctx: UnexpectedCloseContext) => {});
             const client = new InspectorClient({
                 url:      'ws://localhost:6499',
                 handlers: { onUnexpectedClose },
@@ -1847,7 +1849,37 @@ describe('InspectorClient', () => {
             mockWs.close();
 
             expect(onUnexpectedClose).toHaveBeenCalledTimes(1);
-            expect(onUnexpectedClose).toHaveBeenCalledWith({ wsClosed: true, closeExpected: false, isClosing: false });
+            expect(onUnexpectedClose).toHaveBeenCalledWith({
+                wsClosed:               true, closeExpected:          false, isClosing:              false,
+                closeCode:              undefined, closeReason:            undefined, closeWasClean:          undefined,
+                msFromLastFrameToClose: expect.any(Number),
+            });
+        });
+
+        it('calls onUnexpectedClose with the WebSocket close code/reason/wasClean when the socket close event carries them', async () => {
+            const onUnexpectedClose = mock((_ctx: UnexpectedCloseContext) => {});
+            const client = new InspectorClient({
+                url:      'ws://localhost:6499',
+                handlers: { onUnexpectedClose },
+
+                WebSocketClass: MockWebSocketConstructor,
+            });
+
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            // Simulate the Bun idleTimeout:0 ping-cycle bug's abnormal-closure shape
+            // directly (rather than via mockWs.close(), which emits {}) — see
+            // INSPECTOR-PRODUCER-LOSS.md.
+            mockWs.emit('close', { code: 1006, reason: 'ERR_WEBSOCKET_TIMEOUT', wasClean: false });
+
+            expect(onUnexpectedClose).toHaveBeenCalledTimes(1);
+            expect(onUnexpectedClose).toHaveBeenCalledWith({
+                wsClosed:               true, closeExpected:          false, isClosing:              false,
+                closeCode:              1006, closeReason:            'ERR_WEBSOCKET_TIMEOUT', closeWasClean:          false,
+                msFromLastFrameToClose: expect.any(Number),
+            });
         });
 
         it('does NOT call onUnexpectedClose after an explicit close()', async () => {
@@ -2873,6 +2905,356 @@ describe('InspectorClient', () => {
                 })
             );
             expect(client.getEventCounts()).toEqual({ found: 2, start: 2, end: 1 });
+        });
+    });
+
+    describe('getCloseInfo', () => {
+        const makeClient = (handlers?: InspectorEventHandlers): InspectorClient => new InspectorClient({
+            url: 'ws://localhost:6499',
+            handlers,
+
+            WebSocketClass: MockWebSocketConstructor,
+        });
+
+        it('returns all-undefined fields before any close event', async () => {
+            const client = makeClient();
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            expect(client.getCloseInfo()).toEqual({
+                code: undefined, reason: undefined, wasClean: undefined, msFromLastFrameToClose: undefined,
+            });
+        });
+
+        it('captures code/reason/wasClean from the close event', async () => {
+            const client = makeClient();
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            mockWs.emit('close', { code: 1000, reason: 'normal closure', wasClean: true });
+
+            expect(client.getCloseInfo()).toEqual({
+                code: 1000, reason: 'normal closure', wasClean: true, msFromLastFrameToClose: expect.any(Number),
+            });
+        });
+
+        it('computes msFromLastFrameToClose relative to the last received frame, not connection start', async () => {
+            let fakeNow = 1000;
+            const dateNowSpy = spyOn(Date, 'now').mockImplementation(() => fakeNow);
+            try {
+                const client = makeClient();
+                const connectPromise = client.connect();
+                mockWs.simulateOpen();
+                await connectPromise;
+
+                fakeNow = 1500;
+                mockWs.simulateMessage(
+                    JSON.stringify({
+                        method: 'TestReporter.found',
+                        params: { id: 1, name: 'test1', type: 'test' },
+                    })
+                );
+
+                fakeNow = 1800;
+                mockWs.emit('close', { code: 1006, reason: '', wasClean: false });
+
+                expect(client.getCloseInfo().msFromLastFrameToClose).toBe(300);
+            } finally {
+                dateNowSpy.mockRestore();
+            }
+        });
+
+        it('retains the first close info even after a later explicit close() call, which no-ops once ws is already null from the unexpected close', async () => {
+            const client = makeClient();
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            mockWs.emit('close', { code: 1006, reason: 'abnormal', wasClean: false });
+            await client.close();
+
+            expect(client.getCloseInfo()).toEqual({
+                code: 1006, reason: 'abnormal', wasClean: false, msFromLastFrameToClose: expect.any(Number),
+            });
+        });
+    });
+
+    describe('getFoundIdCollisionStats', () => {
+        const found = (id: number, name?: string): void => {
+            mockWs.simulateMessage(
+                JSON.stringify({
+                    method: 'TestReporter.found',
+                    params: { id, name: name ?? `test${id}`, type: 'test' },
+                })
+            );
+        };
+
+        it('starts at all-zero before any found events', async () => {
+            const client = new InspectorClient({ url: 'ws://localhost:6499', WebSocketClass: MockWebSocketConstructor });
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            expect(client.getFoundIdCollisionStats()).toEqual({ rawFoundCount: 0, uniqueFoundIdCount: 0, duplicateFoundIdCount: 0 });
+        });
+
+        it('reports zero duplicates for distinct ids', async () => {
+            const client = new InspectorClient({ url: 'ws://localhost:6499', WebSocketClass: MockWebSocketConstructor });
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            found(1);
+            found(2);
+            found(3);
+
+            expect(client.getFoundIdCollisionStats()).toEqual({ rawFoundCount: 3, uniqueFoundIdCount: 3, duplicateFoundIdCount: 0 });
+        });
+
+        it('counts a repeated id as a duplicate found event — direct evidence of the Bun TestReporter id-collision bug', async () => {
+            const client = new InspectorClient({ url: 'ws://localhost:6499', WebSocketClass: MockWebSocketConstructor });
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            found(1, 'first test assigned id 1');
+            found(2);
+            found(1, 'second, DIFFERENT test that collided onto id 1');
+
+            expect(client.getFoundIdCollisionStats()).toEqual({ rawFoundCount: 3, uniqueFoundIdCount: 2, duplicateFoundIdCount: 1 });
+        });
+
+        it('counts each repeat of the same id as its own duplicate event', async () => {
+            const client = new InspectorClient({ url: 'ws://localhost:6499', WebSocketClass: MockWebSocketConstructor });
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            found(1);
+            found(1);
+            found(1);
+
+            expect(client.getFoundIdCollisionStats()).toEqual({ rawFoundCount: 3, uniqueFoundIdCount: 1, duplicateFoundIdCount: 2 });
+        });
+    });
+
+    describe('onRequestStall', () => {
+        const makeClient = (onRequestStall?: (info: RequestStallInfo) => void): InspectorClient => new InspectorClient({
+            url:      'ws://localhost:6499',
+            handlers: onRequestStall ? { onRequestStall } : undefined,
+
+            WebSocketClass: MockWebSocketConstructor,
+        });
+
+        it('fires onRequestStall when a request goes unanswered for 2000ms while other frames keep arriving', async () => {
+            jest.useFakeTimers();
+            const realDateNow = Date.now.bind(Date);
+            let fakeNow = realDateNow();
+            const dateNowSpy = spyOn(Date, 'now').mockImplementation(() => fakeNow);
+            try {
+                const onRequestStall = mock((_info: RequestStallInfo) => {});
+                const client = makeClient(onRequestStall);
+
+                const connectPromise = client.connect();
+                mockWs.simulateOpen();
+                await connectPromise;
+
+                const sendPromise = client.send('TestReporter.enable', {});
+                sendPromise.catch(() => {});
+
+                // A frame arrives 1000ms after the request was sent, refreshing lastFrameReceivedAt.
+                fakeNow += 1000;
+                jest.advanceTimersByTime(1000);
+                mockWs.simulateMessage(
+                    JSON.stringify({
+                        method: 'TestReporter.found',
+                        params: { id: 999, name: 'other', type: 'test' },
+                    })
+                );
+
+                // Advance to the 2000ms stall-watchdog mark: 1000ms since that frame.
+                fakeNow += 1000;
+                jest.advanceTimersByTime(1000);
+                await Promise.resolve();
+
+                expect(onRequestStall).toHaveBeenCalledTimes(1);
+                expect(onRequestStall).toHaveBeenCalledWith({
+                    method: 'TestReporter.enable', id: 1, msUnanswered: 2000, msSinceLastFrame: 1000,
+                });
+            } finally {
+                dateNowSpy.mockRestore();
+                jest.useRealTimers();
+            }
+        });
+
+        it('does not fire onRequestStall once the request has already resolved before the 2000ms mark', async () => {
+            jest.useFakeTimers();
+            try {
+                const onRequestStall = mock((_info: RequestStallInfo) => {});
+                const client = makeClient(onRequestStall);
+
+                const connectPromise = client.connect();
+                mockWs.simulateOpen();
+                await connectPromise;
+
+                const sendPromise = client.send('TestReporter.enable', {});
+                const sentMessage = JSON.parse(mockWs.sentMessages[0]);
+                mockWs.simulateMessage(JSON.stringify({ id: sentMessage.id, result: {} }));
+                await sendPromise;
+
+                jest.advanceTimersByTime(2000);
+                await Promise.resolve();
+
+                expect(onRequestStall).not.toHaveBeenCalled();
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('does not fire onRequestStall when no frames have arrived at all since the request (total silence is a DIFFERENT, already-covered signal)', async () => {
+            jest.useFakeTimers();
+            const realDateNow = Date.now.bind(Date);
+            let fakeNow = realDateNow();
+            const dateNowSpy = spyOn(Date, 'now').mockImplementation(() => fakeNow);
+            try {
+                const onRequestStall = mock((_info: RequestStallInfo) => {});
+                const client = makeClient(onRequestStall);
+
+                const connectPromise = client.connect();
+                mockWs.simulateOpen();
+                await connectPromise;
+
+                const sendPromise = client.send('TestReporter.enable', {});
+                sendPromise.catch(() => {});
+
+                fakeNow += 2000;
+                jest.advanceTimersByTime(2000);
+                await Promise.resolve();
+
+                expect(onRequestStall).not.toHaveBeenCalled();
+            } finally {
+                dateNowSpy.mockRestore();
+                jest.useRealTimers();
+            }
+        });
+
+        it('does not schedule a stall watchdog timer when no onRequestStall handler is registered', async () => {
+            jest.useFakeTimers();
+            try {
+                const client = makeClient();
+
+                const connectPromise = client.connect();
+                mockWs.simulateOpen();
+                await connectPromise;
+
+                const baseline = jest.getTimerCount();
+                const sendPromise = client.send('TestReporter.enable', {});
+                sendPromise.catch(() => {});
+
+                // Only the per-request timeout timer — no stall watchdog.
+                expect(jest.getTimerCount()).toBe(baseline + 1);
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('clears the stall watchdog timer once the response arrives, leaving no dangling timer', async () => {
+            jest.useFakeTimers();
+            try {
+                const onRequestStall = mock((_info: RequestStallInfo) => {});
+                const client = makeClient(onRequestStall);
+
+                const connectPromise = client.connect();
+                mockWs.simulateOpen();
+                await connectPromise;
+
+                const baseline = jest.getTimerCount();
+                const sendPromise = client.send('TestReporter.enable', {});
+                expect(jest.getTimerCount()).toBe(baseline + 2); // request timeout + stall watchdog
+
+                const sentMessage = JSON.parse(mockWs.sentMessages[0]);
+                mockWs.simulateMessage(JSON.stringify({ id: sentMessage.id, result: {} }));
+                await sendPromise;
+
+                expect(jest.getTimerCount()).toBe(baseline);
+
+                jest.advanceTimersByTime(2000);
+                expect(onRequestStall).not.toHaveBeenCalled();
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('close() clears a pending stall watchdog timer, leaving no dangling timer', async () => {
+            jest.useFakeTimers();
+            try {
+                const onRequestStall = mock((_info: RequestStallInfo) => {});
+                const client = makeClient(onRequestStall);
+
+                const connectPromise = client.connect();
+                mockWs.simulateOpen();
+                await connectPromise;
+
+                const baseline = jest.getTimerCount();
+                const sendPromise = client.send('TestReporter.enable', {});
+                sendPromise.catch(() => {});
+                expect(jest.getTimerCount()).toBe(baseline + 2);
+
+                await client.close();
+
+                expect(jest.getTimerCount()).toBe(baseline);
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('an unexpected close clears a pending stall watchdog timer, leaving no dangling timer', async () => {
+            jest.useFakeTimers();
+            try {
+                const onRequestStall = mock((_info: RequestStallInfo) => {});
+                const client = makeClient(onRequestStall);
+
+                const connectPromise = client.connect();
+                mockWs.simulateOpen();
+                await connectPromise;
+
+                const baseline = jest.getTimerCount();
+                const sendPromise = client.send('TestReporter.enable', {});
+                sendPromise.catch(() => {});
+                expect(jest.getTimerCount()).toBe(baseline + 2);
+
+                mockWs.close();
+
+                expect(jest.getTimerCount()).toBe(baseline);
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('a send() error path clears a pending stall watchdog timer, leaving no dangling timer', async () => {
+            jest.useFakeTimers();
+            try {
+                const onRequestStall = mock((_info: RequestStallInfo) => {});
+                const client = makeClient(onRequestStall);
+
+                const connectPromise = client.connect();
+                mockWs.simulateOpen();
+                await connectPromise;
+
+                mockWs.send = () => {
+                    throw new Error('boom');
+                };
+
+                const baseline = jest.getTimerCount();
+                const sendError = await client.send('TestReporter.enable', {}).catch((e: unknown) => e);
+                expect(sendError).toBeInstanceOf(Error);
+
+                expect(jest.getTimerCount()).toBe(baseline);
+            } finally {
+                jest.useRealTimers();
+            }
         });
     });
 });

@@ -33,7 +33,7 @@ import {
     mapCoverageToInspectorIds,
     type LateHitEntry
 } from './coverage/index.js';
-import { InspectorClient } from './inspector/index.js';
+import { InspectorClient, type InspectorCloseInfo } from './inspector/index.js';
 import type { TestInfo } from './inspector/types.js';
 import type { StrykerBunOptions } from './options.js';
 import { parseBunTestOutput, type ParsedTestResults } from './parsers/console-parser.js';
@@ -80,6 +80,7 @@ class DrainWaitTimeoutError extends Error {
     readonly reason: 'silence' | 'ceiling';
     constructor(message: string, reason: 'silence' | 'ceiling') {
         super(message);
+        // Stryker disable next-line StringLiteral: this.name is never read anywhere in this codebase — only .reason drives behavior (via drainSettleReason, see raceAgainstSilence's callers) — cosmetic Error API surface only, not functionally observable
         this.name = 'DrainWaitTimeoutError';
         this.reason = reason;
     }
@@ -124,9 +125,11 @@ function raceAgainstSilence(
             const totalElapsed = Date.now() - startedAt;
             if(totalElapsed >= absoluteCeilingMs) {
                 clearInterval(timer);
+                // Stryker disable next-line StringLiteral: the message TEMPLATE (not the 'ceiling' literal, which is separately defended by the reason: 'silence'|'ceiling' type — an invalid string here is a TypeScript compile error, killed by the checker) is never read anywhere; only DrainWaitTimeoutError.reason (via drainSettleReason) drives behavior — .message content is not functionally observable
                 reject(new DrainWaitTimeoutError(`${message}: ${absoluteCeilingMs}ms absolute ceiling reached`, 'ceiling'));
             } else if(totalElapsed >= silenceMs && sinceLastFrame >= silenceMs) {
                 clearInterval(timer);
+                // Stryker disable next-line StringLiteral: same reasoning as the ceiling branch above — message TEMPLATE only, not the type-defended 'silence' literal
                 reject(new DrainWaitTimeoutError(`${message}: ${sinceLastFrame}ms of inspector silence (limit ${silenceMs}ms)`, 'silence'));
             }
         }, DRAIN_SILENCE_POLL_INTERVAL_MS);
@@ -1011,8 +1014,19 @@ export class BunTestRunner implements TestRunner {
                     // trigger — see checkCompletenessGate's doc comment).
                     onUnexpectedClose: (context) => {
                         this.logger.debug(
-                            'Inspector WebSocket closed while the run was still thought to be in progress (wsClosed=%s closeExpected=%s isClosing=%s) — often benign; see checkCompletenessGate',
-                            context.wsClosed, context.closeExpected, context.isClosing
+                            'Inspector WebSocket closed while the run was still thought to be in progress (wsClosed=%s closeExpected=%s isClosing=%s closeCode=%s closeReason=%s closeWasClean=%s msFromLastFrameToClose=%s) — often benign; see checkCompletenessGate',
+                            context.wsClosed, context.closeExpected, context.isClosing,
+                            String(context.closeCode), String(context.closeReason), String(context.closeWasClean), String(context.msFromLastFrameToClose)
+                        );
+                    },
+                    // Diagnostic-only, distinct from raceAgainstSilence's total-silence give-up:
+                    // proves the connection is still receiving SOMETHING while one specific
+                    // request (e.g. TestReporter.enable) goes unanswered — see
+                    // InspectorEventHandlers.onRequestStall's doc comment.
+                    onRequestStall: (info) => {
+                        this.logger.warn(
+                            'Inspector request unanswered after %dms even though other frames are still arriving (last frame %dms ago): %s (id=%d) — possible protocol-level stall distinct from total silence',
+                            info.msUnanswered, info.msSinceLastFrame, info.method, info.id
                         );
                     },
                 },
@@ -1150,6 +1164,22 @@ export class BunTestRunner implements TestRunner {
                 formatDrainSettleReason(drainSettleReason)
             );
 
+            // Closes the two evidence gaps identified in INSPECTOR-PRODUCER-LOSS.md: (1) the
+            // WebSocket close code/reason/wasClean — confirms or kills the suspected Bun
+            // idleTimeout:0 ping-cycle bug (ERR_WEBSOCKET_TIMEOUT) on the next incident; (2) raw
+            // vs. unique found-id counts — the gap count above is density-only and cannot detect
+            // the confirmed Bun TestReporter id-collision bug (two interleaved id sequences),
+            // which keeps ids dense while silently merging distinct tests under one shared id.
+            const closeInfo = inspector.getCloseInfo();
+            const collisionStats = inspector.getFoundIdCollisionStats();
+            this.logger.warn(
+                'Post-drain inspector close/collision diagnostics: WS close code=%s reason=%s wasClean=%s msFromLastFrameToClose=%s; '
+                + 'found events %d raw / %d unique id(s) / %d duplicate id event(s) (nonzero duplicates = direct evidence of the Bun '
+                + 'TestReporter id-collision bug; the found-id-gap count above is density-only — it does NOT prove losslessness under collisions)',
+                String(closeInfo.code), String(closeInfo.reason), String(closeInfo.wasClean), String(closeInfo.msFromLastFrameToClose),
+                collisionStats.rawFoundCount, collisionStats.uniqueFoundIdCount, collisionStats.duplicateFoundIdCount
+            );
+
             // 10–12. Handle timeout and process errors; parse output
             const parsed = parseBunTestOutput(result.stdout, result.stderr);
             const earlyResult = this.checkDryRunProcessResult(result, parsed, testHierarchy);
@@ -1160,7 +1190,7 @@ export class BunTestRunner implements TestRunner {
             // 13–16. Collect/remap coverage, build tests, run the completeness gate, and
             // (if it passes) persist the registry — extracted to keep dryRun()'s own
             // complexity under the lint threshold; see buildGatedDryRunResult's doc comment.
-            return await this.buildGatedDryRunResult(result, parsed, testHierarchy, executionOrder, totalElapsedMs, wasClosedUnexpectedly);
+            return await this.buildGatedDryRunResult(result, parsed, testHierarchy, executionOrder, totalElapsedMs, wasClosedUnexpectedly, closeInfo);
         } finally {
             // Abort the child process if it is still running.  This is idempotent —
             // if the process already exited normally, the signal fires to a dead process
@@ -1192,7 +1222,8 @@ export class BunTestRunner implements TestRunner {
         testHierarchy:         TestInfo[],
         executionOrder:        number[],
         totalElapsedMs:        number,
-        wasClosedUnexpectedly: boolean
+        wasClosedUnexpectedly: boolean,
+        closeInfo:              InspectorCloseInfo
     ): Promise<DryRunResult> {
         // 13. Collect and remap coverage data
         const { coverage: mutantCoverage, inspectorIdToProjectFile, rawKeyCount, orphanedKeyCount } = await this.collectAndRemapCoverage(testHierarchy, executionOrder);
@@ -1209,7 +1240,7 @@ export class BunTestRunner implements TestRunner {
         // stream — run AFTER tests are built (so it can see whether the run otherwise looks GREEN)
         // but BEFORE persisting the registry below: a gated run must never let other
         // Stryker workers load a corrupted/partial registry via loadRegistryFile().
-        const gateResult = this.checkCompletenessGate(executionOrder, testHierarchy, parsed, rawKeyCount, orphanedKeyCount, wasClosedUnexpectedly, tests);
+        const gateResult = this.checkCompletenessGate(executionOrder, testHierarchy, parsed, rawKeyCount, orphanedKeyCount, wasClosedUnexpectedly, tests, closeInfo);
         if(gateResult) {
             return gateResult;
         }
@@ -1795,7 +1826,8 @@ export class BunTestRunner implements TestRunner {
         rawKeyCount:            number,
         orphanedKeyCount:       number,
         wasClosedUnexpectedly:  boolean,
-        tests:                  readonly RunnerTestResult[]
+        tests:                  readonly RunnerTestResult[],
+        closeInfo:              InspectorCloseInfo
     ): DryRunResult | null {
         // Stryker disable next-line MethodExpression,EqualityOperator: equivalent — .some() vs .find()!==undefined would produce the same boolean; the guard itself (skip the gate when any built test already Failed) is covered by 'gate does not evaluate when built tests contain failures'
         if(tests.some(t => t.status === TestStatus.Failed)) {
@@ -1835,7 +1867,13 @@ export class BunTestRunner implements TestRunner {
             reasons.push(`${orphanedKeyCount} of ${rawKeyCount} coverage key(s) could not be paired with any inspector test (orphaned)`);
         }
         if(wasClosedUnexpectedly) {
-            reasons.push('the inspector WebSocket closed unexpectedly before this data could be fully drained');
+            // closeInfo.code is undefined whenever the close event itself never carried a code
+            // (e.g. the mock/test path, or a WebSocket implementation that omits it) — distinct
+            // from a genuinely captured code (including 0), so this checks presence, not truthiness.
+            const closeDetail = closeInfo.code === undefined
+                ? 'close code/reason not captured'
+                : `close code=${closeInfo.code} reason=${JSON.stringify(closeInfo.reason ?? '')} wasClean=${String(closeInfo.wasClean)}, ${String(closeInfo.msFromLastFrameToClose)}ms after the last received frame`;
+            reasons.push(`the inspector WebSocket closed unexpectedly before this data could be fully drained (${closeDetail})`);
         }
 
         const errorMessage

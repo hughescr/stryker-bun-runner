@@ -292,24 +292,43 @@ of them in a clean run's logs is worth investigating before trusting the score.
   apply to them.
 
   At the default (WARN) log level, dry runs also emit a few lines tracing this
-  handshake: `Drain-request received`, `Drain handler settled via ...`, and
-  `Post-drain inspector snapshot`, reporting the round-trip's outcome (`ack`,
-  `silence`, `ceiling`, or `send-rejected`), the found/start/end event-count
-  deltas observed during the wait, and any found-id gaps. A separate DEBUG-level
+  handshake: `Drain-request received`, `Drain handler settled via ...`,
+  `Post-drain inspector snapshot`, and `Post-drain inspector close/collision
+  diagnostics`, reporting the round-trip's outcome (`ack`, `silence`,
+  `ceiling`, or `send-rejected`), the found/start/end event-count deltas
+  observed during the wait, any found-id gaps, the WebSocket close
+  code/reason/wasClean (plus how many ms after the last received frame the
+  close arrived), and raw-vs-unique found-event counts. A separate DEBUG-level
   line notes if the inspector socket closed while the run was still thought to
-  be in progress — this is logged at DEBUG rather than WARN because the child
-  closing its own socket right after receiving `'drained'` routinely wins the
-  race against the runner's own close-expectation on a clean run, so on its own
-  it is not evidence of anything wrong (it is folded into the completeness
-  gate's error message as corroborating context only if that gate has already
-  fired for another reason). Together the WARN-level lines are useful for
-  telling apart two different failure shapes: residual loss caused by a
-  runner-side bound being hit (a give-up
-  outcome — `silence` or `ceiling`) versus loss happening inside Bun's own
-  inspector agent (found-id gaps persisting even though the round-trip `ack`
-  succeeded). One caveat: gap detection assumes Bun assigns test-discovery ids
-  densely, which has been observed but is not a guaranteed contract, so treat
-  gap reports as diagnostic rather than definitive.
+  be in progress (including the same close code/reason/wasClean detail) — this
+  is logged at DEBUG rather than WARN because the child closing its own socket
+  right after receiving `'drained'` routinely wins the race against the
+  runner's own close-expectation on a clean run, so on its own it is not
+  evidence of anything wrong (it is folded into the completeness gate's error
+  message as corroborating context — now including the captured close
+  code/reason — only if that gate has already fired for another reason).
+  Together the WARN-level lines are useful for telling apart two different
+  failure shapes: residual loss caused by a runner-side bound being hit (a
+  give-up outcome — `silence` or `ceiling`) versus loss happening inside Bun's
+  own inspector agent (found-id gaps persisting even though the round-trip
+  `ack` succeeded). One caveat: gap detection assumes Bun assigns
+  test-discovery ids densely, which has been observed but is not a guaranteed
+  contract — and even a dense (0-gap) id range does **not** prove
+  losslessness: a confirmed Bun TestReporter id-collision bug (two interleaved
+  `1..N` id sequences when `TestReporter.enable` lands mid-collection) keeps
+  ids dense while silently merging two distinct tests under one shared id.
+  That is exactly what the close/collision diagnostics line's
+  raw/unique/duplicate found counts exist to catch: a **nonzero duplicate
+  count is direct in-the-wild evidence of that id-collision bug**, and the
+  close code/reason/wasClean fields confirm or rule out a separate confirmed
+  Bun bug where `idleTimeout: 0` websockets are force-closed on a ~252-second
+  ping cycle (`ERR_WEBSOCKET_TIMEOUT`) — an abnormal close landing right on
+  that cadence points at the ping-cycle bug, while a clean close rules it out.
+  Finally, a WARN-level `Inspector request unanswered after ...` line fires if
+  an inspector protocol request (e.g. `TestReporter.enable`) goes unanswered
+  for more than 2 seconds while other frames are still arriving on the same
+  connection — a protocol-level stall signature distinct from the
+  total-silence give-up above.
 
 ### Coverage-bleed warning (dry run only)
 
