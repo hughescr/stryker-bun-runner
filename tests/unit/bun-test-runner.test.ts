@@ -3638,10 +3638,11 @@ tests/example.test.ts:
             mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
         });
 
-        it('should treat non-zero exit with no parsed failures as Killed+unknown (bunfig sanitized, so threshold miss cannot occur)', async () => {
+        it('should treat non-zero exit with no parsed failures as Killed with empty killedBy (bunfig sanitized, so threshold miss cannot occur)', async () => {
             // With the sanitized bunfig disabling coverage/coverageThreshold/onlyFailures,
             // a non-zero exit with no parsed failures is now treated as a genuine (unparseable)
-            // kill rather than Survived.  killedBy: ['unknown'] is the fallback.
+            // kill rather than Survived.  killedBy: [] — never 'unknown', which would be
+            // written verbatim into the incremental report and orphan against the registry.
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 if(options.onInspectorReady) {
@@ -3668,7 +3669,7 @@ tests/example.test.ts:
 
             expect(result.status).toBe(MutantRunStatus.Killed);
             if(result.status === MutantRunStatus.Killed) {
-                expect(result.killedBy).toEqual(['unknown']);
+                expect(result.killedBy).toEqual([]);
             }
         });
 
@@ -3731,7 +3732,7 @@ tests/example.test.ts:
             const result = await runner.mutantRun({
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                 activeMutant:    { id: '77' } as any,
-                testFilter:      [],
+                testFilter:      ['tests/foo.test.ts > my test'],
                 sandboxFileName: 'sandbox',
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
             } as any);
@@ -3951,8 +3952,11 @@ tests/example.test.ts:
 
             const result = await runner.mutantRun({
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
-                activeMutant:    { id: '1' } as any,
-                testFilter:      [],
+                activeMutant: { id: '1' } as any,
+                testFilter:   [
+                    'tests/example.test.ts > test 1',
+                    'tests/example.test.ts > test 2',
+                ],
                 sandboxFileName: 'sandbox',
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
             } as any);
@@ -3999,8 +4003,12 @@ tests/example.test.ts:
 
             const result = await runner.mutantRun({
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
-                activeMutant:    { id: '1' } as any,
-                testFilter:      [],
+                activeMutant: { id: '1' } as any,
+                testFilter:   [
+                    'tests/example.test.ts > test alpha',
+                    'tests/example.test.ts > test beta',
+                    'tests/example.test.ts > test gamma',
+                ],
                 sandboxFileName: 'sandbox',
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
             } as any);
@@ -4043,7 +4051,7 @@ tests/example.test.ts:
             const result = await runner.mutantRun({
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
                 activeMutant:    { id: '1' } as any,
-                testFilter:      ['should catch mutant'],
+                testFilter:      ['tests/example.test.ts > should catch mutant'],
                 sandboxFileName: 'sandbox',
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
             } as any);
@@ -4126,9 +4134,9 @@ tests/example.test.ts:
             expect(result.status).toBe(MutantRunStatus.Timeout);
         });
 
-        it('should treat generic non-zero exit with no output as Killed+unknown (sanitized bunfig prevents threshold miss)', async () => {
+        it('should treat generic non-zero exit with no output as Killed with empty killedBy (sanitized bunfig prevents threshold miss)', async () => {
             // With sanitized bunfig in place, a non-zero exit with unparseable output is
-            // a genuine (unknown) kill.  killedBy: ['unknown'] is the expected fallback.
+            // a genuine (unattributable) kill.  killedBy: [] is the expected fallback.
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 if(options.onInspectorReady) {
@@ -4155,7 +4163,7 @@ tests/example.test.ts:
 
             expect(result.status).toBe(MutantRunStatus.Killed);
             if(result.status === MutantRunStatus.Killed) {
-                expect(result.killedBy).toEqual(['unknown']);
+                expect(result.killedBy).toEqual([]);
             }
         });
 
@@ -4395,8 +4403,12 @@ tests/example.test.ts:
 
             const result = await runner.mutantRun({
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
-                activeMutant:    { id: '1' } as any,
-                testFilter:      [],
+                activeMutant: { id: '1' } as any,
+                testFilter:   [
+                    'tests/example.test.ts > passing test',
+                    'tests/example.test.ts > failing test 1',
+                    'tests/example.test.ts > failing test 2',
+                ],
                 sandboxFileName: 'sandbox',
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
             } as any);
@@ -4458,9 +4470,9 @@ tests/example.test.ts:
             }
         });
 
-        it('should classify non-zero exit with no parsed failures as Killed+unknown (sanitized bunfig in place)', async () => {
+        it('should classify non-zero exit with no parsed failures as Killed with empty killedBy (sanitized bunfig in place)', async () => {
             // With sanitized bunfig disabling coverage/onlyFailures, a non-zero exit with
-            // no parseable failure output is treated as a genuine kill with killedBy: ['unknown'].
+            // no parseable failure output is treated as a genuine kill with killedBy: [].
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 if(options.onInspectorReady) {
@@ -4487,7 +4499,7 @@ tests/example.test.ts:
 
             expect(result.status).toBe(MutantRunStatus.Killed);
             if(result.status === MutantRunStatus.Killed) {
-                expect(result.killedBy).toEqual(['unknown']);
+                expect(result.killedBy).toEqual([]);
             }
         });
 
@@ -4696,8 +4708,8 @@ tests/example.test.ts:
             }
         });
 
-        // (e) Unrecognised name → falls back to ['unknown'] and emits a logger.warn
-        it('(e) killedBy resolution: unrecognised name falls back to unknown and warns', async () => {
+        // (e) Unrecognised name → dropped from killedBy (never emitted raw) with a WARN
+        it('(e) killedBy resolution: unrecognised name is dropped with empty killedBy and warns', async () => {
             // Registry has only "tests/e.test.ts > known test"
             setupDryRunThenMutantRun(
                 [{ id: 1, name: 'known test', fullName: 'known test', type: 'test' as const, url: 'file:///proj/.stryker-tmp/sandbox-ABC/tests/e.test.ts', status: 'pass' }],
@@ -4720,21 +4732,20 @@ tests/example.test.ts:
 
             expect(result.status).toBe(MutantRunStatus.Killed);
             if(result.status === MutantRunStatus.Killed) {
-                // The unrecognised name is included as-is (not dropped)
-                expect(result.killedBy).toEqual(['tests/e.test.ts > totally unknown test name']);
+                // The unrecognised name must NOT be emitted — any value outside the
+                // dry-run id space is written verbatim into the incremental report,
+                // orphans against the test registry, and permanently prevents reuse.
+                expect(result.killedBy).toEqual([]);
             }
-            // Should emit a logger.debug (not warn) for the unrecognised name —
-            // the fallback is correct behavior, not a recoverable problem.
+            // A WARN (not debug — the old debug is why this was invisible in CI)
+            // names the dropped name(s).
 
-            expect(mockLogger.debug).toHaveBeenCalledWith(
-                expect.stringContaining('not found in test registry'),
-                expect.stringContaining('totally unknown test name'),
-                '5'
-            );
-            expect(mockLogger.warn).not.toHaveBeenCalledWith(
-                expect.stringContaining('not found in test registry'),
-                expect.anything(),
-                expect.anything()
+            expect(mockLogger.warn).toHaveBeenCalledWith(
+                expect.stringContaining('could not be resolved'),
+                '5',
+                1,
+                'tests/e.test.ts > totally unknown test name',
+                ''
             );
         });
 
@@ -4849,10 +4860,12 @@ tests/example.test.ts:
             if(result.status === MutantRunStatus.Killed) {
                 // "leak test" not in localRegistry, but exact match in cachedTestNames (step 3)
                 expect(result.killedBy).toEqual(['tests/leak.test.ts > leak test']);
-                // Must NOT warn about unrecognised name
+                // Must NOT warn about unresolved names — everything resolved
 
                 expect(mockLogger.warn).not.toHaveBeenCalledWith(
-                    expect.stringContaining('not found in test registry'),
+                    expect.stringContaining('could not be resolved'),
+                    expect.anything(),
+                    expect.anything(),
                     expect.anything(),
                     expect.anything()
                 );
@@ -4893,10 +4906,12 @@ tests/example.test.ts:
                 expect(result.killedBy).toHaveLength(2);
                 expect(result.killedBy).toContain('tests/shared.test.ts > shared name [0]');
                 expect(result.killedBy).toContain('tests/shared.test.ts > shared name [1]');
-                // Must NOT warn about unrecognised name
+                // Must NOT warn about unresolved names — everything resolved
 
                 expect(mockLogger.warn).not.toHaveBeenCalledWith(
-                    expect.stringContaining('not found in test registry'),
+                    expect.stringContaining('could not be resolved'),
+                    expect.anything(),
+                    expect.anything(),
                     expect.anything(),
                     expect.anything()
                 );
@@ -4942,8 +4957,8 @@ tests/example.test.ts:
         });
 
         // (k) Fallback chain: name present in NEITHER local index nor instance registry.
-        //     Warning fires as before and raw name is stored (unchanged behavior).
-        it('(k) killedBy resolution: name in neither local nor instance registry warns and includes as-is', async () => {
+        //     The raw name is DROPPED (never stored) and a WARN names it.
+        it('(k) killedBy resolution: name in neither local nor instance registry is dropped with a WARN', async () => {
             setupDryRunThenMutantRun(
                 [{ id: 1, name: 'known test', fullName: 'known test', type: 'test' as const, url: 'file:///proj/.stryker-tmp/sandbox-ABC/tests/k.test.ts', status: 'pass' }],
                 [1],
@@ -4964,21 +4979,266 @@ tests/example.test.ts:
 
             expect(result.status).toBe(MutantRunStatus.Killed);
             if(result.status === MutantRunStatus.Killed) {
-                // Raw name stored as-is
-                expect(result.killedBy).toContain('tests/k.test.ts > completely unknown test');
+                // Raw name must NOT be stored — killedBy degrades to [] (non-reusable
+                // but never poisonous)
+                expect(result.killedBy).toEqual([]);
             }
-            // Debug (not warn) emitted for unresolved name
+            // WARN emitted for the unresolved name
 
-            expect(mockLogger.debug).toHaveBeenCalledWith(
-                expect.stringContaining('not found in test registry'),
-                expect.stringContaining('completely unknown test'),
-                expect.anything()
+            expect(mockLogger.warn).toHaveBeenCalledWith(
+                expect.stringContaining('could not be resolved'),
+                '104',
+                1,
+                'tests/k.test.ts > completely unknown test',
+                ''
             );
-            expect(mockLogger.warn).not.toHaveBeenCalledWith(
-                expect.stringContaining('not found in test registry'),
-                expect.anything(),
-                expect.anything()
+        });
+
+        // (l) Mixed resolvable + unresolvable names → only resolved ids are emitted,
+        //     with exactly one WARN naming the dropped name.
+        it('(l) killedBy resolution: mixed resolvable and unresolvable names keeps only resolved ids and warns once', async () => {
+            setupDryRunThenMutantRun(
+                [{ id: 1, name: 'known test', fullName: 'known test', type: 'test' as const, url: 'file:///proj/.stryker-tmp/sandbox-ABC/tests/m.test.ts', status: 'pass' }],
+                [1],
+                'tests/m.test.ts:\n✗ known test [1ms]\n  error: a\n✗ ghost test [1ms]\n  error: b\n\n 0 pass\n 2 fail\n'
             );
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            await runner.dryRun();
+
+            const result = await runner.mutantRun({
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                activeMutant:    { id: '105' } as any,
+                testFilter:      [],
+                sandboxFileName: 'sandbox',
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+            } as any);
+
+            expect(result.status).toBe(MutantRunStatus.Killed);
+            if(result.status === MutantRunStatus.Killed) {
+                expect(result.killedBy).toEqual(['tests/m.test.ts > known test']);
+            }
+            // Exactly ONE resolution WARN, and it names the dropped ghost
+            const resolutionWarns = (mockLogger.warn as ReturnType<typeof mock>).mock.calls
+                .filter(call => typeof call[0] === 'string' && call[0].includes('could not be resolved'));
+            expect(resolutionWarns).toHaveLength(1);
+            expect(resolutionWarns[0][1]).toBe('105');
+            expect(resolutionWarns[0][2]).toBe(1);
+            expect(resolutionWarns[0][3]).toBe('tests/m.test.ts > ghost test');
+        });
+
+        // (m) WARN sample is capped at 5 names + ellipsis
+        it('(m) killedBy resolution: unresolved-name WARN sample caps at 5 names with an ellipsis', async () => {
+            const fails = [1, 2, 3, 4, 5, 6]
+                .map(n => `✗ ghost ${n} [1ms]\n  error: e${n}`)
+                .join('\n');
+            setupDryRunThenMutantRun(
+                [{ id: 1, name: 'known test', fullName: 'known test', type: 'test' as const, url: 'file:///proj/.stryker-tmp/sandbox-ABC/tests/cap.test.ts', status: 'pass' }],
+                [1],
+                `tests/cap.test.ts:\n${fails}\n\n 0 pass\n 6 fail\n`
+            );
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            await runner.dryRun();
+
+            const result = await runner.mutantRun({
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                activeMutant:    { id: '106' } as any,
+                testFilter:      [],
+                sandboxFileName: 'sandbox',
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+            } as any);
+
+            expect(result.status).toBe(MutantRunStatus.Killed);
+            if(result.status === MutantRunStatus.Killed) {
+                expect(result.killedBy).toEqual([]);
+            }
+            const resolutionWarns = (mockLogger.warn as ReturnType<typeof mock>).mock.calls
+                .filter(call => typeof call[0] === 'string' && call[0].includes('could not be resolved'));
+            expect(resolutionWarns).toHaveLength(1);
+            expect(resolutionWarns[0][2]).toBe(6);
+            const sample = resolutionWarns[0][3] as string;
+            expect(sample).toContain('tests/cap.test.ts > ghost 1');
+            expect(sample).toContain('tests/cap.test.ts > ghost 5');
+            expect(sample).not.toContain('ghost 6');
+            expect(resolutionWarns[0][4]).toBe(', …');
+        });
+
+        // (n) Same title across two files (Codex regression): a BARE console name that
+        //     collides with tests in multiple files must never be guessed — no attribution.
+        it('(n) killedBy resolution: bare name colliding across files is never guessed', async () => {
+            setupDryRunThenMutantRun(
+                [
+                    { id: 1, name: 'dup', fullName: 'dup', type: 'test' as const, url: 'file:///proj/.stryker-tmp/sandbox-ABC/tests/a.test.ts', status: 'pass' },
+                    { id: 2, name: 'dup', fullName: 'dup', type: 'test' as const, url: 'file:///proj/.stryker-tmp/sandbox-ABC/tests/b.test.ts', status: 'pass' },
+                ],
+                [1, 2],
+                // NO file header — the console name stays bare, exactly what a
+                // parser miss on an unrecognised header format would produce.
+                '✗ dup [1ms]\n  error: which file?\n\n 0 pass\n 1 fail\n'
+            );
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            await runner.dryRun();
+
+            const result = await runner.mutantRun({
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                activeMutant:    { id: '107' } as any,
+                testFilter:      ['tests/a.test.ts > dup'],
+                sandboxFileName: 'sandbox',
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+            } as any);
+
+            expect(result.status).toBe(MutantRunStatus.Killed);
+            if(result.status === MutantRunStatus.Killed) {
+                // Never a guessed killer: the bare "dup" could be either file's test
+                // (and --test-name-pattern leakage means it may not even be the
+                // testFilter one), so it contributes nothing.
+                expect(result.killedBy).toEqual([]);
+            }
+        });
+
+        // (o) Post-change invariant: every killedBy entry ∈ testFilter ∪ dry-run
+        //     registry ids — i.e. survives Stryker core's testIdMap remap.
+        it('(o) killedBy invariant: every emitted entry survives core testIdMap remap', async () => {
+            setupDryRunThenMutantRun(
+                [{ id: 1, name: 'B', fullName: 'B', type: 'test' as const, url: 'file:///proj/.stryker-tmp/sandbox-ABC/tests/bar.test.ts', status: 'pass' }],
+                [1],
+                // Mix: testFilter-resolvable (A), garbage, registry-resolvable leak (B)
+                'tests/foo.test.ts:\n✗ A [1ms]\n  error: a\n✗ some garbage name [1ms]\n  error: g\ntests/bar.test.ts:\n✗ B [1ms]\n  error: b\n\n 0 pass\n 3 fail\n'
+            );
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            await runner.dryRun();
+
+            const result = await runner.mutantRun({
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                activeMutant:    { id: '108' } as any,
+                testFilter:      ['tests/foo.test.ts > A'],
+                sandboxFileName: 'sandbox',
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+            } as any);
+
+            expect(result.status).toBe(MutantRunStatus.Killed);
+            if(result.status === MutantRunStatus.Killed) {
+                expect(result.killedBy).toHaveLength(2);
+                expect(result.killedBy).toContain('tests/foo.test.ts > A');
+                expect(result.killedBy).toContain('tests/bar.test.ts > B');
+
+                // Simulate Stryker core's remapTestId: a Map keyed by dry-run test
+                // ids. Every emitted entry MUST hit the map — the `?? id` verbatim
+                // fallthrough in core must be unreachable.
+                const testIdMap = new Map(
+                    ['tests/foo.test.ts > A', 'tests/bar.test.ts > B'].map((id, i) => [id, i])
+                );
+                for(const entry of result.killedBy) {
+                    expect(testIdMap.get(entry)).not.toBeUndefined();
+                }
+            }
+        });
+
+        // ── Phase 0: GHA-decorated console output → killedBy (integration reproduction) ──
+        // Drives mutantRun end-to-end through the REAL parseBunTestOutput +
+        // buildMutantKilledResult + resolveKilledBy, mocking only the spawned process.
+        // Fixture provenance: bun-main (1.4.0-canary lineage) prints each test-file
+        // header as `::group::tests/foo.test.ts:` when GITHUB_ACTIONS is set AND
+        // CLAUDECODE is unset (bun's is_ai_agent() suppresses the prefix inside
+        // Claude Code sessions) — reproducing this fixture live requires
+        // `env -u CLAUDECODE GITHUB_ACTIONS=true` with a bun-main build; do not
+        // "fix" it against stock bun output.
+        describe('GHA-decorated console output (integration reproduction)', () => {
+            it('resolves killedBy to the exact testFilter id from ::group::-decorated bail output', async () => {
+                const ghaStdout = [
+                    '::group::tests/foo.test.ts:',
+                    '(fail) Suite > kills the mutant [0.42ms]',
+                    '  error: expect(received).toBe(expected)',
+                    '::error file=tests/foo.test.ts,line=12::expect(received).toBe(expected)',
+                    '::endgroup::',
+                    ' 0 pass',
+                    ' 1 fail',
+                    '',
+                ].join('\n');
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    if(options.onInspectorReady) {
+                        // dryRun path — not used in this test
+
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                        return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
+                    }
+                    return Promise.resolve({ exitCode: 1, stdout: ghaStdout, stderr: '', timedOut: false });
+                });
+
+                // mutantRun-only worker: no dryRun, killedBy must resolve via testFilter
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+
+                const result = await runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: 'gha-1' } as any,
+                    testFilter:      ['tests/foo.test.ts > Suite > kills the mutant'],
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+
+                expect(result.status).toBe(MutantRunStatus.Killed);
+                if(result.status === MutantRunStatus.Killed) {
+                    // MUST be exactly the dry-run/testFilter id — a bare console name
+                    // here poisons the incremental cache (the 748-orphan CI signature).
+                    expect(result.killedBy).toEqual(['tests/foo.test.ts > Suite > kills the mutant']);
+                }
+            });
+
+            it('resolves killedBy for multi-file disableBail output with ::group:: headers', async () => {
+                const ghaStdout = [
+                    '::group::tests/foo.test.ts:',
+                    '(fail) Suite > kills the mutant [0.42ms]',
+                    '  error: expect(received).toBe(expected)',
+                    '::endgroup::',
+                    '::group::tests/bar.test.ts:',
+                    '(fail) Other > also kills it [0.10ms]',
+                    '  error: expect(received).toEqual(expected)',
+                    '::endgroup::',
+                    ' 0 pass',
+                    ' 2 fail',
+                    '',
+                ].join('\n');
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    if(options.onInspectorReady) {
+                        // dryRun path — not used in this test
+
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                        return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
+                    }
+                    return Promise.resolve({ exitCode: 1, stdout: ghaStdout, stderr: '', timedOut: false });
+                });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+
+                const result = await runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant: { id: 'gha-2' } as any,
+                    testFilter:   [
+                        'tests/foo.test.ts > Suite > kills the mutant',
+                        'tests/bar.test.ts > Other > also kills it',
+                    ],
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+
+                expect(result.status).toBe(MutantRunStatus.Killed);
+                if(result.status === MutantRunStatus.Killed) {
+                    expect(result.killedBy).toHaveLength(2);
+                    expect(result.killedBy).toContain('tests/foo.test.ts > Suite > kills the mutant');
+                    expect(result.killedBy).toContain('tests/bar.test.ts > Other > also kills it');
+                }
+            });
         });
 
         // ── Registry file persistence/loading tests (Fix: shared registry for all workers) ─────
@@ -5561,7 +5821,7 @@ tests/example.test.ts:
                 }
             });
 
-            it('falls back to raw names and warns when registry file is missing (ENOENT)', async () => {
+            it('drops unresolvable names (empty killedBy) when registry file is missing (ENOENT)', async () => {
                 const enoentErr = Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' });
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock returns error
                 readFileSpy.mockRejectedValue(enoentErr as any);
@@ -5591,12 +5851,20 @@ tests/example.test.ts:
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
                 } as any);
 
-                // Should NOT throw — falls back to raw name
+                // Should NOT throw — the verdict stands, but the raw name is dropped
+                // (no registry to resolve it against; raw names must never be emitted)
                 expect(result.status).toBe(MutantRunStatus.Killed);
                 if(result.status === MutantRunStatus.Killed) {
-                    // Raw name used as-is since no registry available
-                    expect(result.killedBy).toContain('tests/foo.test.ts > raw name test');
+                    expect(result.killedBy).toEqual([]);
                 }
+                // The drop is WARN-visible
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect.stringContaining('could not be resolved'),
+                    '202',
+                    1,
+                    'tests/foo.test.ts > raw name test',
+                    ''
+                );
 
                 // ENOENT is expected on non-dryRun workers; the log is debug not warn
                 expect(mockLogger.debug).toHaveBeenCalledWith(
@@ -5966,12 +6234,21 @@ tests/example.test.ts:
 
                 expect(mockLogger.warn).toHaveBeenCalledWith('dryRun registry file has unexpected version %s; skipping', '1');
 
-                // Nothing loaded → the base name is NOT expanded via the stale v1 baseNameIndex
+                // Nothing loaded → the base name is NOT expanded via the stale v1
+                // baseNameIndex; with no registry it cannot resolve at all and is
+                // dropped (never emitted raw)
 
                 expect(result.status).toBe(MutantRunStatus.Killed);
                 if(result.status === MutantRunStatus.Killed) {
-                    expect(result.killedBy).toEqual(['tests/static.test.ts > static test']);
+                    expect(result.killedBy).toEqual([]);
                 }
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect.stringContaining('could not be resolved'),
+                    '303',
+                    1,
+                    'tests/static.test.ts > static test',
+                    ''
+                );
             });
 
             it('treats a version-2 registry with a non-array testNameIndex as malformed and rejects it all-or-nothing', async () => {
@@ -6013,12 +6290,20 @@ tests/example.test.ts:
                 );
 
                 // All-or-nothing: the (valid) baseNameIndex must NOT have been
-                // half-loaded — the raw base name stays unexpanded
+                // half-loaded — the base name stays unexpanded, cannot resolve,
+                // and is dropped (never emitted raw)
 
                 expect(result.status).toBe(MutantRunStatus.Killed);
                 if(result.status === MutantRunStatus.Killed) {
-                    expect(result.killedBy).toEqual(['tests/static.test.ts > static test']);
+                    expect(result.killedBy).toEqual([]);
                 }
+                expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect.stringContaining('could not be resolved'),
+                    '304',
+                    1,
+                    'tests/static.test.ts > static test',
+                    ''
+                );
 
                 // …and the lazy-load guard fires again on the next mutantRun
                 const callsAfterFirst = readFileSpy.mock.calls.length;
@@ -6090,12 +6375,20 @@ tests/example.test.ts:
                     );
 
                     // All-or-nothing: the (valid) baseNameIndex must NOT have been
-                    // half-loaded — the raw base name stays unexpanded
+                    // half-loaded — the base name stays unexpanded, cannot resolve,
+                    // and is dropped (never emitted raw)
 
                     expect(result.status).toBe(MutantRunStatus.Killed);
                     if(result.status === MutantRunStatus.Killed) {
-                        expect(result.killedBy).toEqual(['tests/static.test.ts > static test']);
+                        expect(result.killedBy).toEqual([]);
                     }
+                    expect(mockLogger.warn).toHaveBeenCalledWith(
+                        expect.stringContaining('could not be resolved'),
+                        '306',
+                        1,
+                        'tests/static.test.ts > static test',
+                        ''
+                    );
                 }
             );
 
@@ -7229,8 +7522,12 @@ error: Expected 1 but got 2
 
                 const result = await runner.mutantRun({
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
-                    activeMutant:    { id: '1' } as any,
-                    testFilter:      [],
+                    activeMutant: { id: '1' } as any,
+                    testFilter:   [
+                        'test/file.test.ts > passing test',
+                        'test/file.test.ts > failing test 1',
+                        'test/file.test.ts > failing test 2',
+                    ],
                     sandboxFileName: 'sandbox',
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
                 } as any);
@@ -7266,8 +7563,11 @@ error: Failed B
 
                 const result = await runner.mutantRun({
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
-                    activeMutant:    { id: '1' } as any,
-                    testFilter:      [],
+                    activeMutant: { id: '1' } as any,
+                    testFilter:   [
+                        'test/file.test.ts > test A',
+                        'test/file.test.ts > test B',
+                    ],
                     sandboxFileName: 'sandbox',
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
                 } as any);
@@ -7794,8 +8094,11 @@ error: Test failure
 
                 const result = await runner.mutantRun({
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
-                    activeMutant:    { id: '1' } as any,
-                    testFilter:      [],
+                    activeMutant: { id: '1' } as any,
+                    testFilter:   [
+                        'test/file.test.ts > passing test',
+                        'test/file.test.ts > failed test',
+                    ],
                     sandboxFileName: 'sandbox',
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
                 } as any);
@@ -7808,10 +8111,10 @@ error: Test failure
                 }
             });
 
-            it('should classify exit 1 with only passing tests as Killed+unknown (sanitized bunfig prevents threshold miss)', async () => {
+            it('should classify exit 1 with only passing tests as Killed with empty killedBy (sanitized bunfig prevents threshold miss)', async () => {
                 // With the sanitized bunfig disabling coverageThreshold, a non-zero exit where
                 // all tests passed but no failure was parsed is treated as an unparseable kill.
-                // killedBy: ['unknown'] is the fallback — the scenario this was protecting against
+                // killedBy: [] is the fallback — the scenario this was protecting against
                 // (coverageThreshold false positive) can no longer occur.
                 mockRunBunTests.mockResolvedValue({
                     exitCode: 1,
@@ -7833,7 +8136,7 @@ error: Test failure
 
                 expect(result.status).toBe(MutantRunStatus.Killed);
                 if(result.status === MutantRunStatus.Killed) {
-                    expect(result.killedBy).toEqual(['unknown']);
+                    expect(result.killedBy).toEqual([]);
                 }
             });
         });
@@ -7936,8 +8239,12 @@ error: Expected error
 
                 const result = await runner.mutantRun({
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
-                    activeMutant:    { id: '1' } as any,
-                    testFilter:      [],
+                    activeMutant: { id: '1' } as any,
+                    testFilter:   [
+                        'test/file.test.ts > passing test A',
+                        'test/file.test.ts > passing test B',
+                        'test/file.test.ts > failed test',
+                    ],
                     sandboxFileName: 'sandbox',
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
                 } as any);
@@ -8017,8 +8324,12 @@ error: Third failure message
 
                 const result = await runner.mutantRun({
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
-                    activeMutant:    { id: '1' } as any,
-                    testFilter:      [],
+                    activeMutant: { id: '1' } as any,
+                    testFilter:   [
+                        'test/file.test.ts > test > suite > first failing test',
+                        'test/file.test.ts > test > suite > second failing test',
+                        'test/file.test.ts > test > suite > third failing test',
+                    ],
                     sandboxFileName: 'sandbox',
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
                 } as any);

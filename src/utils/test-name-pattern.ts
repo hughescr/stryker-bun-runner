@@ -23,9 +23,21 @@
  */
 export const MAX_TEST_NAME_PATTERN_LENGTH = 100_000;
 
+/**
+ * Recognised test-file extension grammar — matches `test.ts`, `spec.tsx`,
+ * `test.mjs`, `spec.cts`, etc. ([jt]sx? = ts/tsx/js/jsx; [mc][jt]s =
+ * mts/mjs/cts/cjs).
+ *
+ * Single source of truth shared with the console parser's file-header regex
+ * (src/parsers/console-parser.ts), so the id prefix-stripping here and the
+ * header recognition there can never drift apart: a file the parser prefixes
+ * onto console test names is always a file whose prefix this module strips
+ * when rebuilding --test-name-pattern alternatives.
+ */
+export const TEST_FILE_EXT_PATTERN = String.raw`(?:test|spec)\.(?:[jt]sx?|[mc][jt]s)`;
+
 // File-extension suffixes that mark the first path segment as a file prefix.
-// Stryker disable next-line Regex: character class lists recognised test-file extensions
-const fileExtRe = /\.(?:test|spec)\.(?:[jt]sx?|m[jt]s)$/;
+const fileExtRe = new RegExp(String.raw`\.${TEST_FILE_EXT_PATTERN}$`);
 
 // Stryker disable next-line Regex: suffix regex is anchored and defensive
 const dedupSuffixRe = / \[\d+\]$/;

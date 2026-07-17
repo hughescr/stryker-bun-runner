@@ -2781,18 +2781,20 @@ Bailed out after 1 failure`;
             expect(result.tests).toHaveLength(0);
         });
 
-        it('should NOT match file header with prefix (fixed greedy capture)', () => {
-            // FIXED: The file header regex now uses [\w./-]+ which only matches valid path characters
-            // So "some prefix tests/example.test.ts:" will NOT match because "some prefix " contains spaces
-            // This prevents matching error output lines like "111 |         // Match file header: tests/example.test.ts:"
+        it('should NOT match file header when the line contains an earlier colon (no-colon-in-path anchor)', () => {
+            // The path may not contain ':' — this prevents matching error output
+            // lines like "111 |         // Match file header: tests/example.test.ts:"
+            // (Note: spaces alone are now LEGAL path characters — "dir with
+            // space/foo.spec.tsx:" is a genuine bun header shape — so the guard
+            // against quoted/echoed header text is the colon anchor, not spaces.)
             const output = `bun test v1.1.0
 
-some prefix tests/example.test.ts:
+// Match file header: tests/example.test.ts:
 ✓ test [1ms]
 
  1 pass`;
             const result = parseBunTestOutput(output, '');
-            // Should NOT match because of the prefix
+            // Should NOT match because of the earlier ':' in the line
             expect(result.tests[0].file).toBeUndefined();
             expect(result.tests[0].name).toBe('test');
         });
@@ -3499,6 +3501,140 @@ tests/example.test.ts:
             expect(result.summaryPassed).toBe(0);
             expect(result.summaryFailed).toBe(0);
             expect(result.summarySkipped).toBe(0);
+        });
+    });
+
+    describe('GitHub Actions workflow-command decorated output', () => {
+        // Fixture provenance: bun-main (1.4.0-canary lineage) prints each test-file
+        // header as `::group::tests/foo.test.ts:` when GITHUB_ACTIONS is set AND
+        // CLAUDECODE is unset (bun's is_ai_agent() suppresses the prefix inside
+        // Claude Code sessions). These fixtures reproduce that CI-only console
+        // shape — stock bun and any local run inside Claude Code will NOT print
+        // it, so do not "fix" these fixtures against locally-observed output.
+
+        it('parses a ::group::-prefixed file header and prefixes the immediately following (fail) line (header must win over workflow-command skip)', () => {
+            const output = [
+                '::group::tests/foo.test.ts:',
+                '(fail) Suite > kills the mutant [0.42ms]',
+                '  error: expect(received).toBe(expected)',
+                '',
+                ' 0 pass',
+                ' 1 fail',
+            ].join('\n');
+            const result = parseBunTestOutput(output, '');
+
+            expect(result.failed).toBe(1);
+            expect(result.tests).toHaveLength(1);
+            expect(result.tests[0]).toMatchObject({
+                name:   'tests/foo.test.ts > Suite > kills the mutant',
+                status: 'failed',
+                file:   'tests/foo.test.ts',
+            });
+        });
+
+        it('parses ✓/✗ lines under a ::group:: header with the full prefixed name', () => {
+            const output = [
+                '::group::tests/bar.test.ts:',
+                '✓ passes [0.10ms]',
+                '✗ fails [0.20ms]',
+                '  error: boom',
+                '::endgroup::',
+                '',
+                ' 1 pass',
+                ' 1 fail',
+            ].join('\n');
+            const result = parseBunTestOutput(output, '');
+
+            expect(result.tests[0].name).toBe('tests/bar.test.ts > passes');
+            expect(result.tests[1].name).toBe('tests/bar.test.ts > fails');
+        });
+
+        it('skips workflow-command lines while collecting a failure message', () => {
+            const output = [
+                '::group::tests/foo.test.ts:',
+                '(fail) Suite > kills the mutant [0.42ms]',
+                '  error: expect(received).toBe(expected)',
+                '::error file=tests/foo.test.ts,line=12::expect(received).toBe(expected)',
+                '::warning file=tests/foo.test.ts::flaky test detected',
+                '::notice::some notice',
+                '::debug::internal detail',
+                '::add-mask::secretvalue',
+                '::add-matcher::path/to/matcher.json',
+                '::remove-matcher owner=eslint::',
+                '::endgroup::',
+                '',
+                ' 0 pass',
+                ' 1 fail',
+            ].join('\n');
+            const result = parseBunTestOutput(output, '');
+
+            expect(result.tests).toHaveLength(1);
+            expect(result.tests[0].failureMessage).toBe('error: expect(received).toBe(expected)');
+            expect(result.tests[0].failureMessage).not.toContain('::');
+        });
+
+        it('skips non-header ::group::Section lines entirely', () => {
+            const output = [
+                '::group::Install dependencies',
+                'tests/foo.test.ts:',
+                '✗ fails [0.20ms]',
+                '  error: boom',
+                '::group::Some Section',
+                '',
+                ' 0 pass',
+                ' 1 fail',
+            ].join('\n');
+            const result = parseBunTestOutput(output, '');
+
+            // The non-header group line must not set currentFile or leak into the error
+            expect(result.tests).toHaveLength(1);
+            expect(result.tests[0].name).toBe('tests/foo.test.ts > fails');
+            expect(result.tests[0].failureMessage).toBe('error: boom');
+            expect(result.tests[0].failureMessage).not.toContain('Some Section');
+        });
+
+        it('recognises headers with @scope, spaces, and cts/cjs extensions', () => {
+            const output = [
+                'packages/@scope/pkg/foo.test.ts:',
+                '✓ scoped [0.10ms]',
+                'dir with space/foo.spec.tsx:',
+                '✓ spaced [0.10ms]',
+                'src/foo.test.cts:',
+                '✓ commonjs ts [0.10ms]',
+                'src/foo.test.cjs:',
+                '✓ commonjs js [0.10ms]',
+                '',
+                ' 4 pass',
+            ].join('\n');
+            const result = parseBunTestOutput(output, '');
+
+            expect(result.tests).toHaveLength(4);
+            expect(result.tests[0].name).toBe('packages/@scope/pkg/foo.test.ts > scoped');
+            expect(result.tests[1].name).toBe('dir with space/foo.spec.tsx > spaced');
+            expect(result.tests[2].name).toBe('src/foo.test.cts > commonjs ts');
+            expect(result.tests[3].name).toBe('src/foo.test.cjs > commonjs js');
+        });
+
+        it('does not treat stack-trace or line-number lines as file headers (no-colon-in-path anchor)', () => {
+            const output = [
+                'tests/a.test.ts:',
+                '✗ first fails [0.10ms]',
+                '  at tests/foo.test.ts:12:5',
+                'tests/foo.test.ts:12:',
+                '✓ second [0.10ms]',
+                '',
+                ' 1 pass',
+                ' 1 fail',
+            ].join('\n');
+            const result = parseBunTestOutput(output, '');
+
+            // Neither the stack-trace line nor the line-number-suffixed line may
+            // change currentFile — "second" stays under tests/a.test.ts.
+            expect(result.tests[0].name).toBe('tests/a.test.ts > first fails');
+            expect(result.tests[1].name).toBe('tests/a.test.ts > second');
+            // The stack-trace line is still collected as part of the error message
+            expect(result.tests[0].failureMessage).toContain('at tests/foo.test.ts:12:5');
+            expect(result.tests[0].failureMessage).toContain('tests/foo.test.ts:12:');
         });
     });
 });

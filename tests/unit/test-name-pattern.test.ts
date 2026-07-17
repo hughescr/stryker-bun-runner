@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect } from 'bun:test';
-import { buildTestNamePattern, MAX_TEST_NAME_PATTERN_LENGTH } from '../../src/utils/test-name-pattern.js';
+import { buildTestNamePattern, MAX_TEST_NAME_PATTERN_LENGTH, TEST_FILE_EXT_PATTERN } from '../../src/utils/test-name-pattern.js';
 
 // ── buildTestNamePattern unit tests ────────────────────────────────────────
 
@@ -69,6 +69,26 @@ describe('buildTestNamePattern', () => {
     it('strips .test.jsx file prefix', () => {
         const result = buildTestNamePattern(['tests/comp.test.jsx > Comp > renders']);
         expect(result).toBe('^(?:Comp renders)$');
+    });
+
+    it('strips .test.cts file prefix', () => {
+        const result = buildTestNamePattern(['tests/util.test.cts > Util > parses']);
+        expect(result).toBe('^(?:Util parses)$');
+    });
+
+    it('strips .test.cjs file prefix', () => {
+        const result = buildTestNamePattern(['tests/util.test.cjs > Util > parses']);
+        expect(result).toBe('^(?:Util parses)$');
+    });
+
+    it('strips .spec.cts file prefix', () => {
+        const result = buildTestNamePattern(['tests/util.spec.cts > Util > parses']);
+        expect(result).toBe('^(?:Util parses)$');
+    });
+
+    it('strips .spec.cjs file prefix', () => {
+        const result = buildTestNamePattern(['tests/util.spec.cjs > Util > parses']);
+        expect(result).toBe('^(?:Util parses)$');
     });
 
     it('collapses " > " to spaces even when no file-prefix is present', () => {
@@ -265,5 +285,31 @@ describe('buildTestNamePattern — testNameIndex fast path', () => {
         const result = buildTestNamePattern(testFilter, index);
         // Falls through to lossy reconstruction (suffix stripped), NOT the exact value above.
         expect(result).toBe('^(?:Suite dup)$');
+    });
+});
+
+// ── TEST_FILE_EXT_PATTERN (shared extension alternation) ───────────────────
+//
+// Single source of truth for the recognised test-file extension grammar,
+// shared with console-parser's file-header regex so the two ends can never
+// drift apart.
+
+describe('TEST_FILE_EXT_PATTERN', () => {
+    it('matches every recognised test-file extension suffix', () => {
+        const re = new RegExp(`^${TEST_FILE_EXT_PATTERN}$`);
+        const kinds = ['test', 'spec'];
+        const exts = ['ts', 'tsx', 'js', 'jsx', 'mts', 'mjs', 'cts', 'cjs'];
+        for(const kind of kinds) {
+            for(const ext of exts) {
+                expect(re.test(`${kind}.${ext}`)).toBe(true);
+            }
+        }
+    });
+
+    it('rejects non-test-file suffixes', () => {
+        const re = new RegExp(`^${TEST_FILE_EXT_PATTERN}$`);
+        for(const bad of ['tests.ts', 'test.tsxx', 'test.mtsx', 'test.d.ts', 'spec.md', 'test_ts', 'foo.ts']) {
+            expect(re.test(bad)).toBe(false);
+        }
     });
 });

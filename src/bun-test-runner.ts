@@ -1579,12 +1579,19 @@ export class BunTestRunner implements TestRunner {
 
         const killedBy = this.resolveKilledBy(rawFailedNames, localRegistry, localBaseIndex, mutantId);
 
-        // If we still have nothing (genuinely unparseable Bun output), fall back to 'unknown'
+        // Genuinely unattributable kill (unparseable Bun output, or every failed
+        // name dropped as unresolvable by resolveKilledBy): emit an EMPTY killedBy.
+        // Never 'unknown' or a raw name — any value outside the dry-run id space
+        // is written verbatim into the incremental report, orphans against the
+        // test registry, and permanently prevents reuse of this mutant's verdict.
+        // killedBy: [] is type-legal and safe: core remaps [] → [], and the differ
+        // simply re-runs this one mutant on incremental passes — same cost as the
+        // old fallback, but WARN-visible and without poisoning the report.
         if(killedBy.length === 0) {
             // Stryker disable StringLiteral: diagnostic logging message format strings — not behaviorally tested
             this.logger.warn(
-                'No failed tests identified for mutant %s — Bun output could not be parsed; '
-                + 'using "unknown" fallback (breaks incremental cache)\n'
+                'Mutant %s: no killing test identifiable — emitting empty killedBy; '
+                + 'this mutant will re-run on every incremental run\n'
                 + 'exit=%s\n--- STDOUT (first 600 chars) ---\n%s\n'
                 + '--- STDERR (first 600 chars) ---\n%s',
                 mutantId,
@@ -1595,7 +1602,6 @@ export class BunTestRunner implements TestRunner {
                 // Stryker disable next-line MethodExpression,ConditionalExpression,LogicalOperator,StringLiteral: equivalent mutant — slice(0,600) and '(empty)' are diagnostic only
                 result.stderr.slice(0, 600) || '(empty)'
             );
-            killedBy.push('unknown');
         }
 
         return {
@@ -2030,7 +2036,19 @@ export class BunTestRunner implements TestRunner {
    *   2. Base-name match in localBaseIndex (built from testFilter)
    *   3. Exact match in this.cachedTestNames (instance registry from dryRun)
    *   4. Base-name match in this.baseNameIndex (instance registry from dryRun)
-   *   5. Raw name as-is with a warn log — last resort if nothing resolves.
+   *
+   * Names resolving through none of these are DROPPED with a single WARN — never
+   * emitted raw. Every entry in a Killed result's killedBy must be exactly a
+   * dry-run TestResult.id: Stryker core's remapTestId (`id => testIdMap.get(id)
+   * ?? id`) writes anything else verbatim into the incremental report, where it
+   * orphans against the test registry and the differ silently re-runs the mutant
+   * on every incremental pass, forever (and the next accumulation pass launders
+   * the orphan into an empty killedBy). Dropping instead degrades that one
+   * mutant to correct-but-non-reusable — same re-run cost, but loudly visible
+   * and never poisonous. No guessed recovery is attempted: bare console names
+   * can collide across files, and --test-name-pattern leakage (see mutantRun)
+   * means the killer may not even be a testFilter member, so any inference
+   * risks crediting the wrong test and enabling stale cache reuse.
    */
     private resolveKilledBy(
         rawFailedNames:  string[],
@@ -2039,6 +2057,7 @@ export class BunTestRunner implements TestRunner {
         mutantId:        string
     ): string[] {
         const killedBySet = new Set<string>();
+        const unresolved = new Set<string>();
         for(const name of rawFailedNames) {
             if(localRegistry.has(name)) {
                 killedBySet.add(name);
@@ -2076,17 +2095,35 @@ export class BunTestRunner implements TestRunner {
                 continue;
             }
 
-            // Step 5: nothing matched — include as-is. Not a real warning:
-            // Stryker's incremental-cache diff tolerates unknown killedBy names,
-            // and the fallback preserves correctness (mutant is still marked killed).
-            // Stryker disable next-line StringLiteral: diagnostic logging message
-            this.logger.debug(
-                'killedBy name "%s" for mutant %s not found in test registry; including as-is',
-                name, mutantId
-            );
-            killedBySet.add(name);
+            // Nothing matched — the name is outside the dry-run id space and is
+            // dropped (see the contract note in this method's doc comment).
+            unresolved.add(name);
         }
+
+        this.warnUnresolvedKilledBy(unresolved, mutantId);
         return [...killedBySet];
+    }
+
+    /**
+   * WARN about failed test names that could not be resolved to dry-run test
+   * ids (and are therefore dropped from killedBy by resolveKilledBy). WARN,
+   * not debug — the old debug-level log is why the resulting cache poisoning
+   * was invisible in CI. No-op when everything resolved.
+   */
+    private warnUnresolvedKilledBy(unresolved: ReadonlySet<string>, mutantId: string): void {
+        if(unresolved.size === 0) {
+            return;
+        }
+        const sample = [...unresolved];
+        // Stryker disable StringLiteral,MethodExpression,ConditionalExpression,EqualityOperator: diagnostic warn — the slice(0, 5) sample cap and the ', …' ellipsis ternary only shape log output; the drop itself is behaviorally tested
+        this.logger.warn(
+            'Mutant %s: %d failed test name(s) could not be resolved to dry-run test ids and will not be recorded in killedBy — this mutant\'s Killed verdict will not be reusable from the incremental cache: %s%s',
+            mutantId,
+            unresolved.size,
+            sample.slice(0, 5).join(', '),
+            sample.length > 5 ? ', …' : ''
+        );
+        // Stryker restore StringLiteral,MethodExpression,ConditionalExpression,EqualityOperator
     }
 
     /**

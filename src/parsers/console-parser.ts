@@ -3,6 +3,8 @@
  * Parses Bun's console output to extract test results
  */
 
+import { TEST_FILE_EXT_PATTERN } from '../utils/test-name-pattern.js';
+
 export interface TestResult {
     name:            string
     file?:           string
@@ -46,13 +48,47 @@ export interface ParsedTestResults {
 }
 
 /**
+ * File-header line grammar: `tests/example.test.ts:`, optionally prefixed with
+ * the GitHub Actions `::group::` workflow command — bun (bun-main lineage,
+ * 1.4.0-canary+) prints each test-file header as `::group::tests/foo.test.ts:`
+ * when GITHUB_ACTIONS is set (and CLAUDECODE is unset). The capture group is
+ * the clean path, prefix excluded.
+ *
+ * The path may contain any character EXCEPT `:` and both ends are anchored, so
+ * stack-trace lines (`at tests/foo.test.ts:12:5`) and line-number-suffixed
+ * lines (`tests/foo.test.ts:12:`) can never match. The extension alternation
+ * is the shared TEST_FILE_EXT_PATTERN so this grammar can never drift from the
+ * prefix-stripping in buildTestNamePattern.
+ */
+const fileHeaderRe = new RegExp(String.raw`^(?:::group::)?([^:]+\.${TEST_FILE_EXT_PATTERN}):$`);
+
+/**
+ * GitHub Actions workflow-command lines (`::group::Section`, `::endgroup::`,
+ * `::error file=…`, annotations, matchers, masks) that bun-main emits when
+ * GITHUB_ACTIONS is set. These must never reach parseTestLine or
+ * failure-message collection.
+ *
+ * Stryker disable next-line Regex: the command-name alternation and terminator class are defensive — each realistic command shape is behaviorally pinned in console-parser tests, and unmatched lines merely fall through to the (harmless) error-line collector
+ */
+const workflowCommandRe = /^::(?:group|endgroup|error|warning|notice|debug|add-mask|add-matcher|remove-matcher)(?:::|\s|$)/;
+
+/**
  * Parse file path from line
  */
 function parseFilePath(line: string): string | null {
-    // Match file header: tests/example.test.ts: or src/foo.test.tsx:
+    // Match file header: tests/example.test.ts: or ::group::tests/example.test.ts:
     // Ensure it only matches valid file paths (no line numbers, pipes, or comment markers)
-    const fileMatch = /^([\w./-]+\.(?:test|spec)\.(?:ts|tsx|js|jsx|mts|mjs)):$/.exec(line);
+    const fileMatch = fileHeaderRe.exec(line);
     return fileMatch ? fileMatch[1] : null;
+}
+
+/**
+ * Check whether the line is a GitHub Actions workflow command.
+ * Must be checked AFTER parseFilePath in the parse loop — a `::group::` file
+ * header is also a workflow-command line and must win as a header.
+ */
+function isWorkflowCommandLine(line: string): boolean {
+    return workflowCommandRe.test(line);
 }
 
 interface TestLineParseResult {
@@ -295,6 +331,13 @@ export function parseBunTestOutput(stdout: string, stderr: string): ParsedTestRe
             continue;
         }
 
+        // Skip GHA workflow-command lines (checked AFTER the header match above,
+        // so a ::group::-prefixed file header is consumed as a header first) —
+        // they must neither parse as test lines nor collect into failure messages.
+        if(isWorkflowCommandLine(line)) {
+            continue;
+        }
+
         // Try to parse as a test result line
         const parseResult = parseTestLine(line, currentFile);
         if(parseResult.test) {
@@ -319,11 +362,11 @@ export function parseBunTestOutput(stdout: string, stderr: string): ParsedTestRe
         }
     }
 
-    // Finalize last test's error message if any
-    // Stryker disable next-line ConditionalExpression,LogicalOperator: finalizeErrorMessage guards against empty errorLines; condition is defensive
-    if(currentTest && collectingError) {
-        finalizeErrorMessage(currentTest, errorLines);
-    }
+    // Finalize last test's error message if any. No conditional needed:
+    // finalizeErrorMessage guards internally (null currentTest / empty
+    // errorLines are no-ops), and errorLines is only ever non-empty while
+    // collectingError is true.
+    finalizeErrorMessage(currentTest, errorLines);
 
     // Parse summary lines and use them as fallback for counts
     const summaryCounts = parseSummaryLines(output);
