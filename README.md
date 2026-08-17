@@ -33,7 +33,9 @@ curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.7"
 
 ### Other Requirements
 
-- **@stryker-mutator/core** ^9.0.0
+- **@stryker-mutator/core** ^9.0.0 || ^10.0.0
+
+Stryker itself runs on Node (only the test children run on Bun), so the host Node version must satisfy the Stryker major you pick: Stryker 9 needs Node >= 20, Stryker 10 needs Node >= 22.
 
 ## Installation
 
