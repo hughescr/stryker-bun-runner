@@ -274,6 +274,7 @@ export class BunTestRunner implements TestRunner {
     private readonly smol:                boolean;
     private readonly maxChildRss?:        number;
     private readonly rssCheckIntervalMs?: number;
+    private readonly maxSpawnDepth?:      number;
     private preloadScriptPath?:           string;
     private coverageFilePath?:            string;
     private sanitizedBunfigPath?:         string;
@@ -310,6 +311,7 @@ export class BunTestRunner implements TestRunner {
         this.smol = bunOptions.smol ?? false;
         this.maxChildRss = bunOptions.maxChildRss;
         this.rssCheckIntervalMs = bunOptions.rssCheckIntervalMs;
+        this.maxSpawnDepth = bunOptions.maxSpawnDepth;
         // Treat empty array as undefined — an empty testFiles list is useless and
         // is most likely a configuration mistake.  getOrDiscoverTestFiles() will
         // auto-discover instead.  A warning is logged so the user is not surprised.
@@ -335,6 +337,7 @@ export class BunTestRunner implements TestRunner {
             smol:               this.smol,
             maxChildRss:        this.maxChildRss,
             rssCheckIntervalMs: this.rssCheckIntervalMs,
+            maxSpawnDepth:      this.maxSpawnDepth,
         });
 
         // Warn when absolute testFiles paths are used inside a Stryker sandbox.
@@ -930,6 +933,7 @@ export class BunTestRunner implements TestRunner {
                 smol:                  this.smol,
                 maxChildRss:           this.maxChildRss,
                 rssCheckIntervalMs:    this.rssCheckIntervalMs,
+                maxSpawnDepth:         this.maxSpawnDepth,
                 onMemoryLimitExceeded: (rssBytes: number) => {
                     this.logger.warn(
                         'bun test child exceeded maxChildRss (%d bytes observed) during dryRun — killing and reporting as a timeout for this run',
@@ -1493,6 +1497,7 @@ export class BunTestRunner implements TestRunner {
                 smol:                  this.smol,
                 maxChildRss:           this.maxChildRss,
                 rssCheckIntervalMs:    this.rssCheckIntervalMs,
+                maxSpawnDepth:         this.maxSpawnDepth,
                 onMemoryLimitExceeded: (rssBytes: number) => {
                     this.logger.warn(
                         'bun test child exceeded maxChildRss (%d bytes observed) during mutant run %s — killing and reporting as a timeout for this mutant',

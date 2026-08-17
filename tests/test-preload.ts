@@ -8,6 +8,7 @@ import * as actualFs from 'node:fs/promises';
 import * as actualNet from 'node:net';
 import { mock } from 'bun:test';
 import * as actualPortUtils from '../src/utils/port.js';
+import * as actualProcessGroup from '../src/utils/process-group.js';
 
 // CRITICAL: Capture functions as local variables BEFORE mock.module()
 // ESM namespace objects have live bindings, so after mock.module() the namespace
@@ -21,6 +22,7 @@ const originalReaddir = actualFs.readdir;
 const originalCreateServer = actualNet.createServer;
 const originalSpawn = actualChildProcess.spawn;
 const originalGetAvailablePort = actualPortUtils.getAvailablePort;
+const originalKillProcessGroup = actualProcessGroup.killProcessGroup;
 
 // Create controllable mock functions for node:fs/promises
 // These start as pass-through implementations - unit tests configure them with mockResolvedValue/mockRejectedValue
@@ -52,6 +54,29 @@ export const mockSpawn = mock((...args: Parameters<typeof actualChildProcess.spa
 // Used by BunTestRunner to get inspector and sync server ports
 export const mockGetAvailablePort = mock((...args: Parameters<typeof actualPortUtils.getAvailablePort>) =>
     originalGetAvailablePort(...args));
+
+/**
+ * Mock for killProcessGroup.
+ *
+ * Unlike every other mock in this file, its default is INERT rather than
+ * pass-through, and deliberately so: the real implementation signals a whole
+ * process group via a negative pid. Mock children carry fabricated pids (12345
+ * and friends), and a real group with that id may well exist on the machine
+ * running the tests — a pass-through default would let a routine unit test
+ * signal unrelated processes. Returning false also exercises the caller's
+ * fallback path, which is the behaviour unit tests actually assert on.
+ *
+ * The real implementation is re-exported as {@link realKillProcessGroup} so an
+ * integration test working with genuine child processes can opt back into it.
+ */
+export const mockKillProcessGroup = mock((_pid: number, _signal: NodeJS.Signals): boolean => false);
+
+/**
+ * The unmocked killProcessGroup, for integration tests that spawn real
+ * processes and need the real group signal. Captured before mock.module() so
+ * it is not itself the mock.
+ */
+export const realKillProcessGroup = originalKillProcessGroup;
 
 /**
  * Reset all fs mocks to their default pass-through implementations.
@@ -113,6 +138,15 @@ export function resetPortMocks(): void {
 }
 
 /**
+ * Reset the process-group mock to its inert default (see mockKillProcessGroup
+ * for why the default is inert rather than pass-through).
+ */
+export function resetProcessGroupMocks(): void {
+    mockKillProcessGroup.mockReset();
+    mockKillProcessGroup.mockImplementation((_pid: number, _signal: NodeJS.Signals): boolean => false);
+}
+
+/**
  * Reset all mocks to their default pass-through implementations.
  */
 export function resetAllMocks(): void {
@@ -120,6 +154,7 @@ export function resetAllMocks(): void {
     resetNetMocks();
     resetChildProcessMocks();
     resetPortMocks();
+    resetProcessGroupMocks();
 }
 
 // Mock the entire node:fs/promises module
@@ -155,6 +190,14 @@ mock.module('node:child_process', () => ({
 mock.module('../src/utils/port.js', () => ({
     ...actualPortUtils,
     getAvailablePort: mockGetAvailablePort,
+}));
+
+// Mock the process-group module so no test can signal a real process group
+// with a mock child's fabricated pid — see mockKillProcessGroup.
+// eslint-disable-next-line @typescript-eslint/no-floating-promises -- Module mock setup, doesn't need await
+mock.module('../src/utils/process-group.js', () => ({
+    ...actualProcessGroup,
+    killProcessGroup: mockKillProcessGroup,
 }));
 
 // NOTE: No global afterEach here - each test file is responsible for its own cleanup

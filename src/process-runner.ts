@@ -4,6 +4,7 @@
  */
 
 import { type ChildProcess, type SpawnOptions, spawn } from 'node:child_process';
+import { killProcessGroup } from './utils/process-group.js';
 import { getProcessRssBytes } from './utils/process-rss.js';
 
 /**
@@ -12,6 +13,35 @@ import { getProcessRssBytes } from './utils/process-rss.js';
  * kill paths so all three follow one consistent escalation policy.
  */
 const KILL_GRACE_PERIOD_MS = 500;
+
+/**
+ * Environment variable carrying this runner's spawn nesting depth into every
+ * `bun test` child, so a child can tell that it is itself running underneath a
+ * runner-spawned process.
+ *
+ * A process that was not spawned by this runner has no such variable and is
+ * therefore depth 0; the `bun test` it spawns is depth 1, and so on.
+ */
+export const SPAWN_DEPTH_ENV = '__STRYKER_BUN_RUNNER_DEPTH__';
+
+/**
+ * Default ceiling on `bun test` spawn nesting — see
+ * {@link BunTestRunOptions.maxSpawnDepth}.
+ */
+export const DEFAULT_MAX_SPAWN_DEPTH = 1;
+
+/**
+ * Read the current process's spawn depth from an environment value.
+ *
+ * Anything that is not a positive integer — absent, empty, malformed, negative
+ * — reads as depth 0. Depth is a safety ceiling, and the safe reading of a
+ * corrupt value is "assume we are at the top", which keeps a legitimate
+ * first-level spawn working rather than refusing everything.
+ */
+export function readSpawnDepth(raw: string | undefined): number {
+    const parsed = Number(raw);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : 0;
+}
 
 export interface BunTestRunOptions {
     /**
@@ -143,6 +173,16 @@ export interface BunTestRunOptions {
    * for the caller to log a diagnostic warning.
    */
     onMemoryLimitExceeded?: (rssBytes: number) => void
+
+    /**
+   * Maximum `bun test` spawn nesting depth. A call made from a process already
+   * at or beyond this depth refuses to spawn and resolves with a non-zero exit
+   * code instead, which is what keeps runaway self-spawning finite — see the
+   * README's "Recursion containment" section for the mechanism.
+   *
+   * @default 1
+   */
+    maxSpawnDepth?: number
 }
 
 export interface BunProcessResult {
@@ -196,17 +236,101 @@ function stripBailArgs(bunArgs: readonly string[]): string[] {
 }
 
 /**
+ * Live children, so a signal arriving at this process can take them down with
+ * it. Spawning `detached` removes them from this process's group, which means
+ * they no longer die with it on Ctrl-C — see {@link ensureSignalCleanup}.
+ */
+const liveChildren = new Set<ChildProcess>();
+
+/**
+ * Kill every live child when this process is signalled, then re-raise so the
+ * default disposition is preserved.
+ *
+ * Necessary because `detached: true` moves each child out of this process's
+ * group, and therefore out of the terminal's foreground group. Stryker's own
+ * UnexpectedExitHandler runs in its main process and does not tree-kill the
+ * worker pool; workers die on Ctrl-C only because the terminal signals their
+ * group directly. Without this, a detached child survives that and is
+ * reparented to PID 1 — reintroducing the leak from the other direction.
+ */
+export function killAllLiveChildren(): void {
+    for(const child of liveChildren) {
+        killProcessTree(child, 'SIGKILL');
+    }
+    liveChildren.clear();
+}
+
+/** Signals worth reaping on. SIGKILL is absent because it cannot be trapped. */
+const CLEANUP_SIGNALS: readonly NodeJS.Signals[] = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+
+// Stryker disable next-line BlockStatement,ArrowFunction,CallExpression,MethodExpression: the body ends by re-raising the signal at this very process, which terminates it — it cannot run under test without killing the test runner. Its testable half is killAllLiveChildren(), which IS covered; what remains is deregistration and the re-raise.
+const onCleanupSignal = (signal: NodeJS.Signals): void => {
+    killAllLiveChildren();
+    removeSignalCleanup();
+    process.kill(process.pid, signal);
+};
+
+/**
+ * Attach the signal cleanup handlers, once. Returns true when this call did the
+ * attaching, false when they were already in place.
+ *
+ * Registration state is derived from the listener list rather than a module
+ * flag, so it stays observable: a caller (or a test) can detach with
+ * {@link removeSignalCleanup} and re-attach, and "did we already register"
+ * never drifts from the truth.
+ */
+export function ensureSignalCleanup(): boolean {
+    // Stryker disable next-line ConditionalExpression,BlockStatement: without this guard every spawn adds another listener; covered by 'attaches its signal listeners once and is idempotent thereafter'
+    if(process.listeners(CLEANUP_SIGNALS[0]).includes(onCleanupSignal)) {
+        return false;
+    }
+    for(const s of CLEANUP_SIGNALS) {
+        process.on(s, onCleanupSignal);
+    }
+    return true;
+}
+
+/** Detach the handlers attached by {@link ensureSignalCleanup}. */
+export function removeSignalCleanup(): void {
+    for(const s of CLEANUP_SIGNALS) {
+        process.off(s, onCleanupSignal);
+    }
+}
+
+/**
+ * Signal a spawned child and everything it spawned in turn.
+ *
+ * The child leads its own process group (spawned `detached`), so signalling the
+ * group reaches processes the test suite itself spawned. Signalling only the
+ * direct child — the plain `ChildProcess.kill()` this replaces — leaves those
+ * grandchildren alive and reparented to PID 1, where nothing ever reaps them.
+ *
+ * Falls back to signalling the child directly when the group signal could not
+ * be delivered, so this is never weaker than the call it replaced.
+ */
+function killProcessTree(childProcess: ChildProcess, signal: NodeJS.Signals): void {
+    const pid = childProcess.pid;
+    // Stryker disable next-line ConditionalExpression,EqualityOperator,LogicalOperator,BlockStatement: pid is undefined only when spawn itself failed; both arms are covered by 'signals the process group' and 'falls back to the direct child when the group signal fails'
+    if(pid === undefined || !killProcessGroup(pid, signal)) {
+        childProcess.kill(signal);
+    }
+}
+
+/**
  * Send SIGTERM to a child process, escalating to SIGKILL after a grace period
  * if it hasn't exited by then. `isClosed` is checked right before the SIGKILL
  * so an already-exited process (e.g. one that responded to SIGTERM promptly)
  * is never signalled again.
+ *
+ * Both signals go to the child's whole process group — see
+ * {@link killProcessTree}.
  */
 function killWithEscalation(childProcess: ChildProcess, isClosed: () => boolean, gracePeriodMs: number): void {
-    childProcess.kill('SIGTERM');
+    killProcessTree(childProcess, 'SIGTERM');
     setTimeout(() => {
         // Stryker disable next-line ConditionalExpression,BlockStatement: escalation guard — skipping SIGKILL when the process already exited is covered by 'does not escalate to SIGKILL when the process exits within the grace period'; the escalation-fires case is covered by 'escalates to SIGKILL when the process ignores SIGTERM'
         if(!isClosed()) {
-            childProcess.kill('SIGKILL');
+            killProcessTree(childProcess, 'SIGKILL');
         }
     }, gracePeriodMs);
 }
@@ -215,6 +339,30 @@ function killWithEscalation(childProcess: ChildProcess, isClosed: () => boolean,
  * Run bun test with the specified options
  */
 export async function runBunTests(options: BunTestRunOptions): Promise<BunProcessResult> {
+    // Recursion ceiling, checked before anything else is built: refusing here is
+    // what makes runaway self-spawning terminate, and nothing in spawnBunTests
+    // is worth computing for a call that will not spawn.
+    const spawnDepth = readSpawnDepth(process.env[SPAWN_DEPTH_ENV]);
+    const maxSpawnDepth = options.maxSpawnDepth ?? DEFAULT_MAX_SPAWN_DEPTH;
+    // Stryker disable next-line EqualityOperator,ConditionalExpression,BlockStatement: removing or inverting this guard restores the unbounded self-spawning it exists to stop; covered by 'refuses to spawn at the depth ceiling'
+    if(spawnDepth >= maxSpawnDepth) {
+        return {
+            stdout:              '',
+            stderr:              `stryker-bun-runner: refusing to spawn \`bun test\` at nesting depth ${spawnDepth} (maxSpawnDepth=${maxSpawnDepth}). A test run spawned by this runner tried to spawn another one; this is almost always runaway recursion. See the bun.maxSpawnDepth option.`,
+            exitCode:            1,
+            timedOut:            false,
+            memoryLimitExceeded: false,
+        };
+    }
+
+    return spawnBunTests(options, spawnDepth);
+}
+
+/**
+ * Build the argv/env and run the child. Split from {@link runBunTests} so the
+ * recursion ceiling is decided before any of this work happens.
+ */
+async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Promise<BunProcessResult> {
     // Stryker disable next-line StringLiteral: mutating 'test' removes the bun test subcommand → bun exits immediately with no tests run → Timeout
     const args = ['test'];
 
@@ -315,6 +463,11 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
         env.__STRYKER_SYNC_PORT__ = String(options.syncPort);
     }
 
+    // Stamp the child's nesting depth so that, if the suite it runs turns
+    // around and drives this runner again, that nested call can see how deep it
+    // already is — see maxSpawnDepth.
+    env[SPAWN_DEPTH_ENV] = String(spawnDepth + 1);
+
     // Stryker disable next-line BlockStatement: removing entire Promise body means resolve() never called → Timeout
     return new Promise((resolve) => {
         const stdoutChunks: Buffer[] = [];
@@ -336,12 +489,23 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
         // Readable | null — the conditional guards below are then genuinely necessary.
         // In practice these are always non-null with stdio:'pipe', but mocks and edge-case
         // spawn failures can produce null streams.
+        // `detached: true` makes the child the leader of a new process group, so
+        // killWithEscalation can signal the whole group and reach anything the
+        // test suite spawned. Without it a grandchild outlives every kill path
+        // here and is reparented to PID 1. The child is deliberately not
+        // unref()'d: the parent still owns it and must still await its exit.
         const spawnOpts: SpawnOptions = {
             env,
-            stdio: ['ignore', 'pipe', 'pipe'],
-            cwd:   process.cwd(),
+            stdio:    ['ignore', 'pipe', 'pipe'],
+            cwd:      process.cwd(),
+            detached: true,
         };
         const childProcess = spawn(options.bunPath, args, spawnOpts);
+
+        // Track the child so a signal arriving here takes it down too — being
+        // detached, it no longer dies with this process on its own.
+        liveChildren.add(childProcess);
+        ensureSignalCleanup();
 
         // Set up timeout — escalate SIGTERM→SIGKILL via the shared helper so a
         // process that responds promptly to SIGTERM isn't needlessly SIGKILLed.
@@ -459,6 +623,7 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
         // Stryker disable next-line BlockStatement,StringLiteral: Promise.resolve never called without 'close' handler → Timeout
         childProcess.on('close', (code) => {
             hasClosed = true;
+            liveChildren.delete(childProcess);
             clearTimeout(timeoutHandle);
             // Stryker disable next-line ConditionalExpression: equivalent mutant — when rssIntervalHandle is undefined (maxChildRss not set), clearInterval(undefined) is a silent no-op in Node/Bun; mutating the guard to `true` cannot introduce an observable difference
             if(rssIntervalHandle) {
@@ -478,6 +643,7 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
         // Stryker disable next-line BlockStatement: emptying this handler means resolve() is never called on a spawn/child error → Timeout — expected, mirrors the 'close' handler's disable comment above
         childProcess.on('error', (error) => {
             hasClosed = true;
+            liveChildren.delete(childProcess);
             clearTimeout(timeoutHandle);
             // Stryker disable next-line ConditionalExpression: equivalent mutant — when rssIntervalHandle is undefined (maxChildRss not set), clearInterval(undefined) is a silent no-op in Node/Bun; mutating the guard to `true` cannot introduce an observable difference
             if(rssIntervalHandle) {

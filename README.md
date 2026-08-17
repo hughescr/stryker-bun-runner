@@ -84,6 +84,7 @@ A second full-suite fallback happens at run time: a `--test-name-pattern` that m
 | `bun.smol` | `boolean` | `false` | Pass Bun's `--smol` flag to every child: a smaller JavaScriptCore heap at some cost to speed. Recommended on memory-constrained machines — see [Memory model](#memory-model). |
 | `bun.maxChildRss` | `number` | `undefined` | Soft memory ceiling in bytes for each child's RSS. A child that exceeds it is killed and the run reported as a clean timeout for that mutant. See [Memory containment](#memory-containment). |
 | `bun.rssCheckIntervalMs` | `number` | `1000` | Poll interval in milliseconds for the `maxChildRss` check. |
+| `bun.maxSpawnDepth` | `number` | `1` | Maximum `bun test` spawn nesting depth before the runner refuses to spawn. Guards against runaway recursion — see [Recursion containment](#recursion-containment). Raise to `2` only if your own tests drive this runner. |
 
 ### Example with all options
 
@@ -123,6 +124,29 @@ What this means for memory planning on a mutation-testing machine:
   - Set `bun.smol: true` to shrink each child's JSC heap ceiling at some speed cost.
   - Set `bun.maxChildRss` as a backstop against a single run growing unexpectedly large (see [Memory containment](#memory-containment)).
   - Use Stryker core's [`maxTestRunnerReuse`](#maxtestrunnerreuse-compatibility) to periodically recycle the *Stryker worker* process itself (see below) — this is orthogonal to the spawned `bun test` child and addresses a different, much smaller source of growth.
+
+## Recursion containment
+
+### Kills reach the whole process tree
+
+Every `bun test` child is spawned **detached**, so it leads its own process group, and every kill path (timeout, `AbortSignal`, the `maxChildRss` ceiling) signals that whole group rather than the single child. This matters whenever your test suite itself spawns processes: signalling only the direct child leaves its grandchildren alive and reparented to PID 1, where nothing will ever clean them up. A suite that starts a server, a database, or another `bun` process therefore leaks one of each on every timed-out mutant unless the group is signalled.
+
+Spawning detached has a consequence worth stating plainly: a detached child is no longer in the terminal's foreground process group, so it does **not** die on its own when you Ctrl-C a run. The runner therefore traps `SIGINT`/`SIGTERM`/`SIGHUP`, kills every live child's group, and re-raises the signal so the default behaviour is preserved. Without that, interrupting a campaign would strand one full `bun test` process per worker.
+
+### The runner refuses to nest indefinitely
+
+Each child carries its spawn depth in `__STRYKER_BUN_RUNNER_DEPTH__`, and a run at or beyond `bun.maxSpawnDepth` fails with a non-zero exit code instead of spawning. The failure mode this prevents is worth spelling out, because it is not hypothetical and it is not survivable:
+
+- The runner can spawn `bun test` from inside a `bun test` it spawned.
+- If a nested run falls back to auto-discovery while its cwd is the project root, it picks up the project's **entire** suite — including the very test that spawned it.
+- That test spawns again, and so on. A new generation appears roughly every second.
+- Every generation leads its own process group, so killing any one of them does not stop the chain; the survivors keep replicating and are reparented to PID 1. (Group-per-generation is a consequence of the detached spawn above — which is why the depth ceiling, not the group kill, is what actually terminates this.)
+
+Under mutation testing this is reachable through ordinary mutants — anything that defeats the `bun.testFiles` override puts a nested run back on auto-discovery. The depth ceiling turns that from an unbounded runaway into a single loud failure.
+
+The default of `1` allows the runner's own `bun test` children and nothing deeper, which is correct for every project whose tests do not themselves drive this runner. If yours do, raise it to `2` — **on the runner instance making the nested call**, since that is where the ceiling is enforced. Setting it in `stryker.conf.mjs` only configures the outer run, which never reaches the ceiling. This plugin's own integration tests are the worked example: they pass `maxSpawnDepth: 2` in their `bun: { … }` literals, because under Stryker the suite is itself a depth-1 run and its own spawns land at depth 2.
+
+A refused spawn is reported as a failure for that mutant, with the reason on stderr, rather than silently passing.
 
 ## Memory containment
 
