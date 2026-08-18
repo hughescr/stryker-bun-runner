@@ -3409,7 +3409,7 @@ tests/example.test.ts:
                 }
             });
 
-            it('MISMATCH diagnostic: warns when bun reports a failure but no built test is Failed', async () => {
+            it('MISMATCH: fails the dry run when bun reports a failure that no built test accounts for', async () => {
                 // parsed.failed must be > 0 here so checkDryRunProcessResult's ERROR
                 // early-return (exitCode !== 0 && parsed.failed === 0) does not fire —
                 // this exercises the Complete-path mismatch diagnostic instead, which
@@ -3426,18 +3426,18 @@ tests/example.test.ts:
                 await runner.init();
                 const result = await runner.dryRun();
 
-                // Diagnostic only — the returned result is unaffected.
-                expect(result.status).toBe(DryRunStatus.Complete);
-                if(result.status === DryRunStatus.Complete) {
-                    expect(result.tests.every(t => t.status === TestStatus.Success)).toBe(true);
+                // The dry run must FAIL: bun counted a failure that no per-test datum
+                // accounts for, so the test data is demonstrably incomplete. Reporting
+                // Complete here is how a suite with an unloadable spec file scores 100%.
+                expect(result.status).toBe(DryRunStatus.Error);
+                if(result.status === DryRunStatus.Error) {
+                    expect(result.errorMessage).toContain('failing test(s), but none of them could be');
+                    // The stderr tail rides along with the error: the separate MISMATCH
+                    // warn is deliberately skipped once the gate fires (see the
+                    // 'does not double-message' test), so this is the only place the
+                    // cause — the unresolvable import — is still visible.
+                    expect(result.errorMessage).toContain('x'.repeat(500));
                 }
-
-                expect(mockLogger.warn).toHaveBeenCalledWith(
-                    expect.stringContaining('no failing test could be identified'),
-                    expect.anything(),
-                    expect.anything(),
-                    expect.stringContaining('x'.repeat(500))
-                );
             });
 
             it('MISMATCH diagnostic: does not warn when everything passes with exit code 0', async () => {

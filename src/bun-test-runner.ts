@@ -1244,7 +1244,7 @@ export class BunTestRunner implements TestRunner {
         // stream — run AFTER tests are built (so it can see whether the run otherwise looks GREEN)
         // but BEFORE persisting the registry below: a gated run must never let other
         // Stryker workers load a corrupted/partial registry via loadRegistryFile().
-        const gateResult = this.checkCompletenessGate(executionOrder, testHierarchy, parsed, rawKeyCount, orphanedKeyCount, wasClosedUnexpectedly, tests, closeInfo);
+        const gateResult = this.checkCompletenessGate(executionOrder, testHierarchy, parsed, rawKeyCount, orphanedKeyCount, wasClosedUnexpectedly, tests, closeInfo, result.stderr);
         if(gateResult) {
             return gateResult;
         }
@@ -1838,7 +1838,8 @@ export class BunTestRunner implements TestRunner {
         orphanedKeyCount:       number,
         wasClosedUnexpectedly:  boolean,
         tests:                  readonly RunnerTestResult[],
-        closeInfo:              InspectorCloseInfo
+        closeInfo:              InspectorCloseInfo,
+        stderr:                 string
     ): DryRunResult | null {
         // Stryker disable next-line MethodExpression,EqualityOperator: equivalent — .some() vs .find()!==undefined would produce the same boolean; the guard itself (skip the gate when any built test already Failed) is covered by 'gate does not evaluate when built tests contain failures'
         if(tests.some(t => t.status === TestStatus.Failed)) {
@@ -1862,8 +1863,20 @@ export class BunTestRunner implements TestRunner {
         // Stryker disable next-line EqualityOperator: threshold predicate — behaviorally tested via the dedicated gate-fires/gate-does-not-fire tests below
         const signalB = orphanedKeyCount > ORPHANED_KEY_ABS_FLOOR;
 
-        // Stryker disable next-line LogicalOperator: equivalent mutants only affect the fast-path skip below; the message-building code that follows is unreachable (and untested as unreachable) when neither signal is material, so && vs || here is caught by the same gate-fires/gate-does-not-fire tests
-        if(!signalA && !signalB) {
+        // Signal C (unattributable failures): bun's own summary reported failing
+        // test(s), yet not one of them survives into `tests` as Failed. Unlike A
+        // and B this needs no floor, because it is not a density heuristic: the
+        // gate's precondition above already returned when any failure WAS
+        // identified, so reaching here with summaryFailed > 0 means the count and
+        // the per-test data flatly disagree. Proceeding would report a dry run as
+        // Complete while silently dropping every failure it contains — a suite
+        // with an unloadable spec file then scores 100%, which is worse than any
+        // false positive this can produce.
+        // Stryker disable next-line EqualityOperator,ConditionalExpression: the > 0 boundary is the whole predicate; covered by 'gate fires when bun reported failures that no test accounts for' and its healthy-run counterpart
+        const signalC = parsed.summaryFailed > 0;
+
+        // Stryker disable next-line LogicalOperator: equivalent mutants only affect the fast-path skip below; the message-building code that follows is unreachable (and untested as unreachable) when no signal is material, so && vs || here is caught by the same gate-fires/gate-does-not-fire tests
+        if(!signalA && !signalB && !signalC) {
             return null;
         }
 
@@ -1876,6 +1889,18 @@ export class BunTestRunner implements TestRunner {
         }
         if(signalB) {
             reasons.push(`${orphanedKeyCount} of ${rawKeyCount} coverage key(s) could not be paired with any inspector test (orphaned)`);
+        }
+        if(signalC) {
+            // The stderr tail is included here rather than left to
+            // warnOnUnidentifiedDryRunFailure: that warn is deliberately skipped once
+            // the gate fires (see its 'does not double-message' test), and for this
+            // signal stderr is the one datum that names the cause — the unresolvable
+            // import, the throwing module — so it must ride along with the error.
+            reasons.push(
+                `bun's console summary reported ${parsed.summaryFailed} failing test(s), but none of them could be `
+                + 'attributed to an individual test — a whole spec file that fails to load (e.g. an unresolvable '
+                + `import) produces exactly this shape. Last 500 chars of stderr:\n${stderr.slice(-500)}`
+            );
         }
         if(wasClosedUnexpectedly) {
             // closeInfo.code is undefined whenever the close event itself never carried a code
