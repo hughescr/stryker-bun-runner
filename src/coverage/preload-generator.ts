@@ -7,6 +7,7 @@ import { mkdir, unlink, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { glob } from 'tinyglobby';
+import { TEST_FILE_EXT_PATTERN } from '../utils/test-name-pattern.js';
 
 export interface PreloadOptions {
     /**
@@ -93,8 +94,18 @@ export async function resolveEagerModulesFromGlobs(
     const sourceFileRe = /\.(?:tsx?|[cm]?js)$/;
     // Stryker disable next-line Regex: declaration-file exclusion pattern
     const dtsRe = /\.d\.[cm]?ts$/;
+    // Test files are never eager-imported, whatever the mutate globs say.
+    // The preload runs before bun registers a test file in its own context, so
+    // importing a spec from here loads its describe/it calls outside that
+    // context and corrupts bun's registration: observed on a real project as a
+    // third of the suite vanishing, with unattributable failures. Reachable without
+    // any config mistake — a CLI `--mutate "src/**/*.ts"` REPLACES the config's
+    // mutate array, silently dropping its `!**/*.spec.ts` negations — so the
+    // guard belongs here rather than in the caller's globs.
+    // Stryker disable next-line Regex: shares TEST_FILE_EXT_PATTERN with the discovery/pattern code so the two can never drift
+    const testFileRe = new RegExp(String.raw`\.${TEST_FILE_EXT_PATTERN}$`);
 
-    const filtered = paths.filter(p => sourceFileRe.test(p) && !dtsRe.test(p));
+    const filtered = paths.filter(p => sourceFileRe.test(p) && !dtsRe.test(p) && !testFileRe.test(p));
 
     // Resolve to absolute paths (glob returns absolute when absolute: true, but
     // be defensive in case cwd is relative).

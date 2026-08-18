@@ -31,9 +31,36 @@ describe('normalizeTestFilePath', () => {
         expect(normalizeTestFilePath(input)).toBe('tests/unit/foo.test.ts');
     });
 
-    it('handles absolute paths without sandbox', () => {
+    it('leaves an absolute path outside cwd as-is', () => {
+        // Helper files and node_modules live outside the project; inventing a
+        // relative path for them would be worse than reporting what bun said.
         const input = '/absolute/path/to/file.ts';
         expect(normalizeTestFilePath(input)).toBe('/absolute/path/to/file.ts');
+    });
+
+    it('makes an absolute in-cwd path relative — the inPlace case', () => {
+        // With `inPlace: true` there is no sandbox segment to strip. The prefix
+        // must still come out project-relative: Stryker resolves it against its
+        // input files, and it is compared for equality with the coverage
+        // preload's own prefix when pairing coverage keys to inspector tests.
+        expect(normalizeTestFilePath('/repo/project/src/lib/api.spec.ts', '/repo/project'))
+            .toBe('src/lib/api.spec.ts');
+    });
+
+    it('does not mistake a sibling directory sharing the cwd prefix for cwd itself', () => {
+        // '/repo/project-other/...' starts with the cwd string but is a different
+        // directory, so the trailing separator in the guard is load-bearing.
+        // cwd is passed explicitly rather than read from the process: when this
+        // suite runs inside a Stryker sandbox the real cwd contains a
+        // a sandbox path segment, and a sibling of it would match the
+        // sandbox branch instead — making the assertion depend on where the suite
+        // happens to be running.
+        const input = '/repo/project-other/src/api.spec.ts';
+        expect(normalizeTestFilePath(input, '/repo/project')).toBe(input);
+    });
+
+    it('defaults cwd to the process cwd', () => {
+        expect(normalizeTestFilePath(`${process.cwd()}/src/lib/api.spec.ts`)).toBe('src/lib/api.spec.ts');
     });
 });
 

@@ -96,6 +96,26 @@ export interface BunTestRunnerOptions {
    * @default 1000
    */
     rssCheckIntervalMs?: number
+
+    /**
+   * Maximum `bun test` spawn nesting depth before the runner refuses to spawn.
+   *
+   * The runner can spawn `bun test` from inside a `bun test` it already
+   * spawned. If a nested run falls back to auto-discovery while its cwd is the
+   * project root, it picks up the project's entire suite — including the test
+   * that spawned it — and the nesting never terminates. This ceiling makes that
+   * finite: a run at or beyond the limit fails with a non-zero exit code
+   * instead of spawning. See the README's "Recursion containment" section.
+   *
+   * The default of 1 allows the runner's own `bun test` children and nothing
+   * deeper, which is right for every project whose tests do not themselves
+   * drive this runner. Raise it to 2 only if yours do — note that the value
+   * must be set on the runner instance making the *nested* call, since that is
+   * where the ceiling is enforced.
+   *
+   * @default 1
+   */
+    maxSpawnDepth?: number
 }
 
 /**

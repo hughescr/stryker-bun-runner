@@ -105,13 +105,38 @@ const perFileCounters = new Map<string, number>();
 
 // Helper: extract a stable relative file prefix from a Bun.main absolute path.
 // Strips the Stryker sandbox prefix so keys are portable across runs.
+//
+// Under `inPlace: true` there IS no sandbox segment to strip, and the old
+// fallback here collapsed the path to its basename. That is not a portable
+// prefix, it is an unmatchable one: Stryker resolves a test's fileName against
+// its input files, so `example.spec.ts` became `<projectRoot>/example.spec.ts`
+// matched nothing. Three symptoms followed from that one line — "Test file … not
+// found in input files" warnings, spurious "Interior coverage gap detected"
+// warnings (the prefix is compared for equality against the inspector's
+// normalised URL), and an incremental report whose differ saw every test as
+// changed (+N -N) and so reused almost nothing.
+//
+// Falling back to the path relative to cwd fixes all three: monorepo task
+// runners invoke per-project builds with cwd set to the project root, which is
+// exactly what Stryker keys its input files on. Kept in lockstep with
+// normalizeTestFilePath, which must produce the same string for the equality
+// check above to hold.
 function extractFilePrefix(bunMain: string): string {
     if(!bunMain) {
         return 'unknown';
     }
     // Stryker disable next-line Regex: sandbox path extraction pattern
     const sandboxMatch = /\.stryker-tmp\/sandbox-[^/]+\/(.+)$/.exec(bunMain);
-    return sandboxMatch ? sandboxMatch[1] : bunMain.replace(/^.*\//, '');
+    if(sandboxMatch) {
+        return sandboxMatch[1];
+    }
+    const cwd = process.cwd();
+    // Stryker disable next-line ConditionalExpression,BlockStatement,StringLiteral: inPlace path; covered by the preload-logic tests for cwd-relative prefixes
+    if(bunMain.startsWith(`${cwd}/`)) {
+        return bunMain.slice(cwd.length + 1);
+    }
+    // Last resort for a path outside cwd entirely (helper files, node_modules).
+    return bunMain.replace(/^.*\//, '');
 }
 
 // ============================================================================
