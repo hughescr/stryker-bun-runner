@@ -43,15 +43,24 @@ describe('normalizeTestFilePath', () => {
         // must still come out project-relative: Stryker resolves it against its
         // input files, and it is compared for equality with the coverage
         // preload's own prefix when pairing coverage keys to inspector tests.
-        const input = `${process.cwd()}/src/lib/api.spec.ts`;
-        expect(normalizeTestFilePath(input)).toBe('src/lib/api.spec.ts');
+        expect(normalizeTestFilePath('/repo/project/src/lib/api.spec.ts', '/repo/project'))
+            .toBe('src/lib/api.spec.ts');
     });
 
     it('does not mistake a sibling directory sharing the cwd prefix for cwd itself', () => {
-        // `${cwd}-other/...` starts with cwd as a STRING but is a different
+        // '/repo/project-other/...' starts with the cwd string but is a different
         // directory, so the trailing separator in the guard is load-bearing.
-        const input = `${process.cwd()}-other/src/api.spec.ts`;
-        expect(normalizeTestFilePath(input)).toBe(input);
+        // cwd is passed explicitly rather than read from the process: when this
+        // suite runs inside a Stryker sandbox the real cwd contains a
+        // a sandbox path segment, and a sibling of it would match the
+        // sandbox branch instead — making the assertion depend on where the suite
+        // happens to be running.
+        const input = '/repo/project-other/src/api.spec.ts';
+        expect(normalizeTestFilePath(input, '/repo/project')).toBe(input);
+    });
+
+    it('defaults cwd to the process cwd', () => {
+        expect(normalizeTestFilePath(`${process.cwd()}/src/lib/api.spec.ts`)).toBe('src/lib/api.spec.ts');
     });
 });
 
