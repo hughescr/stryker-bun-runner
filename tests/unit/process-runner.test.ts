@@ -5,7 +5,7 @@
 
 import type { ChildProcess } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach, mock, jest, spyOn } from 'bun:test';
-import { runBunTests, readSpawnDepth, killAllLiveChildren, ensureSignalCleanup, removeSignalCleanup, SPAWN_DEPTH_ENV, DEFAULT_MAX_SPAWN_DEPTH } from '../../src/process-runner.js';
+import { runBunTests, readSpawnDepth, killAllLiveChildren, ensureSignalCleanup, removeSignalCleanup, stripAnsi, SPAWN_DEPTH_ENV, DEFAULT_MAX_SPAWN_DEPTH } from '../../src/process-runner.js';
 import * as processRss from '../../src/utils/process-rss.js';
 import { mockSpawn, resetChildProcessMocks, mockKillProcessGroup, resetProcessGroupMocks } from '../test-preload.js';
 
@@ -2233,6 +2233,60 @@ describe('runBunTests', () => {
             expect(mockChildProcess.kill).toHaveBeenCalledWith('SIGTERM');
 
             jest.useRealTimers();
+        });
+    });
+
+    describe('inspector URL scraping tolerates a coloured banner', () => {
+        // Verbatim from a real interactive terminal (bun 1.3.14, kitty, FORCE_COLOR=1).
+        // bun dims the URL, so \x1B[2m lands between the newline and `ws://` —
+        // exactly where the pattern expects whitespace only. A non-TTY run never
+        // produces this, which is why it reads as a phantom failure.
+        const COLOURED_BANNER = [
+            '--------------------- Bun Inspector ---------------------',
+            'Listening:',
+            '  \u001B[2mws://127.0.0.1:59443/s5nbnuivpe\u001B[0m',
+            'Inspect in browser:',
+            '',
+        ].join('\n');
+
+        it('extracts the URL from a dimmed banner', async () => {
+            const onInspectorReady = mock((_url: string) => undefined);
+            const resultPromise = runBunTests({
+                bunPath: 'bun', timeout: 5000, inspectWaitPort: 9229, onInspectorReady,
+            });
+            await Promise.resolve();
+            mockChildProcess.stderrHandler?.(Buffer.from(COLOURED_BANNER));
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            expect(onInspectorReady).toHaveBeenCalledWith('ws://127.0.0.1:59443/s5nbnuivpe');
+        });
+
+        it('still extracts the URL from an uncoloured banner', async () => {
+            const onInspectorReady = mock((_url: string) => undefined);
+            const resultPromise = runBunTests({
+                bunPath: 'bun', timeout: 5000, inspectWaitPort: 9229, onInspectorReady,
+            });
+            await Promise.resolve();
+            mockChildProcess.stderrHandler?.(Buffer.from('Listening:\n  ws://127.0.0.1:6499/plain\n'));
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            expect(onInspectorReady).toHaveBeenCalledWith('ws://127.0.0.1:6499/plain');
+        });
+
+        describe('stripAnsi', () => {
+            it('removes CSI sequences', () => {
+                expect(stripAnsi('\u001B[2mws://x\u001B[0m')).toBe('ws://x');
+            });
+
+            it('removes an OSC-8 hyperlink wrapper', () => {
+                expect(stripAnsi('\u001B]8;;http://a\u0007label\u001B]8;;\u0007')).toBe('label');
+            });
+
+            it('leaves plain text untouched', () => {
+                expect(stripAnsi('Listening:\n  ws://127.0.0.1:1/x')).toBe('Listening:\n  ws://127.0.0.1:1/x');
+            });
         });
     });
 });

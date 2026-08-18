@@ -38,6 +38,21 @@ export const DEFAULT_MAX_SPAWN_DEPTH = 1;
  * corrupt value is "assume we are at the top", which keeps a legitimate
  * first-level spawn working rather than refusing everything.
  */
+/**
+ * Remove ANSI escape sequences (CSI and the OSC-8 hyperlink form) from `text`.
+ *
+ * Only used to normalise bun's own stderr before scraping structured facts out
+ * of it — never applied to output forwarded to a user.
+ */
+export function stripAnsi(text: string): string {
+    // The control characters ARE the grammar here: ESC introduces every sequence
+    // and BEL terminates an OSC, so matching them is the entire purpose. eslint's
+    // directive sits on the code line rather than above it because the Stryker
+    // directive below already claims the next-line slot.
+    // Stryker disable next-line Regex: the two alternatives are CSI (ESC [ … final byte) and OSC (ESC ] … BEL/ST); covered by the stripAnsi tests
+    return text.replaceAll(/\u001B\[[0-9;?]*[\u0020-\u002F]*[\u0040-\u007E]|\u001B\][^\u0007\u001B]*(?:\u0007|\u001B\\)/g, ''); // eslint-disable-line sonarjs/no-control-regex -- ESC and BEL are the ANSI grammar being matched, not stray control chars
+}
+
 export function readSpawnDepth(raw: string | undefined): number {
     const parsed = Number(raw);
     return Number.isInteger(parsed) && parsed > 0 ? parsed : 0;
@@ -608,8 +623,18 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
                     // (and from there straight into InspectorClient's dial URL) verbatim — so
                     // pinning the bind host to 127.0.0.1 above is sufficient to keep bind and
                     // dial identical; no host rewriting is needed here.
+                    // ANSI escapes are stripped before matching. When stderr is an
+                    // interactive terminal bun dims the URL, putting `\x1B[2m` between
+                    // the newline and `ws://` — precisely where this pattern expects
+                    // only whitespace — so the match fails and the run dies with
+                    // "Failed to get inspector URL within timeout". Captured from a
+                    // real terminal (bun 1.3.14, FORCE_COLOR=1):
+                    //   Listening:\n  \x1B[2mws://127.0.0.1:59443/s5nbnuivpe\x1B[0m
+                    // Consumers were working around this with FORCE_COLOR=0 in their
+                    // Stryker config, which is invisible unless you already know; a
+                    // non-TTY run never reproduces it, so it looks like a phantom.
                     // Stryker disable next-line Regex: character classes are defensive for whitespace normalization
-                    const match = /Listening:[\t\v\f\r \u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]*\n\s*(ws:\/\/\S+)/.exec(text);
+                    const match = /Listening:[\t\v\f\r \u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]*\n\s*(ws:\/\/\S+)/.exec(stripAnsi(text));
                     if(match) {
                         inspectorUrlExtracted = true;
                         options.onInspectorReady(match[1]);
