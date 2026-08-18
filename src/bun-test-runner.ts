@@ -250,6 +250,13 @@ const EXECUTION_SHORTFALL_RATIO_THRESHOLD = 0.05;
 const ORPHANED_KEY_ABS_FLOOR = 5;
 
 /**
+ * Separator between the project-file prefix and the test's own name inside a
+ * test id — see buildProjectFileTestName, which is the only thing that builds
+ * one. Kept here so resolveCoveringTestFiles splits on exactly what was joined.
+ */
+const TEST_ID_FILE_SEPARATOR = ' > ';
+
+/**
  * How long the completeness gate waits, after {@link InspectorClient.expectClose}
  * is called, for the WebSocket to actually finish closing before snapshotting
  * inspector data — see the drain step in {@link BunTestRunner.dryRun}. This only
@@ -412,6 +419,59 @@ export class BunTestRunner implements TestRunner {
 
     private get registryTmpPath(): string {
         return `${this.registryPath}.tmp`;
+    }
+
+    /**
+   * Narrow a targeted mutant run to just the test FILES its covering tests live
+   * in.
+   *
+   * `--test-name-pattern` filters at the TEST level, not the file level: bun
+   * still loads every test file it was given in order to discover which names
+   * match. On a suite of 31 spec files that costs ~330ms per run of which only
+   * ~54ms is process startup — and a run that ends up executing two tests pays
+   * it in full, on every mutant. Handing bun only the files that can contain a
+   * covering test drops the same measurement to ~66ms.
+   *
+   * Test ids are `<projectFile> > <fullName>` (see buildProjectFileTestName), so
+   * the file is already the id's prefix and no extra bookkeeping is needed.
+   *
+   * Returns undefined — meaning "use the full discovered list" — whenever the
+   * narrowing cannot be proven safe:
+   * - no filter at all (static mutants, full-suite runs),
+   * - any id that carries no parsable file prefix (console-fallback ids), or
+   * - any derived file that is not in the discovered list, which would mean the
+   *   prefix was something other than a real test file.
+   *
+   * A wrong narrowing would silently skip a covering test and turn a killed
+   * mutant into a survivor, so every uncertain case takes the full list.
+   */
+    private resolveCoveringTestFiles(filterIds: readonly string[]): string[] | undefined {
+        // Stryker disable next-line ConditionalExpression,EqualityOperator,BlockStatement: no covering tests means a full-suite run; covered by 'keeps the full file list when there is no test filter'
+        if(filterIds.length === 0) {
+            return undefined;
+        }
+        const discovered = this.cachedTestFiles;
+        // Stryker disable next-line ConditionalExpression,BlockStatement: without a discovered list there is nothing to validate against; covered by 'keeps the full file list when discovery produced nothing'
+        if(!discovered || discovered.length === 0) {
+            return undefined;
+        }
+        const discoveredSet = new Set(discovered);
+        const files = new Set<string>();
+        for(const id of filterIds) {
+            const sepIdx = id.indexOf(TEST_ID_FILE_SEPARATOR);
+            // Stryker disable next-line ConditionalExpression,EqualityOperator,BlockStatement: a fallback-path id has no file prefix; covered by 'keeps the full file list when an id carries no file prefix'
+            if(sepIdx === -1) {
+                return undefined;
+            }
+            const file = id.slice(0, sepIdx);
+            // Stryker disable next-line ConditionalExpression,BlockStatement,UnaryOperator: an unrecognised prefix means the id is not file-qualified; covered by 'keeps the full file list when a derived file was never discovered'
+            if(!discoveredSet.has(file)) {
+                return undefined;
+            }
+            files.add(file);
+        }
+        // Stryker disable next-line MethodExpression: sort is for deterministic argv only; unsorted would still run the same files
+        return [...files].toSorted((a, b) => a.localeCompare(b));
     }
 
     /**
@@ -1455,7 +1515,7 @@ export class BunTestRunner implements TestRunner {
         // When testFilesOverride is set, use it directly without globbing.
         this.cachedTestFiles = await this.getOrDiscoverTestFiles();
 
-        return this.executeMutantRun(options, bunfigPath, testNamePattern, localRegistry, localBaseIndex);
+        return this.executeMutantRun(options, bunfigPath, testNamePattern, localRegistry, localBaseIndex, this.resolveCoveringTestFiles(filterIds));
     }
 
     /**
@@ -1469,11 +1529,12 @@ export class BunTestRunner implements TestRunner {
    * depth 1 by construction, never a retry-of-a-retry.
    */
     private async executeMutantRun(
-        options:         MutantRunOptions,
-        bunfigPath:      string,
-        testNamePattern: string | undefined,
-        localRegistry:   Set<string>,
-        localBaseIndex:  Map<string, string[]>
+        options:           MutantRunOptions,
+        bunfigPath:        string,
+        testNamePattern:   string | undefined,
+        localRegistry:     Set<string>,
+        localBaseIndex:    Map<string, string[]>,
+        coveringTestFiles?: string[]
     ): Promise<MutantRunResult> {
         // Tracked on `this` so dispose() can kill an orphaned child if this runner
         // is disposed while a mutant run is still in flight — mirrors dryRun().
@@ -1492,7 +1553,10 @@ export class BunTestRunner implements TestRunner {
                 sequentialMode:        true,            // Match dryRun's serialized execution for deterministic results
                 preloadScript:         this.preloadScriptPath, // Needed to set globalThis.__stryker__.activeMutant
                 testNamePattern, // undefined → no filter → full suite (current behaviour)
-                testFiles:             this.cachedTestFiles,
+                // Narrowed to the covering tests' own files when the run is
+                // targeted; the full list whenever it is not, or whenever the
+                // narrowing cannot be proven safe (see resolveCoveringTestFiles).
+                testFiles:             testNamePattern === undefined ? this.cachedTestFiles : (coveringTestFiles ?? this.cachedTestFiles),
                 signal:                abortController.signal,
                 smol:                  this.smol,
                 maxChildRss:           this.maxChildRss,

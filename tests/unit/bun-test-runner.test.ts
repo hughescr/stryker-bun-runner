@@ -9109,4 +9109,105 @@ describe('mutantRun testFilter integration', () => {
             })
         );
     });
+
+    describe('narrowing a targeted mutant run to its covering tests\' files', () => {
+        // This outer describe does not stub discovery, so pin it here: the
+        // assertions below are about WHICH of the discovered files get passed on.
+        let discoverySpy: ReturnType<typeof spyOn>;
+
+        beforeEach(() => {
+            discoverySpy = spyOn(testFileDiscovery, 'discoverTestFiles').mockResolvedValue([
+                'tests/alpha.test.ts',
+                'tests/beta.test.ts',
+            ]);
+        });
+
+        afterEach(() => {
+            discoverySpy.mockRestore();
+        });
+
+        /**
+         * `--test-name-pattern` filters at the test level, so bun loads every file
+         * it is handed just to discover which names match. Handing it only the
+         * files that can hold a covering test is what makes a targeted run cheap.
+         * Every uncertain case must fall back to the full discovered list: a wrong
+         * narrowing silently skips a covering test and turns a kill into a survivor.
+         */
+        async function mutantRunWithFilter(testFilter: string[]): Promise<unknown> {
+            mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+            mockRunBunTests.mockImplementation((options: any) => {
+                if(options.onInspectorReady) {
+                    options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                }
+                return Promise.resolve({ exitCode: 0, stdout: '1 pass', stderr: '', timedOut: false });
+            });
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            mockRunBunTests.mockClear();
+
+            return runner.mutantRun({
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                activeMutant:    { id: '1' } as any,
+                testFilter,
+                sandboxFileName: 'sandbox',
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+            } as any);
+        }
+
+        function testFilesPassedToBun(): unknown {
+            return mockRunBunTests.mock.calls[0][0].testFiles;
+        }
+
+        it('passes only the files the covering tests live in', async () => {
+            await mutantRunWithFilter(['tests/alpha.test.ts > suite > covers this mutant']);
+
+            expect(testFilesPassedToBun()).toEqual(['tests/alpha.test.ts']);
+        });
+
+        it('deduplicates and sorts when several covering tests share files', async () => {
+            await mutantRunWithFilter([
+                'tests/beta.test.ts > suite > b',
+                'tests/alpha.test.ts > suite > a',
+                'tests/beta.test.ts > suite > c',
+            ]);
+
+            expect(testFilesPassedToBun()).toEqual(['tests/alpha.test.ts', 'tests/beta.test.ts']);
+        });
+
+        it('keeps the full file list when there is no test filter', async () => {
+            // No filter means a full-suite run (static mutants); narrowing would
+            // skip tests that must run.
+            await mutantRunWithFilter([]);
+
+            expect(testFilesPassedToBun()).toEqual(['tests/alpha.test.ts', 'tests/beta.test.ts']);
+        });
+
+        it('keeps the full file list when an id carries no file prefix', async () => {
+            // Console-fallback ids are bare test names with no ' > ' file segment.
+            await mutantRunWithFilter(['a bare test name with no file prefix']);
+
+            expect(testFilesPassedToBun()).toEqual(['tests/alpha.test.ts', 'tests/beta.test.ts']);
+        });
+
+        it('keeps the full file list when a derived file was never discovered', async () => {
+            // The prefix parsed as a path but is not a file we know about, so the
+            // id is not what we assumed and the narrowing is not trustworthy.
+            await mutantRunWithFilter(['tests/never-discovered.test.ts > suite > x']);
+
+            expect(testFilesPassedToBun()).toEqual(['tests/alpha.test.ts', 'tests/beta.test.ts']);
+        });
+
+        it('keeps the full file list when one id of several is unusable', async () => {
+            // One bad id poisons the whole set: running only alpha would skip
+            // whatever the unparsable id refers to.
+            await mutantRunWithFilter([
+                'tests/alpha.test.ts > suite > a',
+                'a bare test name with no file prefix',
+            ]);
+
+            expect(testFilesPassedToBun()).toEqual(['tests/alpha.test.ts', 'tests/beta.test.ts']);
+        });
+    });
 });
