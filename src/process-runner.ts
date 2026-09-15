@@ -323,31 +323,49 @@ export function removeSignalCleanup(): void {
  * Falls back to signalling the child directly when the group signal could not
  * be delivered, so this is never weaker than the call it replaced.
  */
-function killProcessTree(childProcess: ChildProcess, signal: NodeJS.Signals): void {
+function killProcessTree(childProcess: ChildProcess, signal: NodeJS.Signals): boolean {
     const pid = childProcess.pid;
     // Stryker disable next-line ConditionalExpression,EqualityOperator,LogicalOperator,BlockStatement: pid is undefined only when spawn itself failed; both arms are covered by 'signals the process group' and 'falls back to the direct child when the group signal fails'
     if(pid === undefined || !killProcessGroup(pid, signal)) {
         childProcess.kill(signal);
+        return false;
     }
+    return true;
 }
 
 /**
  * Send SIGTERM to a child process, escalating to SIGKILL after a grace period
- * if it hasn't exited by then. `isClosed` is checked right before the SIGKILL
- * so an already-exited process (e.g. one that responded to SIGTERM promptly)
- * is never signalled again.
+ * while its leader remains alive. The returned callback handles the other
+ * lifecycle: if the leader exits first after a successful group SIGTERM, its
+ * descendants are reaped immediately and the stale timer is cancelled.
  *
  * Both signals go to the child's whole process group — see
  * {@link killProcessTree}.
  */
-function killWithEscalation(childProcess: ChildProcess, isClosed: () => boolean, gracePeriodMs: number): void {
-    killProcessTree(childProcess, 'SIGTERM');
-    setTimeout(() => {
+function killWithEscalation(childProcess: ChildProcess, isClosed: () => boolean, gracePeriodMs: number): () => void {
+    const pid = childProcess.pid;
+    const signalledGroup = killProcessTree(childProcess, 'SIGTERM');
+    let hasEscalated = false;
+    const escalationHandle = setTimeout(() => {
         // Stryker disable next-line ConditionalExpression,BlockStatement: escalation guard — skipping SIGKILL when the process already exited is covered by 'does not escalate to SIGKILL when the process exits within the grace period'; the escalation-fires case is covered by 'escalates to SIGKILL when the process ignores SIGTERM'
         if(!isClosed()) {
+            hasEscalated = true;
             killProcessTree(childProcess, 'SIGKILL');
         }
     }, gracePeriodMs);
+
+    return () => {
+        clearTimeout(escalationHandle);
+        // The leader can exit on SIGTERM while descendants remain in its group.
+        // Reap that already-signalled group immediately, before a delayed timer
+        // leaves the dead leader's numeric PID/PGID available for reuse. Never
+        // fall back to the direct child here: its exit event proves that handle
+        // is no longer a valid signal target.
+        if(!hasEscalated && signalledGroup && pid !== undefined) {
+            hasEscalated = true;
+            killProcessGroup(pid, 'SIGKILL');
+        }
+    };
 }
 
 /**
@@ -359,6 +377,15 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
     // is worth computing for a call that will not spawn.
     const spawnDepth = readSpawnDepth(process.env[SPAWN_DEPTH_ENV]);
     const maxSpawnDepth = options.maxSpawnDepth ?? DEFAULT_MAX_SPAWN_DEPTH;
+    if(!Number.isSafeInteger(maxSpawnDepth) || maxSpawnDepth < 1) {
+        return {
+            stdout:              '',
+            stderr:              `stryker-bun-runner: invalid maxSpawnDepth=${String(maxSpawnDepth)}; expected a positive integer.`,
+            exitCode:            1,
+            timedOut:            false,
+            memoryLimitExceeded: false,
+        };
+    }
     // Stryker disable next-line EqualityOperator,ConditionalExpression,BlockStatement: removing or inverting this guard restores the unbounded self-spawning it exists to stop; covered by 'refuses to spawn at the depth ceiling'
     if(spawnDepth >= maxSpawnDepth) {
         return {
@@ -492,6 +519,8 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
         let memoryLimitExceeded = false;
         let hasClosed = false;
         let rssIntervalHandle: ReturnType<typeof setInterval> | undefined;
+        let onLeaderExitDuringTermination: (() => void) | undefined;
+        let onAbort: (() => void) | undefined;
 
         // If an AbortSignal was provided and is already aborted, resolve immediately
         // Stryker disable next-line ConditionalExpression,BlockStatement: abort-before-spawn guard; mutation caught by 'aborts child process when signal fires'
@@ -522,13 +551,23 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
         liveChildren.add(childProcess);
         ensureSignalCleanup();
 
+        const beginTermination = (): boolean => {
+            // Timeout, abort, and the asynchronous RSS poll can converge in the
+            // same turn. Only the first trigger owns the TERM/KILL lifecycle.
+            if(processKilled) {
+                return false;
+            }
+            processKilled = true;
+            timedOut = true;
+            onLeaderExitDuringTermination = killWithEscalation(childProcess, () => hasClosed, KILL_GRACE_PERIOD_MS);
+            return true;
+        };
+
         // Set up timeout — escalate SIGTERM→SIGKILL via the shared helper so a
         // process that responds promptly to SIGTERM isn't needlessly SIGKILLed.
         // Stryker disable next-line BlockStatement: removing timeout kill body means child process runs forever → Timeout on the Stryker test for this mutation
         const timeoutHandle = setTimeout(() => {
-            timedOut = true;
-            processKilled = true;
-            killWithEscalation(childProcess, () => hasClosed, KILL_GRACE_PERIOD_MS);
+            beginTermination();
         }, options.timeout);
 
         // Wire up the AbortSignal if provided.
@@ -537,11 +576,9 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
         // with timedOut:true to signal the caller that we stopped early.
         // Stryker disable next-line ConditionalExpression,BlockStatement: abort-signal wiring; mutation caught by 'aborts child process when signal fires'
         if(options.signal) {
-            const onAbort = (): void => {
+            onAbort = (): void => {
                 clearTimeout(timeoutHandle);
-                processKilled = true;
-                timedOut = true;
-                killWithEscalation(childProcess, () => hasClosed, KILL_GRACE_PERIOD_MS);
+                beginTermination();
             };
             // Stryker disable next-line ObjectLiteral,BooleanLiteral: AbortSignal 'abort' fires at most once per controller (spec guarantee — WHATWG DOM §9.1), so { once: true } is semantically redundant; mutating to {} or { once: false } is equivalent
             options.signal.addEventListener('abort', onAbort, { once: true });
@@ -563,7 +600,7 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
                 // the interval — this guard is not reachable under real timer
                 // semantics, only defensive against a future change to that ordering.
                 // Stryker disable next-line all: unreachable under real timer semantics; see comment above — not exercised by tests
-                if(hasClosed || memoryLimitExceeded) {
+                if(hasClosed || processKilled) {
                     return;
                 }
                 const pid = childProcess.pid;
@@ -574,20 +611,19 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
                 const rssBytes = await getProcessRssBytes(pid);
                 // Stryker disable next-line ConditionalExpression,EqualityOperator,BlockStatement,LogicalOperator: null probe result (unknown RSS) must not be treated as exceeding the ceiling; covered by 'does not kill when the RSS probe returns null'; the hasClosed re-check guards against the process closing while the probe awaited
                 // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- hasClosed is set by the 'close'/'error' handlers, a different closure; TypeScript cannot track that cross-await mutation
-                if(rssBytes === null || hasClosed) {
+                if(rssBytes === null || hasClosed || processKilled) {
                     return;
                 }
                 if(rssBytes > rssLimit) {
-                    // eslint-disable-next-line require-atomic-updates -- single-threaded reentrancy guarded by the hasClosed/memoryLimitExceeded check at function entry; no concurrent writer can race this assignment
+                    if(!beginTermination()) {
+                        return;
+                    }
                     memoryLimitExceeded = true;
-                    timedOut = true;
-                    processKilled = true;
                     // Stryker disable next-line ConditionalExpression: equivalent mutant — rssIntervalHandle is always defined at this point (assigned synchronously right after this whole maxChildRss block starts, before any tick can run); mutating the guard to `true` only changes clearInterval's argument from a real handle to itself, never to undefined
                     if(rssIntervalHandle) {
                         clearInterval(rssIntervalHandle);
                     }
                     options.onMemoryLimitExceeded?.(rssBytes);
-                    killWithEscalation(childProcess, () => hasClosed, KILL_GRACE_PERIOD_MS);
                 }
             };
             rssIntervalHandle = setInterval(() => {
@@ -644,12 +680,22 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
         }
         // Stryker restore BooleanLiteral,BlockStatement,StringLiteral
 
+        // The exit event fires as soon as the leader is reaped, while close can
+        // be delayed by a descendant that inherited one of its stdio streams.
+        childProcess.on('exit', () => {
+            onLeaderExitDuringTermination?.();
+        });
+
         // Handle process exit
         // Stryker disable next-line BlockStatement,StringLiteral: Promise.resolve never called without 'close' handler → Timeout
         childProcess.on('close', (code) => {
             hasClosed = true;
+            onLeaderExitDuringTermination?.();
             liveChildren.delete(childProcess);
             clearTimeout(timeoutHandle);
+            if(options.signal && onAbort) {
+                options.signal.removeEventListener('abort', onAbort);
+            }
             // Stryker disable next-line ConditionalExpression: equivalent mutant — when rssIntervalHandle is undefined (maxChildRss not set), clearInterval(undefined) is a silent no-op in Node/Bun; mutating the guard to `true` cannot introduce an observable difference
             if(rssIntervalHandle) {
                 clearInterval(rssIntervalHandle);
@@ -668,8 +714,12 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
         // Stryker disable next-line BlockStatement: emptying this handler means resolve() is never called on a spawn/child error → Timeout — expected, mirrors the 'close' handler's disable comment above
         childProcess.on('error', (error) => {
             hasClosed = true;
+            onLeaderExitDuringTermination?.();
             liveChildren.delete(childProcess);
             clearTimeout(timeoutHandle);
+            if(options.signal && onAbort) {
+                options.signal.removeEventListener('abort', onAbort);
+            }
             // Stryker disable next-line ConditionalExpression: equivalent mutant — when rssIntervalHandle is undefined (maxChildRss not set), clearInterval(undefined) is a silent no-op in Node/Bun; mutating the guard to `true` cannot introduce an observable difference
             if(rssIntervalHandle) {
                 clearInterval(rssIntervalHandle);

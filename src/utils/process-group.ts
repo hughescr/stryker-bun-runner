@@ -22,7 +22,7 @@
  *
  * Returns true when the signal was delivered, false when it could not be —
  * the group is already gone (ESRCH), the caller lacks permission (EPERM), or
- * the platform has no process groups. Callers are expected to fall back to
+ * the platform has no POSIX process groups (including Windows). Callers are expected to fall back to
  * signalling the direct child on false, so behaviour never regresses below
  * what a plain `ChildProcess.kill()` would have achieved.
  */

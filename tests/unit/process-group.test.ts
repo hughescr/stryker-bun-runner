@@ -66,6 +66,33 @@ async function spawnWithGrandchild(): Promise<{ child: ChildProcess, grandchildP
     return { child, grandchildPid };
 }
 
+async function spawnLeaderThatExitsButLeavesGrandchild(): Promise<{ child: ChildProcess, grandchildPid: number }> {
+    const child = spawn('/bin/sh', ['-c', String.raw`trap 'exit 0' TERM; bun -e 'const fs = require("node:fs"); process.on("SIGTERM", () => {}); fs.writeSync(3, String(process.pid) + "\n"); fs.closeSync(3); setTimeout(() => process.exit(0), 5000)' 3>&1 </dev/null >/dev/null 2>&1 & while :; do sleep 1; done`], {
+        detached: true,
+        stdio:    ['ignore', 'pipe', 'ignore'],
+    });
+    spawnedChildren.push(child);
+    const grandchildPid = await new Promise<number>((resolve, reject) => {
+        child.stdout.on('data', (data: Buffer) => resolve(Number(data.toString().trim())));
+        child.on('error', reject);
+    });
+    await waitUntil(() => isAlive(grandchildPid));
+    return { child, grandchildPid };
+}
+
+async function spawnLeaderWithGrandchildHoldingStdout(): Promise<{ child: ChildProcess, grandchildPid: number }> {
+    const child = spawn('/bin/sh', ['-c', "trap 'exit 0' TERM; bun -e 'process.on(\"SIGTERM\", () => {}); console.log(process.pid); setTimeout(() => process.exit(0), 5000)' </dev/null 2>/dev/null & while :; do sleep 1; done"], {
+        detached: true,
+        stdio:    ['ignore', 'pipe', 'ignore'],
+    });
+    spawnedChildren.push(child);
+    const grandchildPid = await new Promise<number>((resolve, reject) => {
+        child.stdout.on('data', (data: Buffer) => resolve(Number(data.toString().trim())));
+        child.on('error', reject);
+    });
+    return { child, grandchildPid };
+}
+
 describe('killProcessGroup', () => {
     afterEach(() => {
         // Reap anything a failed assertion left behind — these are detached, so
@@ -107,5 +134,39 @@ describe('killProcessGroup', () => {
 
         expect(await waitUntil(() => !isAlive(child.pid!))).toBe(true);
         expect(await waitUntil(() => !isAlive(grandchildPid))).toBe(true);
+    });
+
+    it('can reap a TERM-ignoring descendant after the group leader exits', async () => {
+        const { child, grandchildPid } = await spawnLeaderThatExitsButLeavesGrandchild();
+
+        expect(realKillProcessGroup(child.pid!, 'SIGTERM')).toBe(true);
+        await new Promise<void>((resolve) => {
+            child.once('exit', () => resolve());
+        });
+        expect(isAlive(grandchildPid)).toBe(true);
+
+        // This is the runner's exit-event escalation path: close cannot be used
+        // as the lifecycle boundary because a descendant may retain stdio.
+        expect(realKillProcessGroup(child.pid!, 'SIGKILL')).toBe(true);
+        expect(await waitUntil(() => !isAlive(grandchildPid))).toBe(true);
+    });
+
+    it('observes leader exit before close when a descendant retains stdout', async () => {
+        const { child, grandchildPid } = await spawnLeaderWithGrandchildHoldingStdout();
+        let hasClosed = false;
+        child.once('close', () => {
+            hasClosed = true;
+        });
+
+        expect(realKillProcessGroup(child.pid!, 'SIGTERM')).toBe(true);
+        await new Promise<void>((resolve) => {
+            child.once('exit', () => resolve());
+        });
+        expect(hasClosed).toBe(false);
+        expect(isAlive(grandchildPid)).toBe(true);
+
+        expect(realKillProcessGroup(child.pid!, 'SIGKILL')).toBe(true);
+        expect(await waitUntil(() => !isAlive(grandchildPid))).toBe(true);
+        expect(await waitUntil(() => hasClosed)).toBe(true);
     });
 });

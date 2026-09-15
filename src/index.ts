@@ -83,7 +83,7 @@ export const strykerValidationSchema = {
                     'default':   1000,
                 },
                 maxSpawnDepth: {
-                    type:        'number',
+                    type:        'integer',
                     minimum:     1,
                     description: 'Maximum `bun test` spawn nesting depth before the runner refuses to spawn (default: 1). Guards against runaway recursion when a run spawned by this runner ends up spawning another one. Raise to 2 only if your own tests drive this runner.',
                     'default':   1,
