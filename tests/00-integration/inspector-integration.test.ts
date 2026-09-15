@@ -231,6 +231,7 @@ describe('Inspector Integration', () => {
                 bunPath:          'bun',  // Use the default bun
                 timeout:          60_000,
                 inspectorTimeout: 30_000,  // Increased for resource contention during full test suite
+                maxSpawnDepth:    2,  // this suite legitimately drives the runner: under Stryker it is itself a depth-1 run, so its own spawns land at depth 2
                 testFiles:        [testFilePath],  // Point to our test file; bypasses auto-discovery
             },
             testRunner: { name: 'bun' },
@@ -277,6 +278,7 @@ describe('Inspector Integration', () => {
                 bunPath:          'bun',
                 timeout:          60_000,
                 inspectorTimeout: 30_000,
+                maxSpawnDepth:    2,  // this suite legitimately drives the runner: under Stryker it is itself a depth-1 run, so its own spawns land at depth 2
                 testFiles:        [gtTestFilePath],
             },
             testRunner: { name: 'bun' },
@@ -336,6 +338,7 @@ describe('Inspector Integration', () => {
                 bunPath:          'bun',
                 timeout:          60_000,
                 inspectorTimeout: 30_000,
+                maxSpawnDepth:    2,  // this suite legitimately drives the runner: under Stryker it is itself a depth-1 run, so its own spawns land at depth 2
                 testFiles:        [gtTestFilePath],
             },
             testRunner: { name: 'bun' },
@@ -393,6 +396,7 @@ describe('Inspector Integration', () => {
                 bunPath:          'bun',
                 timeout:          60_000,
                 inspectorTimeout: 30_000,
+                maxSpawnDepth:    2,  // this suite legitimately drives the runner: under Stryker it is itself a depth-1 run, so its own spawns land at depth 2
                 testFiles:        [gapBleedTestFilePath],
                 bunArgs:          ['--seed=0'],
             },
@@ -429,6 +433,7 @@ describe('Inspector Integration', () => {
                 bunPath:          'bun',
                 timeout:          60_000,
                 inspectorTimeout: 30_000,
+                maxSpawnDepth:    2,  // this suite legitimately drives the runner: under Stryker it is itself a depth-1 run, so its own spawns land at depth 2
                 testFiles:        [cleanTwoTestFilePath],
                 bunArgs:          ['--seed=0'],
             },
@@ -487,6 +492,7 @@ describe('Inspector Integration', () => {
                 bunPath:          'bun',
                 timeout:          60_000,
                 inspectorTimeout: 30_000,
+                maxSpawnDepth:    2,  // this suite legitimately drives the runner: under Stryker it is itself a depth-1 run, so its own spawns land at depth 2
                 testFiles:        largeSuiteFiles,
             },
             testRunner: { name: 'bun' },

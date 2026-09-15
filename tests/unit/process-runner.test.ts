@@ -5,9 +5,9 @@
 
 import type { ChildProcess } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach, mock, jest, spyOn } from 'bun:test';
-import { runBunTests } from '../../src/process-runner.js';
+import { runBunTests, readSpawnDepth, killAllLiveChildren, ensureSignalCleanup, removeSignalCleanup, stripAnsi, SPAWN_DEPTH_ENV, DEFAULT_MAX_SPAWN_DEPTH } from '../../src/process-runner.js';
 import * as processRss from '../../src/utils/process-rss.js';
-import { mockSpawn, resetChildProcessMocks } from '../test-preload.js';
+import { mockSpawn, resetChildProcessMocks, mockKillProcessGroup, resetProcessGroupMocks } from '../test-preload.js';
 
 /**
  * Extended mock interface for ChildProcess with handler storage
@@ -20,11 +20,23 @@ interface MockChildProcess extends Partial<ChildProcess> {
     errorHandler?:  (error: Error) => void
 }
 
+const CLEANUP_SIGNAL_NAMES: NodeJS.Signals[] = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+
 describe('runBunTests', () => {
     let mockChildProcess: MockChildProcess;
+    let ambientSpawnDepth: string | undefined;
 
     beforeEach(() => {
-    // Create a mock child process
+        // These tests drive runBunTests directly with a mocked spawn, so they must
+        // be independent of the depth this process happens to be running at. That
+        // matters concretely: when this suite runs under Stryker it is itself a
+        // depth-1 `bun test` child, and every spawn assertion below would hit the
+        // recursion ceiling instead of the mock. Tests that care about depth set
+        // it explicitly via withSpawnDepth().
+        ambientSpawnDepth = process.env[SPAWN_DEPTH_ENV];
+        delete process.env[SPAWN_DEPTH_ENV];
+
+        // Create a mock child process
         /* eslint-disable @typescript-eslint/no-explicit-any -- mock child process with any-typed properties */
         mockChildProcess = {
             stdout: {
@@ -64,7 +76,13 @@ describe('runBunTests', () => {
 
     afterEach(() => {
         // Reset preload mocks and timers to prevent leakage to other tests
+        if(ambientSpawnDepth === undefined) {
+            delete process.env[SPAWN_DEPTH_ENV];
+        } else {
+            process.env[SPAWN_DEPTH_ENV] = ambientSpawnDepth;
+        }
         resetChildProcessMocks();
+        resetProcessGroupMocks();
         jest.useRealTimers();
     });
 
@@ -1965,6 +1983,310 @@ describe('runBunTests', () => {
 
             const args: readonly string[] = mockSpawn.mock.calls[0][1];
             expect(args).toEqual(['test', '--bail']);
+        });
+    });
+
+    describe('recursive-spawn guard', () => {
+        function setSpawnDepthEnv(value: string | undefined): void {
+            if(value === undefined) {
+                delete process.env[SPAWN_DEPTH_ENV];
+            } else {
+                process.env[SPAWN_DEPTH_ENV] = value;
+            }
+        }
+
+        /**
+         * Run `body` with the spawn-depth env var forced to `depth`, restoring
+         * whatever was there before (the variable is genuinely present when this
+         * suite itself runs underneath the runner).
+         */
+        async function withSpawnDepth(depth: string | undefined, body: () => Promise<void>): Promise<void> {
+            const original = process.env[SPAWN_DEPTH_ENV];
+            setSpawnDepthEnv(depth);
+            try {
+                await body();
+            } finally {
+                setSpawnDepthEnv(original);
+            }
+        }
+
+        describe('readSpawnDepth', () => {
+            it('reads a positive integer', () => {
+                expect(readSpawnDepth('3')).toBe(3);
+            });
+
+            it.each([
+                ['absent', undefined],
+                ['empty string', ''],
+                ['non-numeric', 'not-a-number'],
+                ['negative', '-1'],
+                ['non-integer', '1.5'],
+                ['zero', '0'],
+            ])('treats a %s value as depth 0', (_label, raw) => {
+                expect(readSpawnDepth(raw)).toBe(0);
+            });
+        });
+
+        it.each([
+            [undefined, '1'],
+            ['1', '2'],
+            ['4', '5'],
+        ])('stamps the child environment with depth+1 — from %s to %s', async (envDepth, expected) => {
+            await withSpawnDepth(envDepth, async () => {
+                const resultPromise = runBunTests({ bunPath: 'bun', timeout: 5000, maxSpawnDepth: 99 });
+                mockChildProcess.closeHandler?.(0);
+                await resultPromise;
+
+                const spawnOptions = mockSpawn.mock.calls[0][2];
+                expect(spawnOptions.env![SPAWN_DEPTH_ENV]).toBe(expected);
+            });
+        });
+
+        it.each([
+            [String(DEFAULT_MAX_SPAWN_DEPTH), undefined, 'at the default ceiling'],
+            [String(DEFAULT_MAX_SPAWN_DEPTH + 5), undefined, 'beyond the default ceiling'],
+            ['2', 2, 'at an explicit ceiling'],
+            ['1', 1, 'at a ceiling tighter than a nested caller would need'],
+        ])('refuses to spawn at depth %s with ceiling %s — %s', async (envDepth, maxSpawnDepth) => {
+            await withSpawnDepth(envDepth, async () => {
+                const result = await runBunTests({ bunPath: 'bun', timeout: 5000, maxSpawnDepth });
+
+                expect(mockSpawn).not.toHaveBeenCalled();
+                expect(result.exitCode).toBe(1);
+                expect(result.timedOut).toBe(false);
+                expect(result.stderr).toContain('refusing to spawn');
+                expect(result.stderr).toContain('maxSpawnDepth');
+                expect(result.stdout).toBe('');
+                expect(result.memoryLimitExceeded).toBe(false);
+            });
+        });
+
+        it.each([
+            [undefined, undefined, 'a top-level run under the default ceiling'],
+            ['1', 2, 'a project whose own tests drive the runner, having raised the ceiling'],
+        ])('still spawns at depth %s with ceiling %s — %s', async (envDepth, maxSpawnDepth) => {
+            await withSpawnDepth(envDepth, async () => {
+                const resultPromise = runBunTests({ bunPath: 'bun', timeout: 5000, maxSpawnDepth });
+                mockChildProcess.closeHandler?.(0);
+                const result = await resultPromise;
+
+                expect(mockSpawn).toHaveBeenCalled();
+                expect(result.exitCode).toBe(0);
+            });
+        });
+
+        it('refuses without building argv or cloning the environment', async () => {
+            await withSpawnDepth(String(DEFAULT_MAX_SPAWN_DEPTH), async () => {
+                // The guard is the first thing runBunTests does, so a refusal must
+                // not have touched the spawn path at all.
+                await runBunTests({ bunPath: 'bun', timeout: 5000, bunArgs: ['--only'] });
+
+                expect(mockSpawn).not.toHaveBeenCalled();
+            });
+        });
+    });
+
+    describe('process-group kill', () => {
+        it('spawns detached so the child leads its own process group', async () => {
+            const resultPromise = runBunTests({ bunPath: 'bun', timeout: 5000 });
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            expect(mockSpawn).toHaveBeenCalledWith(
+                'bun',
+                ['test'],
+                expect.objectContaining({ detached: true })
+            );
+        });
+
+        it('signals the process group on timeout, escalating to SIGKILL', async () => {
+            jest.useFakeTimers();
+
+            const resultPromise = runBunTests({ bunPath: 'bun', timeout: 100 });
+            jest.advanceTimersByTime(100 + 500 + 1);
+
+            expect(mockKillProcessGroup).toHaveBeenCalledWith(12_345, 'SIGTERM');
+            expect(mockKillProcessGroup).toHaveBeenCalledWith(12_345, 'SIGKILL');
+
+            mockChildProcess.closeHandler?.(null);
+            await resultPromise;
+
+            jest.useRealTimers();
+        });
+
+        it('does not also signal the child directly when the group signal succeeded', async () => {
+            jest.useFakeTimers();
+            mockKillProcessGroup.mockImplementation(() => true);
+
+            const resultPromise = runBunTests({ bunPath: 'bun', timeout: 100 });
+            jest.advanceTimersByTime(150);
+            mockChildProcess.closeHandler?.(null);
+            await resultPromise;
+
+            expect(mockKillProcessGroup).toHaveBeenCalledWith(12_345, 'SIGTERM');
+            expect(mockChildProcess.kill).not.toHaveBeenCalled();
+
+            jest.useRealTimers();
+        });
+
+        it('falls back to the direct child when the group signal fails', async () => {
+            jest.useFakeTimers();
+            // The preload default already returns false; state it explicitly so the
+            // test does not silently depend on that default.
+            mockKillProcessGroup.mockImplementation(() => false);
+
+            const resultPromise = runBunTests({ bunPath: 'bun', timeout: 100 });
+            jest.advanceTimersByTime(150);
+            mockChildProcess.closeHandler?.(null);
+            await resultPromise;
+
+            expect(mockChildProcess.kill).toHaveBeenCalledWith('SIGTERM');
+
+            jest.useRealTimers();
+        });
+
+        it('reaps every live child on signal cleanup', async () => {
+            const resultPromise = runBunTests({ bunPath: 'bun', timeout: 5000 });
+            await Promise.resolve();
+
+            // The child is live at this point: signal cleanup must reach it.
+            killAllLiveChildren();
+            expect(mockKillProcessGroup).toHaveBeenCalledWith(12_345, 'SIGKILL');
+
+            // And a second sweep finds nothing, because the set was cleared.
+            mockKillProcessGroup.mockClear();
+            killAllLiveChildren();
+            expect(mockKillProcessGroup).not.toHaveBeenCalled();
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+        });
+
+        it('stops tracking a child once it has closed, so cleanup does not signal a dead pid', async () => {
+            const resultPromise = runBunTests({ bunPath: 'bun', timeout: 5000 });
+            await Promise.resolve();
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            killAllLiveChildren();
+
+            expect(mockKillProcessGroup).not.toHaveBeenCalled();
+        });
+
+        it('stops tracking a child that failed to spawn, so cleanup does not signal a dead pid', async () => {
+            const resultPromise = runBunTests({ bunPath: 'bun', timeout: 5000 });
+            await Promise.resolve();
+            mockChildProcess.errorHandler?.(new Error('spawn failed'));
+            await resultPromise;
+
+            killAllLiveChildren();
+
+            expect(mockKillProcessGroup).not.toHaveBeenCalled();
+        });
+
+        it('attaches its signal listeners once and is idempotent thereafter', () => {
+            removeSignalCleanup();
+            const before = CLEANUP_SIGNAL_NAMES.map(s => process.listenerCount(s));
+
+            expect(ensureSignalCleanup()).toBe(true);
+            for(const [i, sig] of CLEANUP_SIGNAL_NAMES.entries()) {
+                expect(process.listenerCount(sig)).toBe(before[i] + 1);
+            }
+
+            // A second call must not stack another listener on any signal.
+            expect(ensureSignalCleanup()).toBe(false);
+            for(const [i, sig] of CLEANUP_SIGNAL_NAMES.entries()) {
+                expect(process.listenerCount(sig)).toBe(before[i] + 1);
+            }
+
+            removeSignalCleanup();
+            for(const [i, sig] of CLEANUP_SIGNAL_NAMES.entries()) {
+                expect(process.listenerCount(sig)).toBe(before[i]);
+            }
+        });
+
+        it('registers its signal listeners only once across many spawns', async () => {
+            const before = process.listenerCount('SIGINT');
+
+            for(const _ of [1, 2, 3]) {
+                const resultPromise = runBunTests({ bunPath: 'bun', timeout: 5000 });
+                mockChildProcess.closeHandler?.(0);
+                // eslint-disable-next-line no-await-in-loop -- sequential spawns: each must settle before the next
+                await resultPromise;
+            }
+
+            // At most one listener was added in total, no matter how many spawns.
+            expect(process.listenerCount('SIGINT') - before).toBeLessThanOrEqual(1);
+        });
+
+        it('falls back to the direct child when the process has no pid', async () => {
+            jest.useFakeTimers();
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- deliberately simulating a failed spawn with no pid
+            (mockChildProcess as any).pid = undefined;
+
+            const resultPromise = runBunTests({ bunPath: 'bun', timeout: 100 });
+            jest.advanceTimersByTime(150);
+            mockChildProcess.closeHandler?.(null);
+            await resultPromise;
+
+            expect(mockKillProcessGroup).not.toHaveBeenCalled();
+            expect(mockChildProcess.kill).toHaveBeenCalledWith('SIGTERM');
+
+            jest.useRealTimers();
+        });
+    });
+
+    describe('inspector URL scraping tolerates a coloured banner', () => {
+        // Verbatim from a real interactive terminal (bun 1.3.14, kitty, FORCE_COLOR=1).
+        // bun dims the URL, so \x1B[2m lands between the newline and `ws://` —
+        // exactly where the pattern expects whitespace only. A non-TTY run never
+        // produces this, which is why it reads as a phantom failure.
+        const COLOURED_BANNER = [
+            '--------------------- Bun Inspector ---------------------',
+            'Listening:',
+            '  \u001B[2mws://127.0.0.1:59443/s5nbnuivpe\u001B[0m',
+            'Inspect in browser:',
+            '',
+        ].join('\n');
+
+        it('extracts the URL from a dimmed banner', async () => {
+            const onInspectorReady = mock((_url: string) => undefined);
+            const resultPromise = runBunTests({
+                bunPath: 'bun', timeout: 5000, inspectWaitPort: 9229, onInspectorReady,
+            });
+            await Promise.resolve();
+            mockChildProcess.stderrHandler?.(Buffer.from(COLOURED_BANNER));
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            expect(onInspectorReady).toHaveBeenCalledWith('ws://127.0.0.1:59443/s5nbnuivpe');
+        });
+
+        it('still extracts the URL from an uncoloured banner', async () => {
+            const onInspectorReady = mock((_url: string) => undefined);
+            const resultPromise = runBunTests({
+                bunPath: 'bun', timeout: 5000, inspectWaitPort: 9229, onInspectorReady,
+            });
+            await Promise.resolve();
+            mockChildProcess.stderrHandler?.(Buffer.from('Listening:\n  ws://127.0.0.1:6499/plain\n'));
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            expect(onInspectorReady).toHaveBeenCalledWith('ws://127.0.0.1:6499/plain');
+        });
+
+        describe('stripAnsi', () => {
+            it('removes CSI sequences', () => {
+                expect(stripAnsi('\u001B[2mws://x\u001B[0m')).toBe('ws://x');
+            });
+
+            it('removes an OSC-8 hyperlink wrapper', () => {
+                expect(stripAnsi('\u001B]8;;http://a\u0007label\u001B]8;;\u0007')).toBe('label');
+            });
+
+            it('leaves plain text untouched', () => {
+                expect(stripAnsi('Listening:\n  ws://127.0.0.1:1/x')).toBe('Listening:\n  ws://127.0.0.1:1/x');
+            });
         });
     });
 });

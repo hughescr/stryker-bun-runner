@@ -82,6 +82,12 @@ export const strykerValidationSchema = {
                     description: 'Poll interval in milliseconds for the maxChildRss check (default: 1000).',
                     'default':   1000,
                 },
+                maxSpawnDepth: {
+                    type:        'number',
+                    minimum:     1,
+                    description: 'Maximum `bun test` spawn nesting depth before the runner refuses to spawn (default: 1). Guards against runaway recursion when a run spawned by this runner ends up spawning another one. Raise to 2 only if your own tests drive this runner.',
+                    'default':   1,
+                },
             },
             additionalProperties: false,
         },

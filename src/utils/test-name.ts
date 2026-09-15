@@ -13,7 +13,7 @@
  * Input:  /path/to/project/.stryker-tmp/sandbox-ABC123/tests/unit/foo.test.ts
  * Output: tests/unit/foo.test.ts
  */
-export function normalizeTestFilePath(url: string | undefined): string | undefined {
+export function normalizeTestFilePath(url: string | undefined, cwd: string = process.cwd()): string | undefined {
     if(!url) {
         return undefined;
     }
@@ -25,7 +25,17 @@ export function normalizeTestFilePath(url: string | undefined): string | undefin
         return sandboxMatch[1];
     }
 
-    // If no sandbox pattern, return as-is (might already be relative or a different format)
+    // No sandbox segment: this is an `inPlace: true` run. Return the path relative
+    // to cwd (the project root, the way monorepo task runners invoke builds), which is what
+    // Stryker matches its input files against — and, critically, the same string
+    // the coverage preload's extractFilePrefix produces, since the two are
+    // compared for equality when pairing coverage keys with inspector tests.
+    // Stryker disable next-line ConditionalExpression,BlockStatement,StringLiteral: inPlace path; covered by 'makes an absolute in-cwd path relative' and the sibling-directory case
+    if(url.startsWith(`${cwd}/`)) {
+        return url.slice(cwd.length + 1);
+    }
+
+    // Outside cwd (helper files, node_modules) — return as-is rather than invent a path.
     return url;
 }
 
