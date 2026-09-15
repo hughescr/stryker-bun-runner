@@ -384,6 +384,16 @@ describe('resolveEagerModulesFromGlobs', () => {
         expect(result).toEqual([path.resolve(absA)]);
     });
 
+    it('never eager-imports test modules matched beside source modules', async () => {
+        const source = await mkfile('src/calculator.ts');
+        await mkfile('src/calculator.test.ts');
+        await mkfile('src/calculator.spec.ts');
+
+        const result = await resolveEagerModulesFromGlobs(['src/**/*.ts'], fixtureDir);
+
+        expect(result).toEqual([path.resolve(source)]);
+    });
+
     it('should filter out .json files', async () => {
         const absA = await mkfile('src/a.ts');
         await mkfile('src/config.json');

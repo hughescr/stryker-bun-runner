@@ -16,6 +16,7 @@ import { mockSpawn, resetChildProcessMocks, mockKillProcessGroup, resetProcessGr
 interface MockChildProcess extends Partial<ChildProcess> {
     stdoutHandler?: (data: Buffer) => void
     stderrHandler?: (data: Buffer) => void
+    exitHandler?:   (code: number | null) => void
     closeHandler?:  (code: number | null) => void
     errorHandler?:  (error: Error) => void
 }
@@ -57,10 +58,22 @@ describe('runBunTests', () => {
             } as any,
             on: mock((event: string, handler: (...args: any[]) => void) => {
                 // Store handlers for later invocation
-                if(event === 'close') {
-                    mockChildProcess.closeHandler = handler;
-                } else if(event === 'error') {
-                    mockChildProcess.errorHandler = handler;
+                switch(event) {
+                    case 'close':
+                    {
+                        mockChildProcess.closeHandler = handler;
+                        break;
+                    }
+                    case 'exit':
+                    {
+                        mockChildProcess.exitHandler = handler;
+                        break;
+                    }
+                    case 'error':
+                    {
+                        mockChildProcess.errorHandler = handler;
+                        break;
+                    }
                 }
                 return mockChildProcess as ChildProcess;
             }) as any,
@@ -272,6 +285,26 @@ describe('runBunTests', () => {
 
                 const result = await resultPromise;
                 expect(result.timedOut).toBe(true);
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('reaps the process group when its leader exits during the grace period', async () => {
+            jest.useFakeTimers();
+            try {
+                mockKillProcessGroup.mockImplementation(() => true);
+                const resultPromise = runBunTests({ bunPath: 'bun', timeout: 100 });
+
+                jest.advanceTimersByTime(100);
+                mockChildProcess.exitHandler?.(null);
+                mockChildProcess.closeHandler?.(null);
+
+                expect(mockKillProcessGroup).toHaveBeenNthCalledWith(1, 12_345, 'SIGTERM');
+                expect(mockKillProcessGroup).toHaveBeenNthCalledWith(2, 12_345, 'SIGKILL');
+                jest.advanceTimersByTime(600);
+                expect(mockKillProcessGroup).toHaveBeenCalledTimes(2);
+                await resultPromise;
             } finally {
                 jest.useRealTimers();
             }
@@ -1345,12 +1378,32 @@ describe('runBunTests', () => {
 
                 const result = await resultPromise;
 
+                mockKillProcessGroup.mockClear();
+                (mockChildProcess.kill as ReturnType<typeof mock>).mockClear();
+                controller.abort();
+
                 // Normal exit — no abort involvement
                 expect(result.exitCode).toBe(0);
                 expect(result.timedOut).toBe(false);
+                expect(mockKillProcessGroup).not.toHaveBeenCalled();
+                expect(mockChildProcess.kill).not.toHaveBeenCalled();
             } finally {
                 jest.useRealTimers();
             }
+        });
+
+        it('removes the abort listener when the child reports an error', async () => {
+            const controller = new AbortController();
+            const resultPromise = runBunTests({ bunPath: 'bun', timeout: 10_000, signal: controller.signal });
+            mockChildProcess.errorHandler?.(new Error('spawn failed'));
+            await resultPromise;
+
+            mockKillProcessGroup.mockClear();
+            (mockChildProcess.kill as ReturnType<typeof mock>).mockClear();
+            controller.abort();
+
+            expect(mockKillProcessGroup).not.toHaveBeenCalled();
+            expect(mockChildProcess.kill).not.toHaveBeenCalled();
         });
 
         it('escalates to SIGKILL when the process ignores SIGTERM after abort', async () => {
@@ -1515,6 +1568,42 @@ describe('runBunTests', () => {
 
                 mockChildProcess.closeHandler?.(null);
                 await resultPromise;
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('does not relabel a timeout when an earlier RSS probe resolves high afterward', async () => {
+            jest.useFakeTimers();
+            try {
+                let resolveRss!: (rss: number | null) => void;
+                getRssSpy.mockImplementation(() => new Promise((resolve) => {
+                    resolveRss = resolve;
+                }));
+                const onMemoryLimitExceeded = mock();
+                const resultPromise = runBunTests({
+                    bunPath:            'bun',
+                    timeout:            200,
+                    maxChildRss:        100,
+                    rssCheckIntervalMs: 100,
+                    onMemoryLimitExceeded,
+                });
+
+                jest.advanceTimersByTime(100);
+                expect(getRssSpy).toHaveBeenCalledTimes(1);
+                jest.advanceTimersByTime(100);
+                resolveRss(200);
+                await Promise.resolve();
+                await Promise.resolve();
+
+                expect(mockChildProcess.kill).toHaveBeenCalledTimes(1);
+                expect(mockChildProcess.kill).toHaveBeenCalledWith('SIGTERM');
+                expect(onMemoryLimitExceeded).not.toHaveBeenCalled();
+
+                mockChildProcess.closeHandler?.(null);
+                const result = await resultPromise;
+                expect(result.timedOut).toBe(true);
+                expect(result.memoryLimitExceeded).toBe(false);
             } finally {
                 jest.useRealTimers();
             }
@@ -2073,6 +2162,14 @@ describe('runBunTests', () => {
                 expect(mockSpawn).toHaveBeenCalled();
                 expect(result.exitCode).toBe(0);
             });
+        });
+
+        it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])('refuses invalid maxSpawnDepth %s before spawning', async (maxSpawnDepth) => {
+            const result = await runBunTests({ bunPath: 'bun', timeout: 5000, maxSpawnDepth });
+
+            expect(mockSpawn).not.toHaveBeenCalled();
+            expect(result.exitCode).toBe(1);
+            expect(result.stderr).toContain('expected a positive integer');
         });
 
         it('refuses without building argv or cloning the environment', async () => {
