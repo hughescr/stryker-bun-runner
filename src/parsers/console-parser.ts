@@ -309,11 +309,16 @@ function parseSummaryLines(output: string): SummaryCounts {
  * emits ' \x1B[0m\x1B[31m1 error\x1B[0m', putting the colour code between the
  * leading space and the digit (unlike its ' N pass' / ' N fail' lines, whose
  * colour code precedes the space).
+ *
+ * The LAST matching line wins: bun prints its summary after everything else, so
+ * a test that logs a whole line like `0 errors` earlier in the output must not
+ * mask (or fake) the real count.
  */
 function parseSummaryErrors(output: string): number {
     // Stryker disable next-line Regex: anchors and the optional plural are pinned by the summaryErrors parser tests (whole-line match, plural, prose rejection)
-    const match = /^[\t ]*(\d+)[\t ]+errors?[\t ]*$/m.exec(stripAnsi(output));
-    return match ? Number.parseInt(match[1], 10) : 0;
+    const matches = [...stripAnsi(output).matchAll(/^[\t ]*(\d+)[\t ]+errors?[\t ]*$/gm)];
+    const last = matches.at(-1);
+    return last ? Number.parseInt(last[1], 10) : 0;
 }
 
 /**

@@ -3582,6 +3582,35 @@ tests/example.test.ts:
             expect(result.summaryErrors).toBe(12);
         });
 
+        it('takes the LAST matching line: bun prints its summary last, so a test\'s own "0 errors" line before it cannot mask the real count', () => {
+            // A test that logs a whole line "0 errors" (e.g. a linter-style report) reaches
+            // the output before bun's summary; the first match would report 0 here.
+            const stdout = 'bun test v1.4.2 (744846f84)\n0 errors\n';
+            const stderr = [
+                'tests/mod.test.ts:',
+                '(pass) a [0.1ms]',
+                '  0 errors',
+                '',
+                '# Unhandled error between tests',
+                '',
+                ' 1 pass',
+                ' 1 fail',
+                ' 1 error',
+                ' 2 expect() calls',
+                'Ran 2 tests across 1 file. [5.00ms]',
+            ].join('\n');
+
+            expect(parseBunTestOutput(stdout, stderr).summaryErrors).toBe(1);
+        });
+
+        it('takes the last match when several whole lines look like the summary', () => {
+            expect(parseBunTestOutput('', '3 errors\n 7 errors\n 2 errors\n').summaryErrors).toBe(2);
+        });
+
+        it('takes the last match across stdout and stderr, which are joined stdout first', () => {
+            expect(parseBunTestOutput('9 errors\n', ' 4 errors\n').summaryErrors).toBe(4);
+        });
+
         it('does not mistake an error message that merely mentions errors for the summary line', () => {
             // Only a whole summary-shaped line counts; prose inside a failure message must not.
             const stderr = '(fail) validates [1ms]\nerror: expected 2 errors but got 3 errors\n\n 0 pass\n 1 fail\n';
