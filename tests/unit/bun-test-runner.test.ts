@@ -4883,6 +4883,185 @@ tests/example.test.ts:
             });
         });
 
+        describe('testFilter holding test FILE paths (Stryker\'s own testFiles option)', () => {
+            // Verified against @stryker-mutator/core 10.0.0 (mutant-test-planner.js): with the
+            // `testFiles` option set, a static / no-coverage mutant's testFilter is
+            // project.testFiles mapped through sandbox.sandboxFileFor — ABSOLUTE paths of the
+            // test files inside the sandbox — instead of undefined. Those are not test ids.
+            let sandboxDir: string;
+            let alphaFile: string;
+            let betaFile: string;
+
+            beforeEach(async () => {
+                // Real files: the runner stats them. Bun.write because fsPromises.writeFile is mocked to a no-op here.
+                sandboxDir = await fsPromises.mkdtemp(path.join(tmpdir(), 'stryker-testfiles-'));
+                alphaFile = path.join(sandboxDir, 'tests', 'alpha.test.ts');
+                betaFile = path.join(sandboxDir, 'tests', 'beta.test.ts');
+                await Bun.write(alphaFile, '');
+                await Bun.write(betaFile, '');
+                mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+            });
+
+            afterEach(async () => {
+                await fsPromises.rm(sandboxDir, { recursive: true, force: true });
+            });
+
+            const passingRun = { exitCode: 0, stdout: ' 1 pass\n', stderr: '', timedOut: false };
+            const killedByDeadline = { exitCode: null, signal: 'SIGTERM', stdout: '', stderr: '', timedOut: true };
+
+            async function runWithFilter(
+                testFilter: string[],
+                timeout: number | undefined = 10_000
+            ): Promise<Awaited<ReturnType<BunTestRunner['mutantRun']>>> {
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                return runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '800' } as any,
+                    testFilter,
+                    sandboxFileName: 'sandbox',
+                    timeout,
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+            }
+
+            it('runs exactly those files with no --test-name-pattern, not the discovered list', async () => {
+                mockRunBunTests.mockResolvedValue(passingRun);
+
+                const result = await runWithFilter([betaFile, alphaFile]);
+
+                expect(result.status).toBe(MutantRunStatus.Survived);
+                expect(mockRunBunTests).toHaveBeenCalledTimes(1);
+                const spawn = mockRunBunTests.mock.calls[0][0];
+                expect(spawn.testNamePattern).toBeUndefined();
+                expect(spawn.testFiles).toEqual([alphaFile, betaFile]);
+            });
+
+            it('de-duplicates repeated files and passes them sorted', async () => {
+                mockRunBunTests.mockResolvedValue(passingRun);
+
+                await runWithFilter([betaFile, alphaFile, betaFile]);
+
+                expect(mockRunBunTests.mock.calls[0][0].testFiles).toEqual([alphaFile, betaFile]);
+            });
+
+            it('resolves a relative entry against the working directory', async () => {
+                mockRunBunTests.mockResolvedValue(passingRun);
+                const cwdSpy = spyOn(process, 'cwd').mockReturnValue(sandboxDir);
+                try {
+                    await runWithFilter(['tests/alpha.test.ts']);
+                } finally {
+                    cwdSpy.mockRestore();
+                }
+
+                expect(mockRunBunTests.mock.calls[0][0].testFiles).toEqual(['tests/alpha.test.ts']);
+                expect(mockRunBunTests.mock.calls[0][0].testNamePattern).toBeUndefined();
+            });
+
+            it('scores a kill by the deadline as Timeout (Stryker sized the budget for these tests), never inconclusive Error, and does not retry', async () => {
+                // A (wrongly) pattern-based first run would match nothing and retry the full suite,
+                // which is the run that then hits the deadline; the file-scoped run is killed directly.
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => Promise.resolve(
+                    options.testNamePattern === undefined
+                        ? killedByDeadline
+                        : { exitCode: 1, stdout: '', stderr: 'error: regex "x" matched 0 tests. Searched 2 files', timedOut: false }
+                ));
+
+                const result = await runWithFilter([alphaFile]);
+
+                expect(result.status).toBe(MutantRunStatus.Timeout);
+                expect(mockRunBunTests).toHaveBeenCalledTimes(1);
+                expect(mockLogger.warn).not.toHaveBeenCalledWith(expect.stringContaining('inconclusive'), expect.anything(), expect.anything());
+            });
+
+            it('does not warn about registry misses or pattern gaps for the file paths', async () => {
+                mockRunBunTests.mockResolvedValue(passingRun);
+
+                await runWithFilter([alphaFile]);
+
+                const warnings = (mockLogger.warn as ReturnType<typeof mock>).mock.calls.map(call => String(call[0]));
+                expect(warnings.filter(w => w.includes('testFilter ids missing') || w.includes('lossy') || w.includes('matched 0 tests'))).toEqual([]);
+            });
+
+            it('resolves killedBy through the shared dry-run registry', async () => {
+                const readFileSpy = spyOn(fsPromises, 'readFile').mockResolvedValue(JSON.stringify({
+                    version:         2,
+                    writtenAt:       Date.now(),
+                    cachedTestNames: ['tests/alpha.test.ts > Suite > kills it'],
+                    baseNameIndex:   [['tests/alpha.test.ts > Suite > kills it', ['tests/alpha.test.ts > Suite > kills it']]],
+                    testNameIndex:   [['tests/alpha.test.ts > Suite > kills it', 'Suite kills it']],
+                }));
+                try {
+                    mockRunBunTests.mockResolvedValue({
+                        exitCode: 1,
+                        stdout:   'tests/alpha.test.ts:\n✗ Suite > kills it [1ms]\n  error: boom\n\n 0 pass\n 1 fail\n',
+                        stderr:   '',
+                        timedOut: false,
+                    });
+
+                    const result = await runWithFilter([alphaFile]);
+
+                    expect(result.status).toBe(MutantRunStatus.Killed);
+                    if(result.status === MutantRunStatus.Killed) {
+                        expect(result.killedBy).toEqual(['tests/alpha.test.ts > Suite > kills it']);
+                    }
+                } finally {
+                    readFileSpy.mockRestore();
+                }
+            });
+
+            it('still uses the pattern path when an entry that looks like a file is also a known test id', async () => {
+                // An id is never mistaken for a file: the registry wins over the path check.
+                const readFileSpy = spyOn(fsPromises, 'readFile').mockResolvedValue(JSON.stringify({
+                    version:         2,
+                    writtenAt:       Date.now(),
+                    cachedTestNames: [alphaFile],
+                    baseNameIndex:   [[alphaFile, [alphaFile]]],
+                    testNameIndex:   [[alphaFile, 'weird title']],
+                }));
+                try {
+                    mockRunBunTests.mockResolvedValue(passingRun);
+
+                    await runWithFilter([alphaFile]);
+
+                    expect(mockRunBunTests.mock.calls[0][0].testNamePattern).toBe('^(?:weird title)$');
+                } finally {
+                    readFileSpy.mockRestore();
+                }
+            });
+
+            it.each([
+                ['an ordinary test id', (): string[] => ['tests/alpha.test.ts > handles alpha']],
+                ['a test-file-shaped path that does not exist', (): string[] => ['/nonexistent/sandbox/tests/gone.test.ts']],
+                ['a directory whose name looks like a test file', (): string[] => [path.join(sandboxDir, 'dir.test.ts')]],
+                ['a file that is not a test file', (): string[] => [path.join(sandboxDir, 'readme.md')]],
+                ['a mix of a real test file and a test id', (): string[] => [alphaFile, 'tests/alpha.test.ts > handles alpha']],
+            ])('keeps the id-based behaviour for %s', async (_name, makeFilter) => {
+                await fsPromises.mkdir(path.join(sandboxDir, 'dir.test.ts'));
+                await Bun.write(path.join(sandboxDir, 'readme.md'), '');
+                mockRunBunTests.mockResolvedValue(passingRun);
+
+                await runWithFilter(makeFilter());
+
+                // Not file-scoped: a pattern is built from the filter, over the discovered files.
+                const spawn = mockRunBunTests.mock.calls[0][0];
+                expect(spawn.testNamePattern).toBeDefined();
+                expect(spawn.testFiles).not.toEqual([alphaFile]);
+            });
+
+            it('keeps scoring a full-suite fallback kill as inconclusive Error when the filter was test ids', async () => {
+                // Regression guard for the distinction: ids that fall back to the full suite are
+                // NOT a file-scoped run, so the existing Error-not-Timeout rule is unchanged.
+                mockRunBunTests.mockResolvedValue(killedByDeadline);
+                const hugeFilter = Array.from({ length: 3000 }, (_, i) => `tests/alpha.test.ts > a test with a fairly long descriptive title number ${i}`);
+
+                const result = await runWithFilter(hugeFilter);
+
+                expect(result.status).toBe(MutantRunStatus.Error);
+            });
+        });
+
         describe('per-mutant timeout from Stryker (MutantRunOptions.timeout)', () => {
             // Stryker computes options.timeout per mutant as timeoutFactor × (dry-run net
             // time of exactly the tests it plans to run) + timeoutMS + overhead, and its

@@ -39,7 +39,7 @@ import type { TestInfo } from './inspector/types.js';
 import type { StrykerBunOptions } from './options.js';
 import { parseBunTestOutput, type ParsedTestResults } from './parsers/console-parser.js';
 import { runBunTests, stripAnsi } from './process-runner.js';
-import { assertSupportedBunArgs, splitBunConfigArg, checkBunVersion, getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, discoverTestFiles, findBuildOutputTestFiles, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery } from './utils/index.js';
+import { assertSupportedBunArgs, splitBunConfigArg, checkBunVersion, getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, TEST_FILE_SUFFIX_RE, discoverTestFiles, findBuildOutputTestFiles, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery } from './utils/index.js';
 
 /**
  * Sleep for the given number of milliseconds.
@@ -421,12 +421,18 @@ interface MutantRunContext {
     bunfigPath:        string
     localRegistry:     Set<string>
     localBaseIndex:    Map<string, string[]>
-    /** Number of covering test ids Stryker asked for (0 for a static mutant / full-suite plan). */
+    /** Number of covering test ids Stryker asked for (0 for a static mutant / full-suite plan, and for a file-scoped run). */
     coveringTestCount: number
     /** Absolute Date.now() by which every spawn of this mutant run must have been killed. */
     deadline:          number
     /** Stryker's options.timeout when it set the deadline; undefined when bun.timeout did. */
     strykerTimeoutMs?: number
+    /**
+     * Set when Stryker's testFilter was a list of test FILES (its own `testFiles`
+     * option) rather than test ids: exactly these files run, with no
+     * --test-name-pattern. See {@link BunTestRunner.resolveTestFileFilter}.
+     */
+    testFileScope?:    string[]
 }
 
 /**
@@ -1834,7 +1840,7 @@ export class BunTestRunner implements TestRunner {
         this.logger.debug('Running mutant run for mutant %s', options.activeMutant.id);
 
         // Stryker disable next-line ArrayDeclaration: equivalent mutant — options.testFilter is always a non-null array in all tests; ?? fallback never fires, so ['Stryker was here'] = [] in practice
-        const filterIds = options.testFilter ?? [];
+        const requestedFilter = options.testFilter ?? [];
 
         // Lazy-load the shared dryRun registry when this worker's instance registry is
         // not yet populated (i.e. this worker never ran dryRun).  We load it
@@ -1848,6 +1854,16 @@ export class BunTestRunner implements TestRunner {
         if(!this.cachedTestNames) {
             await this.loadRegistryFile();
         }
+
+        // Stryker's own `testFiles` option fills testFilter with test FILE paths, not
+        // ids. Such a run is scoped by file (no --test-name-pattern) and its filter
+        // carries no ids, so everything below that works from ids sees an empty filter.
+        const testFileScope = await this.resolveTestFileFilter(requestedFilter);
+        if(testFileScope !== undefined) {
+            // Stryker disable next-line StringLiteral: logging message only
+            this.logger.debug('Mutant %s: testFilter holds %d test file path(s) (Stryker\'s testFiles option); running those files without a --test-name-pattern', options.activeMutant.id, testFileScope.length);
+        }
+        const filterIds = testFileScope === undefined ? requestedFilter : [];
 
         // Lossy-visibility warns — see warnLossyPatternAlternatives.
         this.warnLossyPatternAlternatives(filterIds, options.activeMutant.id);
@@ -1904,7 +1920,50 @@ export class BunTestRunner implements TestRunner {
             coveringTestCount: filterIds.length,
             deadline:          startedAt + limitMs,
             strykerTimeoutMs,
+            testFileScope,
         }, testNamePattern, this.resolveCoveringTestFiles(filterIds));
+    }
+
+    /**
+   * Recognise a testFilter that is a list of test FILES rather than test ids.
+   *
+   * Stryker core's own `testFiles` option (9.6+, also 10) makes the mutant
+   * planner give static and no-coverage mutants `testFilter =
+   * project.testFiles.map(sandbox.sandboxFileFor)` — absolute paths of test files
+   * inside the sandbox (mutant-test-planner.js, verified on 10.0.0) — instead of
+   * undefined. Treated as ids they build a --test-name-pattern that matches
+   * nothing, forcing a full-suite retry whose deadline kill is then (wrongly)
+   * scored as an inconclusive Error. They are the opposite of covering tests:
+   * Stryker sized the timeout for exactly these files, so they run as given.
+   *
+   * Every entry must pass all of: not a known test id (the dry-run registry
+   * wins), ends in a test-file suffix, and names an existing regular file
+   * (resolved against the cwd when relative). One failing entry — or an empty
+   * filter — means this is an ordinary id filter and the answer is undefined.
+   * The checks are ordered so a normal id filter costs no I/O.
+   *
+   * @returns The distinct files, sorted, as Stryker gave them; undefined when
+   *          the filter is not a file list
+   */
+    private async resolveTestFileFilter(filter: readonly string[]): Promise<string[] | undefined> {
+        if(filter.length === 0) {
+            return undefined;
+        }
+        const entries = [...new Set(filter)];
+        const looksLikeFile = (entry: string): boolean => !this.cachedTestNames?.has(entry) && TEST_FILE_SUFFIX_RE.test(entry);
+        if(!entries.every(entry => looksLikeFile(entry))) {
+            return undefined;
+        }
+        const cwd = process.cwd();
+        const exist = await Promise.all(entries.map(async (entry) => {
+            try {
+                const stat = await fsPromises.stat(path.resolve(cwd, entry));
+                return stat.isFile();
+            } catch{
+                return false;
+            }
+        }));
+        return exist.every(Boolean) ? entries.toSorted((a, b) => a.localeCompare(b)) : undefined;
     }
 
     /**
@@ -1945,7 +2004,8 @@ export class BunTestRunner implements TestRunner {
                 // Narrowed to the covering tests' own files when the run is
                 // targeted; the full list whenever it is not, or whenever the
                 // narrowing cannot be proven safe (see resolveCoveringTestFiles).
-                testFiles:             testNamePattern === undefined ? this.cachedTestFiles : (coveringTestFiles ?? this.cachedTestFiles),
+                // A file-scoped run (Stryker's testFiles option) runs exactly its files, whatever was discovered.
+                testFiles:             ctx.testFileScope ?? (testNamePattern === undefined ? this.cachedTestFiles : (coveringTestFiles ?? this.cachedTestFiles)),
                 signal:                abortController.signal,
                 smol:                  this.smol,
                 maxChildRss:           this.maxChildRss,

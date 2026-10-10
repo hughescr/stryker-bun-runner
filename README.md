@@ -90,6 +90,8 @@ The runner therefore kills a mutant run's `bun test` child slightly earlier, at 
 
 One case cannot be scored reliably. When the runner falls back to the full suite for a mutant that has covering tests (the pattern is too long, or matched zero tests), Stryker's timeout was sized for those covering tests, not the full suite. A full suite that is merely slower than that budget looks the same as a mutant that hangs, and the runner cannot extend Stryker's timer. Such a run is scored **Error**, not Timeout, so it does not inflate the score. It is logged at warn as `inconclusive timeout`. If you see it often, raise Stryker's `timeoutMS` or `timeoutFactor`.
 
+Stryker's own `testFiles` option (Stryker 9.6+) is handled separately. With it set, Stryker gives static and no-coverage mutants a list of test **file paths** (inside the sandbox) instead of test ids, and sizes their timeout for those files. The runner recognises that shape (every entry is not a known test id and is an existing test file), runs exactly those files without a `--test-name-pattern`, and scores a run killed at the deadline as a normal **Timeout**, since the budget was sized for it. Note this is Stryker's `testFiles`, not the runner's `bun.testFiles`.
+
 ## Options
 
 | Option | Type | Default | Description |
