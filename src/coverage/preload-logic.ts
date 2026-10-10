@@ -17,6 +17,19 @@ import type { CoverageFileData, LateHitEntry } from './types.js';
 export type { LateHitEntry } from './types.js';
 
 /**
+ * The node:fs functions the preload calls, captured when this module loads,
+ * which is before any test file runs.
+ *
+ * The preload runs inside the suite's own process, and test suites spy on
+ * node:fs (`spyOn(fs, 'appendFileSync')`). Called through the live ESM import
+ * binding, a spy a test leaves installed would swallow the coverage write in
+ * the preload's final afterAll, with no error — the dry run would then find no
+ * coverage file. Calls go through this object instead; this module's own
+ * tests spy on it, not on node:fs.
+ */
+export const preloadFs = { appendFileSync, closeSync, openSync, writeSync };
+
+/**
  * The `__stryker__` global shared with Stryker-instrumented code. Field names
  * are the instrumenter's (INSTRUMENTER_CONSTANTS in @stryker-mutator/api/core).
  */
@@ -130,7 +143,7 @@ export function installHitLimit(
     hitLimit: number,
     report: (line: string) => void = (line) => {
         // eslint-disable-next-line n/no-sync -- must reach stderr before bun's bail exit, which runs no async work
-        writeSync(2, line);
+        preloadFs.writeSync(2, line);
     }
 ): void {
     let hitCount = 0;
@@ -238,11 +251,11 @@ const COVERAGE_APPEND_FLAGS = constants.O_WRONLY | constants.O_APPEND | constant
 /* eslint-disable n/no-sync -- sync required in afterAll hook to ensure write completes before process exit */
 export function writeCoverageToFile(coverageFile: string, data: CoverageFileData): void {
     // mode applies only when the open creates the file: owner-only, like everything else in the runner's private temp dir.
-    const fd = openSync(coverageFile, COVERAGE_APPEND_FLAGS, 0o600);
+    const fd = preloadFs.openSync(coverageFile, COVERAGE_APPEND_FLAGS, 0o600);
     try {
-        appendFileSync(fd, `${JSON.stringify(data)}\n`, 'utf8');
+        preloadFs.appendFileSync(fd, `${JSON.stringify(data)}\n`, 'utf8');
     } finally {
-        closeSync(fd);
+        preloadFs.closeSync(fd);
     }
 }
 /* eslint-enable n/no-sync -- end of writeCoverageToFile */

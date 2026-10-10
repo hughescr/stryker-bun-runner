@@ -16,6 +16,7 @@ import {
     installHitLimit,
     formatHitLimitSentinel,
     HIT_LIMIT_SENTINEL,
+    preloadFs,
     type PreloadConfig,
     type StrykerNamespace
 } from '../../src/coverage/preload-logic';
@@ -581,9 +582,9 @@ describe('preload-logic', () => {
         let closeSyncSpy: ReturnType<typeof spyOn>;
 
         beforeEach(() => {
-            openSyncSpy = spyOn(fs, 'openSync').mockImplementation(() => FAKE_FD);
-            appendFileSyncSpy = spyOn(fs, 'appendFileSync').mockImplementation(() => {});
-            closeSyncSpy = spyOn(fs, 'closeSync').mockImplementation(() => {});
+            openSyncSpy = spyOn(preloadFs, 'openSync').mockImplementation(() => FAKE_FD);
+            appendFileSyncSpy = spyOn(preloadFs, 'appendFileSync').mockImplementation(() => {});
+            closeSyncSpy = spyOn(preloadFs, 'closeSync').mockImplementation(() => {});
         });
 
         afterEach(() => {
@@ -704,6 +705,29 @@ describe('preload-logic', () => {
                 expect(() => writeCoverageToFile(file, { perTest: {}, 'static': {} })).toThrow('ELOOP');
                 expect(await fs.promises.readFile(victim, 'utf8')).toBe('untouched');
             });
+
+            it('still writes the real file while a test has node:fs spied on (or left a spy installed)', async () => {
+                // The preload runs inside the suite's own process and writes coverage in its
+                // final afterAll, after every test file. A spy on node:fs that a test leaves
+                // installed would otherwise swallow that write through the live ESM binding, and
+                // the dry run would find no coverage file (seen with an unrestored
+                // spyOn(fs, 'appendFileSync') in this very file).
+                const spies = [
+                    spyOn(fs, 'openSync').mockImplementation(() => FAKE_FD),
+                    spyOn(fs, 'appendFileSync').mockImplementation(() => {}),
+                    spyOn(fs, 'closeSync').mockImplementation(() => {}),
+                ];
+                const file = path.join(dir, 'coverage.json');
+                try {
+                    writeCoverageToFile(file, { perTest: { a: { '1': 1 } }, 'static': {} });
+                } finally {
+                    for(const spy of spies) {
+                        spy.mockRestore();
+                    }
+                }
+
+                expect(await fs.promises.readFile(file, 'utf8')).toBe('{"perTest":{"a":{"1":1}},"static":{}}\n');
+            });
         });
     });
 
@@ -791,7 +815,7 @@ describe('preload-logic', () => {
         });
 
         it('writes the sentinel straight to fd 2 by default (no buffered console that bun\'s bail exit could drop)', () => {
-            const writeSyncSpy = spyOn(fs, 'writeSync').mockImplementation(() => 0);
+            const writeSyncSpy = spyOn(preloadFs, 'writeSync').mockImplementation(() => 0);
             try {
                 const ns: StrykerNamespace = { activeMutant: '7' };
                 installHitLimit(ns, 1);
