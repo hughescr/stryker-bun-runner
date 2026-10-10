@@ -3501,6 +3501,93 @@ tests/example.test.ts:
             expect(result.summaryPassed).toBe(0);
             expect(result.summaryFailed).toBe(0);
             expect(result.summarySkipped).toBe(0);
+            expect(result.summaryErrors).toBe(0);
+        });
+    });
+
+    // Fixtures captured from real `bun test` runs (bun 1.4.2, stdout/stderr piped, CLAUDECODE
+    // unset) — only the absolute fixture path is replaced with /project. A file that fails to
+    // load prints an "Unhandled error between tests" block and NO (fail) line; the only
+    // machine-readable trace of it is the ' N error' summary line (plus ' N fail' when the
+    // failure happened at import time).
+    describe('summaryErrors (bun\'s " N error" summary line)', () => {
+        it('counts the error line for a source module that throws at import', () => {
+            const stderr = [
+                '',
+                'tests/mod.test.ts:',
+                '',
+                '# Unhandled error between tests',
+                '-------------------------------',
+                '1 | const cfg: any = undefined;',
+                '                     ^',
+                'TypeError: undefined is not an object (evaluating \'(void 0).thing\')',
+                '      at /project/src/mod.ts:1:18',
+                '-------------------------------',
+                '',
+                '',
+                'tests/other.test.ts:',
+                '(pass) other ok [0.04ms]',
+                '',
+                ' 1 pass',
+                ' 1 fail',
+                ' 1 error',
+                ' 1 expect() calls',
+                'Ran 2 tests across 2 files. [6.00ms]',
+                '',
+            ].join('\n');
+            const result = parseBunTestOutput('bun test v1.4.2 (744846f84)\n', stderr);
+
+            expect(result.summaryErrors).toBe(1);
+            expect(result.summaryFailed).toBe(1);
+            expect(result.tests.filter(t => t.status === 'failed')).toEqual([]);
+        });
+
+        it('counts the error line when a describe body throws (0 fail, 1 error — no failure count at all)', () => {
+            const stderr = [
+                '',
+                'tests/describe-throws.test.ts:',
+                '',
+                '# Unhandled error between tests',
+                '-------------------------------',
+                '5 |     throw new ReferenceError(\'describe body threw for real\');',
+                '                                                               ^',
+                'ReferenceError: describe body threw for real',
+                '      at <anonymous> (/project/tests/describe-throws.test.ts:5:60)',
+                '-------------------------------',
+                '',
+                '',
+                ' 3 pass',
+                ' 0 fail',
+                ' 1 error',
+                ' 3 expect() calls',
+                'Ran 3 tests across 3 files. [11.00ms]',
+                '',
+            ].join('\n');
+            const result = parseBunTestOutput('bun test v1.4.2 (744846f84)\n', stderr);
+
+            expect(result.summaryErrors).toBe(1);
+            expect(result.failed).toBe(0);
+        });
+
+        it('reads the error count through bun\'s ANSI colouring (FORCE_COLOR), where the colour code sits between the space and the digit', () => {
+            // Byte-exact tail of a FORCE_COLOR=1 run: ' \x1B[0m\x1B[31m1 error\x1B[0m'.
+            const stderr = '\u001B[0m\u001B[32m 3 pass\u001B[0m\n\u001B[0m\u001B[2m 0 fail\u001B[0m\n \u001B[0m\u001B[31m1 error\u001B[0m\n 3 expect() calls\n';
+            const result = parseBunTestOutput('', stderr);
+
+            expect(result.summaryErrors).toBe(1);
+        });
+
+        it('accepts the plural form and multi-digit counts', () => {
+            const result = parseBunTestOutput('', ' 0 pass\n 12 errors\n');
+            expect(result.summaryErrors).toBe(12);
+        });
+
+        it('does not mistake an error message that merely mentions errors for the summary line', () => {
+            // Only a whole summary-shaped line counts; prose inside a failure message must not.
+            const stderr = '(fail) validates [1ms]\nerror: expected 2 errors but got 3 errors\n\n 0 pass\n 1 fail\n';
+            const result = parseBunTestOutput('', stderr);
+
+            expect(result.summaryErrors).toBe(0);
         });
     });
 

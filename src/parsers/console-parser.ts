@@ -3,6 +3,7 @@
  * Parses Bun's console output to extract test results
  */
 
+import { stripAnsi } from '../process-runner.js';
 import { TEST_FILE_EXT_PATTERN } from '../utils/test-name-pattern.js';
 
 export interface TestResult {
@@ -45,6 +46,15 @@ export interface ParsedTestResults {
     summaryPassed:  number
     summaryFailed:  number
     summarySkipped: number
+    /**
+   * Bun's ' N error' / ' N errors' summary line: errors raised OUTSIDE any
+   * single test — a test file whose import graph throws or fails to parse, a
+   * describe body that throws, an unhandled rejection between tests. Bun
+   * prints these as an "# Unhandled error between tests" block with no
+   * `(fail)` line, so this count is the only machine-readable trace of them
+   * (a describe body that throws even reports ' 0 fail'). 0 when absent.
+   */
+    summaryErrors:  number
 }
 
 /**
@@ -291,6 +301,22 @@ function parseSummaryLines(output: string): SummaryCounts {
 }
 
 /**
+ * Read bun's ' N error(s)' summary line — see {@link ParsedTestResults.summaryErrors}.
+ *
+ * Matched only as a WHOLE line (optional indentation, the count, the word,
+ * nothing else) so failure-message prose such as "expected 2 errors" can never
+ * be mistaken for it. ANSI codes are stripped first: under FORCE_COLOR bun
+ * emits ' \x1B[0m\x1B[31m1 error\x1B[0m', putting the colour code between the
+ * leading space and the digit (unlike its ' N pass' / ' N fail' lines, whose
+ * colour code precedes the space).
+ */
+function parseSummaryErrors(output: string): number {
+    // Stryker disable next-line Regex: anchors and the optional plural are pinned by the summaryErrors parser tests (whole-line match, plural, prose rejection)
+    const match = /^[\t ]*(\d+)[\t ]+errors?[\t ]*$/m.exec(stripAnsi(output));
+    return match ? Number.parseInt(match[1], 10) : 0;
+}
+
+/**
  * Parse Bun test console output
  *
  * Example Bun output:
@@ -382,6 +408,7 @@ export function parseBunTestOutput(stdout: string, stderr: string): ParsedTestRe
         skipped:        counters.skipped,
         summaryPassed:  summaryCounts.genuinePassed,
         summaryFailed:  summaryCounts.genuineFailed,
-        summarySkipped: summaryCounts.skipped
+        summarySkipped: summaryCounts.skipped,
+        summaryErrors:  parseSummaryErrors(output)
     };
 }

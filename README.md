@@ -74,7 +74,9 @@ The plugin uses Bun's Inspector Protocol (WebSocket) to:
 4. **Build hierarchy** - Reconstructs test names from describe blocks for accurate reporting
 5. **Targeted mutant runs** - Runs only the tests that covered each mutant (via `--test-name-pattern`); bails after the first failure unless Stryker's `disableBail` option is set (dry runs never bail, since the full suite must run for coverage). Any bail flag in `bun.bunArgs` is ignored — bail is decided solely by the runner.
 
-**How crashes are scored.** A mutant run's `bun test` child can die from a signal (for example SIGSEGV, or SIGKILL from the operating system's out-of-memory killer) or fail to start at all (for example the `bun` executable is missing). Either outcome is scored **Killed** only when a failing test was reported and could be attributed to a known test. Otherwise the mutant is scored as an **Error** (Stryker shows it as a RuntimeError, which is excluded from the mutation score), and the message names the signal or the spawn error. The runner's own `bun.timeout` and `bun.maxChildRss` kills are unaffected and are still scored as Timeout. Earlier versions counted such crashes as Killed, so upgrading can lower your mutation score; the crashes were never real evidence that a test caught the mutant. Each Error is logged at warn (see [Diagnostic warnings worth grepping for in CI](#diagnostic-warnings-worth-grepping-for-in-ci)).
+**How crashes are scored.** A mutant run's `bun test` child can die from a signal (for example SIGSEGV, or SIGKILL from the operating system's out-of-memory killer) or fail to start at all (for example the `bun` executable is missing). Either outcome is scored **Killed** only when a failing test was reported and could be attributed to a known test. Otherwise the mutant is scored as an **Error** (Stryker shows it as a RuntimeError, which is excluded from the mutation score), and the message names the signal or the spawn error. The runner's own timeout and `bun.maxChildRss` kills are unaffected and are still scored as Timeout (see [Timeouts](#timeouts) for the one exception). Earlier versions counted such crashes as Killed, so upgrading can lower your mutation score; the crashes were never real evidence that a test caught the mutant. Each Error is logged at warn (see [Diagnostic warnings worth grepping for in CI](#diagnostic-warnings-worth-grepping-for-in-ci)).
+
+**Mutants that break module loading are Killed.** A mutant can make a test file fail to load: a source module throws at import (for example a mutated module-level constant or config object), a source file no longer parses, or a `describe` body throws. Bun then prints an `# Unhandled error between tests` block with no `(fail)` line, and reports the failure only in its summary (` 1 fail`, ` 1 error`, or `Bailed out after 1 failure`). The runner scores such a run **Killed** with an empty `killedBy`, because no single test failed. Stryker's jest and vitest runners score a test file that fails to load the same way. This is not a false kill: Stryker only mutates source files, and the dry run, which must pass, loaded every one of these files without error, so the load failure came from the mutant. A run that exits non-zero with no failing test and no fail or error count at all (for example bun cannot find a preload) is scored **Error**, because nothing in it shows a test detecting the mutant. Earlier versions scored load failures as Error, so upgrading can raise your mutation score. They also scored a non-zero exit with no recognizable output as Killed, which can lower it.
 
 Oversized covering-test patterns (over 100,000 UTF-8 bytes) fall back to running the full suite, to stay within OS argument-length limits. This approach provides reliable test-to-mutant correlation, even with multiple test files.
 
@@ -226,11 +228,11 @@ export default {
 
 ## Diagnostic warnings worth grepping for in CI
 
-The runner logs five warnings worth grepping for. The first three flag when a
+The runner logs these mutant-run warnings worth grepping for. The first three flag when a
 mutant run's `--test-name-pattern` couldn't be built or applied with full fidelity.
 None of them indicate a wrong mutation-testing verdict by themselves, but they mark
-where the runner fell back to less-precise behavior. The last two (listed after
-them) flag a mutant scored as an Error instead of Killed:
+where the runner fell back to less-precise behavior. The rest (listed after
+them) flag a mutant scored as an Error instead of Killed or Timeout:
 
 - **`--test-name-pattern matched 0 tests`** — the pattern for a mutant's covering
   tests matched nothing across the whole run (usually because a mutant changed a
@@ -256,8 +258,8 @@ don't — exits 0 with no error text at all. These two warns are the only signal
 that a partial silent drop was possible for a given mutant run, so seeing either
 of them in a clean run's logs is worth investigating before trusting the score.
 
-The remaining two warns mark mutants scored as an `Error` instead of `Killed` (see
-[How It Works](#how-it-works)); they share the form
+The remaining warns mark mutants scored as an `Error` (see
+[How It Works](#how-it-works)); the first three share the form
 `Mutant <id>: <reason> — scoring as Error rather than Killed`:
 
 - **`Mutant <id>: bun test terminated by <SIGNAL> ... — scoring as Error rather than Killed`**
@@ -267,9 +269,14 @@ The remaining two warns mark mutants scored as an `Error` instead of `Killed` (s
   the child's stdout and stderr.
 - **`Mutant <id>: could not start bun test: <error> — scoring as Error rather than Killed`**
   — the child failed to spawn (for example `spawn bun ENOENT`), so no tests ran.
+- **`Mutant <id>: bun test exited with code <N> but reported no failing test and no fail/error count — scoring as Error rather than Killed`**
+  — bun exited non-zero without any test summary, for example because a preload
+  could not be found or the bunfig could not be parsed. The warn includes the head
+  of bun's output.
 
 A handful of these can be a genuine crash worth fixing in your suite; a flood of
-the second kind means the `bun` executable or its environment is broken.
+the second or third kind means the `bun` executable, its environment, or its
+configuration is broken.
 
 ### Dry-run failure diagnostics (dry run only)
 

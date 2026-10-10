@@ -37,7 +37,7 @@ import { InspectorClient, type InspectorCloseInfo } from './inspector/index.js';
 import type { TestInfo } from './inspector/types.js';
 import type { StrykerBunOptions } from './options.js';
 import { parseBunTestOutput, type ParsedTestResults } from './parsers/console-parser.js';
-import { runBunTests } from './process-runner.js';
+import { runBunTests, stripAnsi } from './process-runner.js';
 import { checkBunVersion, getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, discoverTestFiles, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery } from './utils/index.js';
 
 /**
@@ -1755,7 +1755,7 @@ export class BunTestRunner implements TestRunner {
    */
     private buildMutantKilledResult(
         result:         { exitCode: number | null, signal?: NodeJS.Signals | null, stdout: string, stderr: string },
-        parsed:         { tests: { status: string, name: string, failureMessage?: string }[], totalTests: number },
+        parsed:         Pick<ParsedTestResults, 'tests' | 'totalTests' | 'failed' | 'summaryErrors'>,
         localRegistry:  Set<string>,
         localBaseIndex: Map<string, string[]>,
         mutantId:       string
@@ -1774,14 +1774,12 @@ export class BunTestRunner implements TestRunner {
             return this.buildSignalErrorResult(result, mutantId, `bun test terminated by ${result.signal} before any test reported a failure`);
         }
 
-        // Check for runtime errors: tests couldn't run due to module/syntax errors
-        // These should be RuntimeError, not Killed, and don't need killedBy for caching
-        // Stryker disable next-line BlockStatement,LogicalOperator: BlockStatement: runtime error detection covered by 'returns RuntimeError when stderr signals a syntax error'; LogicalOperator: equivalent mutant — rawFailedNames is always derived from parsed.tests (subset), so both are 0 simultaneously; && and || produce identical results for all reachable inputs
-        if(rawFailedNames.length === 0 && parsed.tests.length === 0) {
-            const runtimeResult = this.checkRuntimeError(result, mutantId);
-            // Stryker disable next-line BlockStatement: covered by 'returns runtimeResult when checkRuntimeError returns non-null'
-            if(runtimeResult) {
-                return runtimeResult;
+        // No individual test failed: decide whether bun still reported a failure (Killed)
+        // or nothing at all (Error) — see classifyRunWithoutFailedTest.
+        if(rawFailedNames.length === 0) {
+            const noEvidenceResult = this.classifyRunWithoutFailedTest(result, parsed, mutantId);
+            if(noEvidenceResult) {
+                return noEvidenceResult;
             }
         }
 
@@ -1830,7 +1828,8 @@ export class BunTestRunner implements TestRunner {
                 .filter(test => test.status === 'failed')
                 .map(test => test.failureMessage)
                 .filter((msg): msg is string => !!msg)
-                .join('\n\n') || `Tests failed with exit code ${result.exitCode}`,
+                .join('\n\n') || `Tests failed with exit code ${result.exitCode}: ${stripAnsi(result.stderr).trim().slice(0, 1000)}`,
+            // Stryker restore all
             nrOfTests: parsed.totalTests || 1,
         };
     }
@@ -1863,11 +1862,44 @@ export class BunTestRunner implements TestRunner {
     }
 
     /**
-   * Check if the process failed due to a runtime error (no tests ran).
-   * Returns a MutantRunResult if this is a runtime error, or null to continue.
+   * Classify a non-zero, non-signal, non-timeout mutant run in which no
+   * individual test reported a failure. Returns an Error result when there is
+   * no evidence the mutant was detected, or null to let the caller score it
+   * Killed (with an empty killedBy, since no single test failed).
+   *
+   * Killed needs evidence that the suite failed, and bun's summary is that
+   * evidence: a non-zero ' N fail' (or 'Bailed out after N failures') or
+   * ' N error' count. That is exactly what bun prints when a test file cannot
+   * load — its import graph throws (TypeError, ReferenceError, …), a source or
+   * test file no longer parses, a describe body throws — as an "# Unhandled
+   * error between tests" block with no `(fail)` line. Verified on bun 1.4.2: a
+   * source module that throws at import gives ' 1 fail' + ' 1 error'; a
+   * describe body that throws gives ' 0 fail' + ' 1 error'; under --bail both
+   * the throwing import and a source syntax error give 'Bailed out after 1
+   * failure'. Stryker's jest and vitest runners score a test file that fails to
+   * load as Killed too, and a whole class of mutants (module-level constants,
+   * config objects) can only ever be detected this way.
+   *
+   * Why that is not a false Killed: a load failure in a test FILE and one in a
+   * SOURCE file print the same shape, but under mutation only source files are
+   * changed, and the dry run — which must pass, and which fails outright on any
+   * unattributable fail/error count (see checkDryRunProcessResult and the
+   * completeness gate's Signal C) — loaded every one of these files without
+   * error. So a load failure seen here was caused by the active mutant. The
+   * residual risk is a load failure that depends on which files run together:
+   * a targeted run hands bun only the covering tests' files, so a test file
+   * that only loads after some other file has run would fail here and not in
+   * the dry run. That is a test-isolation defect the same way it is under jest.
+   *
+   * Error remains for the cases that are no evidence at all: bun's zero-match
+   * --test-name-pattern error (a runner pattern gap, not a kill), and a run
+   * whose output carries no failure count whatsoever (a missing preload, an
+   * unparseable bunfig, a crash that printed no summary). An exit code alone is
+   * not evidence that a test caught the mutant.
    */
-    private checkRuntimeError(
-        result:   { exitCode: number | null, stderr: string },
+    private classifyRunWithoutFailedTest(
+        result:   { exitCode: number | null, stdout: string, stderr: string },
+        parsed:   Pick<ParsedTestResults, 'failed' | 'summaryErrors'>,
         mutantId: string
     ): MutantRunResult | null {
         const stderr = result.stderr;
@@ -1892,28 +1924,32 @@ export class BunTestRunner implements TestRunner {
             };
         }
 
-        const isRuntimeError
-            = stderr.includes('Unhandled error')
-              || stderr.includes('Cannot find module')
-              || stderr.includes('SyntaxError')
-              || stderr.includes('TypeError')
-              || stderr.includes('ReferenceError')
-              || stderr.includes('is not defined')
-              || stderr.includes('Unexpected token');
-
-        if(isRuntimeError) {
+        // Stryker disable next-line EqualityOperator: the > 0 boundaries are the whole predicate; covered by the load-failure Killed tests (fail-count, bail, and error-count-only fixtures) and the no-summary Error tests
+        if(parsed.failed > 0 || parsed.summaryErrors > 0) {
             // Stryker disable next-line StringLiteral: diagnostic logging message
             this.logger.debug(
-                'Mutant %s caused runtime error (tests could not run): %s',
+                'Mutant %s: bun reported %d failure(s) and %d error(s) outside any single test (e.g. a test file that failed to load) — scoring Killed',
                 mutantId,
-                stderr.slice(0, 200)
+                parsed.failed,
+                parsed.summaryErrors
             );
-            return {
-                status:       MutantRunStatus.Error,
-                errorMessage: stderr.slice(0, 500) || `Runtime error with exit code ${result.exitCode}`,
-            };
+            return null;
         }
-        return null;
+
+        // Stryker disable next-line StringLiteral,MethodExpression,ConditionalExpression,LogicalOperator: diagnostic text — the exit code and output head are pinned with toContain by the no-summary Error tests
+        const output = (stripAnsi(stderr).trim() || stripAnsi(result.stdout).trim()).slice(0, 500) || '(no output)';
+        // Stryker disable next-line StringLiteral: diagnostic logging message
+        this.logger.warn(
+            'Mutant %s: bun test exited with code %s but reported no failing test and no fail/error count — scoring as Error rather than Killed: %s',
+            mutantId,
+            String(result.exitCode),
+            output
+        );
+        return {
+            status:       MutantRunStatus.Error,
+            // Stryker disable next-line StringLiteral: diagnostic error message text — behaviorally tested via .toContain
+            errorMessage: `bun test exited with code ${result.exitCode} but reported no failing test and no fail/error count, so there is no evidence a test detected this mutant: ${output}`,
+        };
     }
 
     /**

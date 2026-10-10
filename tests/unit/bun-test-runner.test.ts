@@ -4042,11 +4042,10 @@ tests/example.test.ts:
             mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
         });
 
-        it('should treat non-zero exit with no parsed failures as Killed with empty killedBy (bunfig sanitized, so threshold miss cannot occur)', async () => {
-            // With the sanitized bunfig disabling coverage/coverageThreshold/onlyFailures,
-            // a non-zero exit with no parsed failures is now treated as a genuine (unparseable)
-            // kill rather than Survived.  killedBy: [] — never 'unknown', which would be
-            // written verbatim into the incremental report and orphan against the registry.
+        it('should treat non-zero exit with no failing test, no error count and no fail count as Error, not Killed (no evidence any test caught the mutant)', async () => {
+            // Coverage-table-only output: bun exited 1 but reported neither a failing test nor
+            // a ' N fail' / ' N error' summary. Policy: Killed needs evidence that a test (or a
+            // test file) failed; an exit code alone is not that evidence.
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 if(options.onInspectorReady) {
@@ -4071,9 +4070,10 @@ tests/example.test.ts:
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
             } as any);
 
-            expect(result.status).toBe(MutantRunStatus.Killed);
-            if(result.status === MutantRunStatus.Killed) {
-                expect(result.killedBy).toEqual([]);
+            expect(result.status).toBe(MutantRunStatus.Error);
+            if(result.status === MutantRunStatus.Error) {
+                expect(result.errorMessage).toContain('exited with code 1');
+                expect(result.errorMessage).toContain('File | % Funcs');
             }
         });
 
@@ -4146,6 +4146,179 @@ tests/example.test.ts:
             if(result.status === MutantRunStatus.Killed) {
                 expect(result.killedBy).toContain('tests/foo.test.ts > my test');
             }
+        });
+
+        describe('mutant that breaks module loading (no (fail) line, failure only in the summary)', () => {
+            // Byte-exact fixtures captured from real `bun test --max-concurrency=1` runs on
+            // bun 1.4.2 (stdout/stderr piped, CLAUDECODE unset); only the absolute fixture path
+            // is replaced with /project. Every one of these is a test file that could not load
+            // or finish loading — a whole-suite failure the mutant caused (the dry run, which
+            // must pass, loaded the same files without error) — so each must score Killed, as
+            // Stryker's jest/vitest runners do, with an empty killedBy (no single test failed).
+            const BUN_BANNER = 'bun test v1.4.2 (744846f84)\n';
+            const importThrowsStderr = [
+                '',
+                'tests/mod.test.ts:',
+                '',
+                '# Unhandled error between tests',
+                '-------------------------------',
+                '1 | const cfg: any = undefined;',
+                '                     ^',
+                'TypeError: undefined is not an object (evaluating \'(void 0).thing\')',
+                '      at /project/src/mod.ts:1:18',
+                '-------------------------------',
+                '',
+                '',
+                'tests/other.test.ts:',
+                '(pass) other ok [0.04ms]',
+                '',
+                ' 1 pass',
+                ' 1 fail',
+                ' 1 error',
+                ' 1 expect() calls',
+                'Ran 2 tests across 2 files. [6.00ms]',
+                '',
+            ].join('\n');
+            const importThrowsBailStderr = [
+                '',
+                'tests/mod.test.ts:',
+                '',
+                '# Unhandled error between tests',
+                '-------------------------------',
+                '1 | const cfg: any = undefined;',
+                '                     ^',
+                'TypeError: undefined is not an object (evaluating \'(void 0).thing\')',
+                '      at /project/src/mod.ts:1:18',
+                '-------------------------------',
+                '',
+                'Ran 1 test across 1 file. [8.00ms]',
+                'Bailed out after 1 failure',
+                '',
+            ].join('\n');
+            const sourceSyntaxErrorBailStderr = [
+                '',
+                'tests/mod.test.ts:',
+                '',
+                '# Unhandled error between tests',
+                '-------------------------------',
+                '1 | export function add(a: number, b: number) { return a + ; }',
+                '                                                           ^',
+                'error: Unexpected ;',
+                '    at /project/src/mod.ts:1:56',
+                '-------------------------------',
+                '',
+                'Ran 1 test across 1 file. [5.00ms]',
+                'Bailed out after 1 failure',
+                '',
+            ].join('\n');
+            const describeThrowsStderr = [
+                '',
+                'tests/mod.test.ts:',
+                '(pass) adds [0.07ms]',
+                '(pass) adds again [0.02ms]',
+                '',
+                'tests/describe-throws.test.ts:',
+                '',
+                '# Unhandled error between tests',
+                '-------------------------------',
+                '5 |     throw new ReferenceError(\'describe body threw for real\');',
+                '                                                               ^',
+                'ReferenceError: describe body threw for real',
+                '      at <anonymous> (/project/tests/describe-throws.test.ts:5:60)',
+                '-------------------------------',
+                '',
+                '',
+                ' 3 pass',
+                ' 0 fail',
+                ' 1 error',
+                ' 3 expect() calls',
+                'Ran 3 tests across 3 files. [6.00ms]',
+                '',
+            ].join('\n');
+
+            async function runWithLoadFailure(stderr: string, testFilter: string[] = []): Promise<Awaited<ReturnType<BunTestRunner['mutantRun']>>> {
+                mockRunBunTests.mockImplementation(() => Promise.resolve({ exitCode: 1, signal: null, stdout: BUN_BANNER, stderr, timedOut: false }));
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                return runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '501' } as any,
+                    testFilter,
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+            }
+
+            it('scores Killed with empty killedBy when a source module throws at import (bun reports 1 fail, 1 error, no (fail) line)', async () => {
+                const result = await runWithLoadFailure(importThrowsStderr, ['tests/mod.test.ts > adds']);
+
+                expect(result.status).toBe(MutantRunStatus.Killed);
+                if(result.status === MutantRunStatus.Killed) {
+                    expect(result.killedBy).toEqual([]);
+                    // The failure message carries bun's own account of the load failure.
+                    expect(result.failureMessage).toContain('TypeError: undefined is not an object');
+                }
+            });
+
+            it('scores Killed under --bail, where the only failure evidence is "Bailed out after 1 failure"', async () => {
+                const result = await runWithLoadFailure(importThrowsBailStderr, ['tests/mod.test.ts > adds']);
+
+                expect(result.status).toBe(MutantRunStatus.Killed);
+                if(result.status === MutantRunStatus.Killed) {
+                    expect(result.killedBy).toEqual([]);
+                }
+            });
+
+            it('scores Killed when a mutated source file no longer parses', async () => {
+                const result = await runWithLoadFailure(sourceSyntaxErrorBailStderr);
+
+                expect(result.status).toBe(MutantRunStatus.Killed);
+            });
+
+            it('scores Killed when a describe body throws — 0 fail, and the " 1 error" summary is the only evidence', async () => {
+                const result = await runWithLoadFailure(describeThrowsStderr);
+
+                expect(result.status).toBe(MutantRunStatus.Killed);
+                if(result.status === MutantRunStatus.Killed) {
+                    expect(result.killedBy).toEqual([]);
+                    expect(result.failureMessage).toContain('ReferenceError: describe body threw for real');
+                }
+            });
+
+            it('scores Killed through FORCE_COLOR output, where the error count is wrapped in ANSI codes', async () => {
+                const colored = describeThrowsStderr.replace(' 1 error', ' \u001B[0m\u001B[31m1 error\u001B[0m');
+                const result = await runWithLoadFailure(colored);
+
+                expect(result.status).toBe(MutantRunStatus.Killed);
+            });
+
+            it('still scores Error when bun printed no test summary at all (e.g. the preload could not be found)', async () => {
+                // Real bun 1.4.2 output for `bun test --preload ./nope.ts`: exit 1, no summary.
+                const result = await runWithLoadFailure('\ntests/other.test.ts:\nerror: preload not found "./nope.ts"\n');
+
+                expect(result.status).toBe(MutantRunStatus.Error);
+                if(result.status === MutantRunStatus.Error) {
+                    expect(result.errorMessage).toContain('preload not found');
+                }
+            });
+
+            it('keeps a signal death with a fail/error summary but no attributable test as Error (signal policy wins)', async () => {
+                mockRunBunTests.mockImplementation(() => Promise.resolve({ exitCode: null, signal: 'SIGSEGV', stdout: BUN_BANNER, stderr: importThrowsStderr, timedOut: false }));
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                const result = await runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '502' } as any,
+                    testFilter:      [],
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+
+                expect(result.status).toBe(MutantRunStatus.Error);
+                if(result.status === MutantRunStatus.Error) {
+                    expect(result.errorMessage).toContain('SIGSEGV');
+                }
+            });
         });
 
         describe('bun test child killed by a signal', () => {
@@ -4272,7 +4445,7 @@ tests/example.test.ts:
                 }
             });
 
-            it('does not change the no-signal behaviour: a plain non-zero exit with no parsed failures is still Killed with empty killedBy', async () => {
+            it('scores a plain non-zero exit with no failing test and no fail/error summary as Error, like a signal death without evidence', async () => {
                 const result = await runWithChildResult({
                     exitCode: 1,
                     signal:   null,
@@ -4281,10 +4454,7 @@ tests/example.test.ts:
                     timedOut: false,
                 });
 
-                expect(result.status).toBe(MutantRunStatus.Killed);
-                if(result.status === MutantRunStatus.Killed) {
-                    expect(result.killedBy).toEqual([]);
-                }
+                expect(result.status).toBe(MutantRunStatus.Error);
             });
         });
 
@@ -4678,9 +4848,8 @@ tests/example.test.ts:
             expect(result.status).toBe(MutantRunStatus.Timeout);
         });
 
-        it('should treat generic non-zero exit with no output as Killed with empty killedBy (sanitized bunfig prevents threshold miss)', async () => {
-            // With sanitized bunfig in place, a non-zero exit with unparseable output is
-            // a genuine (unattributable) kill.  killedBy: [] is the expected fallback.
+        it('should treat generic non-zero exit with no test output as Error (no evidence a test detected the mutant)', async () => {
+            // Unparseable output with no fail/error count is not evidence of a kill.
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 if(options.onInspectorReady) {
@@ -4705,10 +4874,16 @@ tests/example.test.ts:
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
             } as any);
 
-            expect(result.status).toBe(MutantRunStatus.Killed);
-            if(result.status === MutantRunStatus.Killed) {
-                expect(result.killedBy).toEqual([]);
+            expect(result.status).toBe(MutantRunStatus.Error);
+            if(result.status === MutantRunStatus.Error) {
+                expect(result.errorMessage).toContain('Fatal error');
             }
+            expect(mockLogger.warn).toHaveBeenCalledWith(
+                expect.stringContaining('scoring as Error rather than Killed'),
+                '1',
+                '1',
+                'Fatal error'
+            );
         });
 
         it('should set activeMutant in environment', async () => {
@@ -5014,9 +5189,8 @@ tests/example.test.ts:
             }
         });
 
-        it('should classify non-zero exit with no parsed failures as Killed with empty killedBy (sanitized bunfig in place)', async () => {
-            // With sanitized bunfig disabling coverage/onlyFailures, a non-zero exit with
-            // no parseable failure output is treated as a genuine kill with killedBy: [].
+        it('should classify non-zero exit with no parsed failures and no fail/error count as Error', async () => {
+            // A crash message with no test summary is no evidence that a test caught the mutant.
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
                 if(options.onInspectorReady) {
@@ -5041,9 +5215,34 @@ tests/example.test.ts:
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
             } as any);
 
-            expect(result.status).toBe(MutantRunStatus.Killed);
-            if(result.status === MutantRunStatus.Killed) {
-                expect(result.killedBy).toEqual([]);
+            expect(result.status).toBe(MutantRunStatus.Error);
+            if(result.status === MutantRunStatus.Error) {
+                expect(result.errorMessage).toContain('Process crashed');
+            }
+        });
+
+        it('falls back to stdout for the Error message when stderr is empty, and says so when both are empty', async () => {
+            mockRunBunTests.mockResolvedValueOnce({ exitCode: 2, stdout: 'only on stdout', stderr: '', timedOut: false });
+            mockRunBunTests.mockResolvedValueOnce({ exitCode: 2, stdout: '', stderr: '', timedOut: false });
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            const run = async () => runner.mutantRun({
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                activeMutant:    { id: '1' } as any,
+                testFilter:      [],
+                sandboxFileName: 'sandbox',
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+            } as any);
+
+            const first = await run();
+            const second = await run();
+
+            expect(first.status).toBe(MutantRunStatus.Error);
+            expect(second.status).toBe(MutantRunStatus.Error);
+            if(first.status === MutantRunStatus.Error && second.status === MutantRunStatus.Error) {
+                expect(first.errorMessage).toContain('only on stdout');
+                expect(second.errorMessage).toContain('(no output)');
             }
         });
 
@@ -8655,11 +8854,9 @@ error: Test failure
                 }
             });
 
-            it('should classify exit 1 with only passing tests as Killed with empty killedBy (sanitized bunfig prevents threshold miss)', async () => {
-                // With the sanitized bunfig disabling coverageThreshold, a non-zero exit where
-                // all tests passed but no failure was parsed is treated as an unparseable kill.
-                // killedBy: [] is the fallback — the scenario this was protecting against
-                // (coverageThreshold false positive) can no longer occur.
+            it('should classify exit 1 with only passing tests and no fail/error count as Error, not Killed', async () => {
+                // Every test that ran passed and bun reported no failure or error: whatever made
+                // it exit 1, nothing shows a test detecting the mutant.
                 mockRunBunTests.mockResolvedValue({
                     exitCode: 1,
                     stdout:   '✓ test [0.12ms]\n 1 pass',
@@ -8678,10 +8875,7 @@ error: Test failure
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
                 } as any);
 
-                expect(result.status).toBe(MutantRunStatus.Killed);
-                if(result.status === MutantRunStatus.Killed) {
-                    expect(result.killedBy).toEqual([]);
-                }
+                expect(result.status).toBe(MutantRunStatus.Error);
             });
         });
 
