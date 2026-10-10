@@ -3,6 +3,7 @@
  * Implements the Stryker TestRunner API
  */
 
+import { randomBytes } from 'node:crypto';
 import * as fsPromises from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -483,15 +484,23 @@ function emptyMutantRunCounts(): Record<MutantRunStatus, number> {
     };
 }
 
-/** The coverage preload's own stderr line reporting the active mutant past its hit limit (see installHitLimit in preload-logic.ts). */
-const HIT_LIMIT_SENTINEL_RE = new RegExp(String.raw`^${HIT_LIMIT_SENTINEL} (\d+)$`, 'm');
+/**
+ * A fresh secret for one bun child's hit-limit sentinel (see
+ * formatHitLimitSentinel in preload-logic.ts): 128 random bits as hex, so it is
+ * unguessable and needs no escaping in {@link readReportedHitCount}'s pattern.
+ */
+function newHitLimitToken(): string {
+    return randomBytes(16).toString('hex');
+}
 
 /**
  * The active mutant's hit count, if the coverage preload reported it past its
- * hit limit on the child's stderr; undefined otherwise.
+ * hit limit on the child's stderr; undefined otherwise. Only the preload's own
+ * line counts: alone on its line and carrying `token`, the secret this run's
+ * child was given, so test output cannot forge it.
  */
-function readReportedHitCount(stderr: string): number | undefined {
-    const match = HIT_LIMIT_SENTINEL_RE.exec(stderr);
+function readReportedHitCount(stderr: string, token: string): number | undefined {
+    const match = new RegExp(String.raw`^${HIT_LIMIT_SENTINEL} ${token} (\d+)$`, 'm').exec(stderr);
     return match ? Number(match[1]) : undefined;
 }
 
@@ -2293,6 +2302,8 @@ export class BunTestRunner implements TestRunner {
         // is disposed while a mutant run is still in flight — mirrors dryRun().
         const abortController = new AbortController();
         this.currentAbortController = abortController;
+        // Per spawn, so neither a retry nor a later run can accept another child's report.
+        const hitLimitToken = newHitLimitToken();
         let result;
         try {
             result = await runBunTests({
@@ -2304,6 +2315,7 @@ export class BunTestRunner implements TestRunner {
                 bunfigPath,
                 activeMutant:          options.activeMutant.id,
                 hitLimit:              options.hitLimit, // Arms the instrumenter's infinite-loop protection in the preload
+                hitLimitToken, // The preload signs its hit-limit report with it; see readReportedHitCount
                 bail:                  !options.disableBail, // Bail on first failure unless Stryker's disableBail is set
                 sequentialMode:        true,            // Match dryRun's serialized execution for deterministic results
                 preloadScript:         this.preloadScriptPath, // Needed to set globalThis.__stryker__.activeMutant
@@ -2335,7 +2347,7 @@ export class BunTestRunner implements TestRunner {
             }
         }
 
-        const runawayResult = this.classifyRunawayMutantRun(result, ctx, testNamePattern);
+        const runawayResult = this.classifyRunawayMutantRun(result, ctx, testNamePattern, hitLimitToken);
         if(runawayResult) {
             return runawayResult;
         }
@@ -2406,14 +2418,15 @@ export class BunTestRunner implements TestRunner {
     private classifyRunawayMutantRun(
         result:          BunProcessResult,
         ctx:             MutantRunContext,
-        testNamePattern: string | undefined
+        testNamePattern: string | undefined,
+        hitLimitToken:   string
     ): MutantRunResult | undefined {
         // Stryker's infinite-loop protection: past its hitLimit the instrumenter throws
         // out of the mutant's loop, and the preload reports the count on stderr. That
         // is conclusive whatever happened next — the error failed a test (which would
         // read as Killed), a test swallowed it (Survived), or the run was killed anyway
         // — so, as in Stryker's own runners, it is scored Timeout with Stryker's reason.
-        const hitLimitTimeout = determineHitLimitReached(readReportedHitCount(result.stderr), ctx.options.hitLimit);
+        const hitLimitTimeout = determineHitLimitReached(readReportedHitCount(result.stderr, hitLimitToken), ctx.options.hitLimit);
         if(hitLimitTimeout) {
             return toMutantRunResult(hitLimitTimeout);
         }

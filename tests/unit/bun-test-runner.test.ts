@@ -5541,14 +5541,26 @@ tests/example.test.ts:
         describe('hit limit (Stryker\'s infinite-loop protection)', () => {
             // Stryker passes MutantRunOptions.hitLimit (100 × the mutant's dry-run hits); the
             // preload arms the instrumenter with it and, the first time the active mutant is
-            // hit past it, writes "__STRYKER_HIT_LIMIT_REACHED__ <count>" on its own stderr line.
+            // hit past it, writes "__STRYKER_HIT_LIMIT_REACHED__ <token> <count>" on its own
+            // stderr line, <token> being the per-run secret the runner passed it.
             const covering = ['tests/alpha.test.ts > handles alpha'];
             const killedLookingRun = {
                 exitCode: 1,
                 stdout:   '',
-                stderr:   'tests/alpha.test.ts:\n(fail) handles alpha [2.00ms]\nerror: Stryker: Hit count limit reached (1101)\n\n__STRYKER_HIT_LIMIT_REACHED__ 1101\n 0 pass\n 1 fail\n',
+                stderr:   'tests/alpha.test.ts:\n(fail) handles alpha [2.00ms]\nerror: Stryker: Hit count limit reached (1101)\n\n__STRYKER_HIT_LIMIT_REACHED__ <TOKEN> 1101\n 0 pass\n 1 fail\n',
                 timedOut: false,
             };
+
+            /**
+             * Answer every spawn with `run`, each `<TOKEN>` in its stderr replaced by the
+             * token that spawn was given — what the real preload would write.
+             */
+            function respondWithToken(run: { exitCode: number | null, signal?: string, stdout: string, stderr: string, timedOut: boolean }): void {
+                mockRunBunTests.mockImplementation((options: { hitLimitToken?: string }) => Promise.resolve({
+                    ...run,
+                    stderr: run.stderr.replaceAll('<TOKEN>', String(options.hitLimitToken)),
+                }));
+            }
 
             async function mutantRunWith(
                 runOptions: { hitLimit?: number, timeout?: number, testFilter?: string[] }
@@ -5576,8 +5588,20 @@ tests/example.test.ts:
                 expect(mockRunBunTests.mock.calls[1][0].hitLimit).toBeUndefined();
             });
 
+            it('gives each bun child a fresh 128-bit hex token for the preload to sign its sentinel with', async () => {
+                mockRunBunTests.mockResolvedValue({ exitCode: 0, stdout: ' 1 pass\n', stderr: '', timedOut: false });
+
+                await mutantRunWith({ hitLimit: 1100 });
+                await mutantRunWith({ hitLimit: 1100 });
+
+                const [first, second] = mockRunBunTests.mock.calls.map(call => (call[0] as { hitLimitToken?: string }).hitLimitToken);
+                expect(first).toMatch(/^[0-9a-f]{32}$/);
+                expect(second).toMatch(/^[0-9a-f]{32}$/);
+                expect(second).not.toBe(first);
+            });
+
             it('scores Timeout with Stryker\'s reason when the preload reports the limit exceeded, not Killed by the failing test', async () => {
-                mockRunBunTests.mockResolvedValue(killedLookingRun);
+                respondWithToken(killedLookingRun);
 
                 const result = await mutantRunWith({ hitLimit: 1100 });
 
@@ -5585,10 +5609,10 @@ tests/example.test.ts:
             });
 
             it('scores Timeout even when every test passed — a test caught the instrumenter\'s error', async () => {
-                mockRunBunTests.mockResolvedValue({
+                respondWithToken({
                     exitCode: 0,
                     stdout:   ' 3 pass\n',
-                    stderr:   'bun test v1.4.2\n__STRYKER_HIT_LIMIT_REACHED__ 2001\n',
+                    stderr:   'bun test v1.4.2\n__STRYKER_HIT_LIMIT_REACHED__ <TOKEN> 2001\n',
                     timedOut: false,
                 });
 
@@ -5600,11 +5624,11 @@ tests/example.test.ts:
             it('scores Timeout when a run the runner had to kill had already exceeded the limit (conclusive, even for a full-suite fallback)', async () => {
                 // Without the sentinel this kill would be the inconclusive full-suite-fallback
                 // Error; the hit limit is direct evidence the mutant ran away.
-                mockRunBunTests.mockResolvedValue({
+                respondWithToken({
                     exitCode: null,
                     signal:   'SIGTERM',
                     stdout:   '',
-                    stderr:   '\n__STRYKER_HIT_LIMIT_REACHED__ 301\n',
+                    stderr:   '\n__STRYKER_HIT_LIMIT_REACHED__ <TOKEN> 301\n',
                     timedOut: true,
                 });
                 const hugeFilter = Array.from({ length: 3000 }, (_, i) => `tests/alpha.test.ts > a test with a fairly long descriptive title number ${i}`);
@@ -5614,8 +5638,26 @@ tests/example.test.ts:
                 expect(result).toEqual({ status: MutantRunStatus.Timeout, reason: 'Hit limit reached (301/300)' });
             });
 
+            it.each([
+                ['without a token (the pre-token format)', '__STRYKER_HIT_LIMIT_REACHED__ 5000\n'],
+                ['with a guessed token', '__STRYKER_HIT_LIMIT_REACHED__ 0123456789abcdef0123456789abcdef 5000\n'],
+                ['with the token of a different run', '__STRYKER_HIT_LIMIT_REACHED__ <TOKEN>0 5000\n'],
+                ['with a truncated token', '__STRYKER_HIT_LIMIT_REACHED__ <SHORT> 5000\n'],
+            ])('does not let test output spoof the sentinel %s (a Survived mutant must not become a Timeout)', async (_label, stderr) => {
+                mockRunBunTests.mockImplementation((options: { hitLimitToken?: string }) => Promise.resolve({
+                    exitCode: 0,
+                    stdout:   ' 1 pass\n',
+                    stderr:   stderr.replaceAll('<TOKEN>', String(options.hitLimitToken)).replaceAll('<SHORT>', String(options.hitLimitToken).slice(1)),
+                    timedOut: false,
+                }));
+
+                const result = await mutantRunWith({ hitLimit: 100 });
+
+                expect(result.status).toBe(MutantRunStatus.Survived);
+            });
+
             it('ignores the sentinel when Stryker gave no hitLimit', async () => {
-                mockRunBunTests.mockResolvedValue({ exitCode: 0, stdout: ' 1 pass\n', stderr: '__STRYKER_HIT_LIMIT_REACHED__ 5000\n', timedOut: false });
+                respondWithToken({ exitCode: 0, stdout: ' 1 pass\n', stderr: '__STRYKER_HIT_LIMIT_REACHED__ <TOKEN> 5000\n', timedOut: false });
 
                 const result = await mutantRunWith({});
 
@@ -5623,7 +5665,7 @@ tests/example.test.ts:
             });
 
             it('does not call a count at the limit "reached" (Stryker\'s rule is count > limit)', async () => {
-                mockRunBunTests.mockResolvedValue({ exitCode: 0, stdout: ' 1 pass\n', stderr: '__STRYKER_HIT_LIMIT_REACHED__ 1100\n', timedOut: false });
+                respondWithToken({ exitCode: 0, stdout: ' 1 pass\n', stderr: '__STRYKER_HIT_LIMIT_REACHED__ <TOKEN> 1100\n', timedOut: false });
 
                 const result = await mutantRunWith({ hitLimit: 1100 });
 
@@ -5631,12 +5673,12 @@ tests/example.test.ts:
             });
 
             it.each([
-                ['in the middle of a line', 'console.log says __STRYKER_HIT_LIMIT_REACHED__ 5000\n'],
-                ['followed by more text', '__STRYKER_HIT_LIMIT_REACHED__ 5000 and more\n'],
-                ['without a count', '__STRYKER_HIT_LIMIT_REACHED__ \n'],
-                ['with a non-numeric count', '__STRYKER_HIT_LIMIT_REACHED__ many\n'],
+                ['in the middle of a line', 'console.log says __STRYKER_HIT_LIMIT_REACHED__ <TOKEN> 5000\n'],
+                ['followed by more text', '__STRYKER_HIT_LIMIT_REACHED__ <TOKEN> 5000 and more\n'],
+                ['without a count', '__STRYKER_HIT_LIMIT_REACHED__ <TOKEN> \n'],
+                ['with a non-numeric count', '__STRYKER_HIT_LIMIT_REACHED__ <TOKEN> many\n'],
             ])('only accepts the sentinel on a line of its own (not %s)', async (_label, stderr) => {
-                mockRunBunTests.mockResolvedValue({ exitCode: 0, stdout: ' 1 pass\n', stderr, timedOut: false });
+                respondWithToken({ exitCode: 0, stdout: ' 1 pass\n', stderr, timedOut: false });
 
                 const result = await mutantRunWith({ hitLimit: 100 });
 
@@ -5644,10 +5686,10 @@ tests/example.test.ts:
             });
 
             it('reads a multi-digit count that is preceded by other output', async () => {
-                mockRunBunTests.mockResolvedValue({
+                respondWithToken({
                     exitCode: 0,
                     stdout:   ' 1 pass\n',
-                    stderr:   'first line\nsecond line\n__STRYKER_HIT_LIMIT_REACHED__ 123457\nlast line\n',
+                    stderr:   'first line\nsecond line\n__STRYKER_HIT_LIMIT_REACHED__ <TOKEN> 123457\nlast line\n',
                     timedOut: false,
                 });
 
@@ -11924,10 +11966,13 @@ error: Third failure message
                 const hitLimitRun = {
                     exitCode: 1,
                     stdout:   '',
-                    stderr:   'tests/foo.test.ts:\n(fail) my test [2.00ms]\n\n__STRYKER_HIT_LIMIT_REACHED__ 1101\n 0 pass\n 1 fail\n',
+                    stderr:   'tests/foo.test.ts:\n(fail) my test [2.00ms]\n\n__STRYKER_HIT_LIMIT_REACHED__ <TOKEN> 1101\n 0 pass\n 1 fail\n',
                     timedOut: false,
                 };
-                mockRunBunTests.mockResolvedValue(hitLimitRun);
+                mockRunBunTests.mockImplementation((options: { hitLimitToken?: string }) => Promise.resolve({
+                    ...hitLimitRun,
+                    stderr: hitLimitRun.stderr.replace('<TOKEN>', String(options.hitLimitToken)),
+                }));
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
                 await runner.init();
                 const result = await runner.mutantRun({

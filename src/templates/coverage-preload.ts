@@ -11,6 +11,7 @@ import {
     initializeStrykerNamespace,
     setActiveMutant,
     installHitLimit,
+    HIT_LIMIT_TOKEN_ENV,
     formatCoverageData,
     detectGapWindowBleed,
     writeCoverageToFile,
@@ -69,7 +70,11 @@ const EAGER_MODULES: string[] = __EAGER_MODULES__;
 // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
 const config = getPreloadConfig();
 // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- Config from placeholder import
-const { syncPort, coverageFile, activeMutant, hitLimit } = config;
+const { syncPort, coverageFile, activeMutant, hitLimit, hitLimitToken } = config;
+// Hide the hit-limit token from the code under test: anything that can read it
+// could print a sentinel the runner accepts. See formatHitLimitSentinel.
+// eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- HIT_LIMIT_TOKEN_ENV from placeholder import
+delete process.env[HIT_LIMIT_TOKEN_ENV];
 
 // Skip coverage collection during mutant runs (only need pass/fail)
 // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
@@ -232,10 +237,11 @@ if(activeMutant) {
     setActiveMutant(strykerGlobal, activeMutant);
     // Stryker's infinite-loop protection: arm the instrumenter's hit limit before any
     // instrumented code loads. One bun child runs one mutant, so the count starts at 0
-    // here and never needs resetting. See installHitLimit.
-    if(hitLimit !== undefined) {
+    // here and never needs resetting. See installHitLimit. Armed only with the
+    // run's token: without it the runner could not recognise the report.
+    if(hitLimit !== undefined && hitLimitToken) {
         // eslint-disable-next-line @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
-        installHitLimit(strykerGlobal, hitLimit);
+        installHitLimit(strykerGlobal, hitLimit, hitLimitToken);
     }
 }
 

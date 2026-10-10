@@ -511,6 +511,37 @@ describe('runBunTests', () => {
             expect(Object.hasOwn(mockSpawn.mock.calls[0][2].env!, '__STRYKER_HIT_LIMIT__')).toBe(false);
         });
 
+        it('should set __STRYKER_HIT_LIMIT_TOKEN__ when hitLimitToken is provided, overriding any value in env', async () => {
+            const resultPromise = runBunTests({
+                bunPath:       'bun',
+                timeout:       5000,
+                activeMutant:  '42',
+                hitLimit:      1100,
+                hitLimitToken: '0123456789abcdef0123456789abcdef',
+                env:           { __STRYKER_HIT_LIMIT_TOKEN__: 'outer-token' },
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            expect(mockSpawn.mock.calls[0][2].env!.__STRYKER_HIT_LIMIT_TOKEN__).toBe('0123456789abcdef0123456789abcdef');
+        });
+
+        it('should never pass on an inherited __STRYKER_HIT_LIMIT_TOKEN__ when hitLimitToken is not provided', async () => {
+            // An inherited token (from an outer mutant run, through process.env) would let
+            // the nested child's preload report a hit limit the outer runner accepts.
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+                env:     { __STRYKER_HIT_LIMIT_TOKEN__: 'outer-token' },
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            expect(Object.hasOwn(mockSpawn.mock.calls[0][2].env!, '__STRYKER_HIT_LIMIT_TOKEN__')).toBe(false);
+        });
+
         it('should set __STRYKER_COVERAGE_FILE__ when coverageFile is provided', async () => {
             const resultPromise = runBunTests({
                 bunPath:      'bun',

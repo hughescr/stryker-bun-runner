@@ -122,6 +122,7 @@ describe('hit limit (real bun children)', () => {
     let tempDir: string;
     let sumTestFile: string;
     let swallowTestFile: string;
+    let spoofTestFile: string;
     let originalForceColor: string | undefined;
 
     function createRunner(testFile: string): BunTestRunner {
@@ -169,6 +170,19 @@ describe('hit limit (real bun children)', () => {
             "import { test, expect } from 'bun:test';",
             "import { sumBelow } from './loop.js';",
             "test('tolerates a failing sum', () => { let r; try { r = sumBelow(10); } catch { r = 45; } expect(r).toBe(45); });",
+        ].join('\n'));
+        // A test that asserts nothing and prints lines shaped like the preload's sentinel:
+        // one in the token-less format, one signed with whatever token the test can read.
+        spoofTestFile = path.join(tempDir, 'spoof.test.ts');
+        await fsPromises.writeFile(spoofTestFile, [
+            "import { test } from 'bun:test';",
+            "import { writeSync } from 'node:fs';",
+            "import { sumBelow } from './loop.js';",
+            "test('prints sentinel-shaped lines', () => {",
+            '    sumBelow(10);',
+            String.raw`    writeSync(2, '\n__STRYKER_HIT_LIMIT_REACHED__ 999999\n');`,
+            String.raw`    writeSync(2, '\n__STRYKER_HIT_LIMIT_REACHED__ ' + process.env.__STRYKER_HIT_LIMIT_TOKEN__ + ' 999999\n');`,
+            '});',
         ].join('\n'));
     });
 
@@ -238,6 +252,28 @@ describe('hit limit (real bun children)', () => {
             } as unknown as MutantRunOptions);
 
             expect(result).toEqual({ status: MutantRunStatus.Timeout, reason: `Hit limit reached (${hitLimit + 1}/${hitLimit})` });
+        } finally {
+            await runner.dispose();
+        }
+    }, 60_000);
+
+    test('does not let a test that prints sentinel-shaped lines turn a surviving mutant into a Timeout', async () => {
+        // `total -= i` terminates and the test asserts nothing, so the mutant survives.
+        // The token-less line is rejected by format; the signed one fails because the
+        // preload removes the token from process.env before any test code runs.
+        const runner = createRunner(spoofTestFile);
+        try {
+            const { testId, hits } = await dryRunFor(runner, '5');
+
+            const result = await runner.mutantRun({
+                activeMutant:    { id: '5' },
+                testFilter:      [testId],
+                sandboxFileName: path.join(tempDir, 'loop.js'),
+                timeout:         30_000,
+                hitLimit:        HIT_LIMIT_FACTOR * hits,
+            } as unknown as MutantRunOptions);
+
+            expect(result.status).toBe(MutantRunStatus.Survived);
         } finally {
             await runner.dispose();
         }

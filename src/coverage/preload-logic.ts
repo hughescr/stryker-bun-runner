@@ -48,19 +48,25 @@ export interface StrykerNamespace {
 // ============================================================================
 
 export interface PreloadConfig {
-    syncPort?:     string
-    coverageFile?: string
-    activeMutant?: string
+    syncPort?:      string
+    coverageFile?:  string
+    activeMutant?:  string
     /** Stryker's hit limit for the active mutant (mutant runs only), see {@link installHitLimit}. */
-    hitLimit?:     number
+    hitLimit?:      number
+    /** This run's secret for signing the hit-limit sentinel, see {@link formatHitLimitSentinel}. */
+    hitLimitToken?: string
 }
+
+/** Env var carrying the per-run token the hit-limit sentinel must include. */
+export const HIT_LIMIT_TOKEN_ENV = '__STRYKER_HIT_LIMIT_TOKEN__';
 
 export function getPreloadConfig(): PreloadConfig {
     return {
-        syncPort:     process.env.__STRYKER_SYNC_PORT__,
-        coverageFile: process.env.__STRYKER_COVERAGE_FILE__,
-        activeMutant: process.env.__STRYKER_ACTIVE_MUTANT__,
-        hitLimit:     parseHitLimit(process.env.__STRYKER_HIT_LIMIT__),
+        syncPort:      process.env.__STRYKER_SYNC_PORT__,
+        coverageFile:  process.env.__STRYKER_COVERAGE_FILE__,
+        activeMutant:  process.env.__STRYKER_ACTIVE_MUTANT__,
+        hitLimit:      parseHitLimit(process.env.__STRYKER_HIT_LIMIT__),
+        hitLimitToken: process.env[HIT_LIMIT_TOKEN_ENV],
     };
 }
 
@@ -112,9 +118,14 @@ export const HIT_LIMIT_SENTINEL = '__STRYKER_HIT_LIMIT_REACHED__';
  * The stderr line reporting `hitCount`. It starts with a newline because bun
  * may have just written a partial line, and the runner only accepts the
  * sentinel at the start of a line.
+ *
+ * `token` is the random secret the runner generated for this run and passed in
+ * {@link HIT_LIMIT_TOKEN_ENV}. The runner only accepts a sentinel carrying it, so
+ * test output that happens to print a sentinel-shaped line cannot turn a
+ * surviving mutant into a Timeout.
  */
-export function formatHitLimitSentinel(hitCount: number): string {
-    return `\n${HIT_LIMIT_SENTINEL} ${hitCount}\n`;
+export function formatHitLimitSentinel(token: string, hitCount: number): string {
+    return `\n${HIT_LIMIT_SENTINEL} ${token} ${hitCount}\n`;
 }
 
 /**
@@ -135,12 +146,14 @@ export function formatHitLimitSentinel(hitCount: number): string {
  * reports the first hit past the limit synchronously, from inside the
  * instrumenter's own `++ns.hitCount`, before the error is even thrown.
  *
+ * @param token - This run's sentinel token, see {@link formatHitLimitSentinel}.
  * @param report - Receives {@link formatHitLimitSentinel}'s line once; defaults
  *   to a synchronous write to fd 2, which nothing in bun buffers or drops.
  */
 export function installHitLimit(
     strykerNamespace: StrykerNamespace,
     hitLimit: number,
+    token: string,
     report: (line: string) => void = (line) => {
         // eslint-disable-next-line n/no-sync -- must reach stderr before bun's bail exit, which runs no async work
         preloadFs.writeSync(2, line);
@@ -157,7 +170,7 @@ export function installHitLimit(
             hitCount = value;
             if(!reported && hitCount > hitLimit) {
                 reported = true;
-                report(formatHitLimitSentinel(hitCount));
+                report(formatHitLimitSentinel(token, hitCount));
             }
         },
     });

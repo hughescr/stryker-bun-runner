@@ -93,6 +93,17 @@ describe('preload-logic', () => {
             expect(config).toHaveProperty('coverageFile');
             expect(config).toHaveProperty('activeMutant');
             expect(config).toHaveProperty('hitLimit');
+            expect(config).toHaveProperty('hitLimitToken');
+        });
+
+        it('reads __STRYKER_HIT_LIMIT_TOKEN__ from env', () => {
+            process.env.__STRYKER_HIT_LIMIT_TOKEN__ = '0123456789abcdef0123456789abcdef';
+            expect(getPreloadConfig().hitLimitToken).toBe('0123456789abcdef0123456789abcdef');
+        });
+
+        it('returns undefined hitLimitToken when __STRYKER_HIT_LIMIT_TOKEN__ is unset', () => {
+            delete process.env.__STRYKER_HIT_LIMIT_TOKEN__;
+            expect(getPreloadConfig().hitLimitToken).toBeUndefined();
         });
 
         it('reads __STRYKER_HIT_LIMIT__ from env as a number', () => {
@@ -755,18 +766,21 @@ describe('preload-logic', () => {
             return false;
         }
 
+        /** The per-run token the runner passes in __STRYKER_HIT_LIMIT_TOKEN__. */
+        const TOKEN = '0123456789abcdef0123456789abcdef';
+
         it('HIT_LIMIT_SENTINEL is the marker the runner looks for on the child\'s stderr', () => {
             expect(HIT_LIMIT_SENTINEL).toBe('__STRYKER_HIT_LIMIT_REACHED__');
         });
 
-        it('formatHitLimitSentinel puts the sentinel and the hit count on a line of their own', () => {
+        it('formatHitLimitSentinel puts the sentinel, the run\'s token and the hit count on a line of their own', () => {
             // Leading newline: bun may have written a partial line just before.
-            expect(formatHitLimitSentinel(1101)).toBe('\n__STRYKER_HIT_LIMIT_REACHED__ 1101\n');
+            expect(formatHitLimitSentinel(TOKEN, 1101)).toBe(`\n__STRYKER_HIT_LIMIT_REACHED__ ${TOKEN} 1101\n`);
         });
 
         it('starts the count at 0 and records the limit in the instrumenter\'s fields', () => {
             const ns: StrykerNamespace = { activeMutant: '7' };
-            installHitLimit(ns, 5, () => {});
+            installHitLimit(ns, 5, TOKEN, () => {});
             expect(ns.hitCount).toBe(0);
             expect(ns.hitLimit).toBe(5);
         });
@@ -774,7 +788,7 @@ describe('preload-logic', () => {
         it('lets the active mutant be hit up to the limit without throwing or reporting', () => {
             const ns: StrykerNamespace = { activeMutant: '7' };
             const report = mock((_line: string) => {});
-            installHitLimit(ns, 5, report);
+            installHitLimit(ns, 5, TOKEN, report);
 
             for(let i = 0; i < 5; i++) {
                 expect(isActive(ns, '7')).toBe(true);
@@ -787,7 +801,7 @@ describe('preload-logic', () => {
         it('reports the sentinel once, synchronously, on the first hit past the limit — the instrumenter then throws', () => {
             const ns: StrykerNamespace = { activeMutant: '7' };
             const report = mock((_line: string) => {});
-            installHitLimit(ns, 5, report);
+            installHitLimit(ns, 5, TOKEN, report);
             for(let i = 0; i < 5; i++) {
                 isActive(ns, '7');
             }
@@ -796,7 +810,7 @@ describe('preload-logic', () => {
             // Reported before the throw unwinds: under --bail bun exits without running
             // afterAll hooks or exit handlers, so this is the only reliable moment.
             expect(report).toHaveBeenCalledTimes(1);
-            expect(report).toHaveBeenCalledWith(formatHitLimitSentinel(6));
+            expect(report).toHaveBeenCalledWith(`\n__STRYKER_HIT_LIMIT_REACHED__ ${TOKEN} 6\n`);
 
             // Every later hit keeps throwing (that is what ends the loop), but is not re-reported.
             expect(() => isActive(ns, '7')).toThrow('Stryker: Hit count limit reached (7)');
@@ -807,7 +821,7 @@ describe('preload-logic', () => {
 
         it('does not count hits of other mutants', () => {
             const ns: StrykerNamespace = { activeMutant: '7' };
-            installHitLimit(ns, 1, () => {});
+            installHitLimit(ns, 1, TOKEN, () => {});
             for(let i = 0; i < 10; i++) {
                 expect(isActive(ns, '8')).toBe(false);
             }
@@ -818,12 +832,12 @@ describe('preload-logic', () => {
             const writeSyncSpy = spyOn(preloadFs, 'writeSync').mockImplementation(() => 0);
             try {
                 const ns: StrykerNamespace = { activeMutant: '7' };
-                installHitLimit(ns, 1);
+                installHitLimit(ns, 1, TOKEN);
                 isActive(ns, '7');
                 expect(writeSyncSpy).not.toHaveBeenCalled();
                 expect(() => isActive(ns, '7')).toThrow();
                 expect(writeSyncSpy).toHaveBeenCalledTimes(1);
-                expect(writeSyncSpy).toHaveBeenCalledWith(2, formatHitLimitSentinel(2));
+                expect(writeSyncSpy).toHaveBeenCalledWith(2, formatHitLimitSentinel(TOKEN, 2));
             } finally {
                 writeSyncSpy.mockRestore();
             }

@@ -98,6 +98,14 @@ export interface BunTestRunOptions {
     hitLimit?: number
 
     /**
+   * This run's secret for the coverage preload's hit-limit sentinel, set as the
+   * __STRYKER_HIT_LIMIT_TOKEN__ env var. The preload signs the sentinel with it
+   * and the runner accepts only a sentinel carrying it. When undefined the
+   * variable is removed, so a child never inherits another run's token.
+   */
+    hitLimitToken?: string
+
+    /**
    * Whether to bail on first failure
    */
     bail?: boolean
@@ -445,13 +453,15 @@ function buildChildEnv(options: BunTestRunOptions, spawnDepth: number): Record<s
     // drives this runner, as this package's own integration tests do under Stryker)
     // inherits the outer child's values through process.env: an inherited active
     // mutant switches off the nested dry run's coverage collection, an inherited
-    // hit limit arms it in the wrong run, and an inherited coverage file or sync
+    // hit limit arms it in the wrong run (and an inherited token would let it sign
+    // a sentinel the outer runner accepts), and an inherited coverage file or sync
     // port points the nested preload at the outer run's file and sync server.
     const preloadVars: Record<string, string | undefined> = {
-        __STRYKER_ACTIVE_MUTANT__: options.activeMutant === '' ? undefined : options.activeMutant,
-        __STRYKER_HIT_LIMIT__:     options.hitLimit === undefined ? undefined : String(options.hitLimit),
-        __STRYKER_COVERAGE_FILE__: options.coverageFile === '' ? undefined : options.coverageFile,
-        __STRYKER_SYNC_PORT__:     options.syncPort ? String(options.syncPort) : undefined,
+        __STRYKER_ACTIVE_MUTANT__:   options.activeMutant === '' ? undefined : options.activeMutant,
+        __STRYKER_HIT_LIMIT__:       options.hitLimit === undefined ? undefined : String(options.hitLimit),
+        __STRYKER_HIT_LIMIT_TOKEN__: options.hitLimitToken,
+        __STRYKER_COVERAGE_FILE__:   options.coverageFile === '' ? undefined : options.coverageFile,
+        __STRYKER_SYNC_PORT__:       options.syncPort ? String(options.syncPort) : undefined,
     };
     for(const [name, value] of Object.entries(preloadVars)) {
         if(value === undefined) {
