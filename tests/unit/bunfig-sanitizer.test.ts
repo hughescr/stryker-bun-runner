@@ -336,6 +336,60 @@ describe('generateSanitizedBunfig', () => {
         });
     });
 
+    describe('explicit source bunfig (bun.bunArgs --config)', () => {
+        it('reads the given file, resolved against the project cwd, instead of <cwd>/bunfig.toml', async () => {
+            mockReadFile.mockResolvedValue('[test]\ntimeout = 99\n');
+
+            await generateSanitizedBunfig(projectCwd, tmpDir, './config/ci.toml');
+
+            expect(mockReadFile).toHaveBeenCalledTimes(1);
+            expect(mockReadFile.mock.calls[0][0]).toBe('/project/config/ci.toml');
+        });
+
+        it('uses an absolute source path as-is', async () => {
+            mockReadFile.mockResolvedValue('');
+
+            await generateSanitizedBunfig(projectCwd, tmpDir, '/etc/ci.toml');
+
+            expect(mockReadFile.mock.calls[0][0]).toBe('/etc/ci.toml');
+        });
+
+        it('sanitizes the given file exactly like the default one (allowlist, forced overrides, absolute paths)', async () => {
+            mockReadFile.mockResolvedValue(
+                '[install]\nexact = true\n\n[test]\npreload = "./setup.ts"\ntimeout = 99\ncoverage = true\nonlyFailures = true\ncoverageThreshold = 0.9\n'
+            );
+
+            await generateSanitizedBunfig(projectCwd, tmpDir, 'ci.toml');
+
+            const [, written] = mockWriteFile.mock.calls[0] as [string, string, string];
+            const parsed = parse(written) as { install: Record<string, unknown>, test: Record<string, unknown> };
+            expect(parsed.install.exact).toBe(true);
+            expect(parsed.test.timeout).toBe(99);
+            expect(parsed.test.preload).toBe('/project/setup.ts');
+            expect(parsed.test.coverage).toBe(false);
+            expect(parsed.test.onlyFailures).toBe(false);
+            expect(parsed.test.coverageThreshold).toBeUndefined();
+        });
+
+        it('fails clearly when the given file does not exist (unlike the optional default bunfig)', async () => {
+            mockReadFile.mockRejectedValue(Object.assign(new Error('ENOENT: no such file'), { code: 'ENOENT' }));
+
+            const err = await generateSanitizedBunfig(projectCwd, tmpDir, 'missing.toml').catch((e: unknown) => e);
+
+            expect((err as Error).message).toContain('/project/missing.toml');
+            expect((err as Error).message).toContain('--config');
+            expect(mockWriteFile).not.toHaveBeenCalled();
+        });
+
+        it('fails clearly when the given file cannot be parsed', async () => {
+            mockReadFile.mockResolvedValue('[test\nbroken');
+
+            const err = await generateSanitizedBunfig(projectCwd, tmpDir, 'bad.toml').catch((e: unknown) => e);
+
+            expect((err as Error).message).toContain('/project/bad.toml');
+        });
+    });
+
     describe('round-trip', () => {
         it('written file can be parsed back and has expected structure', async () => {
             mockReadFile.mockResolvedValue(
@@ -391,6 +445,18 @@ describe('readBunfigTestRoot', () => {
         expect(await readBunfigTestRoot('/project')).toBeUndefined();
         mockReadFile.mockResolvedValue('[test]\nroot = 5\n');
         expect(await readBunfigTestRoot('/project')).toBeUndefined();
+    });
+
+    it('reads [test].root from an explicit source bunfig, still resolved against the project cwd', async () => {
+        mockReadFile.mockResolvedValue('[test]\nroot = "./spec"\n');
+        expect(await readBunfigTestRoot('/project', 'config/ci.toml')).toBe('/project/spec');
+        expect(mockReadFile.mock.calls.at(-1)?.[0]).toBe('/project/config/ci.toml');
+    });
+
+    it('throws when an explicit source bunfig does not exist', async () => {
+        mockReadFile.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+        const err = await readBunfigTestRoot('/project', 'nope.toml').catch((e: unknown) => e);
+        expect((err as Error).message).toContain('/project/nope.toml');
     });
 
     it('throws a clear error for non-ENOENT read errors', async () => {

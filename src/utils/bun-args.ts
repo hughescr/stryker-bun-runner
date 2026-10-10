@@ -13,6 +13,10 @@
  * Bail flags are NOT listed here: they are stripped silently by
  * `stripBailArgs` in process-runner.ts (the documented behaviour).
  *
+ * `--config`/`-c` is not rejected either, provided it names a file: it selects
+ * the source bunfig for the runner's sanitizer and is removed from the args
+ * bun sees (`splitBunConfigArg`). Only a flag with no usable path is rejected.
+ *
  * Every entry was checked against bun 1.4.2 (`bun test --help`) and, where the
  * reason below states an effect, measured with a real Stryker run on a fixture
  * project. Flags measured to leave scores and attribution unchanged
@@ -42,7 +46,8 @@ export const REJECTED_BUN_FLAGS: readonly RejectedFlag[] = [
     { flags: ['--pass-with-no-tests'], reason: 'turns a test selection that matched nothing into exit code 0, so such mutants are falsely scored as survived' },
     { flags: ['--watch'], reason: 'never exits, so every run would time out' },
     { flags: ['--coverage', '--coverage-reporter', '--coverage-dir'], reason: "re-enables bun's own coverage, which the runner turns off; it slows every run and skews timeouts" },
-    { flags: ['--config', '-c'], reason: 'replaces the sanitized bunfig the runner generates (coverage and onlyFailures off, paths made absolute)' },
+    // Only spellings splitBunConfigArg could not use are left to reach this table.
+    { flags: ['--config', '-c'], reason: 'has no usable path: write --config=<path>, --config <path> or -c <path> (the runner sanitizes that file and passes its own --config to bun)' },
     { flags: ['--cwd'], reason: 'moves bun out of the Stryker sandbox, so tests run against the unmutated project and every mutant goes uncovered' },
     { flags: ['--inspect', '--inspect-wait', '--inspect-brk'], reason: 'conflicts with the inspector endpoint the runner uses to track tests' },
 ];
@@ -71,17 +76,62 @@ function matchesFlag(arg: string, flag: string): boolean {
     return arg.startsWith(flag);
 }
 
+/** `bunArgs` with the bunfig flag removed, plus the path it named. */
+export interface SplitBunConfigArg {
+    /** Every arg except the consumed config flag(s), in their original order. */
+    args:        string[]
+    /** The user's source bunfig, exactly as written (relative paths are NOT resolved here); the last flag wins, as in bun. */
+    configPath?: string
+}
+
+/** True for a token that can be the separate path value of `--config`/`-c`: present, non-empty and not itself a flag. */
+function isConfigPathToken(token: string | undefined): boolean {
+    return token !== undefined && token !== '' && !token.startsWith('-');
+}
+
+/**
+ * Take the bunfig flag out of `bunArgs`.
+ *
+ * The runner passes its own sanitized `--config=<tmp>` to bun, so a user's
+ * `--config` must not reach bun (the later flag would win and drop the
+ * sanitizing). Instead its path becomes the SOURCE the runner sanitizes (and
+ * reads `[test].root` from). Consumed spellings: `--config=<path>`,
+ * `--config <path>` and `-c <path>`, where the path is non-empty and, for the
+ * space-separated forms, does not start with `-`. Anything else that spells the
+ * flag (`--config` alone, `--config=`, `-c=x`, `-cx`) is left in `args` for
+ * {@link findUnsupportedBunArgs} to reject.
+ *
+ * @param bunArgs - The user's `bun.bunArgs`; not modified
+ */
+export function splitBunConfigArg(bunArgs: readonly string[]): SplitBunConfigArg {
+    const args: string[] = [];
+    let configPath: string | undefined;
+    for(let i = 0; i < bunArgs.length; i++) {
+        const arg = bunArgs[i];
+        if(arg.startsWith('--config=') && arg.length > '--config='.length) {
+            configPath = arg.slice('--config='.length);
+        } else if((arg === '--config' || arg === '-c') && isConfigPathToken(bunArgs.at(i + 1))) {
+            configPath = bunArgs[i + 1];
+            i += 1;
+        } else {
+            args.push(arg);
+        }
+    }
+    return { args, configPath };
+}
+
 /**
  * Find every token in `bunArgs` that spells a rejected flag. A flag's separate
  * value token (`--max-concurrency 5`, `-t pattern`) is not inspected: only the
- * flag itself is reported.
+ * flag itself is reported. A usable `--config`/`-c` is accepted (see
+ * {@link splitBunConfigArg}); only an unusable spelling of it is reported.
  *
  * @returns Offending tokens in the order given, each reported once
  */
 export function findUnsupportedBunArgs(bunArgs: readonly string[]): UnsupportedBunArg[] {
     const found: UnsupportedBunArg[] = [];
     const seen = new Set<string>();
-    for(const arg of bunArgs) {
+    for(const arg of splitBunConfigArg(bunArgs).args) {
         if(seen.has(arg)) {
             continue;
         }

@@ -579,4 +579,28 @@ describe('discoverTestFiles (bunfig [test].root)', () => {
         await writeFile(path.join(tmpDir, 'bunfig.toml'), '[test]\nroot = 5\n');
         expect(await discoverTestFiles(tmpDir)).toEqual(allFiles);
     });
+
+    describe('with an explicit source bunfig (bun.bunArgs --config)', () => {
+        beforeEach(async () => {
+            await writeFile(path.join(tmpDir, 'bunfig.ci.toml'), '[test]\nroot = "./e2e"\n');
+        });
+
+        it('takes [test].root from the given file, relative to the project dir', async () => {
+            expect(await discoverTestFiles(tmpDir, undefined, 'bunfig.ci.toml')).toEqual(['e2e/c.test.ts']);
+        });
+
+        it('takes it from an absolute path', async () => {
+            expect(await discoverTestFiles(tmpDir, undefined, path.join(tmpDir, 'bunfig.ci.toml'))).toEqual(['e2e/c.test.ts']);
+        });
+
+        it('prefers the given file over <cwd>/bunfig.toml', async () => {
+            await writeFile(path.join(tmpDir, 'bunfig.toml'), '[test]\nroot = "./src"\n');
+            expect(await discoverTestFiles(tmpDir, undefined, 'bunfig.ci.toml')).toEqual(['e2e/c.test.ts']);
+            expect(await discoverTestFiles(tmpDir)).toEqual(['src/a.test.ts', 'src/sub/b.test.ts']);
+        });
+
+        it('rejects when the given file is missing', async () => {
+            await expect(discoverTestFiles(tmpDir, undefined, 'nope.toml')).rejects.toThrow('nope.toml');
+        });
+    });
 });

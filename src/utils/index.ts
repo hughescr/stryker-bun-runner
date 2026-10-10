@@ -1,5 +1,5 @@
 export { getAvailablePort } from './port.js';
-export { assertSupportedBunArgs } from './bun-args.js';
+export { assertSupportedBunArgs, splitBunConfigArg } from './bun-args.js';
 export { checkBunVersion, MIN_BUN_VERSION } from './bun-version.js';
 export { SyncServer } from './sync-server.js';
 export type { SyncServerOptions } from './sync-server.js';

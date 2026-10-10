@@ -715,6 +715,78 @@ describe('BunTestRunner', () => {
 
                 await runner.init();
             });
+
+            describe('--config / -c as the source bunfig', () => {
+                it.each([
+                    ['--config=ci.toml form', ['--only', '--config=ci.toml']],
+                    ['--config ci.toml form', ['--only', '--config', 'ci.toml']],
+                    ['-c ci.toml form', ['-c', 'ci.toml', '--only']],
+                ])('accepts the %s: sanitizer and discovery read it, bun never sees it', async (_name, bunArgs) => {
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                    mockRunBunTests.mockImplementation((options: any) => {
+                        options.onInspectorReady?.('ws://127.0.0.1:6499/inspector');
+                        return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
+                    });
+                    mockCollectCoverage.mockResolvedValue(undefined);
+                    mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+                    const runner = new BunTestRunner(mockLogger, { bun: { bunArgs } } as unknown as StrykerOptions);
+
+                    await runner.init();
+                    await runner.dryRun();
+
+                    expect(mockGenerateSanitizedBunfig).toHaveBeenCalledWith(process.cwd(), expect.any(String), 'ci.toml');
+                    expect(discoverTestFilesSpy).toHaveBeenCalledWith(process.cwd(), mockLogger, 'ci.toml');
+                    // Only the runner's own sanitized --config reaches bun (built in process-runner from bunfigPath).
+                    expect(mockRunBunTests).toHaveBeenCalledWith(expect.objectContaining({ bunArgs: ['--only'] }));
+                });
+
+                it('passes no source bunfig when bunArgs has no config flag', async () => {
+                    const runner = new BunTestRunner(mockLogger, { bun: { bunArgs: ['--only'] } } as unknown as StrykerOptions);
+
+                    await runner.init();
+
+                    expect(mockGenerateSanitizedBunfig).toHaveBeenCalledWith(process.cwd(), expect.any(String), undefined);
+                    expect(discoverTestFilesSpy).toHaveBeenCalledWith(process.cwd(), mockLogger, undefined);
+                });
+
+                it('strips the flag from the args of mutant runs too', async () => {
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                    mockRunBunTests.mockImplementation((options: any) => {
+                        options.onInspectorReady?.('ws://127.0.0.1:6499/inspector');
+                        return Promise.resolve({ exitCode: 0, stdout: '1 pass', stderr: '', timedOut: false });
+                    });
+                    mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+                    const runner = new BunTestRunner(mockLogger, {
+                        bun: { bunArgs: ['--config=ci.toml', '--only'] },
+                    } as unknown as StrykerOptions);
+                    await runner.init();
+
+                    await runner.mutantRun({
+                        activeMutant: { id: '1' }, sandboxFileName: 'x.ts', testFilter: [], timeout: 10_000, mutantActivation: 'static',
+                    } as unknown as Parameters<typeof runner.mutantRun>[0]);
+
+                    expect(mockRunBunTests).toHaveBeenLastCalledWith(expect.objectContaining({ bunArgs: ['--only'] }));
+                });
+
+                it('rejects init() for a config flag without a usable path', async () => {
+                    const runner = new BunTestRunner(mockLogger, {
+                        bun: { bunArgs: ['--only', '--config'] },
+                    } as unknown as StrykerOptions);
+
+                    await expect(runner.init()).rejects.toThrow(/bun\.bunArgs contains "--config", which .*--config=<path>/);
+                    expect(mockGeneratePreloadScript).not.toHaveBeenCalled();
+                });
+
+                it('logs the bunArgs exactly as the user wrote them', () => {
+                    const runner = new BunTestRunner(mockLogger, { bun: { bunArgs: ['--config=ci.toml'] } } as unknown as StrykerOptions);
+                    expect(runner).toBeDefined();
+
+                    expect(mockLogger.debug).toHaveBeenCalledWith(
+                        expect.any(String),
+                        expect.objectContaining({ bunArgs: ['--config=ci.toml'] })
+                    );
+                });
+            });
         });
 
         describe('startup bun check', () => {

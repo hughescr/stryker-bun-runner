@@ -52,8 +52,13 @@ export interface BunTestRunnerOptions {
    * test selection (`--concurrent`, `--max-concurrency`, `--parallel`,
    * `--shard`, `--changed`, `-t`/`--test-name-pattern`,
    * `-u`/`--update-snapshots`, `--pass-with-no-tests`, `--watch`,
-   * `--coverage*`, `-c`/`--config`, `--cwd`, `--inspect*`) make `init()` throw
-   * instead of being passed through — see src/utils/bun-args.ts.
+   * `--coverage*`, `--cwd`, `--inspect*`) make `init()` throw instead of being
+   * passed through — see src/utils/bun-args.ts.
+   *
+   * `--config=<path>` (or `--config <path>` / `-c <path>`) names the bunfig the
+   * runner sanitizes and reads `[test].root` from, resolved against the project
+   * directory. It is removed from the bun command line, because the runner
+   * always passes bun its own sanitized `--config`. Without a path it throws.
    *
    * @example ['--only', '--verbose']
    */

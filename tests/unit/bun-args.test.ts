@@ -4,7 +4,52 @@
  */
 
 import { describe, it, expect } from 'bun:test';
-import { assertSupportedBunArgs, findUnsupportedBunArgs, REJECTED_BUN_FLAGS } from '../../src/utils/bun-args.js';
+import { assertSupportedBunArgs, findUnsupportedBunArgs, REJECTED_BUN_FLAGS, splitBunConfigArg } from '../../src/utils/bun-args.js';
+
+describe('splitBunConfigArg', () => {
+    it('returns the args untouched and no path when there is no config flag', () => {
+        expect(splitBunConfigArg(['--only', '--smol'])).toEqual({ args: ['--only', '--smol'], configPath: undefined });
+        expect(splitBunConfigArg([])).toEqual({ args: [], configPath: undefined });
+    });
+
+    it.each([
+        [['--config=./ci.toml'], './ci.toml'],
+        [['--config', './ci.toml'], './ci.toml'],
+        [['-c', './ci.toml'], './ci.toml'],
+        [['--config=/abs/ci.toml'], '/abs/ci.toml'],
+        [['--config=a=b.toml'], 'a=b.toml'],
+    ])('extracts the path from %j and removes the flag from the args', (input, expected) => {
+        expect(splitBunConfigArg(input)).toEqual({ args: [], configPath: expected });
+    });
+
+    it('keeps every other arg, in order', () => {
+        expect(splitBunConfigArg(['--only', '--config', 'ci.toml', '--smol', '--timeout=5'])).toEqual({
+            args:       ['--only', '--smol', '--timeout=5'],
+            configPath: 'ci.toml',
+        });
+    });
+
+    it('lets the last config flag win, as bun does, and removes all of them', () => {
+        expect(splitBunConfigArg(['--config=a.toml', '-c', 'b.toml', '--only'])).toEqual({ args: ['--only'], configPath: 'b.toml' });
+    });
+
+    it('leaves unusable spellings in the args for the validator to reject', () => {
+        for(const bad of [['--config'], ['-c'], ['--config='], ['--config', '--only'], ['-c', '--only'], ['-c=x.toml'], ['-cx.toml']]) {
+            expect(splitBunConfigArg(bad).args).toEqual(bad);
+            expect(splitBunConfigArg(bad).configPath).toBeUndefined();
+        }
+    });
+
+    it('does not mistake flags that merely start with --config for the flag', () => {
+        expect(splitBunConfigArg(['--configure', 'x', '--config-file=y'])).toEqual({ args: ['--configure', 'x', '--config-file=y'], configPath: undefined });
+    });
+
+    it('does not mutate its input', () => {
+        const input = ['--config=a.toml', '--only'];
+        splitBunConfigArg(input);
+        expect(input).toEqual(['--config=a.toml', '--only']);
+    });
+});
 
 describe('findUnsupportedBunArgs', () => {
     describe('rejected long flags', () => {
@@ -24,7 +69,6 @@ describe('findUnsupportedBunArgs', () => {
             '--coverage',
             '--coverage-reporter',
             '--coverage-dir',
-            '--config',
             '--cwd',
             '--inspect',
             '--inspect-wait',
@@ -46,7 +90,33 @@ describe('findUnsupportedBunArgs', () => {
 
         it('covers exactly the documented set (no flag in the table without a test above)', () => {
             const tableLong = REJECTED_BUN_FLAGS.flatMap(r => r.flags).filter(f => f.startsWith('--')).toSorted((a, b) => a.localeCompare(b));
-            expect(tableLong).toEqual([...longFlags].toSorted((a, b) => a.localeCompare(b)));
+            // --config is in the table only for the spellings splitBunConfigArg cannot use (tested below).
+            expect(tableLong).toEqual([...longFlags, '--config'].toSorted((a, b) => a.localeCompare(b)));
+        });
+    });
+
+    describe('--config / -c (accepted with a path, rejected otherwise)', () => {
+        it.each([
+            [['--config=./bunfig.ci.toml']],
+            [['--config', './bunfig.ci.toml']],
+            [['-c', './bunfig.ci.toml']],
+            [['--only', '--config=a.toml', '--smol']],
+        ])('accepts %j', (args) => {
+            expect(findUnsupportedBunArgs(args)).toEqual([]);
+        });
+
+        it.each([
+            ['bare --config', ['--config']],
+            ['bare -c', ['-c']],
+            ['--config= with an empty path', ['--config=']],
+            ['--config followed by another flag', ['--config', '--only']],
+            ['-c followed by another flag', ['-c', '--only']],
+            ['-c=path', ['-c=bunfig.toml']],
+            ['-cpath', ['-cbunfig.toml']],
+        ])('still rejects %s, naming the accepted spellings', (_name, args) => {
+            const found = findUnsupportedBunArgs(args);
+            expect(found.map(f => f.arg)).toEqual([args[0]]);
+            expect(found[0].reason).toContain('--config=<path>');
         });
     });
 
@@ -56,9 +126,6 @@ describe('findUnsupportedBunArgs', () => {
             ['-t', '-t=foo'],
             ['-t', '-tfoo'],
             ['-u', '-u'],
-            ['-c', '-c'],
-            ['-c', '-c=bunfig.toml'],
-            ['-c', '-cbunfig.toml'],
         ])('rejects %s written as %s', (_flag, arg) => {
             expect(findUnsupportedBunArgs([arg]).map(f => f.arg)).toEqual([arg]);
         });
@@ -160,6 +227,21 @@ describe('assertSupportedBunArgs', () => {
         expect(message).toContain('); "-t" (');
         expect(message).not.toContain('--only');
         expect(message).toEndWith('Remove them.');
+    });
+
+    it('accepts a config flag that carries a path, in every supported spelling', () => {
+        expect(assertFn(['--config=./ci.toml'])).not.toThrow();
+        expect(assertFn(['--config', './ci.toml'])).not.toThrow();
+        expect(assertFn(['-c', './ci.toml', '--only'])).not.toThrow();
+    });
+
+    it('throws for a config flag with no usable path, pointing at the supported spellings', () => {
+        expect(assertFn(['--config'])).toThrow(/"--config", which .*--config=<path>/);
+        expect(assertFn(['-c', '--only'])).toThrow(/"-c", which .*--config=<path>/);
+    });
+
+    it('still reports the other offenders when a valid config flag is present', () => {
+        expect(assertFn(['--config=ci.toml', '--concurrent'])).toThrow('bun.bunArgs contains "--concurrent"');
     });
 
     it('uses a reason that fits the flag: test selection for -t', () => {

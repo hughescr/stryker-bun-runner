@@ -179,7 +179,8 @@ async function processEntry(
  * (case-insensitive); `node_modules` (case-insensitive) and dot-directories
  * are skipped; `dist` and `build` are walked.
  *
- * The walk starts at `[test].root` from `<cwd>/bunfig.toml` when set (resolved
+ * The walk starts at `[test].root` from `<cwd>/bunfig.toml` (or the bunfig named
+ * by `--config` in `bun.bunArgs`, see `sourceBunfig`) when set (resolved
  * against cwd, as bun does) and the whole of cwd otherwise. Bun ignores
  * `root` for positional file arguments, so honouring it has to happen here.
  * `pathIgnorePatterns` needs no handling: bun applies it to positional
@@ -192,10 +193,13 @@ async function processEntry(
  * @param cwd - Project directory: holds bunfig.toml and anchors the returned
  *          relative paths (defaults to process.cwd())
  * @param logger - Optional logger for diagnostic messages
+ * @param sourceBunfig - The user's bunfig named by `--config` in `bun.bunArgs`
+ *          (relative to cwd); `<cwd>/bunfig.toml` when omitted
  */
 export async function discoverTestFiles(
     cwd: string = process.cwd(),
-    logger?: Pick<Logger, 'warn' | 'debug'>
+    logger?: Pick<Logger, 'warn' | 'debug'>,
+    sourceBunfig?: string
 ): Promise<string[] | undefined> {
     const results: string[] = [];
     // Track real (resolved) directory paths to prevent infinite loops via symlinks.
@@ -234,7 +238,7 @@ export async function discoverTestFiles(
         }
     }
 
-    const walkRoot = (await readBunfigTestRoot(cwd)) ?? cwd;
+    const walkRoot = (await readBunfigTestRoot(cwd, sourceBunfig)) ?? cwd;
     await walk(walkRoot);
 
     if(results.length === 0) {

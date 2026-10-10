@@ -39,7 +39,7 @@ import type { TestInfo } from './inspector/types.js';
 import type { StrykerBunOptions } from './options.js';
 import { parseBunTestOutput, type ParsedTestResults } from './parsers/console-parser.js';
 import { runBunTests, stripAnsi } from './process-runner.js';
-import { assertSupportedBunArgs, checkBunVersion, getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, discoverTestFiles, findBuildOutputTestFiles, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery } from './utils/index.js';
+import { assertSupportedBunArgs, splitBunConfigArg, checkBunVersion, getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, discoverTestFiles, findBuildOutputTestFiles, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery } from './utils/index.js';
 
 /**
  * Sleep for the given number of milliseconds.
@@ -431,7 +431,12 @@ export class BunTestRunner implements TestRunner {
     private readonly timeout:             number;
     private readonly inspectorTimeout:    number;
     private readonly env?:                Record<string, string>;
+    /** `bun.bunArgs` as the user wrote them; validated at init(). */
+    private readonly configuredBunArgs?:  string[];
+    /** `bun.bunArgs` as spawned: the user's `--config`/`-c` is removed (the runner passes its own sanitized one). */
     private readonly bunArgs?:            string[];
+    /** The user's bunfig named by `--config`/`-c` in `bun.bunArgs`, as written: the source the runner sanitizes and reads `[test].root` from. */
+    private readonly sourceBunfig?:       string;
     private readonly testFilesOverride?:  string[];
     private readonly mutateGlobs:         readonly string[];
     private readonly smol:                boolean;
@@ -476,7 +481,10 @@ export class BunTestRunner implements TestRunner {
         this.timeout = bunOptions.timeout ?? 10_000;
         this.inspectorTimeout = bunOptions.inspectorTimeout ?? 5000;
         this.env = bunOptions.env;
-        this.bunArgs = bunOptions.bunArgs;
+        this.configuredBunArgs = bunOptions.bunArgs;
+        const split = bunOptions.bunArgs === undefined ? undefined : splitBunConfigArg(bunOptions.bunArgs);
+        this.bunArgs = split?.args;
+        this.sourceBunfig = split?.configPath;
         this.smol = bunOptions.smol ?? false;
         this.maxChildRss = bunOptions.maxChildRss;
         this.rssCheckIntervalMs = bunOptions.rssCheckIntervalMs;
@@ -504,7 +512,7 @@ export class BunTestRunner implements TestRunner {
             timeout:            this.timeout,
             inspectorTimeout:   this.inspectorTimeout,
             env:                this.env,
-            bunArgs:            this.bunArgs,
+            bunArgs:            this.configuredBunArgs,
             smol:               this.smol,
             maxChildRss:        this.maxChildRss,
             rssCheckIntervalMs: this.rssCheckIntervalMs,
@@ -664,7 +672,7 @@ export class BunTestRunner implements TestRunner {
         if(this.cachedTestFiles !== undefined && this.cachedTestFilesCwd === cwd) {
             return this.cachedTestFiles;
         }
-        this.cachedTestFiles = await discoverTestFiles(cwd, this.logger);
+        this.cachedTestFiles = await discoverTestFiles(cwd, this.logger, this.sourceBunfig);
         this.cachedTestFilesCwd = cwd;
         this.warnAboutBuildOutputTests(this.cachedTestFiles);
         return this.cachedTestFiles;
@@ -726,7 +734,7 @@ export class BunTestRunner implements TestRunner {
 
         // Reject bunArgs that fight the runner's own flags (concurrency, test selection, ...)
         // before doing any work — a loud config error beats silently wrong mutant scores.
-        assertSupportedBunArgs(this.bunArgs);
+        assertSupportedBunArgs(this.configuredBunArgs);
 
         // Fail fast, with an actionable message, if bun cannot be run or is older than the
         // supported floor — otherwise a missing binary only shows up later as a dry-run
@@ -822,7 +830,7 @@ export class BunTestRunner implements TestRunner {
         }
         // Stryker disable next-line StringLiteral: equivalent mutant — mutating 'stryker-bun-runner' to '' still produces a valid writable directory under tmpdir(); sanitized bunfig generation succeeds either way
         const tempDir = this.tempDir ?? path.join(tmpdir(), 'stryker-bun-runner');
-        this.sanitizedBunfigPath = await generateSanitizedBunfig(cwd, tempDir);
+        this.sanitizedBunfigPath = await generateSanitizedBunfig(cwd, tempDir, this.sourceBunfig);
         this.sanitizedBunfigCwd  = cwd;
         // Stryker disable next-line StringLiteral: logging message only
         this.logger.debug('Sanitized bunfig (re)generated at: %s for cwd: %s', this.sanitizedBunfigPath, cwd);

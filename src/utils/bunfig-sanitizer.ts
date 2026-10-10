@@ -52,40 +52,50 @@ function absolutizePathValue(value: unknown, projectCwd: string): unknown {
 }
 
 /**
- * Read and parse `<projectCwd>/bunfig.toml`, treating absence as an empty config.
+ * Read and parse the source bunfig: `sourceBunfig` (from `bun.bunArgs`
+ * `--config`, resolved against `projectCwd`) when given, else
+ * `<projectCwd>/bunfig.toml`.
  *
- * @throws Error when the file exists but cannot be read or parsed
+ * The default bunfig is optional, so its absence is an empty config. A file the
+ * user named explicitly must exist: silently running without the settings they
+ * pointed at would be worse than failing.
+ *
+ * @throws Error when the file cannot be read or parsed, or when an explicitly
+ *         named file does not exist
  */
-async function readProjectBunfig(projectCwd: string): Promise<Record<string, unknown>> {
-    const bunfigPath = path.join(projectCwd, 'bunfig.toml');
+async function readSourceBunfig(projectCwd: string, sourceBunfig: string | undefined): Promise<Record<string, unknown>> {
+    const bunfigPath = sourceBunfig === undefined ? path.join(projectCwd, 'bunfig.toml') : path.resolve(projectCwd, sourceBunfig);
     try {
         const content = await readFile(bunfigPath, 'utf8');
         // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion -- parse() returns TomlPrimitive, widening to Record is intentional
         return parse(content) as unknown as Record<string, unknown>;
     } catch (err: unknown) {
-        // ENOENT → no bunfig present, use empty config
-        if((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-            // Stryker disable next-line ObjectLiteral: equivalent mutant — { cause: err } vs {} is only observable via error.cause, not the error message tested here
-            throw new Error(`Failed to read bunfig.toml at ${bunfigPath}: ${String(err)}`, { cause: err });
+        // ENOENT → no default bunfig present, use empty config
+        if(sourceBunfig === undefined && (err as NodeJS.ErrnoException).code === 'ENOENT') {
+            return {};
         }
-        return {};
+        const what = sourceBunfig === undefined ? 'bunfig.toml' : 'bunfig (named by --config in bun.bunArgs)';
+        // Stryker disable next-line ObjectLiteral: equivalent mutant — { cause: err } vs {} is only observable via error.cause, not the error message tested here
+        throw new Error(`Failed to read ${what} at ${bunfigPath}: ${String(err)}`, { cause: err });
     }
 }
 
 /**
- * Return the project's `[test].root` from `<projectCwd>/bunfig.toml`, resolved
- * to an absolute path.
+ * Return the project's `[test].root` from the source bunfig (see
+ * {@link readSourceBunfig}), resolved to an absolute path.
  *
  * Bun resolves a relative `root` against the process cwd (verified on bun
  * 1.4.2, including with `--config` pointing elsewhere), which for the runner is
  * the project/sandbox cwd — the same anchor the sanitized bunfig uses.
  *
  * @param projectCwd - Directory holding bunfig.toml (and the bun subprocess cwd)
+ * @param sourceBunfig - Path of the user's bunfig from `bun.bunArgs` (relative
+ *          to projectCwd); `<projectCwd>/bunfig.toml` when omitted
  * @returns The absolute root, or undefined when there is no bunfig, no
  *          `[test].root`, or the value is not a string
  */
-export async function readBunfigTestRoot(projectCwd: string): Promise<string | undefined> {
-    const rawConfig = await readProjectBunfig(projectCwd);
+export async function readBunfigTestRoot(projectCwd: string, sourceBunfig?: string): Promise<string | undefined> {
+    const rawConfig = await readSourceBunfig(projectCwd, sourceBunfig);
     // `test` may be absent or a non-table TOML value; optional chaining reads
     // `.root` off anything object-like and yields undefined for the rest.
     const root = (rawConfig.test as Record<string, unknown> | undefined)?.root;
@@ -101,13 +111,15 @@ export async function readBunfigTestRoot(projectCwd: string): Promise<string | u
  *
  * @param projectCwd - Absolute path of the project root (where bunfig.toml lives)
  * @param tmpDir     - Directory where the sanitized file is written
+ * @param sourceBunfig - Path of the user's bunfig from `bun.bunArgs` `--config`
+ *          (relative to projectCwd); `<projectCwd>/bunfig.toml` when omitted
  * @returns Absolute path of the written sanitized bunfig
  */
-export async function generateSanitizedBunfig(projectCwd: string, tmpDir: string): Promise<string> {
+export async function generateSanitizedBunfig(projectCwd: string, tmpDir: string, sourceBunfig?: string): Promise<string> {
     // Ensure temp directory exists
     await mkdir(tmpDir, { recursive: true });
 
-    const rawConfig = await readProjectBunfig(projectCwd);
+    const rawConfig = await readSourceBunfig(projectCwd, sourceBunfig);
 
     // Build sanitized config
     const sanitized: Record<string, unknown> = {};
