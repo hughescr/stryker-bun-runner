@@ -27,6 +27,7 @@ import * as bunfigSanitizer from '../../src/utils/bunfig-sanitizer.js';
 import * as privateTempDir from '../../src/utils/private-temp-dir.js';
 import * as syncServerModule from '../../src/utils/sync-server.js';
 import * as testFileDiscovery from '../../src/utils/test-file-discovery.js';
+import { runUntilSettled } from '../helpers/fake-clock.js';
 import { mockGetAvailablePort, mockRename, mockWriteFile, resetAllMocks } from '../test-preload.js';
 
 /**
@@ -542,7 +543,14 @@ describe('BunTestRunner mutation kill tests (first half of the runner)', () => {
                 timedOut: false,
             }));
 
-            const result = await dryRunOnce();
+            // The runner polls for the URL every 50ms: drive that poll on the fake clock.
+            jest.useFakeTimers();
+            let result: Awaited<ReturnType<typeof dryRunOnce>>;
+            try {
+                ({ value: result } = await runUntilSettled(dryRunOnce()));
+            } finally {
+                jest.useRealTimers();
+            }
 
             expect(result.status).toBe(DryRunStatus.Error);
             const [errorLog] = callsMatching(mockLogger.error, 'Failed to get inspector URL within timeout (%dms)');
