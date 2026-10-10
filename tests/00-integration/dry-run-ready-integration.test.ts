@@ -21,21 +21,12 @@ import { resetAllMocks } from '../test-preload.js';
 
 // Real bun children: the runner's own timers (inspector-URL timeout, drain-silence
 // poll) have to run on real time here. The tests themselves wait on nothing but
-// events: the runner's results and a helper process's exit.
+// events: the runner's results and the child's sync connection.
 allowRealTimersFromSource();
 
-/**
- * How long the first TestReporter.enable is held back. The preload used to give
- * up waiting for 'ready' after a fixed 2000 ms and run the tests anyway, unseen by
- * the runner; this hold outlasts that window. The wait happens in a separate bun
- * process, not in this one: the test only waits for that process to exit.
- */
-const ENABLE_HOLD_MS = 2500;
-
-/** Stands in for a loaded machine on which the runner's enable round trip is late. */
-async function slowMachineDelay(): Promise<void> {
-    const helper = Bun.spawn([process.execPath, '--eval', `setTimeout(() => {}, ${ENABLE_HOLD_MS})`], { stdout: 'ignore', stderr: 'ignore' });
-    await helper.exited;
+/** The part of the 'ws' server and socket this file listens on. */
+interface ObservableWss {
+    on(event: 'connection', listener: (socket: { on(event: 'message', listener: (data: Buffer) => void): void }) => void): void
 }
 
 /** What Stryker's instrumenter does at a mutant switch: count a hit for the active test, or statically. */
@@ -65,16 +56,29 @@ const silentLogger = {
 /** Spies installed by the current test; restored after each test. */
 const spies: { mockRestore: () => void }[] = [];
 
-/** Hold back the runner's first TestReporter.enable until `before` settles. */
-function interceptFirstEnable(before: () => Promise<void>): void {
+/**
+ * Hold back the runner's first TestReporter.enable until `before` settles, and
+ * hand each InspectorClient that sends anything to `onClient`.
+ */
+function interceptFirstEnable(before: () => Promise<void>, onClient: (client: InspectorClient) => void = () => {}): void {
     const originalSend = InspectorClient.prototype.send;
     let intercepted = false;
     spies.push(spyOn(InspectorClient.prototype, 'send').mockImplementation(async function(this: InspectorClient, ...args: Parameters<InspectorClient['send']>) {
+        onClient(this);
         if(!intercepted && args[0] === 'TestReporter.enable') {
             intercepted = true;
             await before();
         }
         return originalSend.apply(this, args);
+    }));
+}
+
+/** Hand every SyncServer the runner starts to `onStarted`, once it is listening. */
+function observeSyncServers(onStarted: (server: SyncServer) => void): void {
+    const originalStart = SyncServer.prototype.start;
+    spies.push(spyOn(SyncServer.prototype, 'start').mockImplementation(async function(this: SyncServer) {
+        await originalStart.call(this);
+        onStarted(this);
     }));
 }
 
@@ -137,16 +141,51 @@ describe('dry-run ready handshake (real bun children)', () => {
         await fsPromises.rm(await resolveRunTempDir(), { recursive: true, force: true });
     });
 
-    test('collects every test with its own coverage when TestReporter.enable answers late', async () => {
-        // Before the fix the preload ran the tests after 2 s without 'ready': the runner's
-        // inspector saw none of them, and the dry run still completed, with tests missing
-        // and coverage dropped or paired with the wrong test.
-        interceptFirstEnable(slowMachineDelay);
+    test('runs no test before ready, and collects every test with its own coverage, when TestReporter.enable is held until the child is waiting', async () => {
+        // The child's preload connects to the sync server and then waits for 'ready'.
+        // The runner's TestReporter.enable is held until that connection exists, so the
+        // child is provably blocked on 'ready' while enable is outstanding. Nothing may
+        // run before 'ready': no drain-request on the sync socket and no TestReporter
+        // found/start event on the inspector. (That the preload's wait has no deadline
+        // at all is pinned by waitForSyncReady's unit tests.)
+        const order: string[] = [];
+        let inspector: InspectorClient | undefined;
+        let eventsAtReady: { found: number, start: number, end: number } | undefined;
+        let markChildConnected: () => void = () => {};
+        const childConnected = new Promise<void>((resolve) => {
+            markChildConnected = resolve;
+        });
+        observeSyncServers((server) => {
+            // 'wss' is private; listening on it adds a listener and changes nothing.
+            (server as unknown as { wss: ObservableWss }).wss.on('connection', (socket) => {
+                order.push('child connected');
+                markChildConnected();
+                socket.on('message', (data) => {
+                    order.push(`child sent ${data.toString()}`);
+                });
+            });
+        });
+        const originalSignalReady = SyncServer.prototype.signalReady;
+        spies.push(spyOn(SyncServer.prototype, 'signalReady').mockImplementation(function(this: SyncServer) {
+            order.push('ready sent');
+            eventsAtReady = inspector?.getEventCounts();
+            originalSignalReady.call(this);
+        }));
+        interceptFirstEnable(async () => {
+            order.push('enable held');
+            await childConnected;
+            order.push('enable released');
+        }, (client) => {
+            inspector = client;
+        });
         const runner = createRunner();
         try {
             await runner.init();
             const dryRun = await runner.dryRun({ coverageAnalysis: 'perTest' } as Parameters<BunTestRunner['dryRun']>[0]);
 
+            expect(order.filter(entry => entry !== 'enable held')).toEqual(['child connected', 'enable released', 'ready sent', 'child sent drain-request']);
+            expect(order.indexOf('enable held')).toBeLessThan(order.indexOf('enable released'));
+            expect(eventsAtReady).toEqual({ found: 0, start: 0, end: 0 });
             expect(dryRun.status).toBe(DryRunStatus.Complete);
             if(dryRun.status !== DryRunStatus.Complete) {
                 return;
@@ -168,11 +207,9 @@ describe('dry-run ready handshake (real bun children)', () => {
         // Before the fix the preload shrugged off a dead sync channel and ran the
         // tests anyway, after its 2 s timer, whether or not the runner could see them.
         const syncServers: SyncServer[] = [];
-        const originalStart = SyncServer.prototype.start;
-        spies.push(spyOn(SyncServer.prototype, 'start').mockImplementation(function(this: SyncServer) {
-            syncServers.push(this);
-            return originalStart.call(this);
-        }));
+        observeSyncServers((server) => {
+            syncServers.push(server);
+        });
         interceptFirstEnable(async () => {
             await Promise.all(syncServers.map(server => server.close()));
         });
