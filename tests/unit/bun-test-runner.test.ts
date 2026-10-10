@@ -2399,18 +2399,45 @@ tests/example.test.ts:
                 expect(loggedCalls(mockLogger.warn)[0].map(String).join(' ')).toContain('[3,4]');
             });
 
-            it('emits exactly one warn, including the close code, when the inspector WebSocket closed uncleanly despite an ack drain', async () => {
+            // Measured on bun 1.4.2: every healthy dry run (1 test, 50 tests, multi-file; 32/32 runs) ends with
+            // an acknowledged drain and then close code 1006 / wasClean false / reason "Connection ended",
+            // 2-5 ms after the last frame, because the child exits right after receiving 'drained'. That is the
+            // normal outcome, so it must not trigger the abnormal-data warn.
+            it('does not warn when the inspector WebSocket closes with 1006/wasClean=false after an ack drain (the normal healthy-run close)', async () => {
                 mockInspectorClient.getFoundIdGaps.mockReturnValue([]);
                 mockInspectorClient.send.mockResolvedValue(undefined);
-                mockInspectorClient.getCloseInfo.mockReturnValue({ code: 1006, reason: 'abnormal', wasClean: false, msFromLastFrameToClose: 42 });
+                mockInspectorClient.getCloseInfo.mockReturnValue({ code: 1006, reason: 'Connection ended', wasClean: false, msFromLastFrameToClose: 3 });
+
+                await runDryRunWithDrain();
+
+                expect(mockLogger.warn).not.toHaveBeenCalled();
+            });
+
+            it('still records the unclean close code at debug on a healthy dry run', async () => {
+                mockInspectorClient.getFoundIdGaps.mockReturnValue([]);
+                mockInspectorClient.send.mockResolvedValue(undefined);
+                mockInspectorClient.getCloseInfo.mockReturnValue({ code: 1006, reason: 'Connection ended', wasClean: false, msFromLastFrameToClose: 3 });
+
+                await runDryRunWithDrain();
+
+                const closeLine = loggedCalls(mockLogger.debug).find(call => String(call[0]).includes('Post-drain inspector close/collision diagnostics'));
+                expect(closeLine).toBeDefined();
+                expect(closeLine?.map(String)).toContain('1006');
+                expect(closeLine?.map(String)).toContain('false');
+            });
+
+            it('does not blame the close code in the warn when an unclean close accompanies a real problem (gaps remain)', async () => {
+                mockInspectorClient.getFoundIdGaps.mockReturnValue([3, 4]);
+                mockInspectorClient.send.mockResolvedValue(undefined);
+                mockInspectorClient.getCloseInfo.mockReturnValue({ code: 1006, reason: 'Connection ended', wasClean: false, msFromLastFrameToClose: 3 });
 
                 await runDryRunWithDrain();
 
                 expect(mockLogger.warn).toHaveBeenCalledTimes(1);
                 const warnText = loggedCalls(mockLogger.warn)[0].map(String).join(' ');
-                expect(warnText).toContain('Inspector data looks abnormal after the dry run:');
-                expect(warnText).toContain('1006');
-                expect(warnText).toContain('unclean');
+                expect(warnText).toContain('[3,4]');
+                expect(warnText).not.toContain('unclean');
+                expect(warnText).not.toContain('1006');
             });
 
             it('does not warn when the inspector WebSocket closed cleanly with an ack drain', async () => {

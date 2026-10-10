@@ -432,12 +432,15 @@ the coverage it collected before handing it to Stryker:
   `Inspector data looks abnormal after the dry run:`, and only when the
   inspector data may be incomplete or merged: the drain handshake did not
   settle via `ack` (it settled via `silence`, `ceiling`, or `send-rejected`, or
-  the drain request never arrived), the inspector WebSocket closed uncleanly
-  (`wasClean` false, e.g. close code 1006) even though the drain was
-  acknowledged, found-id gaps remain after the wait, or
+  the drain request never arrived), found-id gaps remain after the wait, or
   duplicate found-id events were seen (the id-collision bug described below).
-  The line lists the specific problems found (an unclean close is reported with
-  its close code and reason) and points you at debug logging
+  The WebSocket close code is deliberately not one of the conditions: Bun closes
+  the inspector socket with code 1006 (`wasClean` false, reason
+  `Connection ended`) a few milliseconds after the drain acknowledgment on
+  every healthy run, because the child process exits right after it is
+  released, so an unclean close after an `ack` is normal. The close detail
+  stays in the DEBUG diagnostics. The line lists the specific problems found
+  and points you at debug logging
   for the full diagnostics above. Together, the WARN line and the DEBUG detail
   are useful for telling apart two different failure shapes: residual loss
   caused by a runner-side bound being hit (a
@@ -455,8 +458,10 @@ the coverage it collected before handing it to Stryker:
   what puts the duplicate-event problem into the WARN line above), and the
   close code/reason/wasClean fields confirm or rule out a separate confirmed
   Bun bug where `idleTimeout: 0` websockets are force-closed on a ~252-second
-  ping cycle (`ERR_WEBSOCKET_TIMEOUT`) — an abnormal close landing right on
-  that cadence points at the ping-cycle bug, while a clean close rules it out.
+  ping cycle (`ERR_WEBSOCKET_TIMEOUT`) — a close with that reason landing
+  mid-run, right on that cadence, points at the ping-cycle bug, while the
+  routine post-`ack` `1006` / `Connection ended` close a few milliseconds after
+  the last frame rules it out.
   Finally, a WARN-level `Inspector request unanswered after ...` line fires if
   an inspector protocol request (e.g. `TestReporter.enable`) goes unanswered
   for more than 2 seconds while other frames are still arriving on the same

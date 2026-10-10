@@ -204,28 +204,27 @@ function formatInspectorTimeoutMessage(
  * numbers are logged at debug either way). Anything else is evidence the
  * inspector stream may be incomplete or merged: the drain-request never
  * arrived, the wait gave up ('silence'/'ceiling') or the round-trip was
- * rejected ('send-rejected'), the inspector WebSocket closed uncleanly
- * (wasClean === false, e.g. code 1006) even if the drain was acknowledged,
- * found-id gaps remain, or the Bun TestReporter id-collision bug was observed
- * (duplicate found-id events).
+ * rejected ('send-rejected'), found-id gaps remain, or the Bun TestReporter
+ * id-collision bug was observed (duplicate found-id events). The WebSocket
+ * close code is NOT a condition: bun closes the socket with 1006
+ * (wasClean false) after the drain ack on every healthy run.
  */
 function collectAbnormalDrainProblems(data: {
     drainSettleReason:     DrainSettleReason | undefined
     drainRejection:        string | undefined
     finalGaps:             readonly number[]
     duplicateFoundIdCount: number
-    closeInfo:             InspectorCloseInfo
 }): string[] {
     const problems: string[] = [];
     if(data.drainSettleReason !== 'ack') {
         const rejection = data.drainRejection === undefined ? '' : ` (${data.drainRejection})`;
         problems.push(`drain handshake ${formatDrainSettleReason(data.drainSettleReason)}${rejection}`);
     }
-    // wasClean === false (not merely undefined: a close event that never carried the flag is
-    // not evidence of anything) means the socket dropped without a closing handshake, e.g. 1006.
-    if(data.closeInfo.wasClean === false) {
-        problems.push(`inspector WebSocket closed uncleanly (code ${String(data.closeInfo.code)}, reason ${JSON.stringify(data.closeInfo.reason ?? '')})`);
-    }
+    // The WebSocket close code is deliberately NOT a problem here. Measured on bun 1.4.2, every
+    // healthy dry run ends with close code 1006 / wasClean false / reason "Connection ended" a few
+    // ms after the last frame, because the child exits right after the drain ack. A close that
+    // loses data before the ack already surfaces as a non-'ack' drain; the close detail stays in
+    // the debug diagnostics and the completeness gate's error message.
     if(data.finalGaps.length > 0) {
         problems.push(`${data.finalGaps.length} found-id gap(s) remaining${formatGapIdList(data.finalGaps)}`);
     }
@@ -1431,7 +1430,6 @@ export class BunTestRunner implements TestRunner {
                 drainRejection,
                 finalGaps,
                 duplicateFoundIdCount: collisionStats.duplicateFoundIdCount,
-                closeInfo,
             });
 
             // 10–12. Handle timeout and process errors; parse output
