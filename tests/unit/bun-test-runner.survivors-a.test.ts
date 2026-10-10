@@ -543,7 +543,7 @@ describe('BunTestRunner mutation kill tests (first half of the runner)', () => {
                 timedOut: false,
             }));
 
-            // The runner polls for the URL every 50ms: drive that poll on the fake clock.
+            // The wait arms an inspector-timeout timer: keep it on the fake clock.
             jest.useFakeTimers();
             let result: Awaited<ReturnType<typeof dryRunOnce>>;
             try {

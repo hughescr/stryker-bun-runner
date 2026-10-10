@@ -1380,7 +1380,7 @@ tests/example.test.ts:
 
                 const resultPromise = runner.dryRun();
 
-                // Advance past the inspectorTimeout threshold in polling increments
+                // Advance the fake clock past the inspectorTimeout threshold
                 for(let i = 0; i < 5; i++) {
                     jest.advanceTimersByTime(50);
                     // eslint-disable-next-line no-await-in-loop -- deliberate sequential microtask flush for fake-timer test
@@ -1518,8 +1518,8 @@ tests/example.test.ts:
 
         it('reports a spawn error immediately instead of waiting out bun.inspectorTimeout', async () => {
             // A child that never started cannot print an inspector URL, so waiting the full
-            // (here: 30s) inspectorTimeout is pure delay: the wait ends at the first 50ms poll
-            // after the child settled. Measured on the fake clock.
+            // (here: 30s) inspectorTimeout is pure delay: the wait ends the moment the child
+            // settles, with no fake time passing at all. Measured on the fake clock.
             jest.useFakeTimers();
             try {
                 mockRunBunTests.mockImplementation(() => {
@@ -1544,7 +1544,9 @@ tests/example.test.ts:
                 if(result.status === DryRunStatus.Error) {
                     expect(result.errorMessage).toBe('could not start bun test: spawn bun ENOENT');
                 }
-                expect(fakeMs).toBeLessThanOrEqual(50);
+                expect(fakeMs).toBe(0);
+                // The inspector-timeout timer armed for the wait is cancelled, not left to fire later.
+                expect(jest.getTimerCount()).toBe(0);
             } finally {
                 jest.useRealTimers();
             }
@@ -1575,7 +1577,7 @@ tests/example.test.ts:
                     expect(result.errorMessage).toContain('exit code 1');
                     expect(result.errorMessage).toContain('preload crashed before inspector came up');
                 }
-                expect(fakeMs).toBeLessThanOrEqual(50);
+                expect(fakeMs).toBe(0);
             } finally {
                 jest.useRealTimers();
             }
@@ -1652,10 +1654,9 @@ tests/example.test.ts:
             }
         });
 
-        it('stops waiting once elapsed time equals the timeout, ignoring a URL that arrives on the next poll (fake clock)', async () => {
-            // inspectorTimeout 100 with 50ms polls: the loop checks at t=0, 50 and 100.
-            // At t=100 elapsed === timeout, so the wait ends there; the URL printed at
-            // t=120 must be ignored. An inclusive bound would sleep once more and see it.
+        it('ignores a URL that arrives after the bun.inspectorTimeout deadline has passed (fake clock)', async () => {
+            // inspectorTimeout 100: the deadline timer fires at t=100 and ends the wait; the
+            // URL printed at t=120 comes too late and must not be used.
             jest.useFakeTimers();
             try {
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
@@ -1673,16 +1674,11 @@ tests/example.test.ts:
                     bun: { inspectorTimeout: 100 },
                 } as unknown as StrykerOptions);
                 await runner.init();
-                const resultPromise = runner.dryRun();
-                for(let i = 0; i < 40; i++) {
-                    jest.advanceTimersByTime(50);
-                    // eslint-disable-next-line no-await-in-loop -- let the wait loop's sleep continuation run between ticks
-                    await Promise.resolve();
-                    // eslint-disable-next-line no-await-in-loop -- second microtask hop for the awaited sleep
-                    await Promise.resolve();
-                }
-                const result = await resultPromise;
+                const { value: result } = await runUntilSettled(runner.dryRun());
                 expect(result.status).toBe(DryRunStatus.Error);
+                if(result.status === DryRunStatus.Error) {
+                    expect(result.errorMessage).toStartWith('Timeout waiting for inspector URL after 100ms');
+                }
                 expect(mockInspectorClient.connect).not.toHaveBeenCalled();
             } finally {
                 jest.useRealTimers();
@@ -1756,137 +1752,124 @@ tests/example.test.ts:
             }
         });
 
-        it('should wait in 50ms intervals while waiting for inspector URL', async () => {
-            // Enable fake timers for this test only
+        it('waits with a single bun.inspectorTimeout timer and no recurring poll timers, cancelling it once the URL arrives', async () => {
             jest.useFakeTimers();
             try {
-                const delays: number[] = [];
-
-                // Mock runBunTests to call onInspectorReady after 160ms (will be triggered by fake timers)
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
-                    // Schedule callback after 160ms (3+ polling cycles). As in a real run, the
-                    // child only finishes (the returned promise resolves) AFTER it printed the URL.
+                    // As in a real run, the child only finishes AFTER it printed the URL.
                     return new Promise((resolve) => {
                         setTimeout(() => {
-                            if(options.onInspectorReady) {
-                                options.onInspectorReady('ws://127.0.0.1:6499/inspector');
-                            }
-                            resolve({
-                                exitCode: 0,
-                                stdout:   '✓ test [0.12ms]\n 1 pass',
-                                stderr:   '',
-                                timedOut: false,
-                            });
+                            options.onInspectorReady('ws://127.0.0.1:6499/inspector');
                         }, 160);
+                        setTimeout(() => {
+                            resolve({ exitCode: 0, stdout: '✓ test [0.12ms]\n 1 pass', stderr: '', timedOut: false });
+                        }, 600);
                     });
                 });
                 mockCollectCoverage.mockResolvedValue(undefined);
-
-                // Spy on setTimeout to verify 50ms delays
                 const setTimeoutSpy = jest.spyOn(globalThis, 'setTimeout');
 
                 const runner = new BunTestRunner(mockLogger, {
-                    bun: {
-                        inspectorTimeout: 500,
-                    },
+                    bun: { inspectorTimeout: 5000 },
                 } as unknown as StrykerOptions);
                 await runner.init();
-
-                // Start the dryRun (don't await yet)
-                const resultPromise = runner.dryRun();
-
-                // Advance fake timers in steps to allow async code to progress
-                // Each iteration: advance time, then let microtasks/promises settle
-                for(let i = 0; i < 10; i++) {
-                    jest.advanceTimersByTime(50);
-                    // eslint-disable-next-line no-await-in-loop -- deliberate sequential microtask flush for fake-timer test
-                    await Promise.resolve();
-                }
-
-                const result = await resultPromise;
-
-                // Check all setTimeout calls with 50ms delay
-                for(const call of setTimeoutSpy.mock.calls) {
-                    if(call[1] === 50) {
-                        delays.push(50);
-                    }
-                }
-
+                const { value: result } = await runUntilSettled(runner.dryRun());
+                const delays = setTimeoutSpy.mock.calls.map(call => call[1]);
                 setTimeoutSpy.mockRestore();
 
                 expect(result.status).toBe(DryRunStatus.Complete);
-                // Verify we had at least 3 polling cycles with 50ms delays
-                expect(delays.length).toBeGreaterThanOrEqual(3);
-                // Verify all delays were exactly 50ms
-                for(const delay of delays) {
-                    expect(delay).toBe(50);
-                }
+                expect(delays.filter(delay => delay === 5000)).toHaveLength(1);
+                expect(delays).not.toContain(50);
+                // Nothing left armed: the inspector-timeout timer was cleared when the URL arrived.
+                expect(jest.getTimerCount()).toBe(0);
             } finally {
                 jest.useRealTimers();
             }
         });
 
-        it('should exit wait loop when inspector URL is received before timeout', async () => {
+        it('connects the moment the inspector URL is printed, not at the next poll tick', async () => {
+            // Event-driven wait: the URL printed at t=10 is acted on at t=10. A 50ms poll
+            // would only notice it at t=50.
             jest.useFakeTimers();
             try {
-                let waitLoopIterations = 0;
-
-                // Mock runBunTests to call onInspectorReady after 60ms (just over one polling cycle)
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
-                    // As in a real run, the child only finishes (the returned promise resolves)
-                    // AFTER it printed the URL.
+                    // As in a real run, the child only finishes AFTER it printed the URL.
                     return new Promise((resolve) => {
                         setTimeout(() => {
-                            if(options.onInspectorReady) {
-                                options.onInspectorReady('ws://127.0.0.1:6499/inspector');
-                            }
-                            resolve({
-                                exitCode: 0,
-                                stdout:   '✓ test [0.12ms]\n 1 pass',
-                                stderr:   '',
-                                timedOut: false,
-                            });
-                        }, 60);
+                            options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                        }, 10);
+                        setTimeout(() => {
+                            resolve({ exitCode: 0, stdout: '✓ test [0.12ms]\n 1 pass', stderr: '', timedOut: false });
+                        }, 600);
+                    });
+                });
+                mockCollectCoverage.mockResolvedValue(undefined);
+                const startedAt = Date.now();
+                let connectedAtMs: number | undefined;
+                mockInspectorClient.connect.mockImplementation(() => {
+                    connectedAtMs ??= Date.now() - startedAt;
+                    return Promise.resolve();
+                });
+
+                const runner = new BunTestRunner(mockLogger, {
+                    bun: { inspectorTimeout: 5000 },
+                } as unknown as StrykerOptions);
+                await runner.init();
+                const { value: result } = await runUntilSettled(runner.dryRun());
+
+                expect(result.status).toBe(DryRunStatus.Complete);
+                expect(connectedAtMs).toBe(10);
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('uses a URL that arrives just before bun.inspectorTimeout expires', async () => {
+            jest.useFakeTimers();
+            try {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    return new Promise((resolve) => {
+                        setTimeout(() => {
+                            options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                        }, 99);
+                        setTimeout(() => {
+                            resolve({ exitCode: 0, stdout: '✓ test [0.12ms]\n 1 pass', stderr: '', timedOut: false });
+                        }, 600);
                     });
                 });
                 mockCollectCoverage.mockResolvedValue(undefined);
 
-                // Track setTimeout calls to count loop iterations
-                const setTimeoutSpy = jest.spyOn(globalThis, 'setTimeout');
-
                 const runner = new BunTestRunner(mockLogger, {
-                    bun: {
-                        inspectorTimeout: 5000, // Long timeout, but should exit early
-                    },
+                    bun: { inspectorTimeout: 100 },
                 } as unknown as StrykerOptions);
                 await runner.init();
-
-                // Start the dryRun (don't await yet)
-                const resultPromise = runner.dryRun();
-
-                // Advance fake timers - only need a few iterations since URL arrives at 60ms
-                for(let i = 0; i < 5; i++) {
-                    jest.advanceTimersByTime(50);
-                    // eslint-disable-next-line no-await-in-loop -- deliberate sequential microtask flush for fake-timer test
-                    await Promise.resolve();
-                }
-
-                const result = await resultPromise;
-
-                // Count the 50ms delay calls
-                for(const call of setTimeoutSpy.mock.calls) {
-                    if(call[1] === 50) {
-                        waitLoopIterations++;
-                    }
-                }
-
-                setTimeoutSpy.mockRestore();
+                const { value: result } = await runUntilSettled(runner.dryRun());
 
                 expect(result.status).toBe(DryRunStatus.Complete);
-                // Should have had only a few iterations before URL arrived (well under 20)
-                expect(waitLoopIterations).toBeLessThan(20);
+                expect(mockInspectorClient.connect).toHaveBeenCalledTimes(1);
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('stops waiting the moment a rejected child promise settles, without waiting out bun.inspectorTimeout', async () => {
+            jest.useFakeTimers();
+            try {
+                mockRunBunTests.mockImplementation(() => Promise.reject(new Error('child blew up')));
+
+                const runner = new BunTestRunner(mockLogger, {
+                    bun: { inspectorTimeout: 30_000 },
+                } as unknown as StrykerOptions);
+                await runner.init();
+                const startedAt = Date.now();
+
+                // The diagnostic that follows the wait awaits the same child and so rethrows.
+                await expect(runUntilSettled(runner.dryRun())).rejects.toThrow('child blew up');
+                expect(Date.now() - startedAt).toBe(0);
+                expect(jest.getTimerCount()).toBe(0);
             } finally {
                 jest.useRealTimers();
             }
@@ -10190,7 +10173,7 @@ error: Message 2
 
                     const resultPromise = runner.dryRun();
 
-                    // Advance past the inspectorTimeout threshold in polling increments
+                    // Advance the fake clock past the inspectorTimeout threshold
                     for(let i = 0; i < 5; i++) {
                         jest.advanceTimersByTime(50);
                         // eslint-disable-next-line no-await-in-loop -- deliberate sequential microtask flush for fake-timer test
