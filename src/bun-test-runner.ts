@@ -358,16 +358,24 @@ const INSPECTOR_DRAIN_TIMEOUT_MS = 1000;
 const STRYKER_TIMEOUT_MARGIN_MIN_MS = 750;
 /** Proportional part of the margin: 5% of Stryker's timeout, when that is larger. */
 const STRYKER_TIMEOUT_MARGIN_RATIO = 0.05;
+/**
+ * Upper bound on the margin as a fraction of Stryker's timeout. The 750 ms floor
+ * alone would eat three quarters of a 1 s timeout; capping at 25% leaves a small
+ * `timeoutMS` at least three quarters of its budget to run in. The cap only binds
+ * below 3 s, where the margin is then shorter than the 750 ms SIGTERM-to-SIGKILL
+ * cushion, so a child that handles SIGTERM may outlast Stryker's timer.
+ */
+const STRYKER_TIMEOUT_MARGIN_MAX_RATIO = 0.25;
 /** Fraction of bun.timeout a dry run may use before the runner warns that the limit is tight. */
 const DRY_RUN_TIMEOUT_WARN_RATIO = 0.8;
 
 /**
  * The runner's own kill limit for a mutant run given Stryker's per-mutant
  * `options.timeout`: that timeout minus max(750 ms, 5%), with the margin capped
- * at half the timeout so a tiny budget still leaves the run time to execute.
+ * at 25% of the timeout so a tiny budget still leaves the run most of its time.
  */
 function limitFromStrykerTimeout(strykerTimeoutMs: number): number {
-    const margin = Math.min(strykerTimeoutMs / 2, Math.max(STRYKER_TIMEOUT_MARGIN_MIN_MS, strykerTimeoutMs * STRYKER_TIMEOUT_MARGIN_RATIO));
+    const margin = Math.min(strykerTimeoutMs * STRYKER_TIMEOUT_MARGIN_MAX_RATIO, Math.max(STRYKER_TIMEOUT_MARGIN_MIN_MS, strykerTimeoutMs * STRYKER_TIMEOUT_MARGIN_RATIO));
     return Math.floor(strykerTimeoutMs - margin);
 }
 

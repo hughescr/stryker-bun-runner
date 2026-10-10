@@ -4955,12 +4955,27 @@ tests/example.test.ts:
                 expect(mockRunBunTests.mock.calls[0][0].timeout).toBe(5250);
             });
 
-            it('caps the margin at half the budget so a tiny Stryker timeout still leaves the run time to execute', async () => {
+            it('caps the margin at a quarter of the budget so a tiny Stryker timeout still leaves the run most of its time', async () => {
                 mockRunBunTests.mockResolvedValue(passingRun);
 
                 await mutantRunWith({ timeout: 1000, testFilter: ['tests/alpha.test.ts > handles alpha'] });
 
-                expect(mockRunBunTests.mock.calls[0][0].timeout).toBe(500);
+                // 750 ms floor would leave 250 ms; the 25% cap (250 ms margin) leaves 750 ms.
+                expect(mockRunBunTests.mock.calls[0][0].timeout).toBe(750);
+            });
+
+            it.each([
+                // [Stryker timeout, expected kill limit]
+                [2000, 1500],   // floor 750 > 25% (500): capped at 500
+                [2999, 2249],   // floor 750 > 25% (749.75): capped at 749.75, 2249.25 floored
+                [3000, 2250],   // floor 750 == 25%: both agree from here up
+                [3001, 2251],   // floor 750 < 25%: the floor applies
+            ])('margin boundary: timeout %d ms is killed at %d ms', async (stryker, expected) => {
+                mockRunBunTests.mockResolvedValue(passingRun);
+
+                await mutantRunWith({ timeout: stryker, testFilter: ['tests/alpha.test.ts > handles alpha'] });
+
+                expect(mockRunBunTests.mock.calls[0][0].timeout).toBe(expected);
             });
 
             it('falls back to bun.timeout when Stryker supplies no timeout', async () => {
