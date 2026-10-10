@@ -9,6 +9,9 @@
  * Real processes, so no fake clock — and no real one either: every wait is on
  * an event. A direct child's death is its 'exit' event; a grandchild's is the
  * EOF on a lifeline pipe that only the grandchild holds (see lifelineCut).
+ * That EOF can arrive while the grandchild is still partway through its exit
+ * and not yet a zombie, which isProcessRunning already counts as dead, so the
+ * check right after it needs no further wait.
  */
 
 import type { ChildProcess } from 'node:child_process';
@@ -17,7 +20,7 @@ import { describe, it, expect, afterEach } from 'bun:test';
 // realSpawn, not `spawn` from node:child_process: that import is the shared
 // mockSpawn, whose call history would otherwise accumulate this file's spawns
 // (this file never resets mocks) and leak into other files' call-count assertions.
-import { isProcessRunning, lifelineCut, settlesDead } from '../helpers/process-liveness.js';
+import { isProcessRunning, lifelineCut } from '../helpers/process-liveness.js';
 import { realKillProcessGroup, realSpawn as spawn } from '../test-preload.js';
 
 /** Every child spawned here, so afterEach can reap them even if a test throws. */
@@ -26,7 +29,8 @@ const spawnedChildren: ChildProcess[] = [];
 /**
  * True when a pid is still alive. A bare kill(pid, 0) also succeeds for a zombie,
  * and in a container whose PID 1 never reaps orphans a killed grandchild stays a
- * zombie forever — so liveness comes from the zombie-aware helper instead.
+ * zombie forever — so liveness comes from the zombie-aware helper instead, which
+ * also counts a process that has begun exiting as dead.
  */
 const isAlive = isProcessRunning;
 
@@ -148,7 +152,7 @@ describe('killProcessGroup', () => {
         // The group signal still reaches it, because it stayed in the group.
         expect(realKillProcessGroup(child.pid!, 'SIGKILL')).toBe(true);
         await grandchildGone;
-        expect(await settlesDead(grandchildPid)).toBe(true);
+        expect(isAlive(grandchildPid)).toBe(false);
     });
 
     it('takes down the child and the grandchild together in one signal', async () => {
@@ -159,7 +163,7 @@ describe('killProcessGroup', () => {
         await exited(child);
         expect(isAlive(child.pid!)).toBe(false);
         await grandchildGone;
-        expect(await settlesDead(grandchildPid)).toBe(true);
+        expect(isAlive(grandchildPid)).toBe(false);
     });
 
     it('can reap a TERM-ignoring descendant after the group leader exits', async () => {
@@ -173,7 +177,7 @@ describe('killProcessGroup', () => {
         // as the lifecycle boundary because a descendant may retain stdio.
         expect(realKillProcessGroup(child.pid!, 'SIGKILL')).toBe(true);
         await grandchildGone;
-        expect(await settlesDead(grandchildPid)).toBe(true);
+        expect(isAlive(grandchildPid)).toBe(false);
     });
 
     it('observes leader exit before close when a descendant retains stdout', async () => {
@@ -194,6 +198,6 @@ describe('killProcessGroup', () => {
         expect(realKillProcessGroup(child.pid!, 'SIGKILL')).toBe(true);
         // 'close' needs every holder of the leader's stdout gone, the grandchild included.
         await closed;
-        expect(await settlesDead(grandchildPid)).toBe(true);
+        expect(isAlive(grandchildPid)).toBe(false);
     });
 });

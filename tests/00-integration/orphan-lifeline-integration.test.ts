@@ -20,7 +20,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'bun:test';
 import { LIFELINE_FD_ENV } from '../../src/coverage/preload-logic.js';
-import { isProcessRunning, lifelineCut, settlesDead } from '../helpers/process-liveness.js';
+import { isProcessRunning, lifelineCut } from '../helpers/process-liveness.js';
 
 /**
  * The suite the runner's child runs. It installs fake timers and holds them
@@ -102,7 +102,9 @@ describe('orphan prevention', () => {
         parent.kill('SIGKILL');
         await parent.exited;
 
+        // EOF on the socket the child alone holds means it is exiting, which
+        // isProcessRunning already counts as dead: no further wait is needed.
         await childGone;
-        expect(await settlesDead(childPid)).toBe(true);
+        expect(isProcessRunning(childPid)).toBe(false);
     }, 30_000);
 });

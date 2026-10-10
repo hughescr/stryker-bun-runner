@@ -7,7 +7,17 @@
  * a real init — a killed grandchild stays a zombie indefinitely, so a bare
  * signal-0 check reports "alive" for a process that is dead in every sense that
  * matters. {@link isProcessRunning} additionally reads the process state and
- * treats 'Z' as dead.
+ * treats a zombie as dead.
+ *
+ * It also treats a process that has begun exiting as dead. The kernel closes an
+ * exiting process's descriptors partway through its exit path and only marks
+ * it a zombie at the end of it; nothing tells a process that is not the
+ * parent when that last step happens, and under CPU load the gap between the
+ * two has been measured at 200 ms. A test that has just seen a pipe only
+ * the process held reach EOF (see {@link lifelineCut}) would otherwise catch
+ * it still in state R. Both kernels mark the process as exiting before they
+ * close its descriptors, and that mark is never cleared (the exit path does
+ * not return to user code), so "exiting" is as final as "zombie".
  *
  * Mirrors the platform split in src/utils/process-rss.ts: `/proc` on Linux,
  * `ps` elsewhere (macOS has no /proc).
@@ -21,46 +31,78 @@
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import type { Readable } from 'node:stream';
-import { nextMacrotask } from './fake-clock.js';
+
+/** What a state probe saw: the one-letter state, and whether the process has begun exiting. */
+export interface ProcessState {
+    state:   string
+    exiting: boolean
+}
 
 /**
- * Pull the one-letter process state out of a `/proc/<pid>/stat` line.
- *
- * The line is `pid (comm) state ppid ...`, and `comm` may itself contain spaces
- * and parentheses, so the state is the first field after the LAST ')'.
+ * Linux's PF_EXITING task flag (include/linux/sched.h). do_exit() sets it
+ * first thing, before it closes the task's files, and nothing clears it.
  */
-export function parseProcStatState(statContent: string): string | null {
-    const afterComm = statContent.slice(statContent.lastIndexOf(')') + 1);
-    const state = /^\s+(\S)/.exec(afterComm);
-    return state ? state[1] : null;
+const PF_EXITING = 0x4;
+
+/**
+ * Parse a `/proc/<pid>/stat` line: the state, and the PF_EXITING bit of the
+ * flags field.
+ *
+ * The line is `pid (comm) state ppid pgrp session tty_nr tpgid flags ...`, and
+ * `comm` may itself contain spaces and parentheses, so the fields are counted
+ * from the LAST ')'. A line cut short before the flags field reports not
+ * exiting.
+ */
+export function parseProcStat(statContent: string): ProcessState | null {
+    const commEnd = statContent.lastIndexOf(')');
+    if(commEnd === -1) {
+        return null;
+    }
+    const fields = statContent.slice(commEnd + 1).trim().split(/\s+/);
+    if(fields[0] === '') {
+        return null;
+    }
+    const flags = Number(fields[6] ?? 0);
+    // eslint-disable-next-line no-bitwise -- testing one bit of the kernel's flag word
+    return { state: fields[0], exiting: (flags & PF_EXITING) !== 0 };
 }
 
-/** Pull the leading state letter out of `ps -o stat= -p <pid>` output (e.g. `Ss`, `Z+`). */
-export function parsePsState(psOutput: string): string | null {
+/**
+ * Parse `ps -o stat= -p <pid>` output (e.g. `Ss`, `Z+`, `RE`): the leading
+ * state letter, and whether the modifiers include 'E', which BSD-derived ps
+ * (macOS) prints for a process that has begun exiting — XNU reports it once
+ * exit has started (P_LEXIT), before the process's files are closed. procps
+ * (Linux) never prints 'E'.
+ */
+export function parsePsStat(psOutput: string): ProcessState | null {
     const trimmed = psOutput.trim();
-    return trimmed === '' ? null : trimmed[0];
+    return trimmed === '' ? null : { state: trimmed[0], exiting: trimmed.slice(1).includes('E') };
 }
 
-function readLinuxState(pid: number): string | null {
+function readLinuxState(pid: number): ProcessState | null {
     try {
-        // eslint-disable-next-line n/no-sync -- callers poll this from synchronous predicates (waitUntil), so it must be synchronous
-        return parseProcStatState(readFileSync(`/proc/${pid}/stat`, 'utf8'));
+        // eslint-disable-next-line n/no-sync -- isProcessRunning is a synchronous predicate
+        return parseProcStat(readFileSync(`/proc/${pid}/stat`, 'utf8'));
     } catch{
         // Gone between the signal-0 check and this read.
         return null;
     }
 }
 
-function readPsState(pid: number): string | null {
-    // eslint-disable-next-line sonarjs/no-os-command-from-path, n/no-sync -- 'ps' is a standard system utility (test-only probe), and callers poll this from synchronous predicates (waitUntil), so it must be synchronous
+function readPsState(pid: number): ProcessState | null {
+    // eslint-disable-next-line sonarjs/no-os-command-from-path, n/no-sync -- 'ps' is a standard system utility (test-only probe), and isProcessRunning is a synchronous predicate
     const result = spawnSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-    return result.status === 0 ? parsePsState(result.stdout) : null;
+    return result.status === 0 ? parsePsStat(result.stdout) : null;
 }
 
 /**
- * True when `pid` exists and is not a zombie. `platform` selects the state
- * probe and defaults to the running platform; tests pass it to exercise the
- * other probe on the machine they happen to run on.
+ * True when `pid` exists, is not a zombie ('Z', or Linux's transient 'X' while
+ * a reaper releases it), and has not begun exiting. `platform` selects the
+ * state probe and defaults to the running platform; tests pass it to exercise
+ * the other probe on the machine they happen to run on.
+ *
+ * Once a pipe that only `pid` held has reached EOF, this is already false:
+ * no waiting for the zombie state is needed.
  */
 export function isProcessRunning(pid: number, platform: NodeJS.Platform = process.platform): boolean {
     try {
@@ -68,16 +110,16 @@ export function isProcessRunning(pid: number, platform: NodeJS.Platform = proces
     } catch{
         return false;
     }
-    const state = platform === 'linux' ? readLinuxState(pid) : readPsState(pid);
+    const probed = platform === 'linux' ? readLinuxState(pid) : readPsState(pid);
     // null: the state could not be read, which after a successful signal-0 means the
     // process vanished in between — dead.
-    return state !== null && state !== 'Z';
+    return probed !== null && !probed.exiting && probed.state !== 'Z' && probed.state !== 'X';
 }
 
 /**
  * Resolves when `lifeline` reaches end-of-file. A lifeline is the read end of
  * a pipe whose write end only the watched process holds (it never writes to
- * it), so EOF means the process has exited: the kernel closes every
+ * it), so EOF means the process is exiting: the kernel closes every
  * descriptor of an exiting process. This is how a test waits for the death of
  * a process that is not its own child, which no 'exit' event reports.
  */
@@ -87,26 +129,4 @@ export function lifelineCut(lifeline: Readable): Promise<void> {
         lifeline.once('close', resolve);
         lifeline.resume();
     });
-}
-
-/** Re-checks before {@link settlesDead} gives up; each is one event-loop turn. */
-const SETTLE_CHECKS = 10_000;
-
-/**
- * For a process already seen exiting (its lifeline was cut, its pipe closed):
- * true once {@link isProcessRunning} agrees, false if it never does. An
- * exiting process closes its descriptors a moment before its state turns 'Z',
- * and nothing signals that last step to a process that is not its parent, so
- * this re-checks once per event-loop turn — a yield, not a timer — a bounded
- * number of times.
- */
-export async function settlesDead(pid: number): Promise<boolean> {
-    for(let check = 0; check < SETTLE_CHECKS; check++) {
-        if(!isProcessRunning(pid)) {
-            return true;
-        }
-        // eslint-disable-next-line no-await-in-loop -- one re-check per event-loop turn
-        await nextMacrotask();
-    }
-    return !isProcessRunning(pid);
 }
