@@ -138,14 +138,70 @@ export function waitForSyncReady(socket: SyncReadySocket): Promise<SyncReadyOutc
 }
 
 /**
+ * The runner's sync server address. Dialled at the literal loopback address
+ * the server binds (127.0.0.1), never "localhost", which may resolve to ::1.
+ */
+function syncAddress(syncPort: string): string {
+    return `ws://127.0.0.1:${syncPort}/sync`;
+}
+
+/** A sync socket {@link awaitRunnerReady} can wait on and close. */
+export type RunnerReadySocket = SyncReadySocket & { close(): void };
+
+/** Dependencies of {@link awaitRunnerReady}. */
+export interface RunnerReadyDeps {
+    /** The runner's sync port (`__STRYKER_SYNC_PORT__`). */
+    syncPort:    string
+    /** Keep the socket open after 'ready' (for the drain handshake) and return it; otherwise close it and return null. */
+    keepOpen:    boolean
+    /** Opens the socket. @default a WebSocket */
+    openSocket?: (url: string) => RunnerReadySocket
+    /** Ends this process with the message. @default print it on stderr and exit with code 1 */
+    fail?:       (message: string) => never
+}
+
+/**
+ * The whole of the dry-run preload's wait for 'ready': dial the runner's sync
+ * server, wait with {@link waitForSyncReady} (no deadline), and end the process
+ * through `fail` with {@link formatSyncNotReadyMessage} if the socket cannot be
+ * opened, errors, or closes first. The template only calls this, so the
+ * no-deadline rule lives in one tested place.
+ */
+export async function awaitRunnerReady(deps: RunnerReadyDeps): Promise<RunnerReadySocket | null> {
+    const openSocket = deps.openSocket ?? ((url: string): RunnerReadySocket => new WebSocket(url));
+    const fail = deps.fail ?? ((message: string): never => {
+        // eslint-disable-next-line no-console -- the child's stderr is how this reaches the dry run's error
+        console.error(message);
+        // eslint-disable-next-line n/no-process-exit, unicorn/no-process-exit -- running the tests now would silently lose their results and coverage
+        process.exit(1);
+    });
+    let socket: RunnerReadySocket;
+    let outcome: SyncReadyOutcome;
+    try {
+        socket = openSocket(syncAddress(deps.syncPort));
+        // Listeners are added before this await yields, so no message can arrive unheard.
+        outcome = await waitForSyncReady(socket);
+    } catch (error) {
+        return fail(formatSyncNotReadyMessage(deps.syncPort, `could not be opened (${error instanceof Error ? error.message : String(error)})`));
+    }
+    if(!outcome.ready) {
+        return fail(formatSyncNotReadyMessage(deps.syncPort, outcome.problem));
+    }
+    if(deps.keepOpen) {
+        return socket;
+    }
+    socket.close();
+    return null;
+}
+
+/**
  * The line the preload prints before exiting when {@link waitForSyncReady}
  * ends without 'ready'. It reaches the user inside the dry run's error, which
  * carries the child's stderr.
  */
 export function formatSyncNotReadyMessage(syncPort: string, problem: string): string {
-    const address = `ws://127.0.0.1:${syncPort}/sync`;
     return [
-        `[Stryker] stryker-bun-runner: the dry run's sync connection to the runner (${address}) ${problem}`,
+        `[Stryker] stryker-bun-runner: the dry run's sync connection to the runner (${syncAddress(syncPort)}) ${problem}`,
         'before the runner signalled that it is ready to observe the tests. Exiting without running any test: tests run now',
         'would not be seen by the runner\'s inspector, so their results and per-test coverage would be lost.',
     ].join(' ');

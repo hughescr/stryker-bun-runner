@@ -1071,19 +1071,11 @@ describe('SyncServer', () => {
 
 describe('preload sync dial address', () => {
     it('dials the literal loopback address the server binds (127.0.0.1), not "localhost"', async () => {
+        // The preload dials through awaitRunnerReady in preload-logic; the template itself dials nothing.
         const template = await Bun.file(new URL('../../src/templates/coverage-preload.ts', import.meta.url)).text();
-        expect(template).not.toContain('ws://localhost:');
-        expect(template.match(/ws:\/\/127\.0\.0\.1:\$\{syncPort\}\/sync/g)).toHaveLength(1);
-    });
-
-    it('waits for ready through waitForSyncReady, with no timer that could let the tests start first', async () => {
-        // The preload used to give up on 'ready' after a fixed 2 s and run the tests
-        // unobserved. waitForSyncReady's own tests pin that it has no deadline; this
-        // pins that the template's sync section uses it and arms no timer of its own.
-        const template = await Bun.file(new URL('../../src/templates/coverage-preload.ts', import.meta.url)).text();
-        const syncSection = template.slice(template.indexOf('Section 1: WebSocket Sync'), template.indexOf('Section 2:'));
-        expect(syncSection).toContain('await waitForSyncReady(');
-        expect(syncSection).not.toContain('setTimeout(');
-        expect(syncSection).not.toContain('setInterval(');
+        const preloadLogic = await Bun.file(new URL('../../src/coverage/preload-logic.ts', import.meta.url)).text();
+        expect(template).not.toContain('ws://');
+        expect(preloadLogic).not.toContain('ws://localhost:');
+        expect(preloadLogic.match(/ws:\/\/127\.0\.0\.1:\$\{syncPort\}\/sync/g)).toHaveLength(1);
     });
 });

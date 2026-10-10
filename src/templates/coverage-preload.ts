@@ -17,8 +17,7 @@ import {
     writeCoverageToFile,
     guardAgainstOrphaning,
     orphanDebugLog,
-    waitForSyncReady,
-    formatSyncNotReadyMessage,
+    awaitRunnerReady,
     LIFELINE_FD_ENV,
     ORPHAN_DEBUG_ENV,
     type StrykerNamespace,
@@ -177,32 +176,15 @@ const lateHits: LateHitEntry[] = [];
 // enabled and its drain handler is registered: a test that runs earlier is
 // invisible to the runner, and its result and per-test coverage are lost or
 // paired with the wrong test. So the wait has no deadline (the runner bounds its
-// own side and kills this process if it fails), and a sync channel that fails
+// own side and stops this process if it fails), and a sync channel that fails
 // or closes first ends this process with a message instead of running the
 // tests unobserved; the message reaches the user in the dry run's error.
+// All of that is awaitRunnerReady's (preload-logic); keep this a bare call, with
+// no timer, sleep or race of its own (tests/unit/preload-logic.test.ts checks).
+// The socket is kept open for the drain handshake only when collecting coverage.
 if(syncPort) {
-    let outcome: { ready: boolean, problem?: string };
-    try {
-        const syncSocket = new WebSocket(`ws://127.0.0.1:${syncPort}/sync`);
-        ws = syncSocket;
-        // waitForSyncReady adds its listeners synchronously, before this await
-        // yields, so no message can arrive unheard.
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
-        outcome = await waitForSyncReady(syncSocket);
-    } catch (error) {
-        outcome = { ready: false, problem: `could not be opened (${error instanceof Error ? error.message : String(error)})` };
-    }
-    if(!outcome.ready) {
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
-        console.error(formatSyncNotReadyMessage(syncPort, outcome.problem));
-        // eslint-disable-next-line n/no-process-exit, unicorn/no-process-exit -- running the tests now would silently lose their results and coverage
-        process.exit(1);
-    }
-    if(!shouldCollectCoverage) {
-        // Without coverage there is no drain handshake to keep the socket for.
-        ws?.close();
-        ws = null;
-    }
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
+    ws = await awaitRunnerReady({ syncPort, keepOpen: shouldCollectCoverage });
 }
 
 // ============================================================================

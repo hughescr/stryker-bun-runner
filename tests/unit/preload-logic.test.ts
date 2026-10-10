@@ -26,6 +26,7 @@ import {
     preloadFs,
     waitForSyncReady,
     formatSyncNotReadyMessage,
+    awaitRunnerReady,
     type SyncReadySocket,
     type PreloadConfig,
     type StrykerNamespace
@@ -1348,6 +1349,184 @@ describe('preload-logic', () => {
                 + 'before the runner signalled that it is ready to observe the tests. Exiting without running any test: tests run now '
                 + 'would not be seen by the runner\'s inspector, so their results and per-test coverage would be lost.'
             );
+        });
+    });
+
+    describe('awaitRunnerReady', () => {
+        /** A socket that records close() and lets the test dispatch events on it. */
+        function createOpenedSocket(): { socket: EventTarget & SyncReadySocket & { close: () => void }, closed: () => number } {
+            let closeCount = 0;
+            const socket = Object.assign(new EventTarget(), {
+                close: () => {
+                    closeCount++;
+                },
+            }) as EventTarget & SyncReadySocket & { close: () => void };
+            return { socket, closed: () => closeCount };
+        }
+
+        /** A fail() that stops awaitRunnerReady the way process.exit would, recording the message. */
+        function createFail(): { fail: (message: string) => never, messages: string[] } {
+            const messages: string[] = [];
+            return {
+                messages,
+                fail: (message: string): never => {
+                    messages.push(message);
+                    throw new Error('exited');
+                },
+            };
+        }
+
+        it('dials the sync address and returns the open socket on ready when the caller keeps it open', async () => {
+            const { socket, closed } = createOpenedSocket();
+            const urls: string[] = [];
+            const outcome = awaitRunnerReady({
+                syncPort:   '6501',
+                keepOpen:   true,
+                openSocket: (url) => {
+                    urls.push(url);
+                    return socket;
+                },
+            });
+            socket.dispatchEvent(new MessageEvent('message', { data: 'ready' }));
+
+            expect(await outcome).toBe(socket);
+            expect(urls).toEqual(['ws://127.0.0.1:6501/sync']);
+            expect(closed()).toBe(0);
+        });
+
+        it('closes the socket and returns null on ready when the caller does not keep it', async () => {
+            const { socket, closed } = createOpenedSocket();
+            const outcome = awaitRunnerReady({ syncPort: '6501', keepOpen: false, openSocket: () => socket });
+            socket.dispatchEvent(new MessageEvent('message', { data: 'ready' }));
+
+            expect(await outcome).toBeNull();
+            expect(closed()).toBe(1);
+        });
+
+        it('fails with the problem when the socket closes before ready', async () => {
+            const { socket } = createOpenedSocket();
+            const { fail, messages } = createFail();
+            const outcome = awaitRunnerReady({ syncPort: '6501', keepOpen: true, openSocket: () => socket, fail });
+            socket.dispatchEvent(Object.assign(new Event('close'), { code: 1006, reason: '' }));
+
+            expect(outcome).rejects.toThrow('exited');
+            await outcome.catch(() => undefined);
+            expect(messages).toEqual([formatSyncNotReadyMessage('6501', 'closed (code 1006)')]);
+        });
+
+        it('fails when the socket cannot even be opened', async () => {
+            const { fail, messages } = createFail();
+            const outcome = awaitRunnerReady({
+                syncPort:   '6501',
+                keepOpen:   true,
+                openSocket: () => {
+                    throw new Error('bad url');
+                },
+                fail,
+            });
+
+            expect(outcome).rejects.toThrow('exited');
+            await outcome.catch(() => undefined);
+            expect(messages).toEqual([formatSyncNotReadyMessage('6501', 'could not be opened (bad url)')]);
+        });
+
+        it('names a non-Error throw from opening the socket', async () => {
+            const { fail, messages } = createFail();
+            const outcome = awaitRunnerReady({
+                syncPort:   '6501',
+                keepOpen:   true,
+                openSocket: () => {
+                    throw 'refused';
+                },
+                fail,
+            });
+            await outcome.catch(() => undefined);
+
+            expect(messages).toEqual([formatSyncNotReadyMessage('6501', 'could not be opened (refused)')]);
+        });
+
+        it('by default prints the message on stderr and exits with code 1', async () => {
+            const { socket } = createOpenedSocket();
+            const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
+            const exitSpy = spyOn(process, 'exit').mockImplementation(() => {
+                throw new Error('process.exit');
+            });
+            try {
+                const outcome = awaitRunnerReady({ syncPort: '6501', keepOpen: true, openSocket: () => socket });
+                socket.dispatchEvent(new Event('error'));
+                await outcome.catch(() => undefined);
+
+                expect(errorSpy).toHaveBeenCalledWith(formatSyncNotReadyMessage('6501', 'failed with a connection error'));
+                expect(exitSpy).toHaveBeenCalledWith(1);
+            } finally {
+                errorSpy.mockRestore();
+                exitSpy.mockRestore();
+            }
+        });
+
+        it('by default opens a real WebSocket to the sync address', async () => {
+            // Nothing listens on port 1, so the connection fails and the default fail runs.
+            const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
+            const exitSpy = spyOn(process, 'exit').mockImplementation(() => {
+                throw new Error('process.exit');
+            });
+            try {
+                await awaitRunnerReady({ syncPort: '1', keepOpen: true }).catch(() => undefined);
+
+                expect(errorSpy.mock.calls[0]?.[0]).toStartWith('[Stryker] stryker-bun-runner: the dry run\'s sync connection to the runner (ws://127.0.0.1:1/sync) ');
+                expect(exitSpy).toHaveBeenCalledWith(1);
+            } finally {
+                errorSpy.mockRestore();
+                exitSpy.mockRestore();
+            }
+        });
+    });
+
+    describe('the ready wait has no clock', () => {
+        // The preload used to give up on 'ready' after a fixed 2 s and run the tests
+        // unobserved. Any timer, sleep or race in the ready path, or in the template
+        // code that runs before the test hooks, could bring that back; integration
+        // tests cannot catch it without waiting on the clock themselves.
+        const CLOCK_CONSTRUCTS = [
+            'setTimeout', 'setInterval', 'Bun.sleep', 'sleep(', 'sleepSync', 'Promise.race', 'Promise.any',
+            'AbortSignal.timeout', 'Date.now', 'performance.now', 'node:timers', '\'timers', '"timers', 'timers/promises',
+        ];
+        const clockConstructsIn = (code: string): string[] => CLOCK_CONSTRUCTS.filter(construct => code.includes(construct));
+
+        const templateSource = async (): Promise<string> => Bun.file(new URL('../../src/templates/coverage-preload.ts', import.meta.url)).text();
+        /** Template code that runs before the test hooks: everything up to Section 4. */
+        const preTestTemplateCode = async (): Promise<string> => {
+            const template = await templateSource();
+            return template.slice(0, template.indexOf('Section 4: Coverage Writing Logic'));
+        };
+
+        it('the check rejects the bypasses it exists for', () => {
+            expect(clockConstructsIn('await Bun.sleep(2000); const outcome = { ready: true };')).toEqual(['Bun.sleep', 'sleep(']);
+            expect(clockConstructsIn('await new Promise(r => setTimeout(r, 2000));')).toEqual(['setTimeout']);
+            expect(clockConstructsIn('await Promise.race([awaitRunnerReady(o), sleep(2000)]);')).toEqual(['sleep(', 'Promise.race']);
+            expect(clockConstructsIn('ws.addEventListener(\'open\', () => {}, { signal: AbortSignal.timeout(2000) });')).toEqual(['AbortSignal.timeout']);
+            expect(clockConstructsIn('import { setTimeout as wait } from \'node:timers/promises\';')).toEqual(['setTimeout', 'node:timers', 'timers/promises']);
+            expect(clockConstructsIn('while(Date.now() < end) {}')).toEqual(['Date.now']);
+        });
+
+        it('the template waits for ready through one call to awaitRunnerReady', async () => {
+            const code = await preTestTemplateCode();
+            expect(code.match(/await awaitRunnerReady\(/g)).toHaveLength(1);
+            expect(code).not.toContain('WebSocket(');
+            expect(code).not.toContain('waitForSyncReady');
+        });
+
+        it('the template code that runs before the test hooks has no timer, sleep or race', async () => {
+            expect(clockConstructsIn(await preTestTemplateCode())).toEqual([]);
+        });
+
+        it('the template imports no timers module anywhere', async () => {
+            expect(await templateSource()).not.toMatch(/['"](?:node:)?timers(?:\/promises)?['"]/);
+        });
+
+        it('awaitRunnerReady and waitForSyncReady have no timer, sleep or race', () => {
+            expect(clockConstructsIn(awaitRunnerReady.toString())).toEqual([]);
+            expect(clockConstructsIn(waitForSyncReady.toString())).toEqual([]);
         });
     });
 
