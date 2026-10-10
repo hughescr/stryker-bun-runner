@@ -24,6 +24,9 @@ import {
     formatHitLimitSentinel,
     HIT_LIMIT_SENTINEL,
     preloadFs,
+    waitForSyncReady,
+    formatSyncNotReadyMessage,
+    type SyncReadySocket,
     type PreloadConfig,
     type StrykerNamespace
 } from '../../src/coverage/preload-logic';
@@ -1250,6 +1253,101 @@ describe('preload-logic', () => {
 
             expect(write).toHaveBeenCalledTimes(1);
             expect(write).toHaveBeenCalledWith('hello\n');
+        });
+    });
+
+    describe('waitForSyncReady', () => {
+        // A plain EventTarget dispatches events the way bun's WebSocket does.
+        const createSocket = (): EventTarget & SyncReadySocket => new EventTarget() as EventTarget & SyncReadySocket;
+        // The shape of a WebSocket CloseEvent.
+        const closeEvent = (code: number, reason = ''): Event => Object.assign(new Event('close'), { code, reason });
+
+        afterEach(() => {
+            jest.useRealTimers();
+        });
+
+        it('listens synchronously, so a ready that arrives before the caller yields is heard', async () => {
+            const socket = createSocket();
+            const outcome = waitForSyncReady(socket);
+            socket.dispatchEvent(new MessageEvent('message', { data: 'ready' }));
+
+            expect(await outcome).toEqual({ ready: true });
+        });
+
+        it('has no deadline: it keeps waiting through other messages until ready arrives', async () => {
+            // The old wait gave up after a fixed 2 s and let the tests run before the
+            // runner could observe them. Only the runner decides when the wait ends.
+            jest.useFakeTimers();
+            const timers = trackTimers();
+            try {
+                const socket = createSocket();
+                const outcome = waitForSyncReady(socket);
+
+                socket.dispatchEvent(new MessageEvent('message', { data: 'drained' }));
+                jest.advanceTimersByTime(10 * 60 * 1000);
+                await Promise.resolve();
+                expect(Bun.peek.status(outcome)).toBe('pending');
+                expect(timers.delays).toEqual([]);
+
+                socket.dispatchEvent(new MessageEvent('message', { data: 'ready' }));
+                expect(await outcome).toEqual({ ready: true });
+            } finally {
+                timers.restore();
+            }
+        });
+
+        it('reports a connection error as not ready', async () => {
+            const socket = createSocket();
+            const outcome = waitForSyncReady(socket);
+
+            socket.dispatchEvent(new Event('error'));
+
+            expect(await outcome).toEqual({ ready: false, problem: 'failed with a connection error' });
+        });
+
+        it('reports a close before ready as not ready, with the close code and reason', async () => {
+            const socket = createSocket();
+            const outcome = waitForSyncReady(socket);
+
+            socket.dispatchEvent(closeEvent(1006, 'Connection ended'));
+
+            expect(await outcome).toEqual({ ready: false, problem: 'closed (code 1006, reason "Connection ended")' });
+        });
+
+        it('leaves out an empty close reason, and says when the close carries no code', async () => {
+            const emptyReason = createSocket();
+            const emptyOutcome = waitForSyncReady(emptyReason);
+            emptyReason.dispatchEvent(closeEvent(1000));
+
+            const noDetail = createSocket();
+            const noDetailOutcome = waitForSyncReady(noDetail);
+            noDetail.dispatchEvent(new Event('close'));
+
+            expect(await emptyOutcome).toEqual({ ready: false, problem: 'closed (code 1000)' });
+            expect(await noDetailOutcome).toEqual({ ready: false, problem: 'closed (code unknown)' });
+        });
+
+        it('stays ready when the socket errors or closes after ready', async () => {
+            const socket = createSocket();
+            const outcome = waitForSyncReady(socket);
+
+            socket.dispatchEvent(new MessageEvent('message', { data: 'ready' }));
+            socket.dispatchEvent(new Event('error'));
+            socket.dispatchEvent(closeEvent(1006));
+
+            expect(await outcome).toEqual({ ready: true });
+        });
+    });
+
+    describe('formatSyncNotReadyMessage', () => {
+        it('names the sync address, the problem, and why no test was run', () => {
+            const message = formatSyncNotReadyMessage('6501', 'closed (code 1006)');
+
+            expect(message).toBe(
+                '[Stryker] stryker-bun-runner: the dry run\'s sync connection to the runner (ws://127.0.0.1:6501/sync) closed (code 1006) '
+                + 'before the runner signalled that it is ready to observe the tests. Exiting without running any test: tests run now '
+                + 'would not be seen by the runner\'s inspector, so their results and per-test coverage would be lost.'
+            );
         });
     });
 

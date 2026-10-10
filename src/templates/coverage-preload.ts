@@ -17,6 +17,8 @@ import {
     writeCoverageToFile,
     guardAgainstOrphaning,
     orphanDebugLog,
+    waitForSyncReady,
+    formatSyncNotReadyMessage,
     LIFELINE_FD_ENV,
     ORPHAN_DEBUG_ENV,
     type StrykerNamespace,
@@ -170,62 +172,36 @@ let lastFilePrefix: string | undefined;
 let staticSnapshotAtLastBoundary = new Map<string, number>();
 const lateHits: LateHitEntry[] = [];
 
-if(syncPort && shouldCollectCoverage) {
+// Only the dry run sets a sync port. No test may start before the runner says
+// 'ready', which it does once its inspector is connected, TestReporter is
+// enabled and its drain handler is registered: a test that runs earlier is
+// invisible to the runner, and its result and per-test coverage are lost or
+// paired with the wrong test. So the wait has no deadline (the runner bounds its
+// own side and kills this process if it fails), and a sync channel that fails
+// or closes first ends this process with a message instead of running the
+// tests unobserved; the message reaches the user in the dry run's error.
+if(syncPort) {
+    let outcome: { ready: boolean, problem?: string };
     try {
-        // Install the real 'ready' handler before yielding to the event loop so
-        // there is no window where an arriving message is silently dropped.
-        await new Promise<void>((resolve) => {
-            ws = new WebSocket(`ws://127.0.0.1:${syncPort}/sync`);
-            const timeout = setTimeout(() => {
-                console.warn('[Stryker] Timeout waiting for ready signal');
-                resolve();
-            }, 2000);
-
-            ws.onmessage = (event) => {
-                if(event.data === 'ready') {
-                    clearTimeout(timeout);
-                    resolve();
-                }
-            };
-
-            ws.onerror = () => {
-                clearTimeout(timeout);
-                console.warn('[Stryker] Failed to connect to sync server');
-                resolve();
-            };
-        });
+        const syncSocket = new WebSocket(`ws://127.0.0.1:${syncPort}/sync`);
+        ws = syncSocket;
+        // waitForSyncReady adds its listeners synchronously, before this await
+        // yields, so no message can arrive unheard.
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
+        outcome = await waitForSyncReady(syncSocket);
     } catch (error) {
-        console.warn('[Stryker] Error during synchronization:', error);
+        outcome = { ready: false, problem: `could not be opened (${error instanceof Error ? error.message : String(error)})` };
     }
-} else if(syncPort && !shouldCollectCoverage) {
-    // No coverage collection, just wait for ready signal
-    try {
-        // Install the real 'ready' handler before yielding to the event loop so
-        // there is no window where an arriving message is silently dropped.
-        await new Promise<void>((resolve) => {
-            const wsLocal = new WebSocket(`ws://127.0.0.1:${syncPort}/sync`);
-            const timeout = setTimeout(() => {
-                wsLocal.close();
-                console.warn('[Stryker Sync] Timeout waiting for ready signal, proceeding anyway');
-                resolve();
-            }, 2000);
-
-            wsLocal.onmessage = (event) => {
-                if(event.data === 'ready') {
-                    clearTimeout(timeout);
-                    wsLocal.close();
-                    resolve();
-                }
-            };
-
-            wsLocal.onerror = () => {
-                clearTimeout(timeout);
-                console.warn('[Stryker Sync] Failed to connect to sync server, proceeding anyway');
-                resolve();
-            };
-        });
-    } catch (error) {
-        console.warn('[Stryker Sync] Error during synchronization, proceeding anyway:', error);
+    if(!outcome.ready) {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
+        console.error(formatSyncNotReadyMessage(syncPort, outcome.problem));
+        // eslint-disable-next-line n/no-process-exit, unicorn/no-process-exit -- running the tests now would silently lose their results and coverage
+        process.exit(1);
+    }
+    if(!shouldCollectCoverage) {
+        // Without coverage there is no drain handshake to keep the socket for.
+        ws?.close();
+        ws = null;
     }
 }
 

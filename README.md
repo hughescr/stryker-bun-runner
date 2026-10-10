@@ -504,6 +504,23 @@ the coverage it collected before handing it to Stryker:
   keep up with the event stream under contention would lose whatever hadn't been
   processed by the time the child exited.
 
+  The handshake has a start as well as an end. The child's coverage preload
+  starts no test until the runner sends `ready` over the sync socket, and the
+  runner sends it only once its inspector is connected, `TestReporter.enable`
+  has been answered, and its drain handler is registered, so every test event
+  from then on is observed. The preload waits for `ready` with no deadline of
+  its own, however slow the machine: the runner's side is bounded instead (the
+  inspector connection and `TestReporter.enable` by `bun.inspectorTimeout`,
+  after which the dry run fails and the child is killed). If the sync socket
+  fails or closes before `ready`, the preload exits without running a test and
+  the dry run fails with an error that says so (`the dry run's sync connection
+  to the runner ... closed ... before the runner signalled that it is ready to
+  observe the tests`). The child never runs tests the runner cannot see: such
+  tests used to go missing, or have their coverage dropped or credited to the
+  wrong test, in a dry run that still completed. A `drain-request` that reaches
+  the runner before its drain handler is registered is queued and answered once
+  the handler is in place, never dropped.
+
   The runner's side of this wait is progress-based, not a fixed timer: it keeps
   extending as long as the inspector connection is still receiving frames of any
   kind, since continued arrivals are proof a backlog is actively draining, and

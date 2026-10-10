@@ -87,6 +87,71 @@ export function shouldCollectCoverage(config: PreloadConfig): boolean {
 }
 
 // ============================================================================
+// Dry-run sync: wait for the runner's 'ready'
+// ============================================================================
+
+/**
+ * The part of the preload's sync WebSocket that {@link waitForSyncReady} uses
+ * (bun's browser-style WebSocket).
+ */
+export interface SyncReadySocket {
+    addEventListener(type: 'message', listener: (event: { data: unknown }) => void): void
+    addEventListener(type: 'error', listener: () => void): void
+    addEventListener(type: 'close', listener: (event: { code?: number, reason?: string }) => void): void
+}
+
+/** How {@link waitForSyncReady} ended: ready, or what went wrong before it. */
+export type SyncReadyOutcome = { ready: true } | { ready: false, problem: string };
+
+/**
+ * Wait for the runner's 'ready' on the dry run's sync socket.
+ *
+ * The runner sends 'ready' only once its inspector is connected,
+ * `TestReporter.enable` has been answered and its drain handler is
+ * registered: from then on it observes every test event. A test that runs
+ * before that is invisible to the runner, and its result and per-test coverage
+ * are lost or paired with the wrong test. So this wait has no deadline of its
+ * own: it ends with 'ready', or with the socket failing or closing first, which
+ * the caller must treat as fatal. A runner that never gets ready is not left
+ * waiting forever either: the runner bounds its inspector requests and kills
+ * the child on failure, and its run timeout covers the child's whole life.
+ *
+ * Listeners are added synchronously, before the caller yields, so no message
+ * can arrive unheard. They stay attached but change nothing once the promise
+ * has settled.
+ */
+export function waitForSyncReady(socket: SyncReadySocket): Promise<SyncReadyOutcome> {
+    return new Promise((resolve) => {
+        socket.addEventListener('message', (event) => {
+            if(event.data === 'ready') {
+                resolve({ ready: true });
+            }
+        });
+        socket.addEventListener('error', () => {
+            resolve({ ready: false, problem: 'failed with a connection error' });
+        });
+        socket.addEventListener('close', (event) => {
+            const reason = event.reason ? `, reason "${event.reason}"` : '';
+            resolve({ ready: false, problem: `closed (code ${event.code ?? 'unknown'}${reason})` });
+        });
+    });
+}
+
+/**
+ * The line the preload prints before exiting when {@link waitForSyncReady}
+ * ends without 'ready'. It reaches the user inside the dry run's error, which
+ * carries the child's stderr.
+ */
+export function formatSyncNotReadyMessage(syncPort: string, problem: string): string {
+    const address = `ws://127.0.0.1:${syncPort}/sync`;
+    return [
+        `[Stryker] stryker-bun-runner: the dry run's sync connection to the runner (${address}) ${problem}`,
+        'before the runner signalled that it is ready to observe the tests. Exiting without running any test: tests run now',
+        'would not be seen by the runner\'s inspector, so their results and per-test coverage would be lost.',
+    ].join(' ');
+}
+
+// ============================================================================
 // Stryker Namespace Initialization
 // ============================================================================
 

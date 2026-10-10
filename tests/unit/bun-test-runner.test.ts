@@ -2967,6 +2967,58 @@ tests/example.test.ts:
                 expect(callOrder).toEqual(['setDrainHandler', 'signalReady']);
             });
 
+            it('signals ready only once the inspector is connected, TestReporter.enable has answered and the drain handler is registered', async () => {
+                // 'ready' releases the child's tests; every one of them must be observable by
+                // then, however long the enable round trip takes.
+                mockSuccessfulBunTestRun();
+                const callOrder: string[] = [];
+                let markEnableSent: () => void = () => {};
+                const enableSent = new Promise<void>((resolve) => {
+                    markEnableSent = resolve;
+                });
+                let answerEnable: () => void = () => {};
+                mockInspectorClient.connect.mockImplementation(() => {
+                    callOrder.push('connect');
+                    return Promise.resolve();
+                });
+                mockInspectorClient.send.mockImplementation((method: string) => {
+                    if(method !== 'TestReporter.enable' || callOrder.includes('enable sent')) {
+                        return Promise.resolve();
+                    }
+                    callOrder.push('enable sent');
+                    markEnableSent();
+                    return new Promise<void>((resolve) => {
+                        answerEnable = () => {
+                            callOrder.push('enable answered');
+                            resolve();
+                        };
+                    });
+                });
+                mockSyncServer.setDrainHandler.mockImplementation(() => {
+                    callOrder.push('setDrainHandler');
+                });
+                mockSyncServer.signalReady.mockImplementation(() => {
+                    callOrder.push('signalReady');
+                });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                const dryRun = runner.dryRun();
+                await enableSent;
+                for(let i = 0; i < 10; i++) {
+                    // eslint-disable-next-line no-await-in-loop -- give a premature signalReady every chance to happen
+                    await Promise.resolve();
+                }
+                expect(mockSyncServer.signalReady).not.toHaveBeenCalled();
+                expect(mockSyncServer.setDrainHandler).not.toHaveBeenCalled();
+
+                answerEnable();
+                const result = await dryRun;
+
+                expect(result.status).toBe(DryRunStatus.Complete);
+                expect(callOrder).toEqual(['connect', 'enable sent', 'enable answered', 'setDrainHandler', 'signalReady']);
+            });
+
             it('the registered drain handler performs an inspector TestReporter.enable round-trip', async () => {
                 mockSuccessfulBunTestRun();
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);

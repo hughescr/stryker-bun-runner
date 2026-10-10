@@ -1883,7 +1883,10 @@ export class BunTestRunner implements TestRunner {
                 }
             });
 
-            // 7. Signal preload script to proceed with tests
+            // 7. Signal the preload script to start the tests. Only now: the inspector is
+            // connected, TestReporter is enabled and the drain handler is registered, so
+            // every test event is observed. The preload waits for this with no deadline of
+            // its own, however long steps 5–6.5 take (they are bounded by inspectorTimeout).
             syncServer.signalReady();
             // Stryker disable next-line StringLiteral: logging message only
             this.logger.debug('Signaled preload script to proceed');
