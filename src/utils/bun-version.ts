@@ -57,15 +57,10 @@ type VersionProbe = { stdout: string } | { failure: string };
  * description.
  */
 function probeBunVersion(bunPath: string, env: Record<string, string> | undefined, timeoutMs: number): Promise<VersionProbe> {
+    // Several paths below can report an outcome (timeout, then a late close, or
+    // an error followed by close). A promise settles once, so the first one wins
+    // and the rest are ignored by `resolve` itself.
     return new Promise((resolve) => {
-        let settled = false;
-        const settle = (probe: VersionProbe): void => {
-            if(!settled) {
-                settled = true;
-                resolve(probe);
-            }
-        };
-
         try {
             const child = spawn(bunPath, ['--version'], {
                 env:   { ...process.env, ...env },
@@ -79,25 +74,25 @@ function probeBunVersion(bunPath: string, env: Record<string, string> | undefine
 
             const timer = setTimeout(() => {
                 child.kill('SIGKILL');
-                settle({ failure: `timed out after ${timeoutMs}ms` });
+                resolve({ failure: `timed out after ${timeoutMs}ms` });
             }, timeoutMs);
 
             child.on('error', (error: NodeJS.ErrnoException) => {
                 clearTimeout(timer);
-                settle({ failure: error.code ?? error.message });
+                resolve({ failure: error.code ?? error.message });
             });
 
             child.on('close', (code, signal) => {
                 clearTimeout(timer);
                 if(code === 0) {
-                    settle({ stdout: Buffer.concat(chunks).toString() });
+                    resolve({ stdout: Buffer.concat(chunks).toString() });
                 } else {
-                    settle({ failure: signal ? `terminated by ${signal}` : `exit code ${String(code)}` });
+                    resolve({ failure: signal ? `terminated by ${signal}` : `exit code ${String(code)}` });
                 }
             });
         } catch (error) {
             const err = error as NodeJS.ErrnoException;
-            settle({ failure: err.code ?? err.message });
+            resolve({ failure: err.code ?? err.message });
         }
     });
 }
