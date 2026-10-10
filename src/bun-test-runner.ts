@@ -38,7 +38,7 @@ import type { TestInfo } from './inspector/types.js';
 import type { StrykerBunOptions } from './options.js';
 import { parseBunTestOutput, type ParsedTestResults } from './parsers/console-parser.js';
 import { runBunTests, stripAnsi } from './process-runner.js';
-import { type DroppedBunfigKey, assertSupportedBunArgs, splitBunConfigArg, checkBunVersion, getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, TEST_FILE_SUFFIX_RE, discoverTestFiles, findBuildOutputTestFiles, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery, ensurePrivateDir, runTempDirPath, writePrivateFile } from './utils/index.js';
+import { type DroppedBunfigKey, assertSupportedBunArgs, splitBunConfigArg, checkBunVersion, getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, TEST_FILE_SUFFIX_RE, discoverTestFiles, findBuildOutputTestFiles, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery, ensurePrivateDir, runTempDirPath, writePrivateFile, MutantWarnAggregator } from './utils/index.js';
 
 /**
  * Poll (every 50ms) until `getUrl()` reports the inspector URL, `timeoutMs`
@@ -451,6 +451,38 @@ function coversAnyMutant(coverage: MutantCoverage): boolean {
     return buckets.some(bucket => Object.values(bucket).some(count => count > 0));
 }
 
+/**
+ * The warnings a mutant run can emit once per mutant, by kind. Each is logged through
+ * {@link MutantWarnAggregator}: the first of a kind at warn, later ones at debug, and a
+ * summary line named by these labels at dispose() when a kind affected several mutants.
+ */
+const MUTANT_WARN_KIND = {
+    unresolvedKilledBy:  'failed test names could not be resolved to dry-run test ids',
+    noRegistry:          'no exact-name registry available (lossy covering-test patterns)',
+    registryMiss:        'testFilter ids missing from exact-name registry (lossy fallback)',
+    zeroMatchRetry:      '--test-name-pattern matched 0 tests (retried with the full suite)',
+    zeroMatchNoRetry:    '--test-name-pattern matched 0 tests with no covering tests left to retry',
+    spawnError:          'could not start bun test, scoring as Error rather than Killed',
+    signalError:         'bun test terminated by a signal, scoring as Error rather than Killed',
+    noEvidence:          'bun test exited non-zero with no failing test and no fail/error count, scoring as Error rather than Killed',
+    inconclusiveTimeout: 'inconclusive timeout, scoring as Error rather than Timeout',
+    registryVersion:     'dryRun registry file has an unexpected version (skipped)',
+    registryMalformed:   'dryRun registry file is malformed (treated as absent)',
+    registryLoadFailed:  'failed to load the dryRun registry file',
+    noKillerIdentified:  'no killing test identifiable, emitting empty killedBy',
+    memoryLimit:         'bun test child exceeded maxChildRss, reporting a timeout',
+} as const;
+
+/** A zeroed tally of mutant runs per status. */
+function emptyMutantRunCounts(): Record<MutantRunStatus, number> {
+    return {
+        [MutantRunStatus.Killed]:   0,
+        [MutantRunStatus.Survived]: 0,
+        [MutantRunStatus.Timeout]:  0,
+        [MutantRunStatus.Error]:    0,
+    };
+}
+
 /** Per-mutant-run state shared by the first spawn and the zero-match full-suite retry. */
 interface MutantRunContext {
     options:           MutantRunOptions
@@ -530,6 +562,18 @@ export class BunTestRunner implements TestRunner {
     private lastRegistryTmpPath?:         string;
     /** True once `<bunPath> --version` has passed the startup check; later init() calls skip it. */
     private bunChecked = false;
+    /** The version the startup check reported; set together with {@link bunChecked}. */
+    private bunVersion?:                  string;
+    /** True once the start summary has been logged; it is shown once per runner. */
+    private loggedStartSummary = false;
+    /** Stryker's `disableBail` option as given at construction; undefined when Stryker did not supply it. */
+    private readonly disableBail?:        boolean;
+    /** Per-mutant warnings: the first of each kind at warn, the rest at debug, one summary per repeated kind at dispose(). */
+    private readonly mutantWarnings:      MutantWarnAggregator;
+    /** The mutant runs this worker has executed, by the status returned to Stryker. Reset when the end summary is logged. */
+    private mutantRunsByStatus = emptyMutantRunCounts();
+    /** Mutant runs that had covering tests but ran the full suite anyway (pattern too long, or zero-match retry). Reset with {@link mutantRunsByStatus}. */
+    private fullSuiteFallbacks = 0;
 
     /**
    * AbortController for whichever `dryRun`/`mutantRun` child process is
@@ -573,6 +617,9 @@ export class BunTestRunner implements TestRunner {
         this.mutateGlobs = (options as { mutate?: string[] }).mutate ?? [];
         // Likewise declared non-optional (Stryker defaults it to 'perTest') but absent in partial options.
         this.coverageAnalysis = (options as { coverageAnalysis?: CoverageAnalysis }).coverageAnalysis;
+        // Likewise declared non-optional (Stryker defaults it to false) but absent in partial options.
+        this.disableBail = (options as { disableBail?: boolean }).disableBail;
+        this.mutantWarnings = new MutantWarnAggregator(logger);
 
         // Stryker disable next-line StringLiteral: logging message only
         this.logger.debug('BunTestRunner initialized with options: %o', {
@@ -769,16 +816,46 @@ export class BunTestRunner implements TestRunner {
         }
     }
 
+    /** Where the test files for `cwd` come from, in the precedence of {@link getOrDiscoverTestFiles}, for the log. */
+    private testFilesSource(cwd: string): string {
+        if(this.selectedTestFilesFor(cwd) !== undefined) {
+            return 'Stryker\'s testFiles option';
+        }
+        return this.testFilesOverride === undefined ? 'auto-discovery' : 'bun.testFiles';
+    }
+
     /** Debug-log how many test files the dry run uses and where they came from. Same precedence as {@link getOrDiscoverTestFiles}. */
     private logTestFilesSource(testFiles: readonly string[] | undefined, cwd: string): void {
-        let source = 'auto-discovery';
-        if(this.selectedTestFilesFor(cwd) !== undefined) {
-            source = 'Stryker\'s testFiles option';
-        } else if(this.testFilesOverride !== undefined) {
-            source = 'bun.testFiles';
-        }
         // Stryker disable next-line StringLiteral,LogicalOperator,OptionalChaining: logging only; the format string and the count of an (in practice never undefined) list are not asserted, the source argument is by the 'dryRun' tests of Stryker's testFiles option
-        this.logger.debug('Dry run test files: %d from %s', testFiles?.length ?? 0, source);
+        this.logger.debug('Dry run test files: %d from %s', testFiles?.length ?? 0, this.testFilesSource(cwd));
+    }
+
+    /**
+     * Log the one-line start summary (at info, once per runner): the bun version and path, how
+     * many test files the runner hands bun and where they came from, the sanitized bunfig, and
+     * whether mutant runs bail. Called at the end of init(), so a re-init in another cwd
+     * (Stryker's sandbox rotation) does not repeat it.
+     *
+     * @param testFiles the files {@link getOrDiscoverTestFiles} chose; undefined when discovery
+     *                  found none and bun is left to discover the tests itself
+     */
+    private logStartSummary(testFiles: readonly string[] | undefined): void {
+        if(this.loggedStartSummary) {
+            return;
+        }
+        this.loggedStartSummary = true;
+        const files = testFiles === undefined
+            ? 'no test files found by the runner, bun will discover them itself'
+            : `${testFiles.length} test file(s) from ${this.testFilesSource(process.cwd())}`;
+        const parts = [
+            `Bun test runner started: bun ${this.bunVersion} at ${this.bunPath}`,
+            files,
+            `sanitized bunfig ${this.sanitizedBunfigPath}`,
+        ];
+        if(this.disableBail !== undefined) {
+            parts.push(this.disableBail ? 'bail off' : 'bail on');
+        }
+        this.logger.info('%s', parts.join('; '));
     }
 
     /**
@@ -899,7 +976,7 @@ export class BunTestRunner implements TestRunner {
         // "Timeout waiting for inspector URL". Uses the same bunPath/env the real spawn uses.
         // Done once per runner: the binary does not change between sandbox-rotation re-inits.
         if(!this.bunChecked) {
-            await checkBunVersion(this.bunPath, this.env);
+            this.bunVersion = await checkBunVersion(this.bunPath, this.env);
             this.bunChecked = true;
         }
 
@@ -969,7 +1046,8 @@ export class BunTestRunner implements TestRunner {
         // hot path.  If cwd changes between init and dryRun (Stryker sandbox rotation),
         // getOrDiscoverTestFiles() will detect the stale cachedTestFilesCwd key and
         // re-glob from the new cwd before returning.
-        await this.getOrDiscoverTestFiles();
+        const testFiles = await this.getOrDiscoverTestFiles();
+        this.logStartSummary(testFiles);
     }
 
     /** Create/verify the run's private temp directory (see src/utils/private-temp-dir.ts) and remember it as this worker's tempDir. */
@@ -1043,7 +1121,7 @@ export class BunTestRunner implements TestRunner {
    * verified private first, outside the try, so a registry another user could
    * have planted is never trusted and the mutant run fails loudly instead.
    */
-    private async loadRegistryFile(): Promise<void> {
+    private async loadRegistryFile(mutantId: string): Promise<void> {
         const registryPath = this.registryPath;
         await ensurePrivateDir(path.dirname(registryPath));
         try {
@@ -1051,12 +1129,14 @@ export class BunTestRunner implements TestRunner {
             const parsed = JSON.parse(raw) as RegistryFileV2;
             if(parsed.version !== 2) {
                 // Stryker disable next-line StringLiteral: diagnostic logging message
-                this.logger.warn('dryRun registry file has unexpected version %s; skipping', String(parsed.version));
+                this.mutantWarnings.warn(MUTANT_WARN_KIND.registryVersion, mutantId, 'dryRun registry file has unexpected version %s; skipping', String(parsed.version));
                 return;
             }
             if(!Array.isArray(parsed.cachedTestNames) || !Array.isArray(parsed.baseNameIndex) || !Array.isArray(parsed.testNameIndex)) {
                 // Stryker disable next-line StringLiteral: diagnostic logging message
-                this.logger.warn(
+                this.mutantWarnings.warn(
+                    MUTANT_WARN_KIND.registryMalformed,
+                    mutantId,
                     'dryRun registry file is malformed (cachedTestNames, baseNameIndex, or testNameIndex missing or not an array); treating as absent'
                 );
                 return;
@@ -1068,7 +1148,9 @@ export class BunTestRunner implements TestRunner {
             // the shape-level-only guard above.
             if(!parsed.testNameIndex.every((entry: unknown) => Array.isArray(entry) && entry.length === 2 && typeof entry[0] === 'string' && typeof entry[1] === 'string')) {
                 // Stryker disable next-line StringLiteral: diagnostic logging message
-                this.logger.warn(
+                this.mutantWarnings.warn(
+                    MUTANT_WARN_KIND.registryMalformed,
+                    mutantId,
                     'dryRun registry file is malformed (testNameIndex entry is not a [string, string] pair); treating as absent'
                 );
                 return;
@@ -1097,7 +1179,9 @@ export class BunTestRunner implements TestRunner {
             // Stryker disable next-line BlockStatement: else branch covered by test 'logs warning when registry file load fails with non-ENOENT error'
             } else {
                 // Stryker disable next-line StringLiteral: diagnostic logging message
-                this.logger.warn(
+                this.mutantWarnings.warn(
+                    MUTANT_WARN_KIND.registryLoadFailed,
+                    mutantId,
                     'Failed to load dryRun registry from %s: %s',
                     registryPath,
                     err instanceof Error ? err.message : String(err)
@@ -2017,13 +2101,15 @@ export class BunTestRunner implements TestRunner {
         const exactNameIndex = this.testNameIndex;
         if(exactNameIndex === undefined) {
             // Stryker disable next-line StringLiteral: diagnostic logging message
-            this.logger.warn('Mutant %s: no exact-name registry available — all %d covering-test pattern alternatives use lossy reconstruction; tests with " > " in their titles may be silently dropped', mutantId, filterIds.length);
+            this.mutantWarnings.warn(MUTANT_WARN_KIND.noRegistry, mutantId, 'Mutant %s: no exact-name registry available — all %d covering-test pattern alternatives use lossy reconstruction; tests with " > " in their titles may be silently dropped', mutantId, filterIds.length);
             return;
         }
         const missed = filterIds.filter(id => !exactNameIndex.has(id));
         if(missed.length > 0) {
             // Stryker disable StringLiteral,MethodExpression,ConditionalExpression,EqualityOperator: diagnostic warn — the slice(0, 5) sample cap and the ', …' ellipsis ternary only shape log output; the guarding conditionals around this warn are behaviorally tested
-            this.logger.warn(
+            this.mutantWarnings.warn(
+                MUTANT_WARN_KIND.registryMiss,
+                mutantId,
                 'Mutant %s: %d of %d testFilter ids missing from exact-name registry (lossy fallback; " > " titles among them may be silently dropped): %s%s',
                 mutantId,
                 missed.length,
@@ -2058,7 +2144,7 @@ export class BunTestRunner implements TestRunner {
         // populates this.testNameIndex, whose exact bun names the pattern builder
         // needs for titles that legitimately contain ' > '.
         if(!this.cachedTestNames) {
-            await this.loadRegistryFile();
+            await this.loadRegistryFile(options.activeMutant.id);
         }
 
         // Stryker's own `testFiles` option fills testFilter with test FILE paths, not
@@ -2120,7 +2206,7 @@ export class BunTestRunner implements TestRunner {
         const strykerTimeoutMs = isUsableTimeout(options.timeout) ? options.timeout : undefined;
         const limitMs = strykerTimeoutMs === undefined ? this.timeout : limitFromStrykerTimeout(strykerTimeoutMs);
 
-        return this.executeMutantRun({
+        const result = await this.executeMutantRun({
             options,
             bunfigPath,
             localRegistry,
@@ -2130,6 +2216,8 @@ export class BunTestRunner implements TestRunner {
             strykerTimeoutMs,
             testFileScope,
         }, testNamePattern, this.resolveCoveringTestFiles(filterIds));
+        this.mutantRunsByStatus[result.status]++;
+        return result;
     }
 
     /**
@@ -2191,6 +2279,7 @@ export class BunTestRunner implements TestRunner {
         coveringTestFiles?: string[]
     ): Promise<MutantRunResult> {
         const { options, bunfigPath, localRegistry, localBaseIndex } = ctx;
+        this.countFullSuiteFallback(testNamePattern, ctx.coveringTestCount);
         // Tracked on `this` so dispose() can kill an orphaned child if this runner
         // is disposed while a mutant run is still in flight — mirrors dryRun().
         const abortController = new AbortController();
@@ -2220,7 +2309,9 @@ export class BunTestRunner implements TestRunner {
                 rssCheckIntervalMs:    this.rssCheckIntervalMs,
                 maxSpawnDepth:         this.maxSpawnDepth,
                 onMemoryLimitExceeded: (rssBytes: number) => {
-                    this.logger.warn(
+                    this.mutantWarnings.warn(
+                        MUTANT_WARN_KIND.memoryLimit,
+                        options.activeMutant.id,
                         'bun test child exceeded maxChildRss (%d bytes observed) during mutant run %s — killing and reporting as a timeout for this mutant',
                         rssBytes,
                         options.activeMutant.id
@@ -2261,7 +2352,7 @@ export class BunTestRunner implements TestRunner {
         if(result.spawnError !== undefined) {
             const errorMessage = formatSpawnErrorMessage(result.spawnError);
             // Stryker disable next-line StringLiteral: diagnostic logging message
-            this.logger.warn('Mutant %s: %s — scoring as Error rather than Killed', options.activeMutant.id, errorMessage);
+            this.mutantWarnings.warn(MUTANT_WARN_KIND.spawnError, options.activeMutant.id, 'Mutant %s: %s — scoring as Error rather than Killed', options.activeMutant.id, errorMessage);
             return { status: MutantRunStatus.Error, errorMessage };
         }
 
@@ -2284,7 +2375,9 @@ export class BunTestRunner implements TestRunner {
             // eslint-disable-next-line @typescript-eslint/prefer-includes -- kept as a RegExp (not includes()) to match the module-level ZERO_MATCH_TEST_PATTERN_RE declaration shared with checkRuntimeError; behaviorally identical for this literal pattern
             if(testNamePattern !== undefined && parsed.tests.length === 0 && ZERO_MATCH_TEST_PATTERN_RE.test(result.stderr)) {
                 // Stryker disable next-line StringLiteral: diagnostic logging message
-                this.logger.warn(
+                this.mutantWarnings.warn(
+                    MUTANT_WARN_KIND.zeroMatchRetry,
+                    options.activeMutant.id,
                     'Mutant %s: --test-name-pattern matched 0 tests — usually a runner pattern gap or a mutant that changed an interpolated test title (it.each); retrying once with the full suite',
                     options.activeMutant.id
                 );
@@ -2301,6 +2394,18 @@ export class BunTestRunner implements TestRunner {
     }
 
     /**
+     * Count a spawn that had covering tests but no pattern: it runs the whole suite instead of
+     * just those tests, because the pattern was too long for argv or because this is the retry
+     * of a zero-match pattern. A mutant gets at most one such spawn (the retry never retries),
+     * so this counts mutants.
+     */
+    private countFullSuiteFallback(testNamePattern: string | undefined, coveringTestCount: number): void {
+        if(testNamePattern === undefined && coveringTestCount > 0) {
+            this.fullSuiteFallbacks++;
+        }
+    }
+
+    /**
    * Error result for a full-suite fallback run killed at the limit derived from
    * Stryker's per-mutant timeout — see the timedOut branch of executeMutantRun.
    */
@@ -2308,7 +2413,7 @@ export class BunTestRunner implements TestRunner {
         // Stryker disable next-line StringLiteral: diagnostic error message text — behaviorally tested via .toContain
         const errorMessage = `the full-suite fallback run (used because this mutant's ${coveringTestCount} covering test(s) could not be run by --test-name-pattern) was stopped at the limit derived from Stryker's ${strykerTimeoutMs} ms per-mutant timeout, which Stryker sized for those ${coveringTestCount} covering test(s), not the full suite; a slow full suite and a hanging mutant look the same here, so this is not scored as a Timeout`;
         // Stryker disable next-line StringLiteral: diagnostic logging message
-        this.logger.warn('Mutant %s: inconclusive timeout, scoring as Error rather than Timeout: %s', mutantId, errorMessage);
+        this.mutantWarnings.warn(MUTANT_WARN_KIND.inconclusiveTimeout, mutantId, 'Mutant %s: inconclusive timeout, scoring as Error rather than Timeout: %s', mutantId, errorMessage);
         return { status: MutantRunStatus.Error, errorMessage };
     }
 
@@ -2368,7 +2473,9 @@ export class BunTestRunner implements TestRunner {
         // old fallback, but WARN-visible and without poisoning the report.
         if(killedBy.length === 0) {
             // Stryker disable StringLiteral: diagnostic logging message format strings — not behaviorally tested
-            this.logger.warn(
+            this.mutantWarnings.warn(
+                MUTANT_WARN_KIND.noKillerIdentified,
+                mutantId,
                 'Mutant %s: no killing test identifiable — emitting empty killedBy; '
                 + 'this mutant will re-run on every incremental run\n'
                 + 'exit=%s\n--- STDOUT (first 600 chars) ---\n%s\n'
@@ -2409,7 +2516,9 @@ export class BunTestRunner implements TestRunner {
         errorMessage: string
     ): MutantRunResult {
         // Stryker disable StringLiteral: diagnostic logging message format strings — not behaviorally tested
-        this.logger.warn(
+        this.mutantWarnings.warn(
+            MUTANT_WARN_KIND.signalError,
+            mutantId,
             'Mutant %s: %s — scoring as Error rather than Killed\n'
             + '--- STDOUT (first 600 chars) ---\n%s\n'
             + '--- STDERR (first 600 chars) ---\n%s',
@@ -2476,7 +2585,9 @@ export class BunTestRunner implements TestRunner {
         // eslint-disable-next-line @typescript-eslint/prefer-includes -- kept as a RegExp (not includes()) to match the module-level ZERO_MATCH_TEST_PATTERN_RE declaration shared with executeMutantRun's retry gate; behaviorally identical for this literal pattern
         if(ZERO_MATCH_TEST_PATTERN_RE.test(stderr)) {
             // Stryker disable next-line StringLiteral: diagnostic logging message
-            this.logger.warn(
+            this.mutantWarnings.warn(
+                MUTANT_WARN_KIND.zeroMatchNoRetry,
+                mutantId,
                 'Mutant %s: --test-name-pattern matched 0 tests with no covering tests left to retry — not a kill: %s',
                 mutantId,
                 stderr.slice(0, 200)
@@ -2502,7 +2613,9 @@ export class BunTestRunner implements TestRunner {
         // Stryker disable next-line MethodExpression: the trim() calls and the slice(0, 500) cap only shape diagnostic text
         const output = (stripAnsi(stderr).trim() || stripAnsi(result.stdout).trim()).slice(0, 500) || '(no output)';
         // Stryker disable next-line StringLiteral: diagnostic logging message
-        this.logger.warn(
+        this.mutantWarnings.warn(
+            MUTANT_WARN_KIND.noEvidence,
+            mutantId,
             'Mutant %s: bun test exited with code %s but reported no failing test and no fail/error count — scoring as Error rather than Killed: %s',
             mutantId,
             String(result.exitCode),
@@ -3005,7 +3118,9 @@ export class BunTestRunner implements TestRunner {
         }
         const sample = [...unresolved];
         // Stryker disable StringLiteral,MethodExpression,ConditionalExpression,EqualityOperator: diagnostic warn — the slice(0, 5) sample cap and the ', …' ellipsis ternary only shape log output; the drop itself is behaviorally tested
-        this.logger.warn(
+        this.mutantWarnings.warn(
+            MUTANT_WARN_KIND.unresolvedKilledBy,
+            mutantId,
             'Mutant %s: %d failed test name(s) could not be resolved to dry-run test ids and will not be recorded in killedBy — this mutant\'s Killed verdict will not be reusable from the incremental cache: %s%s',
             mutantId,
             unresolved.size,
@@ -3013,6 +3128,30 @@ export class BunTestRunner implements TestRunner {
             sample.length > 5 ? ', …' : ''
         );
         // Stryker restore StringLiteral,MethodExpression,ConditionalExpression,EqualityOperator
+    }
+
+    /**
+     * Log the one-line end summary (at info): this worker's mutant runs by outcome and how many
+     * of them ran the full suite as a fallback. Nothing is logged for a worker that ran no
+     * mutant, and the tallies restart afterwards so a second dispose() does not repeat the line.
+     */
+    private logMutantRunSummary(): void {
+        const counts = this.mutantRunsByStatus;
+        const total = counts.killed + counts.survived + counts.timeout + counts.error;
+        if(total === 0) {
+            return;
+        }
+        this.logger.info(
+            'Mutant runs on this worker: %d (killed %d, survived %d, timeout %d, error %d); full-suite fallbacks: %d',
+            total,
+            counts.killed,
+            counts.survived,
+            counts.timeout,
+            counts.error,
+            this.fullSuiteFallbacks
+        );
+        this.mutantRunsByStatus = emptyMutantRunCounts();
+        this.fullSuiteFallbacks = 0;
     }
 
     /**
@@ -3028,6 +3167,10 @@ export class BunTestRunner implements TestRunner {
     public async dispose(): Promise<void> {
         // Stryker disable next-line StringLiteral: logging message only
         this.logger.debug('Disposing BunTestRunner');
+
+        // Summaries first: a cleanup failure below must not swallow them.
+        this.logMutantRunSummary();
+        this.mutantWarnings.flush();
 
         // If a dryRun/mutantRun child is still in flight when Stryker disposes
         // this runner (e.g. a hung worker being torn down), kill it rather than

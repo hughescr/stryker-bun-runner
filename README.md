@@ -276,6 +276,21 @@ export default {
 };
 ```
 
+## Start and end summaries
+
+Each Stryker worker logs two `info` lines, and nothing else at `info` for individual mutants:
+
+- **Start**, once per runner at the end of `init()` (it is not repeated when Stryker re-initializes the runner in a new sandbox):
+  `Bun test runner started: bun <version> at <bunPath>; <N> test file(s) from <source>; sanitized bunfig <path>[; bail on|off]`.
+  `<source>` is `auto-discovery` or `bun.testFiles`; Stryker's own `testFiles` option only arrives with the dry run,
+  which reports its source in the debug log. When discovery finds no files the line says
+  `no test files found by the runner, bun will discover them itself` instead. The `bail` part is present when
+  Stryker passes `disableBail` to the runner: `bail off` if it is set, `bail on` if not.
+- **End**, at `dispose()`, only for a worker that ran at least one mutant:
+  `Mutant runs on this worker: <N> (killed <K>, survived <S>, timeout <T>, error <E>); full-suite fallbacks: <F>`.
+  A full-suite fallback is a mutant that had covering tests but ran the whole suite anyway, because its
+  `--test-name-pattern` was too long or matched zero tests (see [How It Works](#how-it-works)).
+
 ## Diagnostic warnings worth grepping for in CI
 
 The runner logs these mutant-run warnings worth grepping for. The first three flag when a
@@ -332,6 +347,35 @@ A handful of these can be a genuine crash worth fixing in your suite; a flood of
 the second or third kind means the `bun` executable, its environment, or its
 configuration is broken. A flood of the last kind means Stryker's `timeoutMS` is
 too small for your full suite.
+
+### Repeated warnings are aggregated
+
+Every warning above, and the other per-mutant warnings listed below, can repeat for thousands of mutants.
+Each *kind* is logged in full at `warn` the first time it occurs in a runner (per Stryker worker), exactly as
+described above, so the strings you grep for still appear. Later occurrences of the same kind are logged at
+`debug` with the same text, and when the runner is disposed it adds one summary `warn` per kind that affected
+more than one mutant:
+
+```text
+<kind>: <N> mutants affected (first: <id>, <id>, … up to 5 ids); see debug log for details
+```
+
+Run Stryker with debug logging to see every occurrence. The kinds, as the summary names them:
+
+| Kind | What the first `warn` is about |
+|------|--------------------------------|
+| `--test-name-pattern matched 0 tests (retried with the full suite)` | the zero-match retry above |
+| `--test-name-pattern matched 0 tests with no covering tests left to retry` | the zero-match `Error` above |
+| `no exact-name registry available (lossy covering-test patterns)` | `no exact-name registry available` above |
+| `testFilter ids missing from exact-name registry (lossy fallback)` | `missing from exact-name registry` above |
+| `bun test terminated by a signal, scoring as Error rather than Killed` | the first `Error` warn above |
+| `could not start bun test, scoring as Error rather than Killed` | the second `Error` warn above |
+| `bun test exited non-zero with no failing test and no fail/error count, scoring as Error rather than Killed` | the third `Error` warn above |
+| `inconclusive timeout, scoring as Error rather than Timeout` | the `inconclusive timeout` warn above |
+| `failed test names could not be resolved to dry-run test ids` | a failed test whose name is not a dry-run test id is left out of `killedBy`, so that Killed verdict is not reusable from the incremental cache |
+| `no killing test identifiable, emitting empty killedBy` | a killed mutant with an empty `killedBy` (it re-runs on every incremental run); the warn includes the head of bun's output |
+| `bun test child exceeded maxChildRss, reporting a timeout` | a mutant run killed by `bun.maxChildRss` |
+| `dryRun registry file has an unexpected version (skipped)`, `dryRun registry file is malformed (treated as absent)`, `failed to load the dryRun registry file` | a worker that never ran the dry run could not use the shared registry; it retries the load on every mutant, so these repeat. Their `debug` repeats name no mutant; the summary lists the first five |
 
 ### Dry-run failure diagnostics (dry run only)
 
