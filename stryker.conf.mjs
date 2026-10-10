@@ -30,7 +30,9 @@ const config = {
     // the file from instrumentation removes the self-reference entirely; it is still fully
     // covered by ordinary (non-mutation) unit tests in tests/unit/preload-logic.test.ts.
     mutate:           ['src/**/*.ts', '!src/templates/**/*.ts', '!src/coverage/preload-logic.ts'],
-    ignorePatterns:   ['**', '!src/**/*.ts', '!tests/**/*.ts', '!bunfig.toml', '!tsconfig.json', '!*.mjs'], // Only include source and test files in the mutation testing process
+    // Only copy into the sandbox what the tests and checker need: sources, tests, their configs, and
+    // package.json (tests/unit/bun-version.test.ts reads it to check MIN_BUN_VERSION against engines.bun).
+    ignorePatterns:   ['**', '!src/**/*.ts', '!tests/**/*.ts', '!bunfig.toml', '!tsconfig.json', '!*.mjs', '!package.json'],
     thresholds:       { high: 100, low: 100, 'break': 100 },
     coverageAnalysis: 'perTest',
     concurrency:      isCI ? 4 : 12,
