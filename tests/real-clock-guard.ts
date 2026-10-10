@@ -54,8 +54,7 @@ let sourceTimersAllowed = false;
 
 /**
  * Off until the first test file starts. Timers armed while preloads load are
- * background machinery no test waits on: under Stryker, the runner's coverage
- * preload starts a 1s orphan watchdog interval in every `bun test` child.
+ * background machinery no test waits on.
  */
 let armed = false;
 const arm = (): void => {

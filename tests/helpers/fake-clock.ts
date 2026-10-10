@@ -72,14 +72,13 @@ type TimerCallback = (...args: unknown[]) => void;
  * Use this instead of `jest.getTimerCount()`, which counts every timer in the
  * fake queue, including ones this test never armed. bun moves a REAL interval
  * into the fake queue when it ticks while fake timers are installed (seen on
- * bun 1.4.2), and under Stryker the runner's coverage preload runs a real 1s
- * orphan-watchdog interval in every `bun test` child. Whenever a fake-timer
- * test hands control back to the event loop (runUntilSettled's macrotask
- * turns, or `expect(pendingPromise).rejects`, which runs the loop until the
- * promise settles) at the moment that watchdog is due, the count is one higher
- * than the code under test can explain. Plain `bun test` has no such interval,
- * so a getTimerCount() assertion passes there and fails at random in a
- * Stryker dry run.
+ * bun 1.4.2), so any real interval armed elsewhere in the process (by a
+ * preload, or by an earlier test file) can turn up in the count. Whenever a
+ * fake-timer test hands control back to the event loop (runUntilSettled's
+ * macrotask turns, or `expect(pendingPromise).rejects`, which runs the loop
+ * until the promise settles) at the moment such an interval is due, the count
+ * is one higher than the code under test can explain, and at random, since it
+ * depends on wall-clock timing.
  */
 export function trackTimers(): TrackedTimers {
     const delays: number[] = [];
