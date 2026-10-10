@@ -345,6 +345,57 @@ const TEST_ID_FILE_SEPARATOR = ' > ';
 const INSPECTOR_DRAIN_TIMEOUT_MS = 1000;
 
 /**
+ * Smallest gap between the runner's own kill of a mutant-run child and
+ * Stryker's per-mutant timeout. Stryker's TimeoutDecorator starts its timer
+ * (options.timeout) in the main process before the run reaches this worker, and
+ * when it fires it disposes and restarts the whole worker (~1 s each) instead of
+ * just reporting Timeout. The runner therefore kills first. 750 ms covers
+ * process-runner's 500 ms SIGTERM→SIGKILL grace (a child that handles SIGTERM
+ * only dies at the SIGKILL), plus the child's reaping, the IPC hop and the
+ * runner's own pre-spawn work. A child that does not handle SIGTERM is gone
+ * within ~20 ms of the kill (measured on bun 1.4.2, sync and async hangs alike).
+ */
+const STRYKER_TIMEOUT_MARGIN_MIN_MS = 750;
+/** Proportional part of the margin: 5% of Stryker's timeout, when that is larger. */
+const STRYKER_TIMEOUT_MARGIN_RATIO = 0.05;
+/** Fraction of bun.timeout a dry run may use before the runner warns that the limit is tight. */
+const DRY_RUN_TIMEOUT_WARN_RATIO = 0.8;
+
+/**
+ * The runner's own kill limit for a mutant run given Stryker's per-mutant
+ * `options.timeout`: that timeout minus max(750 ms, 5%), with the margin capped
+ * at half the timeout so a tiny budget still leaves the run time to execute.
+ */
+function limitFromStrykerTimeout(strykerTimeoutMs: number): number {
+    const margin = Math.min(strykerTimeoutMs / 2, Math.max(STRYKER_TIMEOUT_MARGIN_MIN_MS, strykerTimeoutMs * STRYKER_TIMEOUT_MARGIN_RATIO));
+    return Math.floor(strykerTimeoutMs - margin);
+}
+
+/**
+ * True when Stryker supplied a usable per-mutant timeout. `MutantRunOptions.timeout`
+ * is typed as required, but callers outside Stryker core (and older cores) can
+ * leave it out; anything that is not a positive finite number falls back to
+ * bun.timeout rather than producing a zero or NaN kill timer.
+ */
+function isUsableTimeout(timeout: unknown): timeout is number {
+    return typeof timeout === 'number' && Number.isFinite(timeout) && timeout > 0;
+}
+
+/** Per-mutant-run state shared by the first spawn and the zero-match full-suite retry. */
+interface MutantRunContext {
+    options:           MutantRunOptions
+    bunfigPath:        string
+    localRegistry:     Set<string>
+    localBaseIndex:    Map<string, string[]>
+    /** Number of covering test ids Stryker asked for (0 for a static mutant / full-suite plan). */
+    coveringTestCount: number
+    /** Absolute Date.now() by which every spawn of this mutant run must have been killed. */
+    deadline:          number
+    /** Stryker's options.timeout when it set the deadline; undefined when bun.timeout did. */
+    strykerTimeoutMs?: number
+}
+
+/**
  * Bun test runner for Stryker mutation testing
  */
 export class BunTestRunner implements TestRunner {
@@ -1066,9 +1117,9 @@ export class BunTestRunner implements TestRunner {
                 // reaching the drain phase at all) is also, as a side effect, only
                 // detected/killed after this.timeout + the ceiling rather than
                 // this.timeout alone. Accepted: this only affects the single dry-run
-                // child (not the per-mutant hot loop below, which still uses
-                // this.timeout unmodified), and a genuinely hung dry run is already a
-                // rare, one-time cost.
+                // child (mutant runs are bounded by Stryker's per-mutant timeout, see
+                // mutantRun), and a genuinely hung dry run is already a rare,
+                // one-time cost.
                 timeout:               this.timeout + DRAIN_ACK_ABSOLUTE_CEILING_MS,
                 env:                   this.env,
                 bunArgs:               this.bunArgs,
@@ -1432,12 +1483,32 @@ export class BunTestRunner implements TestRunner {
         await this.buildAndPersistTestRegistry(tests, testNameIndex);
 
         this.warnOnUnidentifiedDryRunFailure(result, parsed, tests);
+        this.warnOnTightDryRunTimeout(totalElapsedMs);
 
         return {
             status: DryRunStatus.Complete,
             tests,
             mutantCoverage,
         };
+    }
+
+    /**
+   * Warn when a completed dry run used more than {@link DRY_RUN_TIMEOUT_WARN_RATIO}
+   * of bun.timeout. bun.timeout now governs only the dry run (mutant runs follow
+   * Stryker's per-mutant timeout), so this is the one place a too-small value
+   * bites: the next, slightly slower dry run is killed. Called once, from the
+   * Complete path of the single dry run.
+   */
+    private warnOnTightDryRunTimeout(elapsedMs: number): void {
+        // Stryker disable next-line EqualityOperator: > vs >= at exactly 80% is not observable in a wall-clock measurement
+        if(elapsedMs > this.timeout * DRY_RUN_TIMEOUT_WARN_RATIO) {
+            // Stryker disable next-line StringLiteral: logging message only
+            this.logger.warn(
+                'The dry run took %dms, more than 80%% of bun.timeout (%dms). bun.timeout bounds the dry run (mutant runs use Stryker\'s per-mutant timeout instead); a dry run that outgrows bun.timeout plus the drain-handshake allowance is killed — raise bun.timeout',
+                elapsedMs,
+                this.timeout
+            );
+        }
     }
 
     /**
@@ -1577,6 +1648,9 @@ export class BunTestRunner implements TestRunner {
    * Run tests with an active mutant
    */
     public async mutantRun(options: MutantRunOptions): Promise<MutantRunResult> {
+        // The time budget starts now, not at spawn: Stryker's own timer is already
+        // running, and the registry load / bunfig / discovery below spend from it.
+        const startedAt = Date.now();
         // Stryker disable next-line StringLiteral: logging message only
         this.logger.debug('Running mutant run for mutant %s', options.activeMutant.id);
 
@@ -1634,7 +1708,24 @@ export class BunTestRunner implements TestRunner {
         // When testFilesOverride is set, use it directly without globbing.
         this.cachedTestFiles = await this.getOrDiscoverTestFiles();
 
-        return this.executeMutantRun(options, bunfigPath, testNamePattern, localRegistry, localBaseIndex, this.resolveCoveringTestFiles(filterIds));
+        // Kill limit: Stryker's per-mutant timeout less a margin, so the runner reports
+        // the Timeout itself before Stryker's TimeoutDecorator fires and restarts the
+        // worker. Stryker sizes options.timeout from the dry-run time of exactly the
+        // tests it planned (the covering tests, or the full suite for a static mutant),
+        // so it is the principled limit; bun.timeout only governs the dry run, and is
+        // the fallback when Stryker supplies no timeout.
+        const strykerTimeoutMs = isUsableTimeout(options.timeout) ? options.timeout : undefined;
+        const limitMs = strykerTimeoutMs === undefined ? this.timeout : limitFromStrykerTimeout(strykerTimeoutMs);
+
+        return this.executeMutantRun({
+            options,
+            bunfigPath,
+            localRegistry,
+            localBaseIndex,
+            coveringTestCount: filterIds.length,
+            deadline:          startedAt + limitMs,
+            strykerTimeoutMs,
+        }, testNamePattern, this.resolveCoveringTestFiles(filterIds));
     }
 
     /**
@@ -1645,16 +1736,15 @@ export class BunTestRunner implements TestRunner {
    * killedBy resolution — avoiding both a false Killed and redundant setup.
    * The retry always recurses with testNamePattern undefined, so the retry
    * gate's first conjunct is false on that call: recursion is bounded to
-   * depth 1 by construction, never a retry-of-a-retry.
+   * depth 1 by construction, never a retry-of-a-retry. The retry spends what is
+   * left of the same deadline, because Stryker's timer covers both spawns.
    */
     private async executeMutantRun(
-        options:           MutantRunOptions,
-        bunfigPath:        string,
-        testNamePattern:   string | undefined,
-        localRegistry:     Set<string>,
-        localBaseIndex:    Map<string, string[]>,
+        ctx:                MutantRunContext,
+        testNamePattern:    string | undefined,
         coveringTestFiles?: string[]
     ): Promise<MutantRunResult> {
+        const { options, bunfigPath, localRegistry, localBaseIndex } = ctx;
         // Tracked on `this` so dispose() can kill an orphaned child if this runner
         // is disposed while a mutant run is still in flight — mirrors dryRun().
         const abortController = new AbortController();
@@ -1663,7 +1753,8 @@ export class BunTestRunner implements TestRunner {
         try {
             result = await runBunTests({
                 bunPath:               this.bunPath,
-                timeout:               this.timeout,
+                // Stryker disable next-line MethodExpression: the 1 ms floor only matters once the deadline has already passed (a retry after a slow first spawn); any non-positive timer fires immediately either way
+                timeout:               Math.max(1, ctx.deadline - Date.now()),
                 env:                   this.env,
                 bunArgs:               this.bunArgs,
                 bunfigPath,
@@ -1697,6 +1788,19 @@ export class BunTestRunner implements TestRunner {
         }
 
         if(result.timedOut) {
+            // A full-suite FALLBACK run (the covering tests' pattern was too long, or
+            // matched nothing and this is the retry) killed at a Stryker-derived limit
+            // proves nothing: Stryker sized that budget for the covering tests only, so
+            // a merely slow full suite and a hanging mutant look identical. Scoring it
+            // Timeout would count it as detected. The runner cannot buy the full suite
+            // more time — Stryker's TimeoutDecorator fires at options.timeout no matter
+            // what the runner does — so it reports Error (excluded from the score). A
+            // maxChildRss kill is evidence of a runaway either way and stays Timeout, as
+            // does a kill at bun.timeout, which is documented as a full-suite limit.
+            const isFullSuiteFallback = testNamePattern === undefined && ctx.coveringTestCount > 0;
+            if(isFullSuiteFallback && ctx.strykerTimeoutMs !== undefined && result.memoryLimitExceeded !== true) {
+                return this.buildInconclusiveFallbackTimeout(options.activeMutant.id, ctx.coveringTestCount, ctx.strykerTimeoutMs);
+            }
             // Stryker disable next-line all: Logging statement
             this.logger.debug('Mutant run timed out');
             return {
@@ -1737,7 +1841,7 @@ export class BunTestRunner implements TestRunner {
                     'Mutant %s: --test-name-pattern matched 0 tests — usually a runner pattern gap or a mutant that changed an interpolated test title (it.each); retrying once with the full suite',
                     options.activeMutant.id
                 );
-                return this.executeMutantRun(options, bunfigPath, undefined, localRegistry, localBaseIndex);
+                return this.executeMutantRun(ctx, undefined);
             }
             return this.buildMutantKilledResult(result, parsed, localRegistry, localBaseIndex, options.activeMutant.id);
         }
@@ -1747,6 +1851,18 @@ export class BunTestRunner implements TestRunner {
             status:    MutantRunStatus.Survived,
             nrOfTests: parsed.totalTests,
         };
+    }
+
+    /**
+   * Error result for a full-suite fallback run killed at the limit derived from
+   * Stryker's per-mutant timeout — see the timedOut branch of executeMutantRun.
+   */
+    private buildInconclusiveFallbackTimeout(mutantId: string, coveringTestCount: number, strykerTimeoutMs: number): MutantRunResult {
+        // Stryker disable next-line StringLiteral: diagnostic error message text — behaviorally tested via .toContain
+        const errorMessage = `the full-suite fallback run (used because this mutant's ${coveringTestCount} covering test(s) could not be run by --test-name-pattern) was stopped at the limit derived from Stryker's ${strykerTimeoutMs} ms per-mutant timeout, which Stryker sized for those ${coveringTestCount} covering test(s), not the full suite; a slow full suite and a hanging mutant look the same here, so this is not scored as a Timeout`;
+        // Stryker disable next-line StringLiteral: diagnostic logging message
+        this.logger.warn('Mutant %s: inconclusive timeout, scoring as Error rather than Timeout: %s', mutantId, errorMessage);
+        return { status: MutantRunStatus.Error, errorMessage };
     }
 
     /**
@@ -1957,13 +2073,20 @@ export class BunTestRunner implements TestRunner {
    * Returns a DryRunResult to short-circuit if the process failed, or null to proceed.
    */
     private checkDryRunProcessResult(
-        result:        { timedOut: boolean, exitCode: number | null, signal?: NodeJS.Signals | null, stderr: string, spawnError?: string },
+        result:        { timedOut: boolean, memoryLimitExceeded?: boolean, exitCode: number | null, signal?: NodeJS.Signals | null, stderr: string, spawnError?: string },
         parsed:        { failed: number },
         testHierarchy: TestInfo[]
     ): DryRunResult | null {
         if(result.timedOut) {
-            // Stryker disable next-line StringLiteral: logging message only
-            this.logger.warn('Dry run timed out');
+            // A maxChildRss kill also sets timedOut; onMemoryLimitExceeded already warned about it.
+            if(result.memoryLimitExceeded !== true) {
+                // Stryker disable next-line StringLiteral: logging message only
+                this.logger.warn(
+                    'Dry run timed out: bun.timeout is %dms, and the dry-run child was killed at its %dms limit (bun.timeout plus the drain-handshake allowance) — raise bun.timeout above your full suite\'s run time',
+                    this.timeout,
+                    this.timeout + DRAIN_ACK_ABSOLUTE_CEILING_MS
+                );
+            }
             return { status: DryRunStatus.Timeout };
         }
         // A child 'error' event (exitCode and signal both null): name the spawn error rather

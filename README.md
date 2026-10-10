@@ -82,12 +82,20 @@ Oversized covering-test patterns (over 100,000 UTF-8 bytes) fall back to running
 
 A second full-suite fallback happens at run time: a `--test-name-pattern` that matches zero tests triggers a one-shot full-suite retry (see [Diagnostic warnings worth grepping for in CI](#diagnostic-warnings-worth-grepping-for-in-ci)).
 
+### Timeouts
+
+Stryker gives every mutant run its own timeout: `timeoutFactor` × the dry-run time of the tests it plans to run for that mutant + `timeoutMS` + the dry run's overhead. For an ordinary mutant those are its covering tests; for a static mutant they are the whole suite. Stryker enforces that timeout itself, and when it fires it restarts the whole worker process, which costs about a second each time.
+
+The runner therefore kills a mutant run's `bun test` child slightly earlier, at Stryker's timeout minus the larger of 750 ms and 5% (never more than half the timeout), and reports the Timeout itself. The 750 ms floor covers the runner's 500 ms SIGTERM-to-SIGKILL grace period. A zero-match retry gets only what is left of the same budget, because Stryker's timer covers both runs. `bun.timeout` governs only the dry run, and is the mutant-run limit only when Stryker supplies no timeout.
+
+One case cannot be scored reliably. When the runner falls back to the full suite for a mutant that has covering tests (the pattern is too long, or matched zero tests), Stryker's timeout was sized for those covering tests, not the full suite. A full suite that is merely slower than that budget looks the same as a mutant that hangs, and the runner cannot extend Stryker's timer. Such a run is scored **Error**, not Timeout, so it does not inflate the score. It is logged at warn as `inconclusive timeout`. If you see it often, raise Stryker's `timeoutMS` or `timeoutFactor`.
+
 ## Options
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `bun.bunPath` | `string` | `'bun'` | Path to the Bun executable |
-| `bun.timeout` | `number` | `10000` | Wall-clock limit in milliseconds for one whole `bun test` child process (an entire dry run, or one mutant run); the child is killed when it expires. This is **not** Bun's per-test `[test].timeout` from `bunfig.toml`, which is independent. Set it comfortably above your full test suite's run time: mutants that need the whole suite (static mutants) are bounded by this limit. The dry run gets an extra 30 s on top of this limit for the coverage drain handshake. |
+| `bun.timeout` | `number` | `10000` | Wall-clock limit in milliseconds for the dry run's `bun test` child process, which is killed when it expires; the dry run gets an extra 30 s on top of this limit for the coverage drain handshake. Set it comfortably above your full test suite's run time; the runner warns when a dry run uses more than 80% of it. Mutant runs follow Stryker's per-mutant timeout instead (see [Timeouts](#timeouts)), and use `bun.timeout` only when Stryker supplies none. This is **not** Bun's per-test `[test].timeout` from `bunfig.toml`, which is independent. |
 | `bun.inspectorTimeout` | `number` | `5000` | Timeout for Inspector WebSocket connection in milliseconds |
 | `bun.env` | `object` | `undefined` | Additional environment variables to pass to bun test |
 | `bun.bunArgs` | `string[]` | `undefined` | Additional bun test flags (e.g., `['--only']`). Bail flags (`--bail`, `--bail=<N>`, or a space-separated `--bail <N>`) are ignored here — bail is fully managed by the runner via Stryker's `disableBail` option (see [How It Works](#how-it-works)). |
@@ -105,7 +113,7 @@ export default {
   testRunner: 'bun',
   bun: {
     bunPath: '/path/to/bun',   // Custom bun executable (defaults to 'bun')
-    timeout: 30000,            // 30 second limit for one whole bun test run (not a per-test timeout)
+    timeout: 30000,            // 30 second limit for the dry run's bun test process (not a per-test timeout)
     inspectorTimeout: 10000,   // 10 second connection timeout
     env: { DEBUG: 'true' },    // Extra environment variables
     bunArgs: ['--only'],       // Extra bun test flags (bail flags here are ignored — see Options table)
@@ -197,7 +205,7 @@ Two independent knobs help bound the memory a single `bun test` child can use, o
 
 Each spawned `bun test` child is protected against being left running forever if something goes wrong:
 
-- **Timeouts and aborts escalate gracefully.** When the per-run `bun.timeout` fires, or when the plugin internally aborts a run (e.g. dry-run inspector connection failure), the child receives SIGTERM first; if it hasn't exited after a short grace period, it's escalated to SIGKILL. The same escalation covers `bun.maxChildRss` kills.
+- **Timeouts and aborts escalate gracefully.** When a run's timeout fires (see [Timeouts](#timeouts)), or when the plugin internally aborts a run (e.g. dry-run inspector connection failure), the child receives SIGTERM first; if it hasn't exited after a short grace period, it's escalated to SIGKILL. The same escalation covers `bun.maxChildRss` kills.
 - **`dispose()` kills any run still in flight.** If Stryker disposes a `TestRunner` instance while its `dryRun`/`mutantRun` hasn't resolved yet (e.g. tearing down a stuck worker), the in-flight child is aborted using the same escalation path — it isn't left running after the plugin instance that spawned it goes away.
 - **A parent-liveness watchdog guards against the parent being killed outright.** If the Stryker worker process itself is killed with SIGKILL, it gets no chance to run any cleanup code at all — `dispose()` never fires. To prevent an orphaned `bun test` process in that case, every child's preload script polls its own `process.ppid` against the value captured at startup. POSIX reparents an orphaned child to the nearest subreaper (commonly PID 1) as soon as its original parent exits, so a changed `ppid` reliably signals "my parent is gone" — no `prctl(PR_SET_PDEATHSIG)` or native addon required, and it works the same on Linux and macOS. On detecting this, the child logs a warning and exits.
 
@@ -274,9 +282,14 @@ The remaining warns mark mutants scored as an `Error` (see
   could not be found or the bunfig could not be parsed. The warn includes the head
   of bun's output.
 
+- **`Mutant <id>: inconclusive timeout, scoring as Error rather than Timeout`**
+  — a full-suite fallback run was stopped at the limit Stryker sized for the
+  mutant's covering tests only (see [Timeouts](#timeouts)).
+
 A handful of these can be a genuine crash worth fixing in your suite; a flood of
 the second or third kind means the `bun` executable, its environment, or its
-configuration is broken.
+configuration is broken. A flood of the last kind means Stryker's `timeoutMS` is
+too small for your full suite.
 
 ### Dry-run failure diagnostics (dry run only)
 
@@ -360,7 +373,7 @@ configuration is broken.
   phase-specific, though, so as a side effect a dry run whose tests themselves hang (rather
   than the drain handshake) is also only detected after `bun.timeout` plus the ceiling — a
   one-time cost on the single dry-run child, not the per-mutant hot loop. Mutant runs are
-  unaffected by any of this and use `bun.timeout` unchanged.
+  unaffected by any of this; they follow Stryker's per-mutant timeout (see [Timeouts](#timeouts)).
 
   This handshake only covers the `dryRun` path (where coverage collection and the
   completeness gate apply) — individual mutant runs are not held open the same way,

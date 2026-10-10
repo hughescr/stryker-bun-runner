@@ -35,7 +35,7 @@ export const strykerValidationSchema = {
                 timeout: {
                     type:        'number',
                     minimum:     0,
-                    description: 'Child-process timeout in milliseconds (default: 10000). Controls how long the entire bun test subprocess may run before being killed. Independent from the per-test timeout in bunfig.toml [test].timeout, which Bun uses to declare individual tests timed out.',
+                    description: 'Dry-run child-process timeout in milliseconds (default: 10000). Controls how long the dry run\'s bun test subprocess may run (plus a 30 s drain allowance) before being killed. Mutant runs follow Stryker\'s per-mutant timeout and use this only when Stryker supplies none. Independent from the per-test timeout in bunfig.toml [test].timeout, which Bun uses to declare individual tests timed out.',
                     'default':   10_000,
                 },
                 inspectorTimeout: {

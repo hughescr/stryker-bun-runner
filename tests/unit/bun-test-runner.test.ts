@@ -3470,6 +3470,62 @@ tests/example.test.ts:
             });
         });
 
+        describe('bun.timeout headroom warning', () => {
+            function respondAfter(delayMs: number): void {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation(async (options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    await new Promise((resolve) => {
+                        setTimeout(resolve, delayMs);
+                    });
+                    return { exitCode: 0, stdout: ' 1 pass\n', stderr: '', timedOut: false };
+                });
+            }
+
+            it('warns once when the dry run took more than 80% of bun.timeout, naming the option', async () => {
+                respondAfter(120);
+                const runner = new BunTestRunner(mockLogger, { bun: { timeout: 100 } } as unknown as StrykerOptions);
+                await runner.init();
+
+                const result = await runner.dryRun();
+
+                expect(result.status).toBe(DryRunStatus.Complete);
+                const headroomWarns = (mockLogger.warn as ReturnType<typeof mock>).mock.calls.filter(call => String(call[0]).includes('bun.timeout'));
+                expect(headroomWarns).toHaveLength(1);
+                expect(headroomWarns[0][0]).toContain('raise bun.timeout');
+                expect(headroomWarns[0][2]).toBe(100);
+            });
+
+            it('does not warn when the dry run finished well inside bun.timeout', async () => {
+                respondAfter(0);
+                const runner = new BunTestRunner(mockLogger, { bun: { timeout: 60_000 } } as unknown as StrykerOptions);
+                await runner.init();
+
+                await runner.dryRun();
+
+                expect(mockLogger.warn).not.toHaveBeenCalledWith(expect.stringContaining('bun.timeout'), expect.anything(), expect.anything());
+            });
+
+            it('names bun.timeout when the dry run itself is killed at its limit', async () => {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({ exitCode: null, signal: 'SIGTERM', stdout: '', stderr: '', timedOut: true });
+                });
+                const runner = new BunTestRunner(mockLogger, { bun: { timeout: 10_000 } } as unknown as StrykerOptions);
+                await runner.init();
+
+                const result = await runner.dryRun();
+
+                expect(result.status).toBe(DryRunStatus.Timeout);
+                expect(mockLogger.warn).toHaveBeenCalledWith(expect.stringContaining('raise bun.timeout'), 10_000, 40_000);
+            });
+        });
+
         describe('in-flight abort via dispose', () => {
             it('clears currentAbortController after dryRun completes (subsequent dispose does not re-abort a finished run)', async () => {
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
@@ -4455,6 +4511,172 @@ tests/example.test.ts:
                 });
 
                 expect(result.status).toBe(MutantRunStatus.Error);
+            });
+        });
+
+        describe('per-mutant timeout from Stryker (MutantRunOptions.timeout)', () => {
+            // Stryker computes options.timeout per mutant as timeoutFactor × (dry-run net
+            // time of exactly the tests it plans to run) + timeoutMS + overhead, and its
+            // TimeoutDecorator enforces it by disposing and restarting the worker. The runner
+            // kills its child slightly earlier so it reports the Timeout itself.
+            const NOW = 1_000_000;
+            let dateNowSpy: ReturnType<typeof spyOn>;
+
+            beforeEach(() => {
+                // Frozen clock: the runner's deadline arithmetic becomes exact.
+                dateNowSpy = spyOn(Date, 'now').mockReturnValue(NOW);
+            });
+
+            afterEach(() => {
+                dateNowSpy.mockRestore();
+            });
+
+            const passingRun = { exitCode: 0, stdout: ' 1 pass\n', stderr: '', timedOut: false };
+            const killedRun = { exitCode: null, signal: 'SIGTERM', stdout: '', stderr: '', timedOut: true };
+            const zeroMatchRun = {
+                exitCode: 1,
+                stdout:   '',
+                stderr:   'error: regex "^(?:handles alpha)$" matched 0 tests. Searched 2 files (skipping 5 tests) [4.00ms]',
+                timedOut: false,
+            };
+
+            async function mutantRunWith(
+                runOptions: { timeout?: number, testFilter?: string[] },
+                strykerOptions: Record<string, unknown> = {}
+            ): Promise<Awaited<ReturnType<BunTestRunner['mutantRun']>>> {
+                const runner = new BunTestRunner(mockLogger, strykerOptions as unknown as StrykerOptions);
+                await runner.init();
+                return runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '700' } as any,
+                    testFilter:      runOptions.testFilter ?? [],
+                    sandboxFileName: 'sandbox',
+                    timeout:         runOptions.timeout,
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+            }
+
+            /** Enough covering ids that the encoded pattern exceeds MAX_TEST_NAME_PATTERN_LENGTH. */
+            function oversizedFilter(): string[] {
+                return Array.from({ length: 3000 }, (_, i) => `tests/alpha.test.ts > a test with a fairly long descriptive title number ${i}`);
+            }
+
+            it('kills a covering-test run at options.timeout minus a 5% margin, before Stryker\'s own timer fires', async () => {
+                mockRunBunTests.mockResolvedValue(passingRun);
+
+                await mutantRunWith({ timeout: 20_000, testFilter: ['tests/alpha.test.ts > handles alpha'] });
+
+                expect(mockRunBunTests).toHaveBeenCalledTimes(1);
+                expect(mockRunBunTests.mock.calls[0][0].timeout).toBe(19_000);
+            });
+
+            it('lets a static mutant\'s full-suite run outlast bun.timeout when Stryker allotted more (a 15 s suite is not a false Timeout)', async () => {
+                mockRunBunTests.mockResolvedValue(passingRun);
+
+                await mutantRunWith({ timeout: 40_000 }, { bun: { timeout: 10_000 } });
+
+                expect(mockRunBunTests.mock.calls[0][0].timeout).toBe(38_000);
+            });
+
+            it('never uses a margin below 750 ms (it must cover the 500 ms SIGTERM-to-SIGKILL grace)', async () => {
+                mockRunBunTests.mockResolvedValue(passingRun);
+
+                await mutantRunWith({ timeout: 6000, testFilter: ['tests/alpha.test.ts > handles alpha'] });
+
+                expect(mockRunBunTests.mock.calls[0][0].timeout).toBe(5250);
+            });
+
+            it('caps the margin at half the budget so a tiny Stryker timeout still leaves the run time to execute', async () => {
+                mockRunBunTests.mockResolvedValue(passingRun);
+
+                await mutantRunWith({ timeout: 1000, testFilter: ['tests/alpha.test.ts > handles alpha'] });
+
+                expect(mockRunBunTests.mock.calls[0][0].timeout).toBe(500);
+            });
+
+            it('falls back to bun.timeout when Stryker supplies no timeout', async () => {
+                mockRunBunTests.mockResolvedValue(passingRun);
+
+                await mutantRunWith({ testFilter: ['tests/alpha.test.ts > handles alpha'] }, { bun: { timeout: 12_345 } });
+
+                expect(mockRunBunTests.mock.calls[0][0].timeout).toBe(12_345);
+            });
+
+            it('falls back to bun.timeout when Stryker\'s timeout is not a positive finite number', async () => {
+                mockRunBunTests.mockResolvedValue(passingRun);
+
+                await mutantRunWith({ timeout: Number.NaN, testFilter: ['tests/alpha.test.ts > handles alpha'] }, { bun: { timeout: 12_345 } });
+                await mutantRunWith({ timeout: 0, testFilter: ['tests/alpha.test.ts > handles alpha'] }, { bun: { timeout: 12_345 } });
+
+                expect(mockRunBunTests.mock.calls[0][0].timeout).toBe(12_345);
+                expect(mockRunBunTests.mock.calls[1][0].timeout).toBe(12_345);
+            });
+
+            it('reports Timeout when a covering-test run is killed at the Stryker-derived limit', async () => {
+                mockRunBunTests.mockResolvedValue(killedRun);
+
+                const result = await mutantRunWith({ timeout: 20_000, testFilter: ['tests/alpha.test.ts > handles alpha'] });
+
+                expect(result.status).toBe(MutantRunStatus.Timeout);
+            });
+
+            it('reports Timeout when a static mutant\'s full-suite run is killed (Stryker sized that budget for the full suite)', async () => {
+                mockRunBunTests.mockResolvedValue(killedRun);
+
+                const result = await mutantRunWith({ timeout: 20_000 });
+
+                expect(result.status).toBe(MutantRunStatus.Timeout);
+            });
+
+            it('reports Error, not Timeout, when the pattern-too-long full-suite fallback is killed: Stryker sized that budget for the covering tests only', async () => {
+                mockRunBunTests.mockResolvedValue(killedRun);
+
+                const result = await mutantRunWith({ timeout: 20_000, testFilter: oversizedFilter() });
+
+                // The fallback really is a full-suite run, under the same Stryker-derived limit.
+                expect(mockRunBunTests.mock.calls[0][0].testNamePattern).toBeUndefined();
+                expect(mockRunBunTests.mock.calls[0][0].timeout).toBe(19_000);
+                expect(result.status).toBe(MutantRunStatus.Error);
+                if(result.status === MutantRunStatus.Error) {
+                    expect(result.errorMessage).toContain('3000 covering test(s)');
+                    expect(result.errorMessage).toContain('20000');
+                }
+                expect(mockLogger.warn).toHaveBeenCalledWith(expect.stringContaining('inconclusive'), '700', expect.any(String));
+            });
+
+            it('gives the zero-match full-suite retry only what is left of the same budget, and reports a killed retry as Error', async () => {
+                // First spawn starts at NOW and finishes 3 s later; the retry gets the remainder.
+                let clock = NOW;
+                dateNowSpy.mockImplementation(() => clock);
+                mockRunBunTests.mockImplementationOnce(() => {
+                    clock += 3000;
+                    return Promise.resolve(zeroMatchRun);
+                });
+                mockRunBunTests.mockResolvedValueOnce(killedRun);
+
+                const result = await mutantRunWith({ timeout: 20_000, testFilter: ['tests/alpha.test.ts > handles alpha'] });
+
+                expect(mockRunBunTests).toHaveBeenCalledTimes(2);
+                expect(mockRunBunTests.mock.calls[0][0].timeout).toBe(19_000);
+                expect(mockRunBunTests.mock.calls[1][0].timeout).toBe(16_000);
+                expect(result.status).toBe(MutantRunStatus.Error);
+            });
+
+            it('still reports a killed full-suite fallback as Timeout when the limit was bun.timeout (documented as a full-suite limit)', async () => {
+                mockRunBunTests.mockResolvedValue(killedRun);
+
+                const result = await mutantRunWith({ testFilter: oversizedFilter() }, { bun: { timeout: 30_000 } });
+
+                expect(mockRunBunTests.mock.calls[0][0].timeout).toBe(30_000);
+                expect(result.status).toBe(MutantRunStatus.Timeout);
+            });
+
+            it('keeps a maxChildRss kill during a fallback run as Timeout', async () => {
+                mockRunBunTests.mockResolvedValue({ ...killedRun, signal: 'SIGKILL', memoryLimitExceeded: true });
+
+                const result = await mutantRunWith({ timeout: 20_000, testFilter: oversizedFilter() });
+
+                expect(result.status).toBe(MutantRunStatus.Timeout);
             });
         });
 

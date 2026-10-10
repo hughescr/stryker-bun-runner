@@ -15,8 +15,11 @@ export interface BunTestRunnerOptions {
     bunPath?: string
 
     /**
-   * Child-process timeout in milliseconds — the maximum wall-clock time that the
-   * entire `bun test` subprocess is allowed to run before it is killed.
+   * Dry-run child-process timeout in milliseconds — the maximum wall-clock time
+   * the dry run's `bun test` subprocess may run (plus a fixed 30 s allowance for
+   * the coverage drain handshake) before it is killed. Mutant runs follow
+   * Stryker's per-mutant `MutantRunOptions.timeout` instead, and fall back to
+   * this value only when Stryker supplies none.
    * @default 10000
    *
    * Note: this is distinct from Bun's per-test timeout configured via
