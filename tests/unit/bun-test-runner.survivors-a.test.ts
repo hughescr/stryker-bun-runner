@@ -455,6 +455,24 @@ describe('BunTestRunner mutation kill tests (first half of the runner)', () => {
             );
 
             expect(callsMatching(mockLogger.warn, 'takes precedence')).toHaveLength(1);
+            expect(mockLogger.warn).toHaveBeenCalledWith(
+                'Both Stryker\'s testFiles option and bun.testFiles are set and select different test files; '
+                + 'Stryker\'s testFiles option takes precedence and bun.testFiles is ignored. '
+                + 'Remove bun.testFiles, or make the two agree, to silence this warning.'
+            );
+        });
+
+        it('takes the synchronous cache-hit path, not async discovery, when bun.testFiles is set', async () => {
+            mockChild();
+            mockHealthyInspectorRun();
+            const runner = await initRunner({ bun: { testFiles: ['only/this.test.ts'] } });
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- private method spied to pin the synchronous hot path
+            const slow = spyOn(runner as any, 'getOrDiscoverTestFiles');
+
+            await runner.dryRun();
+
+            expect(slow).not.toHaveBeenCalled();
+            expect(mockRunBunTests.mock.calls.at(-1)![0].testFiles).toEqual(['only/this.test.ts']);
         });
 
         it('does not narrow a run for an id with no file separator even when dropping its last character names a discovered file', async () => {
@@ -477,6 +495,18 @@ describe('BunTestRunner mutation kill tests (first half of the runner)', () => {
 
             const [warning] = callsMatching(mockLogger.warn, '"dist" or "build"');
             expect(warning.slice(1)).toEqual([5, 'dist/a.test.js, dist/b.test.js, build/c.test.js', ', …']);
+        });
+
+        it.each([
+            [1, ['dist/a.test.js']],
+            [3, ['dist/a.test.js', 'dist/b.test.js', 'build/c.test.js']],
+        ])('adds no ellipsis to the dist/build warning for %d file(s)', async (count, files) => {
+            discoverTestFilesSpy.mockResolvedValue(files);
+
+            await initRunner();
+
+            const [warning] = callsMatching(mockLogger.warn, '"dist" or "build"');
+            expect(warning.slice(1)).toEqual([count, files.join(', '), '']);
         });
     });
 
@@ -743,6 +773,51 @@ describe('BunTestRunner mutation kill tests (first half of the runner)', () => {
             if(result.status === DryRunStatus.Error) {
                 expect(result.errorMessage).toContain('the coverage file (none configured) was missing, unreadable or empty. ');
             }
+        });
+
+        it('warns with the %s format and the full message when coverage is missing but coverageAnalysis is not perTest', async () => {
+            mockChild();
+            mockCollectCoverage.mockResolvedValue(undefined);
+            mockInspectorClient.getExecutionOrder.mockReturnValue([1]);
+            mockInspectorClient.getTests.mockReturnValue([{ id: 1, name: 'test', fullName: 'test', status: 'pass', url: '/project/tests/test.ts' }]);
+
+            const result = await dryRunOnce({}, { coverageAnalysis: 'all' });
+
+            expect(result.status).toBe(DryRunStatus.Complete);
+            expect(mockLogger.warn).toHaveBeenCalledWith('%s', expect.stringContaining('the dry run produced no mutant coverage data'));
+        });
+
+        describe('bun.timeout headroom boundary', () => {
+            /** A dry run whose measured duration is exactly `elapsedMs`, on a clock that only the child moves. */
+            async function dryRunTakingExactly(elapsedMs: number, timeout: number): Promise<void> {
+                let fakeNow = 1_000_000;
+                const dateNowSpy = spyOn(Date, 'now').mockImplementation(() => fakeNow);
+                try {
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                    mockRunBunTests.mockImplementation((options: any) => {
+                        options.onInspectorReady?.('ws://127.0.0.1:6499/inspector');
+                        fakeNow += elapsedMs;
+                        return Promise.resolve({ exitCode: 0, stdout: ' 1 pass\n', stderr: '', timedOut: false });
+                    });
+                    mockHealthyInspectorRun();
+                    const result = await dryRunOnce({ bun: { timeout } });
+                    expect(result.status).toBe(DryRunStatus.Complete);
+                } finally {
+                    dateNowSpy.mockRestore();
+                }
+            }
+
+            it('does not warn when the dry run took exactly 80% of bun.timeout', async () => {
+                await dryRunTakingExactly(80, 100);
+
+                expect(callsMatching(mockLogger.warn, 'bun.timeout')).toEqual([]);
+            });
+
+            it('warns when the dry run took 1 ms more than 80% of bun.timeout', async () => {
+                await dryRunTakingExactly(81, 100);
+
+                expect(callsMatching(mockLogger.warn, 'bun.timeout')).toHaveLength(1);
+            });
         });
 
         it('separates the sentences of the missing-coverage error with spaces and lists preload diagnostics one per line', async () => {

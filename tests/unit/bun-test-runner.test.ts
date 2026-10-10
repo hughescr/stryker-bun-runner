@@ -1444,6 +1444,40 @@ tests/example.test.ts:
             }
         });
 
+        async function inspectorTimeoutMessageFor(child: { exitCode: number | null, signal: NodeJS.Signals | null, stderr: string }): Promise<string> {
+            jest.useFakeTimers();
+            try {
+                mockRunBunTests.mockImplementation(() => Promise.resolve({ ...child, stdout: '', timedOut: false }));
+                const runner = new BunTestRunner(mockLogger, { bun: { inspectorTimeout: 100 } } as unknown as StrykerOptions);
+                await runner.init();
+                const resultPromise = runner.dryRun();
+                for(let i = 0; i < 5; i++) {
+                    jest.advanceTimersByTime(50);
+                    // eslint-disable-next-line no-await-in-loop -- deliberate sequential microtask flush for fake-timer test
+                    await Promise.resolve();
+                }
+                const result = await resultPromise;
+                if(result.status !== DryRunStatus.Error) {
+                    throw new Error('expected an Error dry-run result');
+                }
+                return result.errorMessage;
+            } finally {
+                jest.useRealTimers();
+            }
+        }
+
+        it('names the terminating signal in the inspector-timeout error when bun was killed externally', async () => {
+            const message = await inspectorTimeoutMessageFor({ exitCode: null, signal: 'SIGSEGV', stderr: 'panic: segfault' });
+
+            expect(message).toContain('bun test terminated by signal SIGSEGV');
+            expect(message).not.toContain('exit code');
+        });
+
+        it('trims surrounding whitespace off the stderr tail, and reports (empty) for whitespace-only stderr', async () => {
+            expect(await inspectorTimeoutMessageFor({ exitCode: 1, signal: null, stderr: '\n  preload failed  \n\n' })).toEndWith('last stderr: preload failed');
+            expect(await inspectorTimeoutMessageFor({ exitCode: 1, signal: null, stderr: ' \n\t\n' })).toEndWith('last stderr: (empty)');
+        });
+
         it('names the spawn error clearly in the dry-run error when bun could not be started', async () => {
             jest.useFakeTimers();
             try {
@@ -5162,6 +5196,54 @@ tests/example.test.ts:
                 expect(result.status).toBe(MutantRunStatus.Error);
                 if(result.status === MutantRunStatus.Error) {
                     expect(result.errorMessage).toBe('could not start bun test: spawn bun ENOENT');
+                }
+            });
+
+            it('logs the spawn error at warn', async () => {
+                await runWithChildResult({
+                    exitCode:   null,
+                    signal:     null,
+                    stdout:     '',
+                    stderr:     '\nProcess error: spawn bun ENOENT',
+                    timedOut:   false,
+                    spawnError: 'spawn bun ENOENT',
+                });
+
+                expect(mockLogger.warn).toHaveBeenCalledWith('Mutant %s: %s — scoring as Error rather than Killed', '77', 'could not start bun test: spawn bun ENOENT');
+            });
+
+            it('logs the signal death with exact format, capped output heads, and (empty) placeholders', async () => {
+                const format = 'Mutant %s: %s — scoring as Error rather than Killed\n'
+                  + '--- STDOUT (first 600 chars) ---\n%s\n'
+                  + '--- STDERR (first 600 chars) ---\n%s';
+                const message = 'bun test terminated by SIGSEGV before any test reported a failure';
+
+                await runWithChildResult({ exitCode: null, signal: 'SIGSEGV', stdout: 'o'.repeat(700), stderr: '', timedOut: false });
+                expect(mockLogger.warn).toHaveBeenCalledWith(format, '77', message, 'o'.repeat(600), '(empty)');
+
+                await runWithChildResult({ exitCode: null, signal: 'SIGSEGV', stdout: '', stderr: 'e'.repeat(700), timedOut: false });
+                expect(mockLogger.warn).toHaveBeenCalledWith(format, '77', message, '(empty)', 'e'.repeat(600));
+            });
+
+            it('trims the no-evidence Error output and caps it at 500 chars, preferring stderr over stdout', async () => {
+                const prefix = 'bun test exited with code 1 but reported no failing test and no fail/error count, so there is no evidence a test detected this mutant: ';
+
+                const long = await runWithChildResult({ exitCode: 1, stdout: '', stderr: ` \n${'x'.repeat(600)}\n `, timedOut: false });
+                expect(long.status).toBe(MutantRunStatus.Error);
+                if(long.status === MutantRunStatus.Error) {
+                    expect(long.errorMessage).toBe(`${prefix}${'x'.repeat(500)}`);
+                }
+
+                const blankStderr = await runWithChildResult({ exitCode: 1, stdout: 'from stdout', stderr: '  \n ', timedOut: false });
+                expect(blankStderr.status).toBe(MutantRunStatus.Error);
+                if(blankStderr.status === MutantRunStatus.Error) {
+                    expect(blankStderr.errorMessage).toBe(`${prefix}from stdout`);
+                }
+
+                const padded = await runWithChildResult({ exitCode: 1, stdout: '  \nout text \n', stderr: '', timedOut: false });
+                expect(padded.status).toBe(MutantRunStatus.Error);
+                if(padded.status === MutantRunStatus.Error) {
+                    expect(padded.errorMessage).toBe(`${prefix}out text`);
                 }
             });
 
@@ -10363,7 +10445,6 @@ error: Actual error message
                 }
             });
 
-            // Kill mutation #5: line 470 - .filter() removal from parsed.tests
             it('should only process failed tests when building failureMessage', async () => {
                 mockRunBunTests.mockResolvedValue({
                     exitCode: 1,
@@ -10398,13 +10479,39 @@ error: Expected error
 
                 expect(result.status).toBe(MutantRunStatus.Killed);
                 if(result.status === MutantRunStatus.Killed) {
-                    // Should only have 1 message (from the failed test)
-                    // If .filter() was removed, we'd get 3 items (including passing tests with undefined messages)
+                    // Only the failed test carries a message; the passing tests' undefined ones are dropped
                     expect(result.failureMessage).toBe('error: Expected error');
                     // Verify killedBy also uses filter correctly
                     expect(result.killedBy).toEqual(['test/file.test.ts > failed test']);
                     expect(result.killedBy).not.toContain('test/file.test.ts > passing test A');
                     expect(result.killedBy).not.toContain('test/file.test.ts > passing test B');
+                }
+            });
+
+            it('falls back to the trimmed, 1000-char-capped stderr when no failed test carries a message', async () => {
+                // The failed test comes before a passing one, so it collects no error lines and
+                // the stderr (a whitespace line, then 2000 chars) is not collected into it.
+                mockRunBunTests.mockResolvedValue({
+                    exitCode: 1,
+                    stdout:   '\ntest/file.test.ts:\n✗ failed test [0.05ms]\n✓ passing test [0.12ms]\n\n 1 pass\n 1 fail\n',
+                    stderr:   `   \n${'x'.repeat(2000)}`,
+                    timedOut: false,
+                });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+
+                const result = await runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '1' } as any,
+                    testFilter:      ['test/file.test.ts > failed test', 'test/file.test.ts > passing test'],
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+
+                expect(result.status).toBe(MutantRunStatus.Killed);
+                if(result.status === MutantRunStatus.Killed) {
+                    expect(result.failureMessage).toBe(`Tests failed with exit code 1: ${'x'.repeat(1000)}`);
                 }
             });
 

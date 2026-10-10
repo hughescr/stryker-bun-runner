@@ -3618,6 +3618,25 @@ tests/example.test.ts:
 
             expect(result.summaryErrors).toBe(0);
         });
+
+        it('rejects a summary-shaped line that carries trailing prose or punctuation', () => {
+            expect(parseBunTestOutput('', ' 0 pass\n 2 errors in module\n').summaryErrors).toBe(0);
+            expect(parseBunTestOutput('', ' 0 pass\n 1 error:\n').summaryErrors).toBe(0);
+        });
+
+        it('tolerates trailing whitespace after the summary word', () => {
+            expect(parseBunTestOutput('', ' 0 pass\n 1 error \t \n').summaryErrors).toBe(1);
+        });
+
+        it('accepts no indentation and indentation of several spaces and tabs', () => {
+            expect(parseBunTestOutput('', '5 errors\n').summaryErrors).toBe(5);
+            expect(parseBunTestOutput('', '   \t6 errors\n').summaryErrors).toBe(6);
+        });
+
+        it('accepts more than one space or tab between the count and the word', () => {
+            expect(parseBunTestOutput('', ' 7  errors\n').summaryErrors).toBe(7);
+            expect(parseBunTestOutput('', ' 8\t error\n').summaryErrors).toBe(8);
+        });
     });
 
     describe('summary counts take the LAST matching line (test-printed lookalikes cannot mask the real summary)', () => {

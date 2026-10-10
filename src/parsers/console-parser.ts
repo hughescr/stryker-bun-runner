@@ -329,7 +329,6 @@ function parseSummaryLines(output: string): SummaryCounts {
  * mask (or fake) the real count.
  */
 function parseSummaryErrors(output: string): number {
-    // Stryker disable next-line Regex: anchors and the optional plural are pinned by the summaryErrors parser tests (whole-line match, plural, prose rejection)
     return lastCount(stripAnsi(output), /^[\t ]*(\d+)[\t ]+errors?[\t ]*$/gm) ?? 0;
 }
 

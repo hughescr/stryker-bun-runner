@@ -213,9 +213,7 @@ function formatInspectorTimeoutMessage(
     if(child.spawnError !== undefined) {
         return formatSpawnErrorMessage(child.spawnError);
     }
-    // Stryker disable next-line MethodExpression,UnaryOperator: equivalent mutant — slice(-1000) vs full string / sign only changes how much diagnostic text is shown, which the stderr-tail test pins
     const stderrTail = child.stderr.trim().slice(-1000);
-    // Stryker disable StringLiteral,ConditionalExpression,LogicalOperator: human-readable message wording and the '(empty)'/'none' fallbacks are covered by the inspector-timeout message tests; mutants only alter diagnostic text
     // A timedOut child was SIGTERMed by the runner's own run timeout (it hung without printing the URL), not killed externally.
     let ended = child.signal ? `terminated by signal ${child.signal}` : `exit code ${child.exitCode ?? 'none'}`;
     if(child.timedOut === true) {
@@ -223,7 +221,6 @@ function formatInspectorTimeoutMessage(
     }
     const prefix = `Timeout waiting for inspector URL after ${inspectorTimeoutMs}ms (raise bun.inspectorTimeout if bun is slow to start)`;
     return `${prefix}; bun test ${ended}; last stderr: ${stderrTail || '(empty)'}`;
-    // Stryker restore StringLiteral,ConditionalExpression,LogicalOperator
 }
 
 /**
@@ -779,7 +776,6 @@ export class BunTestRunner implements TestRunner {
             }
             const file = id.slice(0, sepIdx);
             const listed = listedByProjectFile.get(file);
-            // Stryker disable next-line ConditionalExpression,BlockStatement,EqualityOperator: an unrecognised prefix means the id is not file-qualified; covered by 'keeps the full file list when a derived file was never discovered'
             if(listed === undefined) {
                 return undefined;
             }
@@ -826,7 +822,6 @@ export class BunTestRunner implements TestRunner {
         if(requested === undefined || requested.length === 0) {
             this.strykerTestFiles = undefined;
             if(requested !== undefined) {
-                // Stryker disable next-line StringLiteral: logging message only
                 this.logger.debug('Stryker passed an empty testFiles array; ignoring it');
             }
         } else {
@@ -846,7 +841,6 @@ export class BunTestRunner implements TestRunner {
 
     /** Debug-log how many test files the dry run uses and where they came from. Same precedence as {@link getOrDiscoverTestFiles}. */
     private logTestFilesSource(testFiles: readonly string[] | undefined, cwd: string): void {
-        // Stryker disable next-line StringLiteral,LogicalOperator,OptionalChaining: logging only; the format string and the count of an (in practice never undefined) list are not asserted, the source argument is by the 'dryRun' tests of Stryker's testFiles option
         this.logger.debug('Dry run test files: %d from %s', testFiles?.length ?? 0, this.testFilesSource(cwd));
     }
 
@@ -893,7 +887,6 @@ export class BunTestRunner implements TestRunner {
             return;
         }
         this.warnedTestFilesConflict = true;
-        // Stryker disable next-line StringLiteral: diagnostic warning message
         this.logger.warn(
             'Both Stryker\'s testFiles option and bun.testFiles are set and select different test files; '
             + 'Stryker\'s testFiles option takes precedence and bun.testFiles is ignored. '
@@ -946,7 +939,6 @@ export class BunTestRunner implements TestRunner {
         }
         this.warnedBuildOutputTests = true;
         const sample = buildOutput.slice(0, 3).join(', ');
-        // Stryker disable StringLiteral,MethodExpression,ConditionalExpression,EqualityOperator: diagnostic warn — the sample cap and ellipsis only shape log output; when it fires, and the count, are behaviorally tested
         this.logger.warn(
             'Test discovery found %d test file(s) under a "dist" or "build" directory (e.g. %s%s); bun searches those directories too, so compiled copies of your tests will run '
             + '(slower, and a stale compiled test can fail the dry run). To exclude them set [test].root or [test].pathIgnorePatterns in bunfig.toml, '
@@ -955,7 +947,6 @@ export class BunTestRunner implements TestRunner {
             sample,
             buildOutput.length > 3 ? ', …' : ''
         );
-        // Stryker restore StringLiteral,MethodExpression,ConditionalExpression,EqualityOperator
     }
 
     /**
@@ -969,7 +960,6 @@ export class BunTestRunner implements TestRunner {
         if(selected !== undefined) {
             return selected;
         }
-        // Stryker disable next-line EqualityOperator,BlockStatement,ConditionalExpression: mutating to false (ConditionalExpression) causes a null cache-miss that falls through to getOrDiscoverTestFiles(), which re-checks testFilesOverride and returns the same value — equivalent; BlockStatement (removing early-return) and EqualityOperator (flipping guard) mutants are caught by 'should use testFiles override and skip discoverTestFiles'; the ConditionalExpression→true mutant (always returns the override) is equivalent because whenever testFilesOverride is defined and Stryker selected nothing it is returned either way
         if(this.testFilesOverride !== undefined) {
             return this.testFilesOverride;
         }
@@ -1931,11 +1921,9 @@ export class BunTestRunner implements TestRunner {
         const coverageMissing = coverage === undefined && coverageAnalysis !== 'off';
         if(!coverageMissing || tests.some(t => t.status === TestStatus.Failed)) {
             if(preloadLines.length > 0) {
-                // Stryker disable next-line StringLiteral: logging message only
                 this.logger.warn('The coverage preload reported problems on the dry-run child\'s stderr:\n%s', preloadLines.join('\n'));
             }
             if(coverage !== undefined && coverageAnalysis !== 'off' && !coversAnyMutant(coverage)) {
-                // Stryker disable next-line StringLiteral: logging message only
                 this.logger.warn(
                     'The dry run\'s coverage data shows no mutant covered by any test, per test or statically, so Stryker will report every mutant as NoCoverage. '
                     + 'Check that the mutate globs (%s) match the source files your tests import, and that the tests import those files rather than a built copy (e.g. dist/).',
@@ -1961,11 +1949,9 @@ export class BunTestRunner implements TestRunner {
         const message = parts.join(' ');
 
         if(coverageAnalysis === 'perTest') {
-            // Stryker disable next-line StringLiteral: logging message only
             this.logger.error('%s', message);
             return { status: DryRunStatus.Error, errorMessage: message };
         }
-        // Stryker disable next-line StringLiteral: logging message only
         this.logger.warn('%s', message);
         return null;
     }
@@ -1978,9 +1964,7 @@ export class BunTestRunner implements TestRunner {
    * Complete path of the single dry run.
    */
     private warnOnTightDryRunTimeout(elapsedMs: number): void {
-        // Stryker disable next-line EqualityOperator: > vs >= at exactly 80% is not observable in a wall-clock measurement
         if(elapsedMs > this.timeout * DRY_RUN_TIMEOUT_WARN_RATIO) {
-            // Stryker disable next-line StringLiteral: logging message only
             this.logger.warn(
                 'The dry run took %dms, more than 80%% of bun.timeout (%dms). bun.timeout bounds the dry run (mutant runs use Stryker\'s per-mutant timeout instead); a dry run that outgrows bun.timeout plus the drain-handshake allowance is killed — raise bun.timeout',
                 elapsedMs,
@@ -2094,7 +2078,6 @@ export class BunTestRunner implements TestRunner {
             this.logger.warn('Failed to write dryRun registry file: %s', message);
             return;
         }
-        // Stryker disable next-line StringLiteral: diagnostic logging message
         this.logger.warn(
             'Failed to write dryRun registry file: %s. Stryker\'s testFiles option is active, so other workers will not see the selection '
             + 'and will fall back to bun.testFiles or auto-discovery for full-suite runs.',
@@ -2170,7 +2153,6 @@ export class BunTestRunner implements TestRunner {
         // carries no ids, so everything below that works from ids sees an empty filter.
         const testFileScope = await this.resolveTestFileFilter(requestedFilter);
         if(testFileScope !== undefined) {
-            // Stryker disable next-line StringLiteral: logging message only
             this.logger.debug('Mutant %s: testFilter holds %d test file path(s) (Stryker\'s testFiles option); running those files without a --test-name-pattern', options.activeMutant.id, testFileScope.length);
         }
         const filterIds = testFileScope === undefined ? requestedFilter : [];
@@ -2357,7 +2339,6 @@ export class BunTestRunner implements TestRunner {
         // score a run that executed no tests as a kill.
         if(result.spawnError !== undefined) {
             const errorMessage = formatSpawnErrorMessage(result.spawnError);
-            // Stryker disable next-line StringLiteral: diagnostic logging message
             this.mutantWarnings.warn(MUTANT_WARN_KIND.spawnError, options.activeMutant.id, 'Mutant %s: %s — scoring as Error rather than Killed', options.activeMutant.id, errorMessage);
             return { status: MutantRunStatus.Error, errorMessage };
         }
@@ -2459,9 +2440,7 @@ export class BunTestRunner implements TestRunner {
    * Stryker's per-mutant timeout — see classifyRunawayMutantRun.
    */
     private buildInconclusiveFallbackTimeout(mutantId: string, coveringTestCount: number, strykerTimeoutMs: number): MutantRunResult {
-        // Stryker disable next-line StringLiteral: diagnostic error message text — behaviorally tested via .toContain
         const errorMessage = `the full-suite fallback run (used because this mutant's ${coveringTestCount} covering test(s) could not be run by --test-name-pattern) was stopped at the limit derived from Stryker's ${strykerTimeoutMs} ms per-mutant timeout, which Stryker sized for those ${coveringTestCount} covering test(s), not the full suite; a slow full suite and a hanging mutant look the same here, so this is not scored as a Timeout`;
-        // Stryker disable next-line StringLiteral: diagnostic logging message
         this.mutantWarnings.warn(MUTANT_WARN_KIND.inconclusiveTimeout, mutantId, 'Mutant %s: inconclusive timeout, scoring as Error rather than Timeout: %s', mutantId, errorMessage);
         return { status: MutantRunStatus.Error, errorMessage };
     }
@@ -2542,13 +2521,11 @@ export class BunTestRunner implements TestRunner {
         return {
             status:         MutantRunStatus.Killed,
             killedBy,
-            // Stryker disable all: filter chain for failure message extraction
+            // Only failed tests carry a failureMessage (the parser collects error lines for nothing else).
             failureMessage: parsed.tests
-                .filter(test => test.status === 'failed')
                 .map(test => test.failureMessage)
                 .filter((msg): msg is string => !!msg)
                 .join('\n\n') || `Tests failed with exit code ${result.exitCode}: ${stripAnsi(result.stderr).trim().slice(0, 1000)}`,
-            // Stryker restore all
             nrOfTests: parsed.totalTests || 1,
         };
     }
@@ -2564,7 +2541,6 @@ export class BunTestRunner implements TestRunner {
         mutantId:     string,
         errorMessage: string
     ): MutantRunResult {
-        // Stryker disable StringLiteral: diagnostic logging message format strings — not behaviorally tested
         this.mutantWarnings.warn(
             MUTANT_WARN_KIND.signalError,
             mutantId,
@@ -2573,10 +2549,7 @@ export class BunTestRunner implements TestRunner {
             + '--- STDERR (first 600 chars) ---\n%s',
             mutantId,
             errorMessage,
-            // Stryker restore StringLiteral
-            // Stryker disable next-line MethodExpression,ConditionalExpression,LogicalOperator,StringLiteral: equivalent mutant — slice(0,600) and '(empty)' are diagnostic only
             result.stdout.slice(0, 600) || '(empty)',
-            // Stryker disable next-line MethodExpression,ConditionalExpression,LogicalOperator,StringLiteral: equivalent mutant — slice(0,600) and '(empty)' are diagnostic only
             result.stderr.slice(0, 600) || '(empty)'
         );
         return { status: MutantRunStatus.Error, errorMessage };
@@ -2649,7 +2622,6 @@ export class BunTestRunner implements TestRunner {
         }
 
         if(parsed.failed > 0 || parsed.summaryErrors > 0) {
-            // Stryker disable next-line StringLiteral: diagnostic logging message
             this.logger.debug(
                 'Mutant %s: bun reported %d failure(s) and %d error(s) outside any single test (e.g. a test file that failed to load) — scoring Killed',
                 mutantId,
@@ -2659,9 +2631,7 @@ export class BunTestRunner implements TestRunner {
             return null;
         }
 
-        // Stryker disable next-line MethodExpression: the trim() calls and the slice(0, 500) cap only shape diagnostic text
         const output = (stripAnsi(stderr).trim() || stripAnsi(result.stdout).trim()).slice(0, 500) || '(no output)';
-        // Stryker disable next-line StringLiteral: diagnostic logging message
         this.mutantWarnings.warn(
             MUTANT_WARN_KIND.noEvidence,
             mutantId,
@@ -2672,7 +2642,6 @@ export class BunTestRunner implements TestRunner {
         );
         return {
             status:       MutantRunStatus.Error,
-            // Stryker disable next-line StringLiteral: diagnostic error message text — behaviorally tested via .toContain
             errorMessage: `bun test exited with code ${result.exitCode} but reported no failing test and no fail/error count, so there is no evidence a test detected this mutant: ${output}`,
         };
     }
