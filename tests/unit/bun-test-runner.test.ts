@@ -7,6 +7,7 @@ import { createHash } from 'node:crypto';
 import * as fsPromises from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { format as formatLogCall } from 'node:util';
 import type { StrykerOptions } from '@stryker-mutator/api/core';
 import type { Logger } from '@stryker-mutator/api/logging';
 import { DryRunStatus, MutantRunStatus, TestStatus } from '@stryker-mutator/api/test-runner';
@@ -11229,6 +11230,615 @@ error: Third failure message
                 await mutantRunWithFilter(other, []);
 
                 expect(mockRunBunTests.mock.calls[0][0].testFiles).toEqual(['tests/alpha.test.ts', 'tests/beta.test.ts']);
+            });
+        });
+    });
+
+    // ── log volume: start summary, per-mutant warn aggregation, end summary ──
+
+    describe('log volume', () => {
+        let readFileSpy: ReturnType<typeof spyOn>;
+
+        /** Every call of a logger method, rendered the way a real logger formats it. */
+        const logged = (method: unknown): string[] =>
+            (method as ReturnType<typeof mock>).mock.calls.map(args => formatLogCall(...(args as [string, ...unknown[]])));
+
+        const survivedRun = { exitCode: 0, stdout: ' 1 pass\n', stderr: '', timedOut: false };
+        const zeroMatchRun = {
+            exitCode: 1,
+            stdout:   '',
+            stderr:   'error: regex "^(?:handles alpha)$" matched 0 tests. Searched 2 files (skipping 5 tests) [4.00ms]',
+            timedOut: false,
+        };
+
+        beforeEach(() => {
+            mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+            readFileSpy = spyOn(fsPromises, 'readFile');
+            const enoent = Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' });
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock returns error
+            readFileSpy.mockRejectedValue(enoent as any);
+        });
+
+        afterEach(() => {
+            readFileSpy.mockRestore();
+        });
+
+        function mutantRunFor(runner: BunTestRunner, id: string, testFilter: string[] = [], timeout?: number): ReturnType<BunTestRunner['mutantRun']> {
+            return runner.mutantRun({
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                activeMutant:    { id } as any,
+                testFilter,
+                sandboxFileName: 'sandbox',
+                timeout,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+            } as any);
+        }
+
+        /** Runs one mutant after another (the runner serves a single mutant at a time), each with the same filter. */
+        async function runMutantsInOrder(runner: BunTestRunner, ids: readonly string[], testFilter: string[] = [], timeout?: number): Promise<void> {
+            for(const id of ids) {
+                // eslint-disable-next-line no-await-in-loop -- a worker runs its mutants sequentially
+                await mutantRunFor(runner, id, testFilter, timeout);
+            }
+        }
+
+        describe('start summary', () => {
+            it('logs one info line at the end of init(): bun version and path, test files and their source, the sanitized bunfig', async () => {
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+
+                await runner.init();
+
+                expect(logged(mockLogger.info)).toEqual([
+                    'Bun test runner started: bun 1.4.2 at bun; 2 test file(s) from auto-discovery; sanitized bunfig /tmp/stryker-bun-runner-bunfig-0-0.toml',
+                ]);
+            });
+
+            it('names the version the startup check reported and the configured bunPath', async () => {
+                checkBunVersionSpy.mockResolvedValue('1.5.7');
+                const runner = new BunTestRunner(mockLogger, { bun: { bunPath: '/opt/bun/bin/bun' } } as unknown as StrykerOptions);
+
+                await runner.init();
+
+                expect(logged(mockLogger.info)[0]).toStartWith('Bun test runner started: bun 1.5.7 at /opt/bun/bin/bun; ');
+            });
+
+            it('reports bun.testFiles as the source, with its count', async () => {
+                const runner = new BunTestRunner(mockLogger, {
+                    bun: { testFiles: ['tests/a.test.ts', 'tests/b.test.ts', 'tests/c.test.ts'] },
+                } as unknown as StrykerOptions);
+
+                await runner.init();
+
+                expect(logged(mockLogger.info)[0]).toContain('; 3 test file(s) from bun.testFiles; ');
+            });
+
+            it('reports the count of the files auto-discovery found', async () => {
+                discoverTestFilesSpy.mockResolvedValue(['tests/a.test.ts']);
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+
+                await runner.init();
+
+                expect(logged(mockLogger.info)[0]).toContain('; 1 test file(s) from auto-discovery; ');
+            });
+
+            it('says bun will discover the tests itself when the runner found no test files', async () => {
+                discoverTestFilesSpy.mockResolvedValue(undefined);
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+
+                await runner.init();
+
+                expect(logged(mockLogger.info)).toEqual([
+                    'Bun test runner started: bun 1.4.2 at bun; no test files found by the runner, bun will discover them itself; sanitized bunfig /tmp/stryker-bun-runner-bunfig-0-0.toml',
+                ]);
+            });
+
+            it('reports bail as off when Stryker\'s disableBail is set', async () => {
+                const runner = new BunTestRunner(mockLogger, { disableBail: true } as unknown as StrykerOptions);
+
+                await runner.init();
+
+                expect(logged(mockLogger.info)[0]).toEndWith('; bail off');
+            });
+
+            it('reports bail as on when Stryker\'s disableBail is false', async () => {
+                const runner = new BunTestRunner(mockLogger, { disableBail: false } as unknown as StrykerOptions);
+
+                await runner.init();
+
+                expect(logged(mockLogger.info)[0]).toEndWith('; bail on');
+            });
+
+            it('omits bail when Stryker\'s options carry no disableBail', async () => {
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+
+                await runner.init();
+
+                expect(logged(mockLogger.info)[0]).not.toContain('bail');
+            });
+
+            it('is logged once per runner, however often init() runs', async () => {
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+
+                await runner.init();
+                await runner.init();
+
+                expect(mockLogger.info).toHaveBeenCalledTimes(1);
+            });
+
+            it('is logged once even when the second init() runs in another cwd', async () => {
+                const cwdSpy = spyOn(process, 'cwd').mockReturnValue('/first/sandbox');
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                cwdSpy.mockReturnValue('/second/sandbox');
+
+                await runner.init();
+
+                expect(mockLogger.info).toHaveBeenCalledTimes(1);
+                cwdSpy.mockRestore();
+            });
+
+            it('is not logged by an init() that fails, but by the next one that succeeds', async () => {
+                checkBunVersionSpy.mockRejectedValueOnce(new Error('boom'));
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+
+                await expect(runner.init()).rejects.toThrow('boom');
+                expect(mockLogger.info).not.toHaveBeenCalled();
+
+                await runner.init();
+                expect(mockLogger.info).toHaveBeenCalledTimes(1);
+            });
+
+            it('keeps the version from the one startup check when init() runs again', async () => {
+                checkBunVersionSpy.mockResolvedValueOnce('1.6.0');
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+
+                await runner.init();
+
+                expect(logged(mockLogger.info)[0]).toContain('bun 1.6.0 at bun');
+            });
+        });
+
+        describe('nothing at info per mutant', () => {
+            it('logs no info line for any mutant run, whatever its outcome', async () => {
+                const outcomes = [
+                    survivedRun,
+                    { exitCode: 1, stdout: 'tests/foo.test.ts:\n✗ my test [1ms]\n  error: fail\n\n 0 pass\n 1 fail\n', stderr: '', timedOut: false },
+                    // a test file that fails to load: Killed with only a debug line
+                    { exitCode: 1, stdout: ' 0 pass\n 1 fail\n 1 error\n', stderr: '', timedOut: false },
+                    { exitCode: null, stdout: '', stderr: '', timedOut: true, signal: 'SIGTERM' },
+                    { exitCode: 1, stdout: 'bun test v1\n', stderr: 'crash', timedOut: false },
+                ];
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                const infoAfterInit = (mockLogger.info as ReturnType<typeof mock>).mock.calls.length;
+
+                for(const outcome of outcomes) {
+                    mockRunBunTests.mockResolvedValueOnce(outcome);
+                }
+                await runMutantsInOrder(runner, outcomes.map((_, i) => `m${i}`));
+
+                expect((mockLogger.info as ReturnType<typeof mock>).mock.calls.length).toBe(infoAfterInit);
+            });
+        });
+
+        describe('registry load', () => {
+            it('logs at debug, not warn, when a worker that never ran the dry run loads a valid registry', async () => {
+                const registry = JSON.stringify({
+                    version:         2,
+                    writtenAt:       Date.now(),
+                    cachedTestNames: ['tests/foo.test.ts > Suite > present test'],
+                    baseNameIndex:   [['tests/foo.test.ts > Suite > present test', ['tests/foo.test.ts > Suite > present test']]],
+                    testNameIndex:   [['tests/foo.test.ts > Suite > present test', 'Suite present test']],
+                });
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock returns string
+                readFileSpy.mockResolvedValue(registry as any);
+                mockRunBunTests.mockResolvedValue(survivedRun);
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+
+                await mutantRunFor(runner, 'm-a', ['tests/foo.test.ts > Suite > present test']);
+
+                expect(logged(mockLogger.debug)).toContain(`Loaded dryRun registry from ${expectedRegistryPath()} (1 entries)`);
+                expect(mockLogger.warn).not.toHaveBeenCalled();
+            });
+        });
+
+        describe('aggregated per-mutant warnings', () => {
+            interface Scenario {
+                name:         string
+                /** The label the dispose() summary names the kind by. */
+                kind:         string
+                /** Text identifying this kind's warn among all the lines logged. */
+                marker:       string
+                filter:       string[]
+                /** Stryker's per-mutant timeout passed to mutantRun, when the scenario needs one. */
+                timeout?:     number
+                /** The dry-run registry file's content; absent means there is no file. */
+                registry?:    string
+                /** A read failure other than ENOENT, instead of a registry. */
+                readError?:   Error
+                /** False for the registry warnings, whose text does not name a mutant. */
+                namesMutant?: boolean
+                /* eslint-disable-next-line @typescript-eslint/no-explicit-any -- the options object runBunTests receives */
+                child:        (options: any) => object
+            }
+
+            const registryWithPresentTestOnly = JSON.stringify({
+                version:         2,
+                writtenAt:       Date.now(),
+                cachedTestNames: ['tests/foo.test.ts > Suite > present test'],
+                baseNameIndex:   [['tests/foo.test.ts > Suite > present test', ['tests/foo.test.ts > Suite > present test']]],
+                testNameIndex:   [['tests/foo.test.ts > Suite > present test', 'Suite present test']],
+            });
+
+            const scenarios: Scenario[] = [
+                {
+                    name:   'failed test names that cannot be resolved to dry-run test ids',
+                    kind:   'failed test names could not be resolved to dry-run test ids',
+                    marker: 'could not be resolved to dry-run test ids',
+                    filter: [],
+                    child:  () => ({ exitCode: 1, stdout: 'tests/static.test.ts:\n✗ static test [1ms]\n  error: fail\n\n 0 pass\n 1 fail\n', stderr: '', timedOut: false }),
+                },
+                {
+                    name:   'no exact-name registry',
+                    kind:   'no exact-name registry available (lossy covering-test patterns)',
+                    marker: 'no exact-name registry available',
+                    filter: ['tests/foo.test.ts > Suite > my test'],
+                    child:  () => survivedRun,
+                },
+                {
+                    name:     'testFilter ids missing from the exact-name registry',
+                    kind:     'testFilter ids missing from exact-name registry (lossy fallback)',
+                    marker:   'missing from exact-name registry',
+                    registry: registryWithPresentTestOnly,
+                    filter:   ['tests/foo.test.ts > Suite > present test', 'tests/foo.test.ts > Suite > absent test'],
+                    child:    () => survivedRun,
+                },
+                {
+                    name:   '--test-name-pattern matched 0 tests, retried with the full suite',
+                    kind:   '--test-name-pattern matched 0 tests (retried with the full suite)',
+                    marker: 'retrying once with the full suite',
+                    filter: ['tests/example.test.ts > handles alpha'],
+                    child:  options => (options.testNamePattern === undefined ? survivedRun : zeroMatchRun),
+                },
+                {
+                    name:   '--test-name-pattern matched 0 tests with nothing left to retry',
+                    kind:   '--test-name-pattern matched 0 tests with no covering tests left to retry',
+                    marker: 'no covering tests left to retry',
+                    filter: [],
+                    child:  () => zeroMatchRun,
+                },
+                {
+                    name:   'bun test failed to spawn',
+                    kind:   'could not start bun test, scoring as Error rather than Killed',
+                    marker: 'could not start bun test: ENOENT',
+                    filter: [],
+                    child:  () => ({ exitCode: null, stdout: '', stderr: '', timedOut: false, spawnError: 'ENOENT' }),
+                },
+                {
+                    name:   'bun test died from a signal',
+                    kind:   'bun test terminated by a signal, scoring as Error rather than Killed',
+                    marker: 'bun test terminated by SIGSEGV',
+                    filter: [],
+                    child:  () => ({ exitCode: null, signal: 'SIGSEGV', stdout: '', stderr: '', timedOut: false }),
+                },
+                {
+                    name:   'non-zero exit with no failing test and no fail/error count',
+                    kind:   'bun test exited non-zero with no failing test and no fail/error count, scoring as Error rather than Killed',
+                    marker: 'reported no failing test and no fail/error count',
+                    filter: [],
+                    child:  () => ({ exitCode: 1, stdout: 'bun test v1\n', stderr: 'crash', timedOut: false }),
+                },
+                {
+                    name:    'inconclusive full-suite fallback timeout',
+                    kind:    'inconclusive timeout, scoring as Error rather than Timeout',
+                    marker:  'inconclusive timeout',
+                    filter:  ['tests/example.test.ts > handles alpha'],
+                    timeout: 60_000,
+                    child:   options => (options.testNamePattern === undefined
+                        ? { exitCode: null, signal: 'SIGTERM', stdout: '', stderr: '', timedOut: true }
+                        : zeroMatchRun),
+                },
+                {
+                    name:        'registry file with an unexpected version',
+                    kind:        'dryRun registry file has an unexpected version (skipped)',
+                    marker:      'dryRun registry file has unexpected version 1; skipping',
+                    namesMutant: false,
+                    registry:    JSON.stringify({ version: 1 }),
+                    filter:      [],
+                    child:       () => survivedRun,
+                },
+                {
+                    name:        'registry file missing a field',
+                    kind:        'dryRun registry file is malformed (treated as absent)',
+                    marker:      'dryRun registry file is malformed (cachedTestNames, baseNameIndex, or testNameIndex missing or not an array); treating as absent',
+                    namesMutant: false,
+                    registry:    JSON.stringify({ version: 2, cachedTestNames: 'nope', baseNameIndex: [], testNameIndex: [] }),
+                    filter:      [],
+                    child:       () => survivedRun,
+                },
+                {
+                    name:        'registry file with a bad testNameIndex entry',
+                    kind:        'dryRun registry file is malformed (treated as absent)',
+                    marker:      'dryRun registry file is malformed (testNameIndex entry is not a [string, string] pair); treating as absent',
+                    namesMutant: false,
+                    registry:    JSON.stringify({ version: 2, cachedTestNames: [], baseNameIndex: [], testNameIndex: [['only-one']] }),
+                    filter:      [],
+                    child:       () => survivedRun,
+                },
+                {
+                    name:        'registry file that cannot be read',
+                    kind:        'failed to load the dryRun registry file',
+                    marker:      'Failed to load dryRun registry from',
+                    namesMutant: false,
+                    readError:   Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' }),
+                    filter:      [],
+                    child:       () => survivedRun,
+                },
+                {
+                    name:   'no killing test identifiable',
+                    kind:   'no killing test identifiable, emitting empty killedBy',
+                    marker: 'no killing test identifiable',
+                    filter: [],
+                    child:  () => ({ exitCode: 1, stdout: ' 0 pass\n 1 fail\n', stderr: '', timedOut: false }),
+                },
+                {
+                    name:   'maxChildRss exceeded',
+                    kind:   'bun test child exceeded maxChildRss, reporting a timeout',
+                    marker: 'exceeded maxChildRss',
+                    filter: [],
+                    child:  (options) => {
+                        options.onMemoryLimitExceeded?.(600_000_000);
+                        return { exitCode: null, stdout: '', stderr: '', timedOut: true, memoryLimitExceeded: true };
+                    },
+                },
+            ];
+
+            async function runScenario(scenario: Scenario, ids: string[]): Promise<BunTestRunner> {
+                if(scenario.registry !== undefined) {
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock returns string
+                    readFileSpy.mockResolvedValue(scenario.registry as any);
+                }
+                if(scenario.readError !== undefined) {
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock returns error
+                    readFileSpy.mockRejectedValue(scenario.readError as any);
+                }
+                mockRunBunTests.mockImplementation((options: unknown) => Promise.resolve(scenario.child(options)));
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runMutantsInOrder(runner, ids, scenario.filter, scenario.timeout);
+                return runner;
+            }
+
+            it.each(scenarios)('$name: the first mutant warns with full detail, later ones log the same text at debug', async (scenario) => {
+                await runScenario(scenario, ['m-a', 'm-b', 'm-c']);
+
+                const warns = logged(mockLogger.warn).filter(line => line.includes(scenario.marker));
+                const debugs = logged(mockLogger.debug).filter(line => line.includes(scenario.marker));
+
+                expect(warns).toHaveLength(1);
+                expect(debugs).toHaveLength(2);
+                if(scenario.namesMutant === false) {
+                    expect(debugs).toEqual([warns[0], warns[0]]);
+                } else {
+                    expect(warns[0]).toContain('m-a');
+                    expect(debugs[0]).toBe(warns[0].replaceAll('m-a', 'm-b'));
+                    expect(debugs[1]).toBe(warns[0].replaceAll('m-a', 'm-c'));
+                }
+            });
+
+            it.each(scenarios)('$name: dispose() adds one summary warn naming the kind and the affected mutants', async (scenario) => {
+                const runner = await runScenario(scenario, ['m-a', 'm-b', 'm-c']);
+                const before = logged(mockLogger.warn).length;
+
+                await runner.dispose();
+
+                // Other kinds the same scenario also triggers (no registry, no killing test, ...) add their own lines.
+                expect(logged(mockLogger.warn).slice(before)).toContain(
+                    `${scenario.kind}: 3 mutants affected (first: m-a, m-b, m-c); see debug log for details`
+                );
+            });
+
+            it.each(scenarios)('$name: a kind that affected a single mutant gets no summary', async (scenario) => {
+                const runner = await runScenario(scenario, ['m-a']);
+                const before = logged(mockLogger.warn).length;
+
+                await runner.dispose();
+
+                expect(logged(mockLogger.warn).slice(before)).toEqual([]);
+            });
+
+            it('summarizes each kind separately, and only the kinds that repeated', async () => {
+                mockRunBunTests.mockImplementation(() => Promise.resolve({ exitCode: null, stdout: '', stderr: '', timedOut: false, spawnError: 'ENOENT' }));
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await mutantRunFor(runner, 'm-a');
+                await mutantRunFor(runner, 'm-b');
+                mockRunBunTests.mockImplementation(() => Promise.resolve({ exitCode: 1, stdout: ' 0 pass\n 1 fail\n', stderr: '', timedOut: false }));
+                await mutantRunFor(runner, 'm-c');
+                const before = logged(mockLogger.warn).length;
+
+                await runner.dispose();
+
+                expect(logged(mockLogger.warn).slice(before)).toEqual([
+                    'could not start bun test, scoring as Error rather than Killed: 2 mutants affected (first: m-a, m-b); see debug log for details',
+                ]);
+            });
+
+            it('files both registry-malformed warnings under one kind', async () => {
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock returns string
+                readFileSpy.mockResolvedValueOnce(JSON.stringify({ version: 2, cachedTestNames: 'nope', baseNameIndex: [], testNameIndex: [] }) as any);
+                mockRunBunTests.mockResolvedValue(survivedRun);
+                await mutantRunFor(runner, 'm-a');
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock returns string
+                readFileSpy.mockResolvedValueOnce(JSON.stringify({ version: 2, cachedTestNames: [], baseNameIndex: [], testNameIndex: [['only-one']] }) as any);
+                await mutantRunFor(runner, 'm-b');
+                const warnedBefore = logged(mockLogger.warn).filter(line => line.includes('is malformed'));
+
+                await runner.dispose();
+
+                expect(warnedBefore).toEqual(['dryRun registry file is malformed (cachedTestNames, baseNameIndex, or testNameIndex missing or not an array); treating as absent']);
+                expect(logged(mockLogger.debug)).toContain('dryRun registry file is malformed (testNameIndex entry is not a [string, string] pair); treating as absent');
+                expect(logged(mockLogger.warn)).toContain('dryRun registry file is malformed (treated as absent): 2 mutants affected (first: m-a, m-b); see debug log for details');
+            });
+
+            it('lists only the first five mutant ids of a repeated kind, then an ellipsis', async () => {
+                mockRunBunTests.mockImplementation(() => Promise.resolve({ exitCode: null, stdout: '', stderr: '', timedOut: false, spawnError: 'ENOENT' }));
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runMutantsInOrder(runner, ['1', '2', '3', '4', '5', '6', '7']);
+                const before = logged(mockLogger.warn).length;
+
+                await runner.dispose();
+
+                expect(logged(mockLogger.warn).slice(before)).toEqual([
+                    'could not start bun test, scoring as Error rather than Killed: 7 mutants affected (first: 1, 2, 3, 4, 5, …); see debug log for details',
+                ]);
+            });
+
+            it('emits the dispose() summaries once, even if dispose() runs twice', async () => {
+                const runner = await runScenario(scenarios[5], ['m-a', 'm-b']);
+                await runner.dispose();
+                const before = logged(mockLogger.warn).length;
+
+                await runner.dispose();
+
+                expect(logged(mockLogger.warn).slice(before)).toEqual([]);
+            });
+
+            it('logs the summaries before cleaning up, so a failing cleanup cannot swallow them', async () => {
+                const runner = await runScenario(scenarios[5], ['m-a', 'm-b']);
+                mockCleanupPreloadScript.mockRejectedValue(new Error('cleanup failed'));
+
+                await expect(runner.dispose()).rejects.toThrow('cleanup failed');
+
+                expect(logged(mockLogger.warn).at(-1)).toBe('could not start bun test, scoring as Error rather than Killed: 2 mutants affected (first: m-a, m-b); see debug log for details');
+            });
+        });
+
+        describe('end summary', () => {
+            const killedRun = { exitCode: 1, stdout: 'tests/foo.test.ts:\n✗ my test [1ms]\n  error: fail\n\n 0 pass\n 1 fail\n', stderr: '', timedOut: false };
+            const timeoutRun = { exitCode: null, stdout: '', stderr: '', timedOut: true, signal: 'SIGTERM' };
+            const errorRun = { exitCode: 1, stdout: 'bun test v1\n', stderr: 'crash', timedOut: false };
+
+            it('logs no end summary for a worker that ran no mutant', async () => {
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                const before = logged(mockLogger.info).length;
+
+                await runner.dispose();
+
+                expect(logged(mockLogger.info).slice(before)).toEqual([]);
+            });
+
+            it('logs one info line counting the worker\'s mutant runs by outcome', async () => {
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                const runs = [killedRun, killedRun, killedRun, survivedRun, survivedRun, timeoutRun, errorRun];
+                for(const run of runs) {
+                    mockRunBunTests.mockResolvedValueOnce(run);
+                }
+                await runMutantsInOrder(runner, runs.map((_, i) => `m${i}`));
+                const before = logged(mockLogger.info).length;
+
+                await runner.dispose();
+
+                expect(logged(mockLogger.info).slice(before)).toEqual([
+                    'Mutant runs on this worker: 7 (killed 3, survived 2, timeout 1, error 1); full-suite fallbacks: 0',
+                ]);
+            });
+
+            it('counts a zero-match retry as one full-suite fallback and the run as one mutant', async () => {
+                mockRunBunTests.mockImplementation((options: { testNamePattern?: string }) =>
+                    Promise.resolve(options.testNamePattern === undefined ? survivedRun : zeroMatchRun));
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await mutantRunFor(runner, 'm-a', ['tests/example.test.ts > handles alpha']);
+                const before = logged(mockLogger.info).length;
+
+                await runner.dispose();
+
+                expect(logged(mockLogger.info).slice(before)).toEqual([
+                    'Mutant runs on this worker: 1 (killed 0, survived 1, timeout 0, error 0); full-suite fallbacks: 1',
+                ]);
+            });
+
+            it('counts a covering-test pattern too long for argv as a full-suite fallback', async () => {
+                mockRunBunTests.mockResolvedValue(survivedRun);
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                // Distinct names (the pattern builder collapses duplicates) that together exceed MAX_TEST_NAME_PATTERN_LENGTH.
+                const huge = ['a', 'b'].map(name => `tests/${name}.test.ts > ${name}${'x'.repeat(60_000)}`);
+                await mutantRunFor(runner, 'm-a', huge);
+                expect(mockRunBunTests.mock.calls[0][0].testNamePattern).toBeUndefined();
+                const before = logged(mockLogger.info).length;
+
+                await runner.dispose();
+
+                expect(logged(mockLogger.info).slice(before)).toEqual([
+                    'Mutant runs on this worker: 1 (killed 0, survived 1, timeout 0, error 0); full-suite fallbacks: 1',
+                ]);
+            });
+
+            it('does not count targeted runs or runs with no covering tests as fallbacks', async () => {
+                mockRunBunTests.mockResolvedValue(survivedRun);
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await mutantRunFor(runner, 'm-a', ['tests/example.test.ts > handles alpha']);
+                await mutantRunFor(runner, 'm-b', []);
+                const before = logged(mockLogger.info).length;
+
+                await runner.dispose();
+
+                expect(logged(mockLogger.info).slice(before)).toEqual([
+                    'Mutant runs on this worker: 2 (killed 0, survived 2, timeout 0, error 0); full-suite fallbacks: 0',
+                ]);
+            });
+
+            it('restarts its tallies after logging: later runs are counted afresh, fallbacks included', async () => {
+                mockRunBunTests.mockImplementation((options: { testNamePattern?: string }) =>
+                    Promise.resolve(options.testNamePattern === undefined ? survivedRun : zeroMatchRun));
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await mutantRunFor(runner, 'm-a', ['tests/example.test.ts > handles alpha']);
+                await runner.dispose();
+                mockRunBunTests.mockResolvedValue(killedRun);
+                await mutantRunFor(runner, 'm-b');
+                const before = logged(mockLogger.info).length;
+
+                await runner.dispose();
+
+                expect(logged(mockLogger.info).slice(before)).toEqual([
+                    'Mutant runs on this worker: 1 (killed 1, survived 0, timeout 0, error 0); full-suite fallbacks: 0',
+                ]);
+            });
+
+            it('logs the end summary only once, even if dispose() runs twice', async () => {
+                mockRunBunTests.mockResolvedValue(survivedRun);
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await mutantRunFor(runner, 'm-a');
+                await runner.dispose();
+                const before = logged(mockLogger.info).length;
+
+                await runner.dispose();
+
+                expect(logged(mockLogger.info).slice(before)).toEqual([]);
+            });
+
+            it('logs the end summary before cleaning up, so a failing cleanup cannot swallow it', async () => {
+                mockRunBunTests.mockResolvedValue(survivedRun);
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await mutantRunFor(runner, 'm-a');
+                mockCleanupPreloadScript.mockRejectedValue(new Error('cleanup failed'));
+                const before = logged(mockLogger.info).length;
+
+                await expect(runner.dispose()).rejects.toThrow('cleanup failed');
+
+                expect(logged(mockLogger.info).slice(before)).toHaveLength(1);
             });
         });
     });
