@@ -4,7 +4,6 @@
  * by the instrumenter's hit limit and scored Timeout in well under its time budget.
  */
 
-import { createHash } from 'node:crypto';
 import * as fsPromises from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -13,6 +12,7 @@ import type { Logger } from '@stryker-mutator/api/logging';
 import { DryRunStatus, MutantRunStatus, type MutantRunOptions } from '@stryker-mutator/api/test-runner';
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { BunTestRunner } from '../../src/bun-test-runner.js';
+import { resolveRunTempDir } from '../../src/utils/private-temp-dir.js';
 import { resetAllMocks } from '../test-preload.js';
 
 /**
@@ -123,7 +123,6 @@ describe('hit limit (real bun children)', () => {
     let sumTestFile: string;
     let swallowTestFile: string;
     let originalForceColor: string | undefined;
-    let originalActiveMutant: string | undefined;
 
     function createRunner(testFile: string): BunTestRunner {
         return new BunTestRunner(silentLogger, {
@@ -155,11 +154,6 @@ describe('hit limit (real bun children)', () => {
         // See inspector-integration.test.ts: a set FORCE_COLOR breaks the inspector-URL scrape.
         originalForceColor = process.env.FORCE_COLOR;
         delete process.env.FORCE_COLOR;
-        // Under Stryker this process runs with the OUTER mutant active, and the children
-        // spawned here would inherit it — their dry run would then collect no coverage.
-        // These children model a top-level Stryker run, so they must not see it.
-        originalActiveMutant = process.env.__STRYKER_ACTIVE_MUTANT__;
-        delete process.env.__STRYKER_ACTIVE_MUTANT__;
 
         tempDir = await fsPromises.mkdtemp(path.join(tmpdir(), 'hit-limit-integration-'));
         await fsPromises.writeFile(path.join(tempDir, 'loop.js'), INSTRUMENTED_LOOP);
@@ -182,15 +176,10 @@ describe('hit limit (real bun children)', () => {
         if(originalForceColor !== undefined) {
             process.env.FORCE_COLOR = originalForceColor;
         }
-        if(originalActiveMutant !== undefined) {
-            process.env.__STRYKER_ACTIVE_MUTANT__ = originalActiveMutant;
-        }
         await fsPromises.rm(tempDir, { recursive: true, force: true });
-        // The dryRun registry BunTestRunner writes, keyed like its registryPath getter.
-        const registryHash = createHash('sha256').update(`${process.cwd()}:${process.ppid}`).digest('hex').slice(0, 16);
-        const registryPath = path.join(tmpdir(), 'stryker-bun-runner', `registry-${registryHash}.json`);
-        await fsPromises.rm(registryPath, { force: true });
-        await fsPromises.rm(`${registryPath}.tmp`, { force: true });
+        // Clean up the run's private temp directory (and the dryRun registry the runner
+        // leaves in it), resolved exactly as the runner resolves it for this process.
+        await fsPromises.rm(await resolveRunTempDir(), { recursive: true, force: true });
     });
 
     test('the dry run reports the instrumenter\'s real hit counts', async () => {

@@ -1127,90 +1127,66 @@ describe('runBunTests', () => {
             expect(onInspectorReady).not.toHaveBeenCalled();
         });
 
-        it('should not set __STRYKER_ACTIVE_MUTANT__ when activeMutant is undefined - line 145 mutation', async () => {
-            // Kills mutation on line 145: if(options.activeMutant) → if(true)
-            // If mutated to always true, would set env var to undefined
-            // Store original value from process.env before test
-            const originalValue = process.env.__STRYKER_ACTIVE_MUTANT__;
-
+        // A run nested inside another (a suite that drives this runner, as this package's own
+        // integration tests do under Stryker) inherits the outer child's __STRYKER_* variables
+        // through process.env, which is spread into the child env exactly like `env` here. The
+        // child must only ever see what THIS run was given: an inherited active mutant switches
+        // off a nested dry run's coverage, and an inherited coverage file or sync port points the
+        // nested preload at the outer run's file and sync server.
+        it.each([
+            ['__STRYKER_ACTIVE_MUTANT__', '17'],
+            ['__STRYKER_COVERAGE_FILE__', '/tmp/outer-run/coverage.json'],
+            ['__STRYKER_SYNC_PORT__', '41234'],
+        ])('should never pass on an inherited %s when this run does not set it', async (name, inheritedValue) => {
             const resultPromise = runBunTests({
                 bunPath: 'bun',
                 timeout: 5000,
-                // activeMutant intentionally not provided
+                env:     { [name]: inheritedValue },
             });
 
             mockChildProcess.closeHandler?.(0);
             await resultPromise;
 
-            const spawnCall = mockSpawn.mock.calls[0];
-
-            const spawnOptions = spawnCall[2];
-
-            // Check that env matches process.env (not set to 'undefined' string)
-            // When running in Stryker, process.env has this set; when running normally it's undefined
-
-            expect(spawnOptions.env!.__STRYKER_ACTIVE_MUTANT__).toBe(originalValue);
+            expect(Object.hasOwn(mockSpawn.mock.calls[0][2].env!, name)).toBe(false);
         });
 
-        it('should not set __STRYKER_COVERAGE_FILE__ when coverageFile is undefined - kills line 150 mutation', async () => {
-            // CRITICAL: Kills mutation on line 150: if(options.coverageFile) → if(true)
-            // If mutated to if(true), would execute: env.__STRYKER_COVERAGE_FILE__ = undefined
-            // This explicitly sets the property to undefined, which is observable
-
+        it('should not pass on inherited __STRYKER_* variables for empty activeMutant/coverageFile or a zero syncPort', async () => {
             const resultPromise = runBunTests({
-                bunPath: 'bun',
-                timeout: 5000,
-                // coverageFile intentionally not provided (undefined)
+                bunPath:      'bun',
+                timeout:      5000,
+                activeMutant: '',
+                coverageFile: '',
+                syncPort:     0,
+                env:          { __STRYKER_ACTIVE_MUTANT__: '17', __STRYKER_COVERAGE_FILE__: '/tmp/outer-run/coverage.json', __STRYKER_SYNC_PORT__: '41234' },
             });
 
             mockChildProcess.closeHandler?.(0);
             await resultPromise;
 
-            const spawnCall = mockSpawn.mock.calls[0];
-
-            const spawnOptions = spawnCall[2];
-
-            // The mutation would set the property to undefined explicitly
-            // We check that the behavior matches: if process.env has it, we inherit it; if not, we don't set it
-            // This test will fail if the mutation makes it always execute the assignment
-
-            const actualValue = spawnOptions.env!.__STRYKER_COVERAGE_FILE__;
-            const expectedValue = process.env.__STRYKER_COVERAGE_FILE__;
-
-            // Both should be undefined (not set) when coverageFile option is not provided
-            expect(actualValue).toBe(expectedValue);
-
-            // Additionally verify it's actually undefined, not the string 'undefined'
-            if(expectedValue === undefined) {
-                expect(actualValue).toBeUndefined();
-            }
+            const env = mockSpawn.mock.calls[0][2].env!;
+            expect(Object.hasOwn(env, '__STRYKER_ACTIVE_MUTANT__')).toBe(false);
+            expect(Object.hasOwn(env, '__STRYKER_COVERAGE_FILE__')).toBe(false);
+            expect(Object.hasOwn(env, '__STRYKER_SYNC_PORT__')).toBe(false);
         });
 
-        it('should not set __STRYKER_SYNC_PORT__ when syncPort is undefined - line 155 mutation', async () => {
-            // Kills mutation on line 155: if(options.syncPort) → if(true)
-            // If mutated to always true, would set env var to string 'undefined'
-            // Store original value from process.env before test
-            const originalValue = process.env.__STRYKER_SYNC_PORT__;
-
+        it('should override inherited __STRYKER_* variables with the values this run was given', async () => {
             const resultPromise = runBunTests({
-                bunPath: 'bun',
-                timeout: 5000,
-                // syncPort intentionally not provided
+                bunPath:      'bun',
+                timeout:      5000,
+                activeMutant: '42',
+                coverageFile: '/tmp/this-run/coverage.json',
+                syncPort:     8080,
+                env:          { __STRYKER_ACTIVE_MUTANT__: '17', __STRYKER_COVERAGE_FILE__: '/tmp/outer-run/coverage.json', __STRYKER_SYNC_PORT__: '41234' },
             });
 
             mockChildProcess.closeHandler?.(0);
             await resultPromise;
 
-            const spawnCall = mockSpawn.mock.calls[0];
-
-            const spawnOptions = spawnCall[2];
-
-            // Should match process.env value (could be undefined or inherited from parent)
-            // The key check: if mutation changes condition to if(true), it would set to string 'undefined'
-            // which would differ from originalValue (either undefined stays undefined correctly, or
-            // if Stryker set a value, it should remain that value, not become 'undefined')
-
-            expect(spawnOptions.env!.__STRYKER_SYNC_PORT__).toBe(originalValue);
+            expect(mockSpawn.mock.calls[0][2].env).toMatchObject({
+                __STRYKER_ACTIVE_MUTANT__: '42',
+                __STRYKER_COVERAGE_FILE__: '/tmp/this-run/coverage.json',
+                __STRYKER_SYNC_PORT__:     '8080',
+            });
         });
     });
 

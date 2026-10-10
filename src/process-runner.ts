@@ -442,28 +442,25 @@ function buildChildEnv(options: BunTestRunOptions, spawnDepth: number): Record<s
         ...options.env,
     };
 
-    // Set active mutant if specified
-    if(options.activeMutant) {
-        env.__STRYKER_ACTIVE_MUTANT__ = options.activeMutant;
-    }
-
-    // Always set or cleared, never inherited: a run nested inside a mutant run
-    // must not pick up the outer run's limit.
-    if(options.hitLimit === undefined) {
-        delete env.__STRYKER_HIT_LIMIT__;
-    } else {
-        env.__STRYKER_HIT_LIMIT__ = String(options.hitLimit);
-    }
-
-    // Set coverage file path if specified
-    // Stryker disable next-line ConditionalExpression: mutating to always true would set env var to undefined
-    if(options.coverageFile) {
-        env.__STRYKER_COVERAGE_FILE__ = options.coverageFile;
-    }
-
-    // Set sync port if specified
-    if(options.syncPort) {
-        env.__STRYKER_SYNC_PORT__ = String(options.syncPort);
+    // Each variable the coverage preload reads is set from this run's options or
+    // cleared, never inherited. A run nested inside another one (a test suite that
+    // drives this runner, as this package's own integration tests do under Stryker)
+    // inherits the outer child's values through process.env: an inherited active
+    // mutant switches off the nested dry run's coverage collection, an inherited
+    // hit limit arms it in the wrong run, and an inherited coverage file or sync
+    // port points the nested preload at the outer run's file and sync server.
+    const preloadVars: Record<string, string | undefined> = {
+        __STRYKER_ACTIVE_MUTANT__: options.activeMutant === '' ? undefined : options.activeMutant,
+        __STRYKER_HIT_LIMIT__:     options.hitLimit === undefined ? undefined : String(options.hitLimit),
+        __STRYKER_COVERAGE_FILE__: options.coverageFile === '' ? undefined : options.coverageFile,
+        __STRYKER_SYNC_PORT__:     options.syncPort ? String(options.syncPort) : undefined,
+    };
+    for(const [name, value] of Object.entries(preloadVars)) {
+        if(value === undefined) {
+            delete env[name];
+        } else {
+            env[name] = value;
+        }
     }
 
     // Stamp the child's nesting depth so that, if the suite it runs turns
