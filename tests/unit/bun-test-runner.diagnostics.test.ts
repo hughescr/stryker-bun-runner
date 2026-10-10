@@ -152,21 +152,22 @@ describe('BunTestRunner diagnostics and killedBy resolution', () => {
         }
 
         function gate(opts: {
-            order?:  number[]
-            tree?:   TestInfo[]
-            passed?: number
-            failed?: number
-            keys?:   { keyCount: number, unmatchedKeyCount: number }
-            closed?: boolean
-            tests?:  readonly { status: TestStatus }[]
-            close?:  CloseInfoShape
-            stderr?: string
+            order?:   number[]
+            tree?:    TestInfo[]
+            passed?:  number
+            failed?:  number
+            keys?:    { keyCount: number, unmatchedKeyCount: number }
+            closed?:  boolean
+            tests?:   readonly { status: TestStatus }[]
+            close?:   CloseInfoShape
+            stderr?:  string
+            printed?: boolean
         }): { status: DryRunStatus, errorMessage?: string } | null {
             return internals.checkCompletenessGate(
                 {
                     executionOrder:        opts.order ?? [],
                     testHierarchy:         opts.tree ?? [],
-                    summary:               { passed: opts.passed ?? 0, skipped: 0, todo: 0 },
+                    summary:               { passed: opts.passed ?? 0, skipped: 0, todo: 0, printed: opts.printed ?? true },
                     coverageKeys:          opts.keys,
                     coveredTestIds:        [],
                     resultTestIds:         [],
@@ -186,6 +187,16 @@ describe('BunTestRunner diagnostics and killedBy resolution', () => {
           + 'been persisted. If a cause named above is in your test suite, fix it there; otherwise re-run the dry run, and '
           + 'if this recurs, please report it at https://github.com/hughescr/stryker-bun-runner/issues with this message, '
           + 'your bun version and a debug log (logLevel: \'debug\').';
+
+        it('says bun printed no summary, not that inspector events were lost, when a test left the process early', () => {
+            const result = gate({ order: [1], tree: hierarchy([undefined]), printed: false, closed: true });
+
+            expect(result?.status).toBe(DryRunStatus.Error);
+            expect(result?.errorMessage).toContain('bun printed no test summary');
+            expect(result?.errorMessage).toContain('process.exit');
+            expect(result?.errorMessage).not.toContain('were lost');
+            expect(mockLogger.error).toHaveBeenCalledTimes(1);
+        });
 
         it('reports the exact error message for a single lost test, and logs it through logger.error', () => {
             const { order, tree } = passing(9);

@@ -1165,6 +1165,7 @@ bun test v1.1.0
             const output = `
 bun test v1.1.0
 
+ 0 pass
  3 fail
 `;
             const result = parseBunTestOutput(output, '');
@@ -1176,6 +1177,7 @@ bun test v1.1.0
             const output = `
 bun test v1.1.0
 
+ 0 pass
  2 skip
 `;
             const result = parseBunTestOutput(output, '');
@@ -1366,6 +1368,7 @@ Ran 10 tests across 1 files. [100.00ms]
             const output = `
 bun test v1.1.0
 
+ 0 pass
  1 fail
 Ran 10 tests across 1 files. [100.00ms]
 `;
@@ -1397,7 +1400,9 @@ Ran 15 tests across 3 files. [150.00ms]
             const output = `
 bun test v1.1.0
 
+ 0 pass
  3 skip
+ 0 fail
 Ran 10 tests across 1 files. [100.00ms]
 `;
             const result = parseBunTestOutput(output, '');
@@ -2675,6 +2680,7 @@ Ran 10 tests across 1 files. [100.00ms]
             const output = `
 bun test v1.1.0
 
+ 0 pass
  1 fail
 Ran 10 tests across 1 files. [100.00ms]
 `;
@@ -3207,7 +3213,9 @@ tests/example.test.ts:
             // Critical test case: Ran N reports more tests than parsed (triggers derivation)
             const output = `bun test v1.1.0
 
+ 0 pass
  2 skip
+ 0 fail
 Ran 10 tests across 1 file.`;
             const result = parseBunTestOutput(output, '');
 
@@ -3246,7 +3254,9 @@ Ran 7 tests across 1 file.`;
             // If replaced with true, would ALWAYS derive passed count
             const output = `bun test v1.1.0
 
+ 0 pass
  3 skip
+ 0 fail
 Ran 3 tests across 1 file.`;
             const result = parseBunTestOutput(output, '');
 
@@ -3646,11 +3656,11 @@ tests/example.test.ts:
         });
 
         it('takes the last match when several whole lines look like the summary', () => {
-            expect(parseBunTestOutput('', '3 errors\n 7 errors\n 2 errors\n').summaryErrors).toBe(2);
+            expect(parseBunTestOutput('', ' 0 pass\n3 errors\n 7 errors\n 2 errors\n').summaryErrors).toBe(2);
         });
 
         it('takes the last match across stdout and stderr, which are joined stdout first', () => {
-            expect(parseBunTestOutput('9 errors\n', ' 4 errors\n').summaryErrors).toBe(4);
+            expect(parseBunTestOutput(' 0 pass\n9 errors\n', ' 4 errors\n').summaryErrors).toBe(4);
         });
 
         it('does not mistake an error message that merely mentions errors for the summary line', () => {
@@ -3671,13 +3681,13 @@ tests/example.test.ts:
         });
 
         it('accepts no indentation and indentation of several spaces and tabs', () => {
-            expect(parseBunTestOutput('', '5 errors\n').summaryErrors).toBe(5);
-            expect(parseBunTestOutput('', '   \t6 errors\n').summaryErrors).toBe(6);
+            expect(parseBunTestOutput('', ' 0 pass\n5 errors\n').summaryErrors).toBe(5);
+            expect(parseBunTestOutput('', ' 0 pass\n   \t6 errors\n').summaryErrors).toBe(6);
         });
 
         it('accepts more than one space or tab between the count and the word', () => {
-            expect(parseBunTestOutput('', ' 7  errors\n').summaryErrors).toBe(7);
-            expect(parseBunTestOutput('', ' 8\t error\n').summaryErrors).toBe(8);
+            expect(parseBunTestOutput('', ' 0 pass\n 7  errors\n').summaryErrors).toBe(7);
+            expect(parseBunTestOutput('', ' 0 pass\n 8\t error\n').summaryErrors).toBe(8);
         });
     });
 

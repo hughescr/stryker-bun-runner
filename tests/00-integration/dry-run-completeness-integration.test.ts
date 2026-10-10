@@ -195,6 +195,105 @@ describe('dry-run completeness gate (real bun children)', () => {
         });
     }, 60_000);
 
+    test('completes a suite whose tests print lines shaped like bun\'s own summary lines (they are not counts)', async () => {
+        // Whole lines on stdout and stderr, in the shapes bun prints its summary in. None of them is bun's summary:
+        // bun prints no skip or pending-test line here, because there are no such tests.
+        const lookalikeFile = path.join(tempDir, 'lookalike.test.ts');
+        await fsPromises.writeFile(lookalikeFile, [
+            "import { test } from 'bun:test';",
+            "import { cover } from './cover.js';",
+            "test('logs lookalikes', () => {",
+            '    cover(\'logged\');',
+            "    console.log('you have 3 todo items');",
+            "    console.log(' 3 todo');",
+            "    console.log(' 3 skip');",
+            String.raw`    process.stdout.write('\n 7 pass\n 2 fail\n 3 skip\n 4 todo\n 5 errors\n');`,
+            String.raw`    process.stderr.write('\n 7 pass\n 2 fail\n 3 skip\n 4 todo\n 5 errors\nRan 99 tests across 1 file.\n 3 todo\n');`,
+            '});',
+        ].join('\n'));
+
+        const result = await dryRun([lookalikeFile]);
+
+        expect(result.status).toBe(DryRunStatus.Complete);
+        if(result.status !== DryRunStatus.Complete) {
+            return;
+        }
+        expect(result.tests.map(t => [t.id, t.status])).toEqual([['lookalike.test.ts > logs lookalikes', TestStatus.Success]]);
+        expect(result.mutantCoverage?.perTest).toEqual({ 'lookalike.test.ts > logs lookalikes': { logged: 1 } });
+    }, 60_000);
+
+    test('completes a suite whose test files sit in a directory with "@@" in its name, with the coverage on the right tests', async () => {
+        // Under a Stryker sandbox path, the way the files sit in a real run: the preload keeps the path below
+        // the sandbox in its coverage keys (outside a sandbox and the cwd it would keep only the file name).
+        const sandboxDir = path.join(tempDir, '.stryker-tmp', 'sandbox-ABC');
+        const atDir = path.join(sandboxDir, 'x@@y');
+        await fsPromises.mkdir(atDir, { recursive: true });
+        const atFile = path.join(atDir, 'at.test.ts');
+        await fsPromises.writeFile(atFile, [
+            "import { test } from 'bun:test';",
+            "import { cover } from '../../../cover.js';",
+            "test('first', () => { cover('first'); });",
+            "test('second', () => { cover('second'); });",
+        ].join('\n'));
+        const otherFile = path.join(sandboxDir, 'other.test.ts');
+        await fsPromises.writeFile(otherFile, [
+            "import { test } from 'bun:test';",
+            "import { cover } from '../../cover.js';",
+            "test('third', () => { cover('third'); });",
+        ].join('\n'));
+
+        const result = await dryRun([atFile, otherFile]);
+
+        expect(result.status).toBe(DryRunStatus.Complete);
+        if(result.status !== DryRunStatus.Complete) {
+            return;
+        }
+        expect(result.mutantCoverage?.perTest).toEqual({
+            'x@@y/at.test.ts > first':  { first: 1 },
+            'x@@y/at.test.ts > second': { second: 1 },
+            'other.test.ts > third':    { third: 1 },
+        });
+    }, 60_000);
+
+    test('fails the dry run, naming the early exit, when a test calls process.exit before bun can print its summary', async () => {
+        const exitFile = path.join(tempDir, 'exit.test.ts');
+        await fsPromises.writeFile(exitFile, [
+            "import { test } from 'bun:test';",
+            "test('before', () => {});",
+            "test('exits', () => { process.exit(0); });",
+            "test('after', () => {});",
+        ].join('\n'));
+
+        const result = await dryRun([exitFile]);
+
+        expect(result.status).toBe(DryRunStatus.Error);
+        const message = result.status === DryRunStatus.Error ? result.errorMessage : '';
+        expect(message).toContain('bun printed no test summary');
+        expect(message).toContain('process.exit');
+        expect(message).not.toContain('were lost');
+    }, 60_000);
+
+    test('reports a test that times out as a failed test, not as a pass', async () => {
+        // A promise that never settles, against bun's own 1 ms test timeout: nothing here waits on a clock.
+        const timeoutFile = path.join(tempDir, 'timeout.test.ts');
+        await fsPromises.writeFile(timeoutFile, [
+            "import { test } from 'bun:test';",
+            "test('hangs', () => new Promise(() => {}), 1);",
+            "test('fine', () => {});",
+        ].join('\n'));
+
+        const result = await dryRun([timeoutFile]);
+
+        expect(result.status).toBe(DryRunStatus.Complete);
+        if(result.status !== DryRunStatus.Complete) {
+            return;
+        }
+        const hangs = result.tests.find(t => t.id.endsWith('hangs'));
+        expect(hangs?.status).toBe(TestStatus.Failed);
+        expect(hangs?.status === TestStatus.Failed ? hangs.failureMessage : '').toContain('timed out');
+        expect(result.tests.find(t => t.id.endsWith('fine'))?.status).toBe(TestStatus.Success);
+    }, 60_000);
+
     test('fails the dry run when a single TestReporter.start event is lost', async () => {
         // A test that runs once: bun's --randomize (from this repo's bunfig) may start any test first.
         dropFirstEvent('handleTestStart', (_params, name) => name === 'plain');

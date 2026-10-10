@@ -4,9 +4,24 @@
  */
 
 /**
+ * Every status Bun's inspector reports in a TestReporter.end event (its
+ * TestReporter.TestStatus protocol enum; the same six on bun 1.3.7, 1.3.14 and
+ * 1.4.2):
+ * - `pass` and `fail`;
+ * - `timeout`: the test ran past its timeout. Bun counts it on its ' N fail'
+ *   line, and it carries no error. It is a FAILED test;
+ * - `skip` and the status of a pending test: skipped and pending tests;
+ * - `skipped_because_label`: the test was filtered out by name (`-t`); bun's
+ *   ' N filtered out' line counts it.
+ * A status outside this list is a protocol change the runner does not know how
+ * to score, and the dry-run completeness gate reports it.
+ */
+export const TEST_STATUSES = ['pass', 'fail', 'timeout', 'skip', 'todo', 'skipped_because_label'] as const;
+
+/**
  * Test status as reported by Bun's test runner
  */
-export type TestStatus = 'pass' | 'fail' | 'skip' | 'todo';
+export type TestStatus = typeof TEST_STATUSES[number];
 
 /**
  * Type of test entity

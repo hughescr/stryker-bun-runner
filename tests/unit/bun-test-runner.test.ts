@@ -4691,7 +4691,7 @@ tests/example.test.ts:
                 // this exercises the Complete-path mismatch diagnostic instead, which
                 // is exactly the incident fingerprint: bun's summary says 1 failed, but
                 // nothing in the recap or inspector data says which test.
-                mockProcessResult({ exitCode: 1, stdout: '1 tests failed:\n 1 fail', stderr: 'x'.repeat(600) });
+                mockProcessResult({ exitCode: 1, stdout: '1 tests failed:\n 1 pass\n 1 fail', stderr: 'x'.repeat(600) });
                 const testHierarchy: TestInfo[] = [
                     { id: 1, name: 'test1', fullName: 'test1', type: 'test', status: 'pass' },
                 ];
@@ -4713,6 +4713,100 @@ tests/example.test.ts:
                     // 'does not double-message' test), so this is the only place the
                     // cause — the unresolvable import — is still visible.
                     expect(result.errorMessage).toContain('x'.repeat(500));
+                }
+            });
+
+            it('TIMEOUT: a test the inspector ended with status "timeout" is built as Failed, with the console recap\'s message when there is one', async () => {
+                mockProcessResult({ exitCode: 1, stdout: '(fail) slow [50.86ms]\n  ^ this test timed out after 50ms.\n\n 1 pass\n 1 fail\nRan 2 tests across 1 file. [87.00ms]\n' });
+                mockInspectorClient.getTests.mockReturnValue([
+                    { id: 1, name: 'slow', fullName: 'slow', type: 'test', status: 'timeout', elapsed: 50_855_026 },
+                    { id: 2, name: 'ok', fullName: 'ok', type: 'test', status: 'pass' },
+                ] as TestInfo[]);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([1, 2]);
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                const result = await runner.dryRun();
+
+                expect(result.status).toBe(DryRunStatus.Complete);
+                if(result.status === DryRunStatus.Complete) {
+                    const slow = result.tests.find(t => t.name.endsWith('slow'));
+                    expect(slow?.status).toBe(TestStatus.Failed);
+                    expect(slow && 'failureMessage' in slow ? slow.failureMessage : '').toContain('this test timed out after 50ms');
+                    expect(result.tests.find(t => t.name.endsWith('ok'))?.status).toBe(TestStatus.Success);
+                }
+            });
+
+            it('TIMEOUT: names the timeout in the failure message when neither the console recap nor the inspector carries one', async () => {
+                mockProcessResult({ exitCode: 1, stdout: ' 0 pass\n 1 fail\nRan 1 test across 1 file. [87.00ms]\n' });
+                mockInspectorClient.getTests.mockReturnValue([
+                    { id: 1, name: 'slow', fullName: 'slow', type: 'test', status: 'timeout', elapsed: 50_855_026 },
+                ] as TestInfo[]);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([1]);
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                const result = await runner.dryRun();
+
+                expect(result.status).toBe(DryRunStatus.Complete);
+                if(result.status === DryRunStatus.Complete) {
+                    const slow = result.tests[0];
+                    expect(slow.status).toBe(TestStatus.Failed);
+                    expect(slow.status === TestStatus.Failed ? slow.failureMessage : '').toBe('Test timed out');
+                }
+            });
+
+            it('says "Test failed" for a failed test when neither the console recap nor the inspector carries a message', async () => {
+                mockProcessResult({ exitCode: 1, stdout: ' 0 pass\n 1 fail\nRan 1 test across 1 file. [87.00ms]\n' });
+                mockInspectorClient.getTests.mockReturnValue([
+                    { id: 1, name: 'bad', fullName: 'bad', type: 'test', status: 'fail' },
+                ] as TestInfo[]);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([1]);
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                const result = await runner.dryRun();
+
+                expect(result.status).toBe(DryRunStatus.Complete);
+                if(result.status === DryRunStatus.Complete) {
+                    const bad = result.tests[0];
+                    expect(bad.status === TestStatus.Failed ? bad.failureMessage : '').toBe('Test failed');
+                }
+            });
+
+            it('TIMEOUT: an inspector error message still wins over the generic timeout message', async () => {
+                mockProcessResult({ exitCode: 1, stdout: ' 0 pass\n 1 fail\nRan 1 test across 1 file. [87.00ms]\n' });
+                mockInspectorClient.getTests.mockReturnValue([
+                    { id: 1, name: 'slow', fullName: 'slow', type: 'test', status: 'timeout', error: { message: 'timed out after 50ms' } },
+                ] as TestInfo[]);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([1]);
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                const result = await runner.dryRun();
+
+                expect(result.status).toBe(DryRunStatus.Complete);
+                if(result.status === DryRunStatus.Complete) {
+                    const slow = result.tests[0];
+                    expect(slow.status === TestStatus.Failed ? slow.failureMessage : '').toBe('timed out after 50ms');
+                }
+            });
+
+            it('a started test with status "skipped_because_label" is built as Skipped (bun filtered it out by name)', async () => {
+                mockProcessResult({ exitCode: 0, stdout: ' 1 pass\n 3 filtered out\n 0 fail\nRan 1 test across 1 file. [5.00ms]\n' });
+                mockInspectorClient.getTests.mockReturnValue([
+                    { id: 1, name: 'a', fullName: 'a', type: 'test', status: 'pass' },
+                    { id: 2, name: 'b', fullName: 'b', type: 'test', status: 'skipped_because_label' },
+                ] as TestInfo[]);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([1, 2]);
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                const result = await runner.dryRun();
+
+                expect(result.status).toBe(DryRunStatus.Complete);
+                if(result.status === DryRunStatus.Complete) {
+                    expect(result.tests.find(t => t.name.endsWith('b'))?.status).toBe(TestStatus.Skipped);
                 }
             });
 
@@ -11041,11 +11135,12 @@ error: Third failure message
             expect(result.status).toBe(DryRunStatus.Complete);
         });
 
-        it('fails a green run whose console output carries no summary at all: nothing can vouch for the inspector\'s count', async () => {
+        it('fails a green run whose console output carries no summary at all, and says bun printed none (not that events were lost)', async () => {
             // bun 1.3.7 and 1.4.2 print their ' N pass' / ' N fail' summary with every
             // reporter (--reporter=junit needs --reporter-outfile and still prints it),
             // --dots and --only-failures, even when the count is 0. Its absence means the
-            // console output itself was lost.
+            // bun process left early (a test called process.exit) or the console output
+            // itself was lost.
             mockBunRun('');
             const hierarchy = healthyHierarchy(50);
             mockInspectorClient.getTests.mockReturnValue(hierarchy);
@@ -11057,8 +11152,56 @@ error: Third failure message
 
             expect(result).toEqual({
                 status:       DryRunStatus.Error,
-                errorMessage: gateError('bun\'s summary counts 0 passing test(s), but the Bun inspector reported 50: test events were lost or merged on the way from bun to the runner'),
+                errorMessage: gateError(
+                    'bun printed no test summary (no \' N pass\' or \' N fail\' lines): the test process most likely exited before it finished, '
+                    + 'for example because a test or hook called process.exit, or because it crashed, '
+                    + 'so the tests after that point never ran and their results and coverage are missing'
+                ),
             });
+        });
+
+        it('NO SUMMARY: a test that called process.exit (bun printed only its header and the file name) is reported as an early exit', async () => {
+            // Byte-shape of a bun 1.4.2 run whose second test calls process.exit(0): the header, the
+            // file name, and nothing else. Exit code 0; one test started and never ended.
+            mockRunBunTests.mockImplementation((options: { onInspectorReady?: (url: string) => void }) => {
+                options.onInspectorReady?.('ws://127.0.0.1:6499/inspector');
+                return Promise.resolve({ exitCode: 0, stdout: 'bun test v1.4.2 (744846f84)\n', stderr: '\nx.test.ts:\n', timedOut: false });
+            });
+            const hierarchy: TestInfo[] = [
+                ...healthyHierarchy(1),
+                { id: 2, name: 'exits', fullName: 'exits', type: 'test', url: '/project/tests/healthy.test.ts' },
+            ];
+            mockInspectorClient.getTests.mockReturnValue(hierarchy);
+            mockInspectorClient.getExecutionOrder.mockReturnValue([1, 2]);
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            const result = await runner.dryRun();
+
+            expect(result.status).toBe(DryRunStatus.Error);
+            if(result.status === DryRunStatus.Error) {
+                expect(result.errorMessage).toContain('bun printed no test summary');
+                expect(result.errorMessage).not.toContain('were lost');
+            }
+        });
+
+        it('UNKNOWN STATUS: fails the dry run loudly for an inspector status the runner does not know, instead of scoring the test as passed', async () => {
+            mockBunRun(' 2 pass\n 0 fail\nRan 2 tests across 1 file. [5.00ms]\n');
+            const hierarchy = [
+                ...healthyHierarchy(1),
+                { id: 2, name: 'b', fullName: 'b', type: 'test', status: 'quantum', url: '/project/tests/healthy.test.ts' },
+            ] as unknown as TestInfo[];
+            mockInspectorClient.getTests.mockReturnValue(hierarchy);
+            mockInspectorClient.getExecutionOrder.mockReturnValue([1, 2]);
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            const result = await runner.dryRun();
+
+            expect(result.status).toBe(DryRunStatus.Error);
+            if(result.status === DryRunStatus.Error) {
+                expect(result.errorMessage).toContain('1 test(s) ended with a status this runner does not recognise ("quantum")');
+            }
         });
 
         it('compares skipped and todo counts too: a lost skipped test fails the run', async () => {

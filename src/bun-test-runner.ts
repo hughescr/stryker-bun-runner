@@ -342,6 +342,11 @@ function buildTestNameIndex(
 // Stryker disable next-line Regex: version-coupled to bun's exact wording; see the doc comment above and mutantRun/checkRuntimeError's behavioral tests
 const ZERO_MATCH_TEST_PATTERN_RE = /matched 0 tests\./;
 
+/** What a failed test says when neither bun's console recap nor the inspector says why. */
+function defaultFailureMessage(testInfo: TestInfo): string {
+    return testInfo.status === 'timeout' ? 'Test timed out' : 'Test failed';
+}
+
 /**
  * Cap on how many failed-test entries formatInspectorFailureDetails lists
  * individually before collapsing the remainder into a "...and N more" line.
@@ -1367,8 +1372,7 @@ export class BunTestRunner implements TestRunner {
    */
     private buildFailureMessage(testInfo: TestInfo, parsed: ParsedTestResults): string {
         const parsedTest = parsed.tests.find(t => t.name.includes(testInfo.name));
-        // Stryker disable next-line StringLiteral: fallback error message has no behavioral impact
-        const baseFailureMessage = parsedTest?.failureMessage ?? testInfo.error?.message ?? 'Test failed';
+        const baseFailureMessage = parsedTest?.failureMessage ?? testInfo.error?.message ?? defaultFailureMessage(testInfo);
         const stack = testInfo.error?.stack;
         return stack && !baseFailureMessage.includes(stack)
             ? `${baseFailureMessage}\n${stack}`
@@ -1472,7 +1476,8 @@ export class BunTestRunner implements TestRunner {
 
             const startPosition = testInfo.line === undefined ? undefined : { line: testInfo.line, column: 0 };
 
-            if(status === 'fail') {
+            // A timed-out test is a failed one: bun counts it on its ' N fail' line.
+            if(status === 'fail' || status === 'timeout') {
                 return {
                     id:             uniqueName,
                     name:           uniqueName,
@@ -1484,7 +1489,7 @@ export class BunTestRunner implements TestRunner {
                 } satisfies FailedTestResult;
             }
 
-            if(status === 'skip' || status === 'todo') {
+            if(status === 'skip' || status === 'todo' || status === 'skipped_because_label') {
                 return {
                     id:          uniqueName,
                     name:        uniqueName,
@@ -2020,7 +2025,7 @@ export class BunTestRunner implements TestRunner {
         const facts: DryRunCompletenessFacts = {
             executionOrder,
             testHierarchy,
-            summary:               { passed: parsed.summaryPassed, skipped: parsed.summarySkipped, todo: parsed.summaryTodo },
+            summary:               { passed: parsed.summaryPassed, skipped: parsed.summarySkipped, todo: parsed.summaryTodo, printed: parsed.summaryPrinted },
             coverageKeys,
             coveredTestIds:        Object.keys(mutantCoverage?.perTest ?? {}),
             resultTestIds:         tests.map(t => t.id),

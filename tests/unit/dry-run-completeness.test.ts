@@ -29,7 +29,7 @@ function healthyFacts(): DryRunCompletenessFacts {
             // Filtered out by test.only: found, never started, never ended.
             testInfo(7, undefined),
         ],
-        summary:               { passed: 3, skipped: 1, todo: 1 },
+        summary:               { passed: 3, skipped: 1, todo: 1, printed: true },
         coverageKeys:          { keyCount: 5, unmatchedKeyCount: 0 },
         coveredTestIds:        ['a > t2', 'a > t3'],
         resultTestIds:         ['a > t2', 'a > t3', 'a > t4'],
@@ -83,6 +83,72 @@ describe('findDryRunDataLoss', () => {
             const facts = healthyFacts();
             facts.testHierarchy = [...facts.testHierarchy, { id: 8, name: 'd', fullName: 'd', type: 'describe', status: 'pass' }];
             expect(findDryRunDataLoss(facts)).toEqual([]);
+        });
+    });
+
+    describe('bun printed no summary at all', () => {
+        const NO_SUMMARY = 'bun printed no test summary (no \' N pass\' or \' N fail\' lines): the test process most likely exited before it finished, '
+          + 'for example because a test or hook called process.exit, or because it crashed, so the tests after that point never ran and their results and coverage are missing';
+
+        it('says so, and does not blame lost inspector events', () => {
+            // The shape of a test that calls process.exit: the inspector saw one test start and none end,
+            // and bun's summary counts are all 0 because there is no summary to count.
+            const facts: DryRunCompletenessFacts = {
+                executionOrder:        [1],
+                testHierarchy:         [testInfo(1, undefined), testInfo(2, undefined)],
+                summary:               { passed: 0, skipped: 0, todo: 0, printed: false },
+                coverageKeys:          { keyCount: 1, unmatchedKeyCount: 0 },
+                coveredTestIds:        [],
+                resultTestIds:         [],
+                duplicateFoundIdCount: 0,
+            };
+            expect(findDryRunDataLoss(facts)).toEqual([NO_SUMMARY]);
+        });
+
+        it('reports it as the only problem, since every other comparison is meaningless without a summary', () => {
+            const facts = healthyFacts();
+            facts.summary = { passed: 0, skipped: 0, todo: 0, printed: false };
+            facts.coverageKeys = { keyCount: 1, unmatchedKeyCount: 1 };
+            facts.duplicateFoundIdCount = 2;
+            expect(findDryRunDataLoss(facts)).toEqual([NO_SUMMARY]);
+        });
+
+        it('says nothing extra when the summary was printed', () => {
+            expect(findDryRunDataLoss(healthyFacts())).not.toContain(NO_SUMMARY);
+        });
+    });
+
+    describe('inspector end statuses', () => {
+        it.each(['pass', 'fail', 'timeout', 'skip', 'todo', 'skipped_because_label'] as const)('accepts the status %s bun can emit', (status) => {
+            const facts = healthyFacts();
+            // Extra tests with this status, kept out of the per-status count comparison below.
+            facts.testHierarchy = [...facts.testHierarchy, testInfo(20, status)];
+            const problems = findDryRunDataLoss(facts).filter(p => p.includes('does not recognise'));
+            expect(problems).toEqual([]);
+        });
+
+        it('reports a status the runner does not know, naming it and how many tests ended with it', () => {
+            const facts = healthyFacts();
+            facts.testHierarchy = [
+                ...facts.testHierarchy,
+                testInfo(20, 'flaky' as TestInfo['status']),
+                testInfo(21, 'flaky' as TestInfo['status']),
+                testInfo(22, 'exploded' as TestInfo['status']),
+            ];
+            expect(findDryRunDataLoss(facts)[0]).toBe(
+                '3 test(s) ended with a status this runner does not recognise ("flaky", "exploded"): '
+                + 'the Bun inspector protocol has changed, so their results cannot be trusted'
+            );
+        });
+
+        it('ignores a describe block with an unknown status, as it ignores every describe status', () => {
+            const facts = healthyFacts();
+            facts.testHierarchy = [...facts.testHierarchy, { id: 8, name: 'd', fullName: 'd', type: 'describe', status: 'flaky' as TestInfo['status'] }];
+            expect(findDryRunDataLoss(facts)).toEqual([]);
+        });
+
+        it('does not count a test with no status as unknown', () => {
+            expect(findDryRunDataLoss(healthyFacts())).toEqual([]);
         });
     });
 
@@ -199,7 +265,7 @@ describe('findDryRunDataLoss', () => {
         const facts: DryRunCompletenessFacts = {
             executionOrder:        [1],
             testHierarchy:         [testInfo(1, undefined), testInfo(2, 'pass', { parentId: 50 })],
-            summary:               { passed: 2, skipped: 0, todo: 0 },
+            summary:               { passed: 2, skipped: 0, todo: 0, printed: true },
             coverageKeys:          { keyCount: 2, unmatchedKeyCount: 1 },
             coveredTestIds:        ['ghost'],
             resultTestIds:         [],

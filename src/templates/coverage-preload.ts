@@ -321,7 +321,8 @@ if(shouldCollectCoverage) {
         const endedTestId: string | undefined = strykerGlobal.currentTestId;
         lastEndedTestId = endedTestId;
         if(endedTestId) {
-            const sepIdx = endedTestId.indexOf('@@');
+            // The LAST '@@': the file prefix may contain one itself (a directory such as tests/x@@y/).
+            const sepIdx = endedTestId.lastIndexOf('@@');
             lastFilePrefix = sepIdx === -1 ? endedTestId : endedTestId.slice(0, sepIdx);
         }
         // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-argument -- MutantCoverage from placeholder import

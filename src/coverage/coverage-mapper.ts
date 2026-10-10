@@ -230,10 +230,31 @@ export function restoreHitTotals(rawCoverage: MutantCoverage, mapped: MutantCove
 }
 
 /**
+ * Split a file-prefixed counter key ("relativeFile@@test-N") into its file and
+ * its 1-based position within that file.
+ *
+ * The key is split at its LAST "@@": the file may contain "@@" itself (a
+ * directory such as `tests/x@@y/`), but the counter after the separator never
+ * does. A key with no "@@" at all is all file, at position 0, and a counter
+ * that is not a number is position 0 too, so such a key resolves to no test.
+ */
+export function splitCounterKey(key: string): { filePrefix: string, position: number } {
+    const sepIdx = key.lastIndexOf('@@');
+    if(sepIdx === -1) {
+        return { filePrefix: key, position: 0 };
+    }
+    return {
+        filePrefix: key.slice(0, sepIdx),
+        position:   Number.parseInt(key.slice(sepIdx + '@@test-'.length), 10) || 0,
+    };
+}
+
+/**
  * Map file-prefixed counter keys ("relativeFile@@test-N") to full test names.
  *
  * For each key we:
- *  1. Split on "@@" to get `[filePrefix, "test-N"]`.
+ *  1. Split at the last "@@" (see {@link splitCounterKey}) to get
+ *     `[filePrefix, "test-N"]`.
  *  2. Find all inspector tests whose normalised URL matches `filePrefix`, in
  *     their execution order.
  *  3. Take the (N-1)th element as the test that produced coverage key N.
@@ -272,10 +293,7 @@ function pairKeysWithInspectorIds(
 
     // Stryker disable next-line UpdateOperator: i-- would cause infinite loop → Timeout
     for(let i = 0; i < pairCount; i++) {
-        const key = globallyOrderedPerTestKeys[i];
-        const sepIdx = key.indexOf('@@');
-        // Stryker disable next-line EqualityOperator,ConditionalExpression,UnaryOperator: malformed-key branch is unreachable in practice — resolveCounterKeys independently extracts filePrefix without a -1 guard, so a malformed key already fails lookup there regardless of which branch this takes; all three mutant forms produce identical end-to-end output
-        const filePrefix = sepIdx === -1 ? key : key.slice(0, sepIdx);
+        const { filePrefix } = splitCounterKey(globallyOrderedPerTestKeys[i]);
         pairs.push({ filePrefix, inspectorId: executionOrder[i] });
     }
 
@@ -331,10 +349,7 @@ function resolveCounterKeys(
     logger?: Pick<Logger, 'warn' | 'debug'>
 ): ResolvedCounterKey[] {
     return counterIds.map((key) => {
-        const sepIdx = key.indexOf('@@');
-        const filePrefix = key.slice(0, sepIdx);
-        const counterStr = key.slice(sepIdx + 2 + 'test-'.length); // skip "@@test-"
-        const n = Number.parseInt(counterStr, 10); // 1-based
+        const { filePrefix, position: n } = splitCounterKey(key); // n is 1-based
 
         const inspectorId = fileToInspectorIds.get(filePrefix)?.[n - 1];
         const testInfo = inspectorId === undefined ? undefined : testHierarchy.get(inspectorId);
@@ -578,9 +593,7 @@ function reportOrphanedKeys(
     if(orphanedKeyCount > 0) {
         const orphanedFiles = new Set<string>();
         for(const i of orphanedIndexes) {
-            const key = counterIds[i];
-            const sepIdx = key.indexOf('@@');
-            orphanedFiles.add(sepIdx === -1 ? key : key.slice(0, sepIdx));
+            orphanedFiles.add(splitCounterKey(counterIds[i]).filePrefix);
         }
         // Stryker disable StringLiteral: diagnostic logging message
         logger?.warn(
@@ -637,13 +650,8 @@ function mapFilePrefixedCounterKeys(
     // resolveCounterKeys extracts position N from "file@@test-N" and uses
     // fileIds[N-1] to look up the inspector ID.  The global positional pairing
     // already placed them in per-file order, so N-1 always lands on the correct inspector ID.
-    // Stryker disable StringLiteral,LogicalOperator,ArithmeticOperator: equivalent mutants — sort order doesn't affect correctness since resolveCounterKeys extracts position from key string directly; '??' fallback only fires for malformed keys not present in valid coverage files
-    const counterIds = globallyOrderedKeys.toSorted((a, b) => {
-        const nA = Number.parseInt(a.split('@@test-')[1] ?? '0', 10);
-        const nB = Number.parseInt(b.split('@@test-')[1] ?? '0', 10);
-        return nA - nB;
-    });
-    // Stryker restore StringLiteral,LogicalOperator,ArithmeticOperator
+    // Stryker disable next-line ArithmeticOperator: equivalent mutant — sort order doesn't affect correctness since resolveCounterKeys extracts position from key string directly
+    const counterIds = globallyOrderedKeys.toSorted((a, b) => splitCounterKey(a).position - splitCounterKey(b).position);
 
     const resolved = resolveCounterKeys(counterIds, fileToInspectorIds, testHierarchy, logger);
     const remappedPerTest = buildRemappedPerTest(counterIds, resolved, rawCoverage.perTest, testHierarchy);

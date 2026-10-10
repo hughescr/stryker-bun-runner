@@ -30,19 +30,31 @@
  *   other test.
  * - bun prints its summary lines (pass, skip, pending, fail counts) with every
  *   reporter, `--dots` and `--only-failures` included; the pass and fail lines
- *   even when their count is 0.
+ *   even when their count is 0. A run with no summary at all is one whose
+ *   process left early (a test called process.exit): the counts are then
+ *   meaningless, and that is the only problem reported.
+ * - A test that exceeds its timeout ends with the inspector status `timeout`
+ *   and is built as a failed test, so such a run never reaches these checks.
+ *   A status outside the six bun's protocol defines (see TEST_STATUSES) is
+ *   reported as a problem rather than scored.
  * A run with failing tests never reaches these checks (the caller skips them),
  * so hook failures, which bun counts as failures with no inspector events, do
  * not need a rule here.
  */
 
-import type { TestInfo } from './inspector/types.js';
+import { TEST_STATUSES, type TestInfo } from './inspector/types.js';
 
 /** bun's own console summary counts. */
 export interface BunSummaryCounts {
     passed:  number
     skipped: number
     todo:    number
+    /**
+   * Whether bun printed a summary at all. When it did not, the three counts
+   * above are 0 for lack of a summary, so they must not be compared with
+   * anything.
+   */
+    printed: boolean
 }
 
 /** Per-test coverage keys read from the dry run's coverage file. */
@@ -78,6 +90,25 @@ const STATUS_COUNTS = [
     { status: 'skip', label: 'skipped', summaryKey: 'skipped' },
     { status: 'todo', label: 'todo', summaryKey: 'todo' },
 ] as const;
+
+const NO_SUMMARY_PROBLEM
+    = 'bun printed no test summary (no \' N pass\' or \' N fail\' lines): the test process most likely exited before it finished, '
+      + 'for example because a test or hook called process.exit, or because it crashed, '
+      + 'so the tests after that point never ran and their results and coverage are missing';
+
+const KNOWN_STATUSES: ReadonlySet<string> = new Set(TEST_STATUSES);
+
+function checkStatuses(tests: readonly TestInfo[]): string[] {
+    const unknown = tests.flatMap(t => (t.status === undefined || KNOWN_STATUSES.has(t.status) ? [] : [t.status]));
+    if(unknown.length === 0) {
+        return [];
+    }
+    const names = [...new Set(unknown)].map(status => JSON.stringify(status)).join(', ');
+    return [
+        `${unknown.length} test(s) ended with a status this runner does not recognise (${names}): `
+        + 'the Bun inspector protocol has changed, so their results cannot be trusted',
+    ];
+}
 
 function compareStatusCounts(tests: readonly TestInfo[], summary: BunSummaryCounts): string[] {
     const problems: string[] = [];
@@ -164,8 +195,15 @@ function checkFoundEvents(testHierarchy: readonly TestInfo[], duplicateFoundIdCo
  * Empty when everything is accounted for.
  */
 export function findDryRunDataLoss(facts: DryRunCompletenessFacts): string[] {
+    // Without a summary there is nothing to compare the other records with, and what
+    // they show (tests that started and never ended, coverage keys missing) is the
+    // expected trace of a process that left early, not of lost events.
+    if(!facts.summary.printed) {
+        return [NO_SUMMARY_PROBLEM];
+    }
     const tests = facts.testHierarchy.filter(t => t.type === 'test');
     return [
+        ...checkStatuses(tests),
         ...compareStatusCounts(tests, facts.summary),
         ...compareStartsAndEnds(tests, facts.executionOrder),
         ...(facts.coverageKeys ? compareCoverageKeys(facts.coverageKeys, facts.executionOrder.length) : []),

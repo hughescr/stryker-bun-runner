@@ -23,13 +23,16 @@ export interface ParsedTestResults {
     skipped:        number
     duration?:      number
     /**
-   * The summary* counts are sourced EXCLUSIVELY from bun's ' N pass' /
-   * ' N fail' / ' N skip' and pending-count summary lines (plus the 'Bailed
-   * out after N failures' bail variant), read with colour codes stripped — never from per-line ✓/✗ matches, and never
-   * from the 'Ran N tests' fallback that {@link parseSummaryLines} uses to
-   * backfill `passed`/`failed`/`skipped` below ('Ran N tests' counts every
-   * status at once). Each is 0 when its line is absent; bun prints the pass
-   * and fail lines on every run, even when their count is 0.
+   * The summary* counts are sourced EXCLUSIVELY from bun's own summary block:
+   * its ' N pass' / ' N fail' / ' N skip' / pending-count / ' N error' lines
+   * (plus the 'Bailed out after N failures' bail variant), read with colour
+   * codes stripped — never from per-line ✓/✗ matches, never from a line of a
+   * test's own console output that merely looks like a summary line (see
+   * {@link readBunSummary} for how the block is located), and never from the
+   * 'Ran N tests' fallback that {@link parseSummaryLines} uses to backfill
+   * `passed`/`failed`/`skipped` below ('Ran N tests' counts every status at
+   * once). Each is 0 when its line is absent; bun prints the pass and fail
+   * lines on every run, even when their count is 0.
    * Unlike `passed`/`failed`/`skipped` above (which are `Math.max(perLine,
    * summary)`), these are summary-only so that per-ATTEMPT output from
    * retried tests (bun prints one error block per failed retry attempt, but
@@ -50,6 +53,15 @@ export interface ParsedTestResults {
    * (a describe body that throws even reports ' 0 fail'). 0 when absent.
    */
     summaryErrors:  number
+    /**
+   * Whether bun got as far as printing its summary: the output holds a
+   * 'Ran N tests' line or a ' N pass' line. False when it holds neither, which
+   * on a run that was not killed from outside means the bun process left
+   * early (a test or hook called process.exit, or the process crashed) and
+   * every summary* count above is 0 for lack of a summary rather than because
+   * nothing happened.
+   */
+    summaryPrinted: boolean
 }
 
 /**
@@ -267,6 +279,9 @@ interface SummaryCounts {
     failed:        number
     skipped:       number
     todo:          number
+    errors:        number
+    /** Whether bun got as far as printing its summary — see {@link ParsedTestResults.summaryPrinted}. */
+    printed:       boolean
     /**
    * `passed`/`failed` as populated ONLY by genuine ' N pass' / ' N fail' (and
    * 'Bailed out after N failures') summary lines — never by the 'Ran N tests'
@@ -277,55 +292,141 @@ interface SummaryCounts {
     genuineFailed: number
 }
 
+/** `Ran 4 tests across 1 file. [7.00ms]` (`Ran 1 test across…` for one): bun's last summary line. */
+const RAN_LINE = /^\s*Ran\s+(\d+)\s+tests?\b/;
+/** The first line of bun's summary block. It is printed on every run that reaches the summary, even with a count of 0. */
+const PASS_LINE = /^\s*\d+\s+pass\s*$/;
+/** One count line of the summary block: the pass, skip, pending-test, fail and error(s) counts, e.g. ` 2 pass` or ` 2 errors`. */
+const COUNT_LINE = /^\s*(\d+)\s+(pass|skip|todo|fail|errors?)\s*$/;
+/** `Bailed out after 1 failure`: printed after the Ran line when --bail stops the run. */
+const BAIL_LINE = /^\s*Bailed out after (\d+) failures?\s*$/;
+
 /**
- * The count captured by the LAST match of `pattern` (capture group 1) in
- * `text`, or `undefined` when nothing matches. `pattern` must carry the `g`
- * flag.
- *
- * Bun prints its summary after everything else, so when a test's own console
- * output contains a line shaped like a summary line (` 3 pass`, `0 errors`,
- * `Ran 9 tests`), the last match is the real one. Every summary count shares
- * this helper so that none of them can drift back to first-match.
+ * The last line at or before index `from` that matches `pattern`, with its
+ * index, or `undefined`. With `stopAtBlank` the search gives up at the first
+ * blank line it reaches.
  */
-function lastCount(text: string, pattern: RegExp): number | undefined {
-    const last = [...text.matchAll(pattern)].at(-1);
-    return last ? Number.parseInt(last[1], 10) : undefined;
+function lastLineMatching(
+    lines: readonly string[],
+    from: number,
+    pattern: RegExp,
+    stopAtBlank: boolean
+): { index: number, match: RegExpExecArray } | undefined {
+    for(let index = from; index >= 0; index--) {
+        const match = pattern.exec(lines[index]);
+        if(match) {
+            return { index, match };
+        }
+        if(stopAtBlank && !lines[index].trim()) {
+            return undefined;
+        }
+    }
+    return undefined;
+}
+
+type CountWord = 'pass' | 'skip' | 'todo' | 'fail' | 'error';
+
+/**
+ * The counts of bun's own summary block, with 0 for every line it did not
+ * print (bun prints the skip, pending-test and error lines only when their
+ * count is not 0).
+ */
+interface BunSummary extends Record<CountWord, number> {
+    /** The `N` of the `Ran N tests` line, when there is one. */
+    ran:     number | undefined
+    /** The `N` of the `Bailed out after N failures` line, when there is one. */
+    bailed:  number | undefined
+    /** Whether the output holds a `Ran N tests` line or a ` N pass` line. */
+    printed: boolean
+}
+
+/**
+ * Read bun's summary block out of the run's output. Everything a summary count
+ * is taken from comes through here, and ONLY from the block itself.
+ *
+ * A test's own console output shares the stream and can print lines shaped
+ * exactly like summary lines (a whole line of ` 3 skip`, ` 3 pass`, ` 3 fail`
+ * or ` 3 errors`, a pending-test count, or `Ran 9 tests`). Reading counts
+ * anywhere in the output would let a test fake them (a test logging a pending
+ * count made the dry run fail on every run); bun prints its summary after
+ * everything a test can log, so the block is located from the end. Bun 1.3.7,
+ * 1.3.14 and 1.4.2 all print, with every reporter and with or without colour
+ * (`--dots` drops the leading space):
+ *
+ * ```
+ *  2 pass            <- always printed; the first line of the block
+ *  1 skip            <- only when not 0
+ *  1 (pending)       <- the pending-test count, only when not 0
+ *  0 fail            <- always printed
+ *  1 error           <- only when not 0
+ *  1 expect() calls  <- (and "N filtered out", "snapshots: …" lines, in places)
+ * Ran 4 tests across 1 file. [7.00ms]
+ * Bailed out after 1 failure   <- only when --bail stopped the run; no counts then
+ * ```
+ *
+ * So the block runs from the ` N pass` line nearest above the LAST `Ran N tests`
+ * line (the search gives up at a blank line, so it cannot wander into the
+ * test output of a --bail run, which prints no counts) to the Ran line.
+ * Lines after the Ran line are not counted, except the bail line. A run with no
+ * Ran line (cut off before the summary; older tests' fixtures) uses the last
+ * ` N pass` line to the end of the output instead, and a run with neither has
+ * no summary at all: every count is 0 and `printed` is false.
+ *
+ * Within the block each line must be a WHOLE count line, so a failure message
+ * such as "expected 2 errors" cannot be mistaken for one. ANSI codes are
+ * stripped first: under FORCE_COLOR the colour code sits before the leading
+ * space of the pass and fail lines but between the space and the digit of the
+ * others.
+ */
+function readBunSummary(output: string): BunSummary {
+    const lines = stripAnsi(output).split('\n');
+    const lastIndex = lines.length - 1;
+
+    const ran = lastLineMatching(lines, lastIndex, RAN_LINE, false);
+    const pass = ran
+        ? lastLineMatching(lines, ran.index - 1, PASS_LINE, true)
+        : lastLineMatching(lines, lastIndex, PASS_LINE, false);
+
+    const summary: BunSummary = {
+        pass:    0,
+        skip:    0,
+        todo:    0,
+        fail:    0,
+        error:   0,
+        ran:     ran && Number.parseInt(ran.match[1], 10),
+        bailed:  undefined,
+        printed: ran !== undefined || pass !== undefined,
+    };
+
+    if(pass) {
+        for(const line of lines.slice(pass.index, ran?.index ?? lines.length)) {
+            const match = COUNT_LINE.exec(line);
+            if(match) {
+                summary[match[2] === 'errors' ? 'error' : match[2] as CountWord] = Number.parseInt(match[1], 10);
+            }
+        }
+    }
+
+    for(const line of lines.slice(ran?.index ?? 0)) {
+        const match = BAIL_LINE.exec(line);
+        if(match) {
+            summary.bailed = Number.parseInt(match[1], 10);
+        }
+    }
+
+    return summary;
 }
 
 /**
  * Parse summary lines from output
  */
 function parseSummaryLines(output: string): SummaryCounts {
-    const counts = { passed: 0, failed: 0, skipped: 0 };
+    const bun = readBunSummary(output);
+    const counts = { passed: bun.pass, failed: bun.fail, skipped: bun.skip };
 
-    // Match summary lines with flexible whitespace handling
-    // Bun outputs lines like: " 2840 pass" or " 10 fail"
     // Or in bail mode: "Bailed out after 1 failure"
-    // Stryker disable next-line Regex: word boundaries are defensive for summary parsing
-    const passSummary = lastCount(output, /\s(\d+)\s+pass\b/g);
-    // Stryker disable next-line Regex: word boundaries are defensive for summary parsing
-    const failSummary = lastCount(output, /\s(\d+)\s+fail\b/g);
-    // Stryker disable next-line Regex: word boundaries are defensive for summary parsing
-    const skipSummary = lastCount(output, /\s(\d+)\s+skip\b/g);
-    // bun counts pending tests on a line of their own, apart from skipped ones.
-    const todoSummary = lastCount(output, /\s(\d+) todo\b/g) ?? 0;
-    // Stryker disable next-line Regex: character classes are defensive for optional plural
-    const bailSummary = lastCount(output, /Bailed out after (\d+) failures?/g);
-
-    if(passSummary !== undefined) {
-        counts.passed = passSummary;
-    }
-
-    if(failSummary !== undefined) {
-        counts.failed = failSummary;
-    }
-
-    if(skipSummary !== undefined) {
-        counts.skipped = skipSummary;
-    }
-
-    if(bailSummary !== undefined) {
-        counts.failed = Math.max(counts.failed, bailSummary);
+    if(bun.bailed !== undefined) {
+        counts.failed = Math.max(counts.failed, bun.bailed);
     }
 
     // Snapshot the genuine-only counts NOW, before the 'Ran N tests' fallback below can
@@ -335,37 +436,17 @@ function parseSummaryLines(output: string): SummaryCounts {
     const genuineFailed = counts.failed;
 
     // Also try to parse from "Ran N tests" line as ultimate fallback
-    // Stryker disable next-line Regex: character classes are defensive for optional plural
-    const totalFromRan = lastCount(output, /Ran\s+(\d+)\s+tests?/g);
-    if(totalFromRan !== undefined) {
+    if(bun.ran !== undefined) {
         // Use this as source of truth for total, and derive passed if needed
         // Stryker disable next-line ArithmeticOperator: condition requires passed=0 and failed=0, making arithmetic mutations equivalent
         const totalParsed = counts.passed + counts.failed + counts.skipped;
-        if(totalParsed !== totalFromRan && counts.passed === 0 && counts.failed === 0) {
+        if(totalParsed !== bun.ran && counts.passed === 0 && counts.failed === 0) {
             // No individual counts parsed, assume all passed
-            counts.passed = totalFromRan;
+            counts.passed = bun.ran;
         }
     }
 
-    return { ...counts, todo: todoSummary, genuinePassed, genuineFailed };
-}
-
-/**
- * Read bun's ' N error(s)' summary line — see {@link ParsedTestResults.summaryErrors}.
- *
- * Matched only as a WHOLE line (optional indentation, the count, the word,
- * nothing else) so failure-message prose such as "expected 2 errors" can never
- * be mistaken for it. ANSI codes are stripped first: under FORCE_COLOR bun
- * emits ' \x1B[0m\x1B[31m1 error\x1B[0m', putting the colour code between the
- * leading space and the digit (unlike its ' N pass' / ' N fail' lines, whose
- * colour code precedes the space).
- *
- * The LAST matching line wins: bun prints its summary after everything else, so
- * a test that logs a whole line like `0 errors` earlier in the output must not
- * mask (or fake) the real count.
- */
-function parseSummaryErrors(output: string): number {
-    return lastCount(stripAnsi(output), /^[\t ]*(\d+)[\t ]+errors?[\t ]*$/gm) ?? 0;
+    return { ...counts, todo: bun.todo, errors: bun.error, printed: bun.printed, genuinePassed, genuineFailed };
 }
 
 /**
@@ -450,11 +531,9 @@ export function parseBunTestOutput(stdout: string, stderr: string, testFiles?: r
     // collectingError is true.
     finalizeErrorMessage(currentTest, errorLines);
 
-    // Parse summary lines and use them as fallback for counts
-    // Without colour codes: under FORCE_COLOR bun puts them between the leading
-    // space and the count of its skip and pending lines, and with --dots there is no
-    // leading space at all, only the colour code.
-    const summaryCounts = parseSummaryLines(stripAnsi(output));
+    // Parse summary lines and use them as fallback for counts. Only bun's own summary
+    // block counts (see readBunSummary), read without colour codes.
+    const summaryCounts = parseSummaryLines(output);
     counters.passed = Math.max(counters.passed, summaryCounts.passed);
     counters.failed = Math.max(counters.failed, summaryCounts.failed);
     counters.skipped = Math.max(counters.skipped, summaryCounts.skipped);
@@ -469,6 +548,7 @@ export function parseBunTestOutput(stdout: string, stderr: string, testFiles?: r
         summaryFailed:  summaryCounts.genuineFailed,
         summarySkipped: summaryCounts.skipped,
         summaryTodo:    summaryCounts.todo,
-        summaryErrors:  parseSummaryErrors(output)
+        summaryErrors:  summaryCounts.errors,
+        summaryPrinted: summaryCounts.printed
     };
 }

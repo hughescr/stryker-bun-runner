@@ -498,6 +498,8 @@ the coverage it collected before handing it to Stryker:
   | `<N> TestReporter.found event(s) reused a test id already seen` | a test merged into another under one id | bun's `TestReporter` id collision |
   | `<N> test(s) or describe block(s) name a parent describe block whose TestReporter.found event never arrived` | the describe path of those tests' names, which mutant runs need to select them | a lost `TestReporter.found` event |
   | `bun's console summary reported <N> failing test(s), but none of them could be attributed to an individual test` | every failure in the run | a spec file that fails to load (the message includes the end of stderr) |
+  | `bun printed no test summary (no ' N pass' or ' N fail' lines): the test process most likely exited before it finished` | every test after the point where the process left, and their coverage. This is the only problem listed when it applies, since every other comparison needs the summary | a test or hook called `process.exit`, or the process crashed |
+  | `<N> test(s) ended with a status this runner does not recognise (...)` | those tests' results | a bun release whose inspector protocol reports a test status this runner does not know: please report it |
 
   When the inspector socket also closed before the runner expected it, the message
   adds that as context; on its own it is routine (bun closes the socket a few
@@ -520,7 +522,12 @@ the coverage it collected before handing it to Stryker:
   `describe.each` rows, duplicate titles, `test.failing`, `test.concurrent`, tests
   defined in a shared helper module, `--randomize`, `--isolate`, `--dots`,
   `--only-failures`, `--reporter=junit` and `FORCE_COLOR` (whose colour codes the
-  runner strips before reading the summary) all complete normally. Coverage
+  runner strips before reading the summary) all complete normally. The runner
+  reads the counts only from bun's own summary block (the lines from ` N pass`
+  to `Ran N tests across N files`), so a test that logs a line that looks like a
+  summary line, such as ` 3 skip` or `Ran 9 tests`, cannot change them. A test
+  that exceeds its timeout ends with the inspector status `timeout`, which bun
+  counts as a failure, and the dry run reports it as a failed test. Coverage
   recorded while no test is running (module load, `beforeAll`, or between tests)
   goes to Stryker's static coverage, which runs every test for that mutant, so it
   is never lost; recording between tests is reported by the coverage-bleed warning
