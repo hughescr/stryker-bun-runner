@@ -87,8 +87,10 @@ export class SyncServer {
    * Clients whose 'drain-request' arrived before {@link setDrainHandler} was
    * called. They are served as soon as a handler is registered: dropping such a
    * request would leave the child waiting for a 'drained' that never comes.
+   * A Set, so a client that repeats its request is queued once; a client that
+   * closes is removed, since there is no one left to answer.
    */
-    private pendingDrainClients: WebSocket[] = [];
+    private pendingDrainClients = new Set<WebSocket>();
 
     constructor(options: SyncServerOptions) {
         this.port = options.port;
@@ -140,6 +142,7 @@ export class SyncServer {
 
                     ws.on('close', () => {
                         this.clients.delete(ws);
+                        this.pendingDrainClients.delete(ws);
                     });
 
                     // Only one inbound message type is understood: 'drain-request' (see
@@ -207,7 +210,7 @@ export class SyncServer {
     setDrainHandler(handler: () => Promise<void>): void {
         this.drainHandler = handler;
         const pending = this.pendingDrainClients;
-        this.pendingDrainClients = [];
+        this.pendingDrainClients = new Set();
         for(const ws of pending) {
             this.handleDrainRequest(ws);
         }
@@ -222,7 +225,7 @@ export class SyncServer {
    */
     private handleDrainRequest(ws: WebSocket): void {
         if(!this.drainHandler) {
-            this.pendingDrainClients.push(ws);
+            this.pendingDrainClients.add(ws);
             return;
         }
 
@@ -256,7 +259,7 @@ export class SyncServer {
         this.readyLatched = false;
         this.drainHandler = null;
         this.drainInFlight = null;
-        this.pendingDrainClients = [];
+        this.pendingDrainClients = new Set();
 
         // Close all client connections
         for(const client of this.clients) {

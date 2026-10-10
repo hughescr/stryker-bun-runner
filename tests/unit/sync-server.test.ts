@@ -601,6 +601,73 @@ describe('SyncServer', () => {
             expect(client.send).toHaveBeenCalledTimes(1);
         });
 
+        it('queues a client once however often it repeats drain-request before the handler exists', async () => {
+            const server = createServer();
+            await server.start();
+
+            const client = createMockClient(1);
+            const messageHandler = captureHandler(client, 'message');
+            mockWss.triggerConnection(client);
+            messageHandler(Buffer.from('drain-request'));
+            messageHandler(Buffer.from('drain-request'));
+            messageHandler(Buffer.from('drain-request'));
+
+            server.setDrainHandler(mock(() => Promise.resolve()));
+            await Promise.resolve();
+            await Promise.resolve();
+            await Promise.resolve();
+
+            expect(client.send.mock.calls).toEqual([['drained']]);
+        });
+
+        it('drops a queued client when it closes, so the handler is not even invoked for it', async () => {
+            const server = createServer();
+            await server.start();
+
+            const client = createMockClient(1);
+            const handlers = new Map<string, (...args: unknown[]) => void>();
+            client.on = mock((event: string, handler: (...args: unknown[]) => void) => {
+                handlers.set(event, handler);
+            });
+            mockWss.triggerConnection(client);
+            handlers.get('message')?.(Buffer.from('drain-request'));
+            handlers.get('close')?.();
+
+            const drainHandler = mock(() => Promise.resolve());
+            server.setDrainHandler(drainHandler);
+            await Promise.resolve();
+            await Promise.resolve();
+
+            expect(drainHandler).not.toHaveBeenCalled();
+            expect(client.send).not.toHaveBeenCalled();
+        });
+
+        it('keeps other queued clients when one of them closes', async () => {
+            const server = createServer();
+            await server.start();
+
+            const leaving = createMockClient(1);
+            const leavingHandlers = new Map<string, (...args: unknown[]) => void>();
+            leaving.on = mock((event: string, handler: (...args: unknown[]) => void) => {
+                leavingHandlers.set(event, handler);
+            });
+            mockWss.triggerConnection(leaving);
+            const staying = createMockClient(1);
+            const stayingMessage = captureHandler(staying, 'message');
+            mockWss.triggerConnection(staying);
+            leavingHandlers.get('message')?.(Buffer.from('drain-request'));
+            stayingMessage(Buffer.from('drain-request'));
+            leavingHandlers.get('close')?.();
+
+            server.setDrainHandler(mock(() => Promise.resolve()));
+            await Promise.resolve();
+            await Promise.resolve();
+            await Promise.resolve();
+
+            expect(staying.send).toHaveBeenCalledWith('drained');
+            expect(leaving.send).not.toHaveBeenCalled();
+        });
+
         it('does not invoke a handler on registration when no request is queued, including on re-registration', async () => {
             const server = createServer();
             await server.start();
@@ -1004,19 +1071,11 @@ describe('SyncServer', () => {
 
 describe('preload sync dial address', () => {
     it('dials the literal loopback address the server binds (127.0.0.1), not "localhost"', async () => {
+        // The preload dials through awaitRunnerReady in preload-logic; the template itself dials nothing.
         const template = await Bun.file(new URL('../../src/templates/coverage-preload.ts', import.meta.url)).text();
-        expect(template).not.toContain('ws://localhost:');
-        expect(template.match(/ws:\/\/127\.0\.0\.1:\$\{syncPort\}\/sync/g)).toHaveLength(1);
-    });
-
-    it('waits for ready through waitForSyncReady, with no timer that could let the tests start first', async () => {
-        // The preload used to give up on 'ready' after a fixed 2 s and run the tests
-        // unobserved. waitForSyncReady's own tests pin that it has no deadline; this
-        // pins that the template's sync section uses it and arms no timer of its own.
-        const template = await Bun.file(new URL('../../src/templates/coverage-preload.ts', import.meta.url)).text();
-        const syncSection = template.slice(template.indexOf('Section 1: WebSocket Sync'), template.indexOf('Section 2:'));
-        expect(syncSection).toContain('await waitForSyncReady(');
-        expect(syncSection).not.toContain('setTimeout(');
-        expect(syncSection).not.toContain('setInterval(');
+        const preloadLogic = await Bun.file(new URL('../../src/coverage/preload-logic.ts', import.meta.url)).text();
+        expect(template).not.toContain('ws://');
+        expect(preloadLogic).not.toContain('ws://localhost:');
+        expect(preloadLogic.match(/ws:\/\/127\.0\.0\.1:\$\{syncPort\}\/sync/g)).toHaveLength(1);
     });
 });
