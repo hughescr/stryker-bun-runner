@@ -54,6 +54,22 @@ async function tryStat(p: string): Promise<Awaited<ReturnType<typeof fsPromises.
     }
 }
 
+// Directory names that conventionally hold compiled output. Bun walks them, so
+// a project whose tsc emits `dist/**/*.test.js` has those copies discovered.
+const BUILD_OUTPUT_DIR_NAMES = new Set(['dist', 'build']);
+
+/**
+ * The files among `relativeFiles` that live below a `dist` or `build`
+ * directory (any depth, case-insensitive; a file merely NAMED dist/build does
+ * not count). Used to warn that bun-parity discovery picked up compiled copies
+ * of the tests.
+ *
+ * @param relativeFiles - Paths relative to the project directory, as returned by {@link discoverTestFiles}
+ */
+export function findBuildOutputTestFiles(relativeFiles: readonly string[]): string[] {
+    return relativeFiles.filter(file => file.split('/').slice(0, -1).some(seg => BUILD_OUTPUT_DIR_NAMES.has(seg.toLowerCase())));
+}
+
 interface WalkContext {
     cwd:              string
     results:          string[]

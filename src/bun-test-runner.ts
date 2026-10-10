@@ -39,7 +39,7 @@ import type { TestInfo } from './inspector/types.js';
 import type { StrykerBunOptions } from './options.js';
 import { parseBunTestOutput, type ParsedTestResults } from './parsers/console-parser.js';
 import { runBunTests, stripAnsi } from './process-runner.js';
-import { assertSupportedBunArgs, checkBunVersion, getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, discoverTestFiles, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery } from './utils/index.js';
+import { assertSupportedBunArgs, checkBunVersion, getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, discoverTestFiles, findBuildOutputTestFiles, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery } from './utils/index.js';
 
 /**
  * Sleep for the given number of milliseconds.
@@ -450,6 +450,8 @@ export class BunTestRunner implements TestRunner {
     private testNameIndex?:               Map<string, string>;
     private cachedTestFiles?:             string[];
     private cachedTestFilesCwd?:          string;
+    /** True once the dist/build-discovery warning has been logged; it is shown once per runner. */
+    private warnedBuildOutputTests = false;
     private cachedEagerModules?:          string[];
     private cachedEagerModulesCwd?:       string;
     private lastRegistryTmpPath?:         string;
@@ -664,7 +666,37 @@ export class BunTestRunner implements TestRunner {
         }
         this.cachedTestFiles = await discoverTestFiles(cwd, this.logger);
         this.cachedTestFilesCwd = cwd;
+        this.warnAboutBuildOutputTests(this.cachedTestFiles);
         return this.cachedTestFiles;
+    }
+
+    /**
+   * Warn, once per runner, when auto-discovery picked up test files below a
+   * `dist` or `build` directory. Bun searches those directories too, so a
+   * project whose tsc emits `dist/**\/*.test.js` gets the compiled copies run
+   * as well: slower, and a stale compiled test can fail the dry run. Parity
+   * with `bun test` is kept on purpose; the warning names the ways out.
+   */
+    private warnAboutBuildOutputTests(discovered: readonly string[] | undefined): void {
+        if(this.warnedBuildOutputTests || !discovered) {
+            return;
+        }
+        const buildOutput = findBuildOutputTestFiles(discovered);
+        if(buildOutput.length === 0) {
+            return;
+        }
+        this.warnedBuildOutputTests = true;
+        const sample = buildOutput.slice(0, 3).join(', ');
+        // Stryker disable StringLiteral,MethodExpression,ConditionalExpression,EqualityOperator: diagnostic warn — the sample cap and ellipsis only shape log output; when it fires, and the count, are behaviorally tested
+        this.logger.warn(
+            'Test discovery found %d test file(s) under a "dist" or "build" directory (e.g. %s%s); bun searches those directories too, so compiled copies of your tests will run '
+            + '(slower, and a stale compiled test can fail the dry run). To exclude them set [test].root or [test].pathIgnorePatterns in bunfig.toml, '
+            + 'or list the tests to run in bun.testFiles. This warning is shown once.',
+            buildOutput.length,
+            sample,
+            buildOutput.length > 3 ? ', …' : ''
+        );
+        // Stryker restore StringLiteral,MethodExpression,ConditionalExpression,EqualityOperator
     }
 
     /**

@@ -113,6 +113,12 @@ Unless `bun.testFiles` is set, the runner finds test files itself and hands bun 
 - `node_modules` and dot-directories (`.git`, `.stryker-tmp`, …) are skipped; other directories such as `dist` and `build` are searched.
 - `[test].root` from your `bunfig.toml` is respected: the search starts there (resolved against the project directory), so test files outside `root` are not run. Bun ignores `root` for files passed on the command line, which is why the runner applies it itself. `pathIgnorePatterns` is applied by bun even to explicitly listed files, so it keeps working.
 
+Because `dist` and `build` are searched, a project whose TypeScript build emits compiled tests (for example `dist/**/*.test.js`) gets those copies run as well. That is slower, and a stale compiled test can fail the dry run. The runner keeps parity with `bun test` and logs a one-time warning when auto-discovery finds any test file below a `dist` or `build` directory. To leave them out, do one of:
+
+- set `[test].root` in `bunfig.toml` to your source/test directory (e.g. `root = "./tests"`),
+- add the build directory to `[test].pathIgnorePatterns` in `bunfig.toml` (e.g. `pathIgnorePatterns = ["dist/**"]`),
+- or list the tests to run in `bun.testFiles`.
+
 To run something else, set `bun.testFiles`.
 
 ### Example with all options

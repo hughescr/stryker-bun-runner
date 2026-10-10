@@ -5,7 +5,7 @@
 import { mkdtemp, rm, mkdir, writeFile, symlink } from 'node:fs/promises';
 import path from 'node:path';
 import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
-import { discoverTestFiles } from '../../src/utils/test-file-discovery.js';
+import { discoverTestFiles, findBuildOutputTestFiles } from '../../src/utils/test-file-discovery.js';
 
 describe('discoverTestFiles (symlink handling)', () => {
     let tmpDir: string;
@@ -476,6 +476,47 @@ describe('discoverTestFiles (matches bun discovery rules)', () => {
         await writeFile(path.join(tmpDir, 'ok.test.ts'), '');
         const result = await discoverTestFiles(tmpDir);
         expect(result).toEqual(['ok.test.ts']);
+    });
+});
+
+// ── build-output directories ────────────────────────────────────────────────
+// Bun walks `dist` and `build`, so compiled copies of the tests (tsc output)
+// are discovered. findBuildOutputTestFiles lets the runner warn about that.
+
+describe('findBuildOutputTestFiles', () => {
+    it('returns the files that have a dist or build directory segment', () => {
+        const files = [
+            'build/a.test.js',
+            'dist/b.test.js',
+            'packages/x/dist/c.spec.js',
+            'src/d.test.ts',
+            'tests/e.test.ts',
+            'tests/build/f.test.ts',
+        ];
+        expect(findBuildOutputTestFiles(files)).toEqual([
+            'build/a.test.js',
+            'dist/b.test.js',
+            'packages/x/dist/c.spec.js',
+            'tests/build/f.test.ts',
+        ]);
+    });
+
+    it('matches the directory names case-insensitively', () => {
+        expect(findBuildOutputTestFiles(['Dist/a.test.js', 'BUILD/b.test.js'])).toEqual(['Dist/a.test.js', 'BUILD/b.test.js']);
+    });
+
+    it('does not match a file whose own name is dist or build, or a longer directory name', () => {
+        expect(findBuildOutputTestFiles([
+            'src/dist.test.ts',
+            'src/build.test.ts',
+            'distribution/a.test.ts',
+            'rebuild/b.test.ts',
+            'src/build-tools/c.test.ts',
+        ])).toEqual([]);
+    });
+
+    it('returns an empty list for no files', () => {
+        expect(findBuildOutputTestFiles([])).toEqual([]);
     });
 });
 

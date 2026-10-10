@@ -3395,6 +3395,73 @@ tests/example.test.ts:
                 );
             });
 
+            describe('warning about tests discovered under dist/ or build/', () => {
+                const buildOutputWarnings = (): unknown[][] =>
+                    (mockLogger.warn as ReturnType<typeof mock>).mock.calls.filter(call => String(call[0]).includes('"dist" or "build"'));
+
+                it('warns once at init, naming the files and every remedy', async () => {
+                    discoverTestFilesSpy.mockResolvedValue(['dist/a.test.js', 'src/b.test.ts', 'build/c.spec.js']);
+                    const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                    mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+
+                    await runner.init();
+
+                    const warnings = buildOutputWarnings();
+                    expect(warnings).toHaveLength(1);
+                    const [format, ...rest] = warnings[0];
+                    const message = String(format);
+                    expect(message).toContain('[test].root');
+                    expect(message).toContain('[test].pathIgnorePatterns');
+                    expect(message).toContain('bun.testFiles');
+                    // Names how many files and which ones.
+                    expect(rest).toContain(2);
+                    expect(rest.join(' ')).toContain('dist/a.test.js');
+                    expect(rest.join(' ')).toContain('build/c.spec.js');
+                    expect(rest.join(' ')).not.toContain('src/b.test.ts');
+                });
+
+                it('does not warn again on re-init or when the working directory changes and discovery repeats', async () => {
+                    discoverTestFilesSpy.mockResolvedValue(['dist/a.test.js']);
+                    let cwd = '/first/cwd';
+                    const cwdSpy = spyOn(process, 'cwd').mockImplementation(() => cwd);
+                    try {
+                        const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                        mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+                        await runner.init();
+                        cwd = '/second/cwd';
+                        await runner.init();
+                        expect(discoverTestFilesSpy).toHaveBeenCalledTimes(2);
+                        expect(buildOutputWarnings()).toHaveLength(1);
+                    } finally {
+                        cwdSpy.mockRestore();
+                    }
+                });
+
+                it('does not warn when nothing was discovered under dist/ or build/', async () => {
+                    const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                    mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+                    await runner.init();
+                    expect(buildOutputWarnings()).toHaveLength(0);
+                });
+
+                it('does not warn when bun.testFiles is set explicitly', async () => {
+                    const runner = new BunTestRunner(mockLogger, {
+                        bun: { testFiles: ['dist/a.test.js'] },
+                    } as unknown as StrykerOptions);
+                    mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+                    await runner.init();
+                    expect(buildOutputWarnings()).toHaveLength(0);
+                });
+
+                it('does not warn when discovery found nothing', async () => {
+                    discoverTestFilesSpy.mockResolvedValue(undefined);
+                    const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                    mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+                    await runner.init();
+                    expect(buildOutputWarnings()).toHaveLength(0);
+                });
+            });
+
             it('passes undefined testFiles when discoverTestFiles returns undefined (no test files found)', async () => {
                 // Override the global spy: no test files found → fallback to Bun discovery
 
