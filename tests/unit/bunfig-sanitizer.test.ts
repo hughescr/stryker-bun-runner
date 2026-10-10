@@ -3,9 +3,10 @@
  * Covers sanitization logic for bunfig.toml files used during mutation testing
  */
 
+import { lstat, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, mock, spyOn } from 'bun:test';
 import { parse } from 'smol-toml';
 import { generateSanitizedBunfig, cleanupSanitizedBunfig, readBunfigTestRoot, type DroppedBunfigKey } from '../../src/utils/bunfig-sanitizer.js';
 import { mockMkdir, mockReadFile, mockWriteFile, mockUnlink, resetFsMocks } from '../test-preload.js';
@@ -678,5 +679,56 @@ describe('cleanupSanitizedBunfig', () => {
 
         const err = await cleanupSanitizedBunfig('/tmp/protected.toml').catch((e: unknown) => e);
         expect((err as Error).message).toContain('Permission denied');
+    });
+});
+
+describe('generateSanitizedBunfig file safety (real filesystem)', () => {
+    const FROZEN_NOW = 1_700_000_000_000;
+    let root: string;
+    let projectCwd: string;
+    let privateDir: string;
+
+    beforeEach(async () => {
+        // Pass-through fs mocks: these tests exercise the kernel's modes and symlinks.
+        resetFsMocks();
+        root = await mkdtemp(path.join(tmpdir(), 'sbr-bunfig-safety-'));
+        projectCwd = path.join(root, 'project');
+        privateDir = path.join(root, 'private');
+        await mkdir(projectCwd, { recursive: true });
+        await mkdir(privateDir, { mode: 0o700 });
+        await writeFile(path.join(projectCwd, 'bunfig.toml'), '[test]\ntimeout = 5000\n', 'utf8');
+    });
+
+    afterEach(async () => {
+        resetFsMocks();
+        await rm(root, { recursive: true, force: true });
+    });
+
+    it('writes the sanitized bunfig with mode 0600', async () => {
+        const outPath = await generateSanitizedBunfig(projectCwd, privateDir);
+
+        const { mode } = await stat(outPath);
+        expect(mode & 0o777).toBe(0o600); // eslint-disable-line no-bitwise -- extracting permission bits
+        expect(parse(await readFile(outPath, 'utf8'))).toMatchObject({ test: { timeout: 5000 } });
+    });
+
+    it('replaces a symlink planted at the output path instead of writing through it', async () => {
+        const nowSpy = spyOn(Date, 'now').mockReturnValue(FROZEN_NOW);
+        try {
+            const victim = path.join(root, 'victim.txt');
+            await writeFile(victim, 'untouched', 'utf8');
+            const outPath = path.join(privateDir, `stryker-bun-runner-bunfig-${process.pid}-${FROZEN_NOW}.toml`);
+            await symlink(victim, outPath);
+
+            const result = await generateSanitizedBunfig(projectCwd, privateDir);
+
+            expect(result).toBe(outPath);
+            const planted = await lstat(outPath);
+            expect(planted.isSymbolicLink()).toBe(false);
+            expect(await readFile(victim, 'utf8')).toBe('untouched');
+            expect(parse(await readFile(outPath, 'utf8'))).toMatchObject({ test: { timeout: 5000 } });
+        } finally {
+            nowSpy.mockRestore();
+        }
     });
 });

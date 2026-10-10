@@ -8,10 +8,11 @@
  * forced off — settings that would break mutation testing.
  */
 
-import { readFile, unlink, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, unlink, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { parse, stringify } from 'smol-toml';
 import { RETRY_REASON, RERUN_EACH_REASON } from './bun-args.js';
+import { writePrivateFile } from './private-temp-dir.js';
 
 // [test] keys that are safe to forward to child bun test processes.
 // Coverage, reporter, and output-filtering keys are deliberately excluded.
@@ -220,7 +221,7 @@ export async function generateSanitizedBunfig(
     const serialized = stringify(sanitized);
 
     const outPath = path.join(tmpDir, `stryker-bun-runner-bunfig-${process.pid}-${Date.now()}.toml`);
-    await writeFile(outPath, serialized, 'utf8');
+    await writePrivateFile(outPath, serialized);
 
     return outPath;
 }
