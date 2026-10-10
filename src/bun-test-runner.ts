@@ -45,44 +45,54 @@ import { runBunTests, stripAnsi, type BunProcessResult } from './process-runner.
 import { type DroppedBunfigKey, assertSupportedBunArgs, splitBunConfigArg, checkBunVersion, getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, TEST_FILE_SUFFIX_RE, discoverTestFiles, findBuildOutputTestFiles, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery, resolveRunTempDir, writePrivateFile, MutantWarnAggregator } from './utils/index.js';
 
 /**
- * Poll (every 50ms) until `getUrl()` reports the inspector URL, `timeoutMs`
- * elapses, or `child` settles — whichever comes first.
+ * Event-driven wait for the inspector URL bun prints on startup.
  *
- * Settling is the short-circuit that matters when bun cannot start at all
- * (`spawnError`, e.g. ENOENT) or exits before printing its inspector banner:
- * the URL callback fires from stdout/stderr data, which always precedes the
- * process-close that resolves `child`, so once `child` has settled a URL that
- * was printed is already visible to `getUrl()` and nothing can set one later.
- * Waiting out the rest of `timeoutMs` would only delay the error report.
+ * `onReady` is handed to process-runner's `onInspectorReady`, which calls it
+ * when bun's inspector banner is seen. `wait(child, timeoutMs)` then resolves,
+ * with no polling, at the first of:
+ *  - the URL arriving (`onReady` fires),
+ *  - `child` settling (resolved or rejected), or
+ *  - `timeoutMs` elapsing.
+ * It resolves with the URL, or `null` when none arrived by then. A URL that
+ * arrives after `wait` has resolved is never reported: the deadline decides.
+ *
+ * Child settling is the short-circuit that matters when bun cannot start at
+ * all (`spawnError`, e.g. ENOENT) or exits before printing its inspector
+ * banner: the URL callback fires from stdout/stderr data, which always
+ * precedes the process-close that resolves `child`, so once `child` has
+ * settled a URL that was printed has already been delivered and nothing can
+ * set one later. Waiting out the rest of `timeoutMs` would only delay the
+ * error report.
+ *
+ * The timeout timer is cleared as soon as the wait resolves, so nothing is
+ * left armed.
  */
-async function waitForInspectorUrl(getUrl: () => string | null, child: Promise<unknown>, timeoutMs: number): Promise<void> {
-    let childSettled = false;
-    const markSettled = (): void => {
-        childSettled = true;
+function createInspectorUrlWaiter(): { onReady: (url: string) => void, wait: (child: Promise<unknown>, timeoutMs: number) => Promise<string | null> } {
+    let url: string | null = null;
+    let wake: (() => void) | undefined;
+    return {
+        onReady: (readyUrl: string): void => {
+            url = readyUrl;
+            wake?.();
+        },
+        wait: async (child: Promise<unknown>, timeoutMs: number): Promise<string | null> => {
+            // The URL can be delivered before `wait` is called.
+            if(url) {
+                return url;
+            }
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            await new Promise<void>((resolve) => {
+                const finish = (): void => {
+                    resolve();
+                };
+                timer = setTimeout(finish, timeoutMs);
+                wake = finish;
+                child.then(finish).catch(finish);
+            });
+            clearTimeout(timer);
+            return url;
+        },
     };
-    child.then(markSettled).catch(markSettled);
-
-    const waitStart = Date.now();
-    while(!getUrl() && Date.now() - waitStart < timeoutMs) {
-        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- childSettled is set by an async callback; TypeScript cannot track cross-await mutations
-        if(childSettled) {
-            break;
-        }
-        // eslint-disable-next-line no-await-in-loop -- sequential polling required; the URL is set by an async callback
-        await sleep(50);
-    }
-}
-
-/**
- * Sleep for the given number of milliseconds.
- * Extracted to satisfy no-promise-executor-return: the executor only schedules a
- * timer and does not return its value.
- */
-function sleep(ms: number): Promise<void> {
-    // Stryker disable next-line BlockStatement: removing the setTimeout body causes the Promise to never resolve → infinite loop / Timeout — expected
-    return new Promise((resolve) => {
-        setTimeout(resolve, ms);
-    });
 }
 
 /**
@@ -1456,7 +1466,7 @@ export class BunTestRunner implements TestRunner {
         }
 
         const startTime = Date.now();
-        let inspectorUrl: string | null = null;
+        const inspectorUrlWaiter = createInspectorUrlWaiter();
 
         // Wrap everything after server start in try/finally so syncServer.close()
         // is always called even if any intermediate step throws (bunfig regen, test
@@ -1518,16 +1528,12 @@ export class BunTestRunner implements TestRunner {
                         rssBytes
                     );
                 },
-                // Stryker disable next-line BlockStatement: removing callback body means inspectorUrl never set → infinite poll → Timeout
-                onInspectorReady: (url: string) => {
-                    inspectorUrl = url;
-                },
+                onInspectorReady: inspectorUrlWaiter.onReady,
             });
 
             // 4. Wait for inspector URL with timeout (or until the child is gone)
-            await waitForInspectorUrl(() => inspectorUrl, testProcess, this.inspectorTimeout);
+            const inspectorUrl = await inspectorUrlWaiter.wait(testProcess, this.inspectorTimeout);
 
-            // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- inspectorUrl set by async callback; TypeScript cannot track cross-await mutations
             if(!inspectorUrl) {
                 // Await the child to drain its stdout/stderr so we can surface what Bun
                 // actually emitted before we abandoned it.  Some setups (e.g. preload

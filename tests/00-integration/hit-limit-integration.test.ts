@@ -16,7 +16,7 @@ import { resolveRunTempDir } from '../../src/utils/private-temp-dir.js';
 import { allowRealTimersFromSource } from '../real-clock-guard.js';
 import { resetAllMocks } from '../test-preload.js';
 
-// Real bun children: the runner's own timers (inspector-URL poll, drain-silence
+// Real bun children: the runner's own timers (inspector-URL timeout, drain-silence
 // poll) have to run on real time here. The tests themselves wait on nothing but
 // the runner's results.
 allowRealTimersFromSource();
