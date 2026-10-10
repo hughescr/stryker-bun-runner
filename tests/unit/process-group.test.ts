@@ -7,9 +7,12 @@
  * child this file spawned itself — never a fabricated pid.
  */
 
-import { type ChildProcess, spawn } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
 import { describe, it, expect, afterEach } from 'bun:test';
-import { realKillProcessGroup } from '../test-preload.js';
+// realSpawn, not `spawn` from node:child_process: that import is the shared
+// mockSpawn, whose call history would otherwise accumulate this file's spawns
+// (this file never resets mocks) and leak into other files' call-count assertions.
+import { realKillProcessGroup, realSpawn as spawn } from '../test-preload.js';
 
 /** Every child spawned here, so afterEach can reap them even if a test throws. */
 const spawnedChildren: ChildProcess[] = [];

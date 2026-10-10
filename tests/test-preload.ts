@@ -50,6 +50,15 @@ export const mockCreateServer = mock((...args: Parameters<typeof actualNet.creat
 export const mockSpawn = mock((...args: Parameters<typeof actualChildProcess.spawn>) =>
     originalSpawn(...args));
 
+/**
+ * The unmocked child_process.spawn, for tests that need genuine child
+ * processes (see process-group.test.ts). Spawning through this instead of the
+ * mocked `node:child_process` keeps those calls out of mockSpawn's shared call
+ * history, which every other file asserts on. Captured before mock.module() so
+ * it is not itself the mock.
+ */
+export const realSpawn = originalSpawn;
+
 // Create controllable mock function for getAvailablePort
 // Used by BunTestRunner to get inspector and sync server ports
 export const mockGetAvailablePort = mock((...args: Parameters<typeof actualPortUtils.getAvailablePort>) =>

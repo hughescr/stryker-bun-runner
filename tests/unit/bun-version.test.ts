@@ -54,6 +54,10 @@ describe('checkBunVersion', () => {
     let child: MockChild;
 
     beforeEach(() => {
+        // Start from a clean slate rather than trusting that whichever file ran
+        // before this one reset the shared mockSpawn (afterEach only protects the
+        // tests that follow, never the first one in this file).
+        resetAllMocks();
         child = { kill: mock() };
         /* eslint-disable @typescript-eslint/no-explicit-any -- test mock of ChildProcess */
         const fake = {
