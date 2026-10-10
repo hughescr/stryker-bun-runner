@@ -594,8 +594,11 @@ export class BunTestRunner implements TestRunner {
     private readonly bunArgs?:            string[];
     /** {@link bunArgs} for mutant runs: without `--randomize`/`--seed`, which only the dry run keeps (see stripRandomizeArgs). */
     private readonly mutantBunArgs?:      string[];
-    /** True when the current sanitized bunfig randomizes the test order, so mutant runs use its mutant-run copy (see mutantRunBunfigPath). */
-    private sanitizedBunfigRandomizes = false;
+    /**
+     * True when the current sanitized bunfig randomizes the test order, so mutant runs use its mutant-run
+     * copy (see mutantRunBunfigPath). Set whenever the sanitized bunfig is (re)generated, which every run does first.
+     */
+    private sanitizedBunfigRandomizes?:   boolean;
     /** True once the "randomized order is off for mutant runs" debug line has been logged; it is shown once per runner. */
     private loggedRandomizeOff = false;
     /**
