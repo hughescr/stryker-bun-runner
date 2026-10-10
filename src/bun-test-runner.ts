@@ -42,7 +42,7 @@ import type { TestInfo } from './inspector/types.js';
 import type { StrykerBunOptions } from './options.js';
 import { parseBunTestOutput, type ParsedTestResults } from './parsers/console-parser.js';
 import { runBunTests, stripAnsi, type BunProcessResult } from './process-runner.js';
-import { type DroppedBunfigKey, assertSupportedBunArgs, splitBunConfigArg, stripRandomizeArgs, checkBunVersion, getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, mutantRunBunfigPath, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, TEST_FILE_SUFFIX_RE, discoverTestFiles, findBuildOutputTestFiles, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery, resolveRunTempDir, writePrivateFile, MutantWarnAggregator } from './utils/index.js';
+import { type DroppedBunfigKey, assertSupportedBunArgs, splitBunConfigArg, stripRandomizeArgs, checkBunVersion, getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, mutantRunBunfigPath, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, TEST_FILE_SUFFIX_RE, discoverTestFiles, findBuildOutputTestFiles, buildTestFileArgs, MAX_TEST_FILE_ARGS_BYTES, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery, resolveRunTempDir, writePrivateFile, MutantWarnAggregator } from './utils/index.js';
 
 /**
  * Event-driven wait for the inspector URL bun prints on startup.
@@ -601,6 +601,8 @@ export class BunTestRunner implements TestRunner {
     private sanitizedBunfigRandomizes?:   boolean;
     /** True once the "randomized order is off for mutant runs" debug line has been logged; it is shown once per runner. */
     private loggedRandomizeOff = false;
+    /** Which argv-budget notes (see {@link fitTestFiles}) have been logged; each is shown once per runner. */
+    private readonly loggedFileArgNotes = new Set<'relative' | 'none' | 'oversized'>();
     /**
      * Each test file's dry-run duration in ms (project-relative file → sum of its tests' durations),
      * from this worker's dry run or the shared registry. Mutant runs hand bun their files in
@@ -946,10 +948,64 @@ export class BunTestRunner implements TestRunner {
 
     /** Where the test files for `cwd` come from, in the precedence of {@link getOrDiscoverTestFiles}, for the log. */
     private testFilesSource(cwd: string): string {
+        return this.explicitTestFilesSource(cwd) ?? 'auto-discovery';
+    }
+
+    /** Like {@link testFilesSource}, but undefined when the files are auto-discovered rather than chosen by the user. */
+    private explicitTestFilesSource(cwd: string): string | undefined {
         if(this.selectedTestFilesFor(cwd) !== undefined) {
             return 'Stryker\'s testFiles option';
         }
-        return this.testFilesOverride === undefined ? 'auto-discovery' : 'bun.testFiles';
+        return this.testFilesOverride === undefined ? undefined : 'bun.testFiles';
+    }
+
+    /**
+     * The test files to hand bun for this spawn, kept within the argv budget (see
+     * MAX_TEST_FILE_ARGS_BYTES). `files` is already narrowed and ordered.
+     *
+     * - Within the budget (as absolute paths, or as the shorter ./-relative ones
+     *   runBunTests then picks, said once at debug): `files` as given.
+     * - Over it, with auto-discovered files: undefined, so bun finds and runs every
+     *   test file itself. That is the full suite, which is what a full-suite run
+     *   lists anyway, and a superset of a targeted run's covering files — safe,
+     *   because a targeted run keeps its --test-name-pattern; it only loses the
+     *   cheapest-first order (said once at info).
+     * - Over it, with files the user chose (bun.testFiles, Stryker's testFiles):
+     *   `files`, as no other list would keep the selection, and a warning (once)
+     *   that bun may fail to start.
+     *
+     * @param explicitSource - What chose the files, or undefined when they were auto-discovered
+     */
+    private fitTestFiles(files: string[] | undefined, explicitSource: string | undefined): string[] | undefined {
+        if(files === undefined) {
+            return undefined;
+        }
+        const fit = buildTestFileArgs(files);
+        if(fit.fits) {
+            if(fit.form === 'relative' && !this.loggedFileArgNotes.has('relative')) {
+                this.loggedFileArgNotes.add('relative');
+                this.logger.debug('The %d test file argument(s) as absolute paths would exceed the %d-byte budget; passing ./-relative paths (%d bytes) instead', files.length, MAX_TEST_FILE_ARGS_BYTES, fit.bytes);
+            }
+            return files;
+        }
+        if(explicitSource === undefined) {
+            if(!this.loggedFileArgNotes.has('none')) {
+                this.loggedFileArgNotes.add('none');
+                this.logger.info('The %d test file argument(s) take %d bytes even as ./-relative paths, over the %d-byte budget; passing no file list, so bun finds and runs every test file itself (in its own order, not cheapest first)', files.length, fit.bytes, MAX_TEST_FILE_ARGS_BYTES);
+            }
+            return undefined;
+        }
+        if(!this.loggedFileArgNotes.has('oversized')) {
+            this.loggedFileArgNotes.add('oversized');
+            this.logger.warn(
+                'The %d test file argument(s) from %s take %d bytes even as ./-relative paths, over the %d-byte budget, and no other list would keep your selection; spawning bun may fail with E2BIG. List directories rather than individual files, or select fewer files',
+                files.length,
+                explicitSource,
+                fit.bytes,
+                MAX_TEST_FILE_ARGS_BYTES
+            );
+        }
+        return files;
     }
 
     /** Debug-log how many test files the dry run uses and where they came from. Same precedence as {@link getOrDiscoverTestFiles}. */
@@ -1597,8 +1653,9 @@ export class BunTestRunner implements TestRunner {
             // would otherwise introduce on the hot path (which matters for fake-timer tests).
             // Stryker disable next-line ConditionalExpression,BlockStatement: cache-miss path covered by 'rediscovers test files when cwd changes between init() and dryRun()'
             const testFilesCached = this.testFilesCacheHit(cwd);
-            const testFiles = testFilesCached === null ? await this.getOrDiscoverTestFiles() : testFilesCached;
-            this.logTestFilesSource(testFiles, cwd);
+            const listed = testFilesCached === null ? await this.getOrDiscoverTestFiles() : testFilesCached;
+            this.logTestFilesSource(listed, cwd);
+            const testFiles = this.fitTestFiles(listed, this.explicitTestFilesSource(cwd));
 
             // Start test process with callback to get inspector URL
             const testProcess = runBunTests({
@@ -2407,7 +2464,9 @@ export class BunTestRunner implements TestRunner {
         // list whenever it is not, or whenever the narrowing cannot be proven safe (see
         // resolveCoveringTestFiles). A file-scoped run (Stryker's testFiles option) runs
         // exactly its files, whatever was discovered. Either way cheapest first.
-        const testFiles = this.orderCheapestFirst(ctx.testFileScope ?? (testNamePattern === undefined ? this.effectiveTestFiles : (coveringTestFiles ?? this.effectiveTestFiles)));
+        // Then kept within the argv budget: see fitTestFiles.
+        const ordered = this.orderCheapestFirst(ctx.testFileScope ?? (testNamePattern === undefined ? this.effectiveTestFiles : (coveringTestFiles ?? this.effectiveTestFiles)));
+        const testFiles = this.fitTestFiles(ordered, ctx.testFileScope === undefined ? this.explicitTestFilesSource(process.cwd()) : 'Stryker\'s testFiles option');
         let result;
         try {
             result = await runBunTests({

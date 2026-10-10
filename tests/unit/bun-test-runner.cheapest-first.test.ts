@@ -37,6 +37,7 @@ import * as bunVersion from '../../src/utils/bun-version.js';
 import * as bunfigSanitizer from '../../src/utils/bunfig-sanitizer.js';
 import * as privateTempDir from '../../src/utils/private-temp-dir.js';
 import * as syncServerModule from '../../src/utils/sync-server.js';
+import { buildTestFileArgs, MAX_TEST_FILE_ARGS_BYTES } from '../../src/utils/test-file-args.js';
 import * as testFileDiscovery from '../../src/utils/test-file-discovery.js';
 import { mockGetAvailablePort, mockReadFile, mockRename, mockWriteFile, resetAllMocks } from '../test-preload.js';
 
@@ -220,8 +221,8 @@ describe('BunTestRunner cheapest-first file order and fixed test order in mutant
     }
 
     /** The options of the last mutant-run spawn. */
-    function lastMutantSpawn(): { testFiles?: string[], bunfigPath?: string, bunArgs?: string[] } {
-        const calls = mockRunBunTests.mock.calls as [{ onInspectorReady?: unknown, testFiles?: string[], bunfigPath?: string, bunArgs?: string[] }][];
+    function lastMutantSpawn(): { testFiles?: string[], bunfigPath?: string, bunArgs?: string[], testNamePattern?: string } {
+        const calls = mockRunBunTests.mock.calls as [{ onInspectorReady?: unknown, testFiles?: string[], bunfigPath?: string, bunArgs?: string[], testNamePattern?: string }][];
         return calls.findLast(([options]) => options.onInspectorReady === undefined)![0];
     }
 
@@ -590,6 +591,198 @@ describe('BunTestRunner cheapest-first file order and fixed test order in mutant
             const result = await mutantRun(runner, [id(BETA, 'b1')]);
 
             expect(result).toMatchObject({ status: MutantRunStatus.Killed, killedBy: [id(BETA, 'b1')] });
+        });
+    });
+
+    // ---------------------------------------------------------------------
+    // The argv budget for the file list
+    // ---------------------------------------------------------------------
+
+    describe('a file list too long for the argv budget', () => {
+        const generated = (i: number): string => `tests/gen/f${String(i).padStart(5, '0')}.test.ts`;
+        /** The fewest generated files whose spellings, at `cost` bytes each, are over the budget. */
+        const filesOver = (spell: (file: string) => string): string[] => {
+            const cost = spell(generated(0)).length + 9;
+            return Array.from({ length: Math.floor(MAX_TEST_FILE_ARGS_BYTES / cost) + 1 }, (_, i) => generated(i));
+        };
+        const overAbsolute = (): string[] => filesOver(file => path.resolve(file));
+        const overRelative = (): string[] => filesOver(file => `./${file}`);
+        const bytesOf = (files: string[], budget: number): number => buildTestFileArgs(files, process.cwd(), budget).bytes;
+
+        const infoCalls = (needle: string): unknown[][] =>
+            ((mockLogger.info as ReturnType<typeof mock>).mock.calls as unknown[][]).filter(args => String(args[0]).includes(needle));
+        const warnCalls = (needle: string): unknown[][] =>
+            ((mockLogger.warn as ReturnType<typeof mock>).mock.calls as unknown[][]).filter(args => String(args[0]).includes(needle));
+
+        /** Every spawn's test files: the dry run's, then each mutant run's. */
+        const spawnedFiles = (): (string[] | undefined)[] =>
+            (mockRunBunTests.mock.calls as [{ testFiles?: string[] }][]).map(([options]) => options.testFiles);
+
+        it('says nothing about the budget for a list that fits', async () => {
+            standardSuite();
+            const runner = await dryRunWorker();
+
+            await mutantRun(runner, []);
+
+            expect(debugCalls('budget')).toEqual([]);
+            expect(infoCalls('budget')).toEqual([]);
+            expect(warnCalls('budget')).toEqual([]);
+        });
+
+        describe('that fits as ./-relative paths', () => {
+            it('hands bun the list unchanged (runBunTests picks the spelling) and says so once, at debug', async () => {
+                const files = overAbsolute();
+                expect(bytesOf(files, 1)).toBeLessThanOrEqual(MAX_TEST_FILE_ARGS_BYTES);
+                discoverTestFilesSpy.mockResolvedValue([ALPHA, BETA, GAMMA, ...files]);
+                standardSuite();
+                const runner = await dryRunWorker();
+
+                await mutantRun(runner, []);
+                await mutantRun(runner, [id(ALPHA, 'a1')]);
+
+                const expectedCount = files.length + 3;
+                expect(spawnedFiles()[0]).toHaveLength(expectedCount);
+                expect(spawnedFiles()[1]).toHaveLength(expectedCount);
+                expect(spawnedFiles()[2]).toEqual([ALPHA]);
+                const notes = debugCalls('budget');
+                expect(notes).toHaveLength(1);
+                expect(notes[0]).toEqual([
+                    expect.stringContaining('as absolute paths'),
+                    expectedCount,
+                    MAX_TEST_FILE_ARGS_BYTES,
+                    bytesOf([ALPHA, BETA, GAMMA, ...files], 1),
+                ]);
+                expect(infoCalls('budget')).toEqual([]);
+                expect(warnCalls('budget')).toEqual([]);
+            });
+        });
+
+        describe('that does not fit even as ./-relative paths', () => {
+            const listed = (): string[] => [ALPHA, BETA, GAMMA, ...overRelative()];
+
+            it('lets bun find the files when they were auto-discovered: the dry run and a static mutant', async () => {
+                discoverTestFilesSpy.mockResolvedValue(listed());
+                standardSuite();
+                const runner = await dryRunWorker();
+
+                await mutantRun(runner, []);
+
+                expect(spawnedFiles()).toEqual([undefined, undefined]);
+            });
+
+            it('still narrows a targeted run whose covering files fit', async () => {
+                discoverTestFilesSpy.mockResolvedValue(listed());
+                standardSuite();
+                const runner = await dryRunWorker();
+
+                await mutantRun(runner, [id(ALPHA, 'a1')]);
+
+                expect(lastMutantSpawn().testFiles).toEqual([ALPHA]);
+            });
+
+            it('lets bun find the files for a targeted run whose covering files do not fit, which keeps its test-name pattern', async () => {
+                const files = overRelative();
+                discoverTestFilesSpy.mockResolvedValue([ALPHA, BETA, ...files]);
+                standardSuite();
+                const runner = await dryRunWorker();
+
+                await mutantRun(runner, [...files.map(file => id(file, 'a1')), id(ALPHA, 'a1')]);
+
+                expect(lastMutantSpawn().testFiles).toBeUndefined();
+                // Only the covering tests run, in every file bun finds.
+                expect(lastMutantSpawn().testNamePattern).toContain('a1');
+                expect(infoCalls('no file list')).toHaveLength(1);
+            });
+
+            it('says so once, at info, with the figures', async () => {
+                const files = listed();
+                discoverTestFilesSpy.mockResolvedValue(files);
+                standardSuite();
+                const runner = await dryRunWorker();
+
+                await mutantRun(runner, []);
+                await mutantRun(runner, [id(ALPHA, 'a1')]);
+
+                const notes = infoCalls('no file list');
+                expect(notes).toHaveLength(1);
+                expect(notes[0]).toEqual([
+                    expect.stringContaining('even as ./-relative paths'),
+                    files.length,
+                    bytesOf(files, 1),
+                    MAX_TEST_FILE_ARGS_BYTES,
+                ]);
+                expect(debugCalls('budget')).toEqual([]);
+                expect(warnCalls('budget')).toEqual([]);
+            });
+
+            it('still attributes a kill to its covering test when bun was handed no list', async () => {
+                discoverTestFilesSpy.mockResolvedValue(listed());
+                standardSuite();
+                const runner = await dryRunWorker();
+                mutantOutcome = {
+                    exitCode: 1,
+                    stdout:   '',
+                    stderr:   [`${BETA}:`, '(fail) b1 [3.56ms]', 'Bailed out after 1 failure'].join('\n'),
+                    timedOut: false,
+                };
+
+                const result = await mutantRun(runner, [id(BETA, 'b1')]);
+
+                expect(result).toMatchObject({ status: MutantRunStatus.Killed, killedBy: [id(BETA, 'b1')] });
+            });
+
+            it('keeps bun.testFiles whole, and warns once that bun may fail to start', async () => {
+                const files = overRelative();
+                standardSuite();
+                const runner = await dryRunWorker({ bun: { testFiles: files } });
+
+                await mutantRun(runner, []);
+                await mutantRun(runner, []);
+
+                expect(spawnedFiles()).toEqual([files, files, files]);
+                const notes = warnCalls('E2BIG');
+                expect(notes).toHaveLength(1);
+                expect(notes[0]).toEqual([
+                    expect.stringContaining('even as ./-relative paths'),
+                    files.length,
+                    'bun.testFiles',
+                    bytesOf(files, 1),
+                    MAX_TEST_FILE_ARGS_BYTES,
+                ]);
+                expect(infoCalls('no file list')).toEqual([]);
+            });
+
+            it('keeps Stryker\'s testFiles selection whole', async () => {
+                const files = overRelative().map(file => path.join(process.cwd(), file));
+                standardSuite();
+                const runner = await dryRunWorker({}, { testFiles: files });
+
+                await mutantRun(runner, []);
+
+                expect(spawnedFiles()).toEqual([files, files]);
+                expect(warnCalls('E2BIG')).toHaveLength(1);
+                expect(warnCalls('E2BIG')[0]).toEqual([
+                    expect.stringContaining('even as ./-relative paths'),
+                    files.length,
+                    'Stryker\'s testFiles option',
+                    bytesOf(files, 1),
+                    MAX_TEST_FILE_ARGS_BYTES,
+                ]);
+            });
+
+            it('keeps the file-scoped list of a Stryker testFiles run, though the dry run auto-discovered its files', async () => {
+                const files = overRelative().map(file => path.join(process.cwd(), file));
+                standardSuite();
+                const runner = await dryRunWorker();
+                spyOn(fsPromises, 'stat').mockResolvedValue({ isFile: () => true } as Awaited<ReturnType<typeof fsPromises.stat>>);
+
+                await mutantRun(runner, files);
+
+                expect(lastMutantSpawn().testFiles).toEqual(files);
+                expect(warnCalls('E2BIG')).toHaveLength(1);
+                expect(warnCalls('E2BIG')[0][2]).toBe('Stryker\'s testFiles option');
+                expect(infoCalls('no file list')).toEqual([]);
+            });
         });
     });
 });

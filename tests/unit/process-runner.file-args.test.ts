@@ -6,13 +6,16 @@
  * path contains it, in bun's own directory-scan order, whatever the argument
  * order (measured on bun 1.4.2). An explicit path runs exactly that file, and
  * explicit paths run in the order given. So every entry is passed as an
- * absolute path, resolved against the cwd the child runs in.
+ * absolute path, resolved against the cwd the child runs in, unless the list is
+ * too long for the argv budget (see utils/test-file-args), in which case the
+ * entries are `./`-relative paths, which bun also takes as paths.
  */
 
 import type { ChildProcess } from 'node:child_process';
 import path from 'node:path';
 import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
 import { runBunTests, SPAWN_DEPTH_ENV } from '../../src/process-runner.js';
+import { MAX_TEST_FILE_ARGS_BYTES } from '../../src/utils/test-file-args.js';
 import { mockSpawn, resetChildProcessMocks, resetProcessGroupMocks } from '../test-preload.js';
 
 describe('runBunTests test-file arguments', () => {
@@ -70,5 +73,24 @@ describe('runBunTests test-file arguments', () => {
         const argv = await argvFor(['./tests/a.test.ts', '../b.test.ts']);
 
         expect(argv.slice(2)).toEqual([path.resolve('tests/a.test.ts'), path.resolve('..', 'b.test.ts')]);
+    });
+
+    describe('a list too long for the argv budget', () => {
+        const nameOf = (i: number): string => `tests/gen/f${String(i).padStart(5, '0')}.test.ts`;
+        // The smallest list whose absolute spelling is over the budget; its ./ spelling is far under it.
+        const absoluteCost = path.resolve(nameOf(0)).length + 9;
+        const overBudget = Array.from({ length: Math.floor(MAX_TEST_FILE_ARGS_BYTES / absoluteCost) + 1 }, (_, i) => nameOf(i));
+
+        it('passes the entries as ./ paths, still in the given order', async () => {
+            const argv = await argvFor(overBudget);
+
+            expect(argv.slice(2)).toEqual(overBudget.map(file => `./${file}`));
+        });
+
+        it('passes the absolute paths for a list one entry shorter', async () => {
+            const argv = await argvFor(overBudget.slice(1));
+
+            expect(argv.slice(2)).toEqual(overBudget.slice(1).map(file => path.resolve(file)));
+        });
     });
 });

@@ -87,6 +87,20 @@ describe('file order in a real bun test child', () => {
         expect(reversed.ran).toEqual(['S1', 'S2', 'S3', 'A1', 'A2', 'A3']);
     });
 
+    it('takes the ./-relative spelling used past the argv budget as paths too: same files, same order, no dist/ copy', async () => {
+        const files = ['tests/00-integration/slow.test.ts', 'tests/unit/a.test.ts'];
+        const run = await inFixture([
+            `const { buildTestFileArgs } = await import(${JSON.stringify(SRC('utils/test-file-args.ts'))});`,
+            `const built = buildTestFileArgs(${JSON.stringify(files)}, process.cwd(), 1);`,
+            'const spawned = Bun.spawnSync([process.execPath, \'test\', \'--config=/dev/null\', ...built.args], { cwd: process.cwd() });',
+            'result = { stdout: spawned.stdout.toString(), stderr: spawned.stderr.toString(), exitCode: spawned.exitCode };',
+            'extra = built;',
+        ].join('\n'));
+
+        expect(run.extra).toMatchObject({ form: 'relative', args: ['./tests/00-integration/slow.test.ts', './tests/unit/a.test.ts'] });
+        expect(run.ran).toEqual(['S1', 'S2', 'S3', 'A1', 'A2', 'A3']);
+    });
+
     it('with bail, stops at the first failure in the order given', async () => {
         const run = await inFixture(RUN(['tests/unit/a.test.ts', 'tests/unit/c.test.ts', 'tests/unit/b.test.ts'], ', bail: true'));
         const other = await inFixture(RUN(['tests/unit/b.test.ts', 'tests/unit/c.test.ts'], ', bail: true'));
