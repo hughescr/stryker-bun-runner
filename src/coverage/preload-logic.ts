@@ -6,7 +6,8 @@
  * uses these functions.
  */
 
-import { appendFileSync, closeSync, constants, openSync, writeSync } from 'node:fs';
+import { appendFileSync, closeSync, constants, createReadStream, openSync, writeSync } from 'node:fs';
+import type { Readable } from 'node:stream';
 import type { MutantCoverage } from '@stryker-mutator/api/core';
 import type { CoverageFileData, LateHitEntry } from './types.js';
 
@@ -274,53 +275,72 @@ export function writeCoverageToFile(coverageFile: string, data: CoverageFileData
 /* eslint-enable n/no-sync -- end of writeCoverageToFile */
 
 // ============================================================================
-// Orphan prevention: parent-liveness watchdog
+// Orphan prevention: the parent lifeline
 // ============================================================================
 
 /**
- * Dependencies injected into {@link startOrphanWatchdog}, so the polling
- * logic is testable without real timers or a real process tree.
+ * Environment variable through which the runner tells a `bun test` child which
+ * of its file descriptors is the parent lifeline: the read end of a pipe whose
+ * other end only the spawning runner process holds.
  */
-export interface OrphanWatchdogDeps {
-    /** Returns the current parent PID, e.g. `() => process.ppid`. */
-    getPpid:     () => number
-    /** Called (once) the first time a parent-PID change is observed. */
-    onOrphaned:  () => void
-    /** Poll interval in milliseconds. @default 1000 */
-    intervalMs?: number
+export const LIFELINE_FD_ENV = '__STRYKER_LIFELINE_FD__';
+
+/** Dependencies of {@link watchParentLifeline}. */
+export interface ParentLifelineDeps {
+    /** The descriptor as the runner named it: `process.env[LIFELINE_FD_ENV]`. */
+    fdValue:    string | undefined
+    /** Called once the parent is gone. */
+    onOrphaned: () => void
+    /** Opens the descriptor for reading. Defaults to an fs read stream on it. */
+    open?:      (fd: number) => Readable
 }
 
 /**
- * Detects when this process's original parent has died and invokes
- * `onOrphaned`, so a spawned `bun test` child never outlives the Stryker
- * worker that started it — even when that worker is killed with SIGKILL,
- * which gives it no chance to run any cleanup/kill-child code itself.
- *
- * POSIX reparents an orphaned child to the nearest subreaper (commonly PID 1,
- * or a container's init) as soon as its original parent exits. Polling
- * `process.ppid` and comparing it to the value captured when this watchdog
- * started is therefore a portable, dependency-free way to detect that
- * reparenting — no prctl(PR_SET_PDEATHSIG) or native addon required, and it
- * works the same on Linux and macOS.
- *
- * @returns A function that stops the watchdog (used by the preload script's
- *   own afterAll cleanup, and by tests).
+ * The lifeline descriptor named by `value`, or undefined when there is none.
+ * Descriptors 0–2 are stdio, never a lifeline: stdin is /dev/null for a
+ * runner child, and reading it would look like the parent dying at once.
  */
-export function startOrphanWatchdog(deps: OrphanWatchdogDeps): () => void {
-    const originalPpid = deps.getPpid();
-    let fired = false;
-    const intervalId = setInterval(() => {
-        // Stryker disable next-line ConditionalExpression,LogicalOperator,EqualityOperator: reentrancy guard — the callback is invoked at most once regardless of how many further ticks observe the changed ppid; covered by 'invokes onOrphaned only once even if the interval ticks again before being stopped'
-        if(fired || deps.getPpid() === originalPpid) {
-            return;
-        }
-        fired = true;
-        deps.onOrphaned();
-    }, deps.intervalMs ?? 1000);
-    // Never let the watchdog itself keep the process alive once real work
-    // (the test run) has otherwise finished.
-    intervalId.unref();
-    return () => {
-        clearInterval(intervalId);
-    };
+function parseLifelineFd(value: string | undefined): number | undefined {
+    if(value === undefined || !/^\d+$/.test(value)) {
+        return undefined;
+    }
+    const fd = Number(value);
+    return Number.isSafeInteger(fd) && fd > 2 ? fd : undefined;
+}
+
+/**
+ * Calls `onOrphaned` when the process that spawned this one dies, so a
+ * `bun test` child never outlives the Stryker worker that started it — even
+ * when that worker is killed with SIGKILL, which gives it no chance to run any
+ * cleanup of its own.
+ *
+ * The runner spawns each child with an extra pipe and holds the write end
+ * without ever closing it. The kernel closes every descriptor of a process
+ * that exits, however it exits, so end-of-file on the read end means the
+ * parent is gone. This is an I/O event: no timer is involved. A timer-based
+ * check (polling `process.ppid`) is lost to any suite that installs bun's fake
+ * timers, because bun moves a real interval that ticks while fake timers are
+ * installed into the fake-timer queue, where it never fires again on its own
+ * (bun 1.4.2). Capturing the real timer functions does not avoid that: the
+ * timer itself is moved. Reading also drains anything the parent writes.
+ *
+ * Only end-of-file counts. A descriptor that is not open errors and closes
+ * without one, and says nothing about the parent.
+ *
+ * @returns true when the lifeline is being watched, false when `fdValue`
+ *   names no usable descriptor (the process was not spawned by the runner).
+ */
+export function watchParentLifeline(deps: ParentLifelineDeps): boolean {
+    const fd = parseLifelineFd(deps.fdValue);
+    if(fd === undefined) {
+        return false;
+    }
+    const open = deps.open ?? ((lifelineFd: number) => createReadStream('', { fd: lifelineFd }));
+    const lifeline = open(fd);
+    lifeline.once('end', deps.onOrphaned);
+    lifeline.on('error', () => {
+        // Not end-of-file: see above.
+    });
+    lifeline.resume();
+    return true;
 }

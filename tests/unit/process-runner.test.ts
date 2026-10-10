@@ -6,6 +6,7 @@
 import type { ChildProcess } from 'node:child_process';
 import path from 'node:path';
 import { describe, it, expect, beforeEach, afterEach, mock, jest, spyOn } from 'bun:test';
+import { LIFELINE_FD_ENV } from '../../src/coverage/preload-logic.js';
 import { runBunTests, readSpawnDepth, killAllLiveChildren, ensureSignalCleanup, removeSignalCleanup, stripAnsi, SPAWN_DEPTH_ENV, DEFAULT_MAX_SPAWN_DEPTH } from '../../src/process-runner.js';
 import * as processRss from '../../src/utils/process-rss.js';
 import { mockSpawn, resetChildProcessMocks, mockKillProcessGroup, resetProcessGroupMocks } from '../test-preload.js';
@@ -121,7 +122,7 @@ describe('runBunTests', () => {
                 'bun',
                 ['test'],
                 expect.objectContaining({
-                    stdio: ['ignore', 'pipe', 'pipe'],
+                    stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
                 })
             );
             expect(result.exitCode).toBe(0);
@@ -441,6 +442,30 @@ describe('runBunTests', () => {
     });
 
     describe('environment variable handling', () => {
+        it('hands the child a parent lifeline on fd 3 and names it, overriding an inherited value', async () => {
+            // A runner nested inside another run inherits the outer child's value
+            // through process.env; this run's child must be told about its own pipe.
+            // The child's environment is built synchronously, before the first await.
+            const inherited = process.env[LIFELINE_FD_ENV];
+            process.env[LIFELINE_FD_ENV] = '9';
+            let resultPromise: ReturnType<typeof runBunTests>;
+            try {
+                resultPromise = runBunTests({ bunPath: 'bun', timeout: 5000, env: { [LIFELINE_FD_ENV]: '8' } });
+            } finally {
+                if(inherited === undefined) {
+                    delete process.env[LIFELINE_FD_ENV];
+                } else {
+                    process.env[LIFELINE_FD_ENV] = inherited;
+                }
+            }
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const spawnOptions = mockSpawn.mock.calls[0][2];
+            expect(spawnOptions.stdio).toEqual(['ignore', 'pipe', 'pipe', 'pipe']);
+            expect(spawnOptions.env![LIFELINE_FD_ENV]).toBe('3');
+        });
+
         it('should pass custom environment variables', async () => {
             const resultPromise = runBunTests({
                 bunPath: 'bun',

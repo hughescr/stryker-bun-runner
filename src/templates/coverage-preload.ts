@@ -15,7 +15,8 @@ import {
     formatCoverageData,
     detectGapWindowBleed,
     writeCoverageToFile,
-    startOrphanWatchdog,
+    watchParentLifeline,
+    LIFELINE_FD_ENV,
     type StrykerNamespace,
     type LateHitEntry
 } from '__PRELOAD_LOGIC_PATH__';
@@ -24,21 +25,20 @@ import {
 // Section 0: Orphan prevention
 // ============================================================================
 // Every bun test child loads this preload script (dryRun AND mutant runs), so
-// this watchdog runs unconditionally, regardless of coverage collection.
+// the lifeline is watched unconditionally, regardless of coverage collection.
 // If the Stryker worker that spawned this process dies (including via
 // SIGKILL, which gives it no chance to kill its children), this process would
 // otherwise run forever, or until its own --timeout is reached — see README
-// "Orphan prevention".
-const stopOrphanWatchdog = startOrphanWatchdog({
-    getPpid:    () => process.ppid,
+// "Orphan prevention". The watch is left in place for the life of the process:
+// it arms no timer and does not keep bun test from exiting.
+watchParentLifeline({
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- LIFELINE_FD_ENV from placeholder import
+    fdValue:    process.env[LIFELINE_FD_ENV],
     onOrphaned: () => {
         console.warn('[Stryker] Parent process is no longer running — terminating to avoid an orphaned bun test process');
         // eslint-disable-next-line n/no-process-exit, unicorn/no-process-exit -- deliberate self-termination once orphaned; nothing else can stop this process from running forever
         process.exit(1);
     },
-});
-afterAll(() => {
-    stopOrphanWatchdog();
 });
 
 // Patch .concurrent() to be regular sequential execution

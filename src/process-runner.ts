@@ -4,6 +4,7 @@
  */
 
 import { type ChildProcess, type SpawnOptions, spawn } from 'node:child_process';
+import { LIFELINE_FD_ENV } from './coverage/preload-logic.js';
 import { killProcessGroup } from './utils/process-group.js';
 import { getProcessRssBytes } from './utils/process-rss.js';
 import { buildTestFileArgs } from './utils/test-file-args.js';
@@ -14,6 +15,12 @@ import { buildTestFileArgs } from './utils/test-file-args.js';
  * kill paths so all three follow one consistent escalation policy.
  */
 const KILL_GRACE_PERIOD_MS = 500;
+
+/**
+ * The child's descriptor for its parent lifeline: the fourth entry of the
+ * spawn's stdio array. Named to the child in {@link LIFELINE_FD_ENV}.
+ */
+const LIFELINE_FD = 3;
 
 /**
  * Environment variable carrying this runner's spawn nesting depth into every
@@ -465,6 +472,7 @@ function buildChildEnv(options: BunTestRunOptions, spawnDepth: number): Record<s
         __STRYKER_HIT_LIMIT_TOKEN__: options.hitLimitToken,
         __STRYKER_COVERAGE_FILE__:   options.coverageFile === '' ? undefined : options.coverageFile,
         __STRYKER_SYNC_PORT__:       options.syncPort ? String(options.syncPort) : undefined,
+        [LIFELINE_FD_ENV]:           String(LIFELINE_FD),
     };
     for(const [name, value] of Object.entries(preloadVars)) {
         if(value === undefined) {
@@ -600,9 +608,13 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
         // test suite spawned. Without it a grandchild outlives every kill path
         // here and is reparented to PID 1. The child is deliberately not
         // unref()'d: the parent still owns it and must still await its exit.
+        // Fd 3 (LIFELINE_FD) is the child's parent lifeline: this process holds
+        // the other end and never writes to or closes it, so the child reads
+        // end-of-file exactly when this process is gone — see
+        // watchParentLifeline in the coverage preload.
         const spawnOpts: SpawnOptions = {
             env,
-            stdio:    ['ignore', 'pipe', 'pipe'],
+            stdio:    ['ignore', 'pipe', 'pipe', 'pipe'],
             cwd:      process.cwd(),
             detached: true,
         };
