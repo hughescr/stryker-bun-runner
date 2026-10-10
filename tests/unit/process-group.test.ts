@@ -12,23 +12,18 @@ import { describe, it, expect, afterEach } from 'bun:test';
 // realSpawn, not `spawn` from node:child_process: that import is the shared
 // mockSpawn, whose call history would otherwise accumulate this file's spawns
 // (this file never resets mocks) and leak into other files' call-count assertions.
+import { isProcessRunning } from '../helpers/process-liveness.js';
 import { realKillProcessGroup, realSpawn as spawn } from '../test-preload.js';
 
 /** Every child spawned here, so afterEach can reap them even if a test throws. */
 const spawnedChildren: ChildProcess[] = [];
 
 /**
- * True when a pid is still alive. Signal 0 performs the permission/existence
- * check without delivering anything.
+ * True when a pid is still alive. A bare kill(pid, 0) also succeeds for a zombie,
+ * and in a container whose PID 1 never reaps orphans a killed grandchild stays a
+ * zombie forever — so liveness comes from the zombie-aware helper instead.
  */
-function isAlive(pid: number): boolean {
-    try {
-        process.kill(pid, 0);
-        return true;
-    } catch{
-        return false;
-    }
-}
+const isAlive = isProcessRunning;
 
 async function waitUntil(predicate: () => boolean, timeoutMs = 500): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;

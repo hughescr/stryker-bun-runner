@@ -42,6 +42,36 @@ import { runBunTests, stripAnsi } from './process-runner.js';
 import { type DroppedBunfigKey, assertSupportedBunArgs, splitBunConfigArg, checkBunVersion, getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, TEST_FILE_SUFFIX_RE, discoverTestFiles, findBuildOutputTestFiles, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery } from './utils/index.js';
 
 /**
+ * Poll (every 50ms) until `getUrl()` reports the inspector URL, `timeoutMs`
+ * elapses, or `child` settles — whichever comes first.
+ *
+ * Settling is the short-circuit that matters when bun cannot start at all
+ * (`spawnError`, e.g. ENOENT) or exits before printing its inspector banner:
+ * the URL callback fires from stdout/stderr data, which always precedes the
+ * process-close that resolves `child`, so once `child` has settled a URL that
+ * was printed is already visible to `getUrl()` and nothing can set one later.
+ * Waiting out the rest of `timeoutMs` would only delay the error report.
+ */
+async function waitForInspectorUrl(getUrl: () => string | null, child: Promise<unknown>, timeoutMs: number): Promise<void> {
+    let childSettled = false;
+    const markSettled = (): void => {
+        childSettled = true;
+    };
+    child.then(markSettled).catch(markSettled);
+
+    const waitStart = Date.now();
+    // Stryker disable next-line EqualityOperator: `<` vs `<=` only moves the timeout boundary by a single millisecond, which no test can pin; every other mutant of this loop (the && operator, either operand, the body) is pinned by the dryRun wait-loop tests
+    while(!getUrl() && Date.now() - waitStart < timeoutMs) {
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- childSettled is set by an async callback; TypeScript cannot track cross-await mutations
+        if(childSettled) {
+            break;
+        }
+        // eslint-disable-next-line no-await-in-loop -- sequential polling required; the URL is set by an async callback
+        await sleep(50);
+    }
+}
+
+/**
  * Sleep for the given number of milliseconds.
  * Extracted to satisfy no-promise-executor-return: the executor only schedules a
  * timer and does not return its value.
@@ -1389,14 +1419,8 @@ export class BunTestRunner implements TestRunner {
                 },
             });
 
-            // 4. Wait for inspector URL with timeout
-            const waitStart = Date.now();
-            // Stryker disable next-line EqualityOperator,LogicalOperator,ConditionalExpression,BlockStatement: EqualityOperator < vs <= is equivalent; LogicalOperator && → || loops forever → Timeout; ConditionalExpression always-true loops forever → Timeout; BlockStatement removes sleep → busy-wait blocks callback → Timeout
-            // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition, no-unmodified-loop-condition -- inspectorUrl set by async callback in runBunTests; TypeScript cannot track cross-await mutations
-            while(!inspectorUrl && Date.now() - waitStart < this.inspectorTimeout) {
-                // eslint-disable-next-line no-await-in-loop -- sequential polling required; inspectorUrl set by async callback
-                await sleep(50);
-            }
+            // 4. Wait for inspector URL with timeout (or until the child is gone)
+            await waitForInspectorUrl(() => inspectorUrl, testProcess, this.inspectorTimeout);
 
             // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- inspectorUrl set by async callback; TypeScript cannot track cross-await mutations
             if(!inspectorUrl) {

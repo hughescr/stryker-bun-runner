@@ -3620,6 +3620,63 @@ tests/example.test.ts:
         });
     });
 
+    describe('summary counts take the LAST matching line (test-printed lookalikes cannot mask the real summary)', () => {
+        // bun prints its summary after everything a test can log, so when a test's own
+        // console output contains a whole line shaped like a summary line, the LAST
+        // match is the real one. The per-test lines are deliberately absent so the
+        // summary counts are the only source of the totals.
+        it('ignores test-printed " N pass" / " N fail" / " N skip" lines that precede the real summary', () => {
+            const stdout = 'bun test v1.4.2 (744846f84)\n 3 pass\n 9 fail\n 5 skip\n';
+            const stderr = ' 2 pass\n 1 fail\n 4 skip\nRan 7 tests across 1 file. [5.00ms]\n';
+            const result = parseBunTestOutput(stdout, stderr);
+
+            expect(result.passed).toBe(2);
+            expect(result.failed).toBe(1);
+            expect(result.skipped).toBe(4);
+            expect(result.summaryPassed).toBe(2);
+            expect(result.summaryFailed).toBe(1);
+            expect(result.summarySkipped).toBe(4);
+        });
+
+        it('keeps the real summary when an earlier lookalike is LARGER than it (max() must not resurrect it)', () => {
+            const result = parseBunTestOutput('', ' 100 pass\n 50 fail\n 25 skip\n 1 pass\n 0 fail\n 0 skip\n');
+
+            expect(result.passed).toBe(1);
+            expect(result.failed).toBe(0);
+            expect(result.skipped).toBe(0);
+            expect(result.summaryPassed).toBe(1);
+            expect(result.summaryFailed).toBe(0);
+            expect(result.summarySkipped).toBe(0);
+        });
+
+        it('takes the last "Bailed out after N failures" line', () => {
+            const result = parseBunTestOutput('', 'Bailed out after 9 failures\n 0 pass\n 1 fail\nBailed out after 2 failures\n');
+
+            expect(result.failed).toBe(2);
+        });
+
+        it('takes the last "Ran N tests" line for the fallback total', () => {
+            const result = parseBunTestOutput('', 'Ran 99 tests across 1 file.\nRan 4 tests across 1 file. [5.00ms]\n');
+
+            expect(result.passed).toBe(4);
+            expect(result.summaryPassed).toBe(0);
+        });
+
+        it('takes the last line across stdout and stderr, which are joined stdout first', () => {
+            const result = parseBunTestOutput(' 8 pass\n', ' 3 pass\n');
+
+            expect(result.summaryPassed).toBe(3);
+        });
+
+        it('still reads a lone summary line (no regression for the ordinary single-match case)', () => {
+            const result = parseBunTestOutput('', ' 6 pass\n 2 fail\n 1 skip\n');
+
+            expect(result.summaryPassed).toBe(6);
+            expect(result.summaryFailed).toBe(2);
+            expect(result.summarySkipped).toBe(1);
+        });
+    });
+
     describe('GitHub Actions workflow-command decorated output', () => {
         // Fixture provenance: bun-main (1.4.0-canary lineage) prints each test-file
         // header as `::group::tests/foo.test.ts:` when GITHUB_ACTIONS is set AND
