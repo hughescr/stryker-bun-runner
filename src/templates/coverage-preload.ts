@@ -162,7 +162,7 @@ if(syncPort && shouldCollectCoverage) {
         // Install the real 'ready' handler before yielding to the event loop so
         // there is no window where an arriving message is silently dropped.
         await new Promise<void>((resolve) => {
-            ws = new WebSocket(`ws://localhost:${syncPort}/sync`);
+            ws = new WebSocket(`ws://127.0.0.1:${syncPort}/sync`);
             const timeout = setTimeout(() => {
                 console.warn('[Stryker] Timeout waiting for ready signal');
                 resolve();
@@ -190,7 +190,7 @@ if(syncPort && shouldCollectCoverage) {
         // Install the real 'ready' handler before yielding to the event loop so
         // there is no window where an arriving message is silently dropped.
         await new Promise<void>((resolve) => {
-            const wsLocal = new WebSocket(`ws://localhost:${syncPort}/sync`);
+            const wsLocal = new WebSocket(`ws://127.0.0.1:${syncPort}/sync`);
             const timeout = setTimeout(() => {
                 wsLocal.close();
                 console.warn('[Stryker Sync] Timeout waiting for ready signal, proceeding anyway');

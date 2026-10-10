@@ -38,7 +38,7 @@ import type { TestInfo } from './inspector/types.js';
 import type { StrykerBunOptions } from './options.js';
 import { parseBunTestOutput, type ParsedTestResults } from './parsers/console-parser.js';
 import { runBunTests } from './process-runner.js';
-import { getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, discoverTestFiles, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery } from './utils/index.js';
+import { checkBunVersion, getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, discoverTestFiles, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery } from './utils/index.js';
 
 /**
  * Sleep for the given number of milliseconds.
@@ -151,8 +151,87 @@ function formatGapIdList(gaps: readonly number[]): string {
  * log — extracted (rather than an inline ternary in {@link BunTestRunner.dryRun})
  * purely to keep dryRun's own cyclomatic complexity under the lint threshold.
  */
-function formatDrainSettleReason(reason: 'ack' | 'silence' | 'ceiling' | 'send-rejected' | undefined): string {
+function formatDrainSettleReason(reason: DrainSettleReason | undefined): string {
     return reason === undefined ? 'never requested' : `settled via ${reason}`;
+}
+
+/** How the drain handler settled: acknowledged, or one of the give-up paths. */
+type DrainSettleReason = 'ack' | 'silence' | 'ceiling' | 'send-rejected';
+
+/**
+ * Error message for a `bun test` child that emitted an `'error'` event
+ * (ENOENT, EACCES, …) — the tests never ran, so there is no kill to score.
+ * Shared by the dry-run and mutant-run paths so both name the cause identically.
+ */
+function formatSpawnErrorMessage(spawnError: string): string {
+    return `could not start bun test: ${spawnError}`;
+}
+
+/**
+ * User-facing dry-run error for "bun never printed its inspector URL". Carries
+ * what is needed to act on it without digging through logs: the timeout and the
+ * option that controls it, how the child ended, and the TAIL of stderr (where
+ * e.g. `spawn bun ENOENT` or a preload resolution error lands — the head is
+ * usually just startup banner).
+ */
+function formatInspectorTimeoutMessage(
+    inspectorTimeoutMs: number,
+    child:              { exitCode: number | null, signal?: NodeJS.Signals | null, stderr: string, spawnError?: string, timedOut?: boolean }
+): string {
+    // The child never ran, so "exit code none" and a stderr tail would bury the real cause.
+    if(child.spawnError !== undefined) {
+        return formatSpawnErrorMessage(child.spawnError);
+    }
+    // Stryker disable next-line MethodExpression,UnaryOperator: equivalent mutant — slice(-1000) vs full string / sign only changes how much diagnostic text is shown, which the stderr-tail test pins
+    const stderrTail = child.stderr.trim().slice(-1000);
+    // Stryker disable StringLiteral,ConditionalExpression,LogicalOperator: human-readable message wording and the '(empty)'/'none' fallbacks are covered by the inspector-timeout message tests; mutants only alter diagnostic text
+    // A timedOut child was SIGTERMed by the runner's own run timeout (it hung without printing the URL), not killed externally.
+    let ended = child.signal ? `terminated by signal ${child.signal}` : `exit code ${child.exitCode ?? 'none'}`;
+    if(child.timedOut === true) {
+        ended = 'killed by the runner after the run timeout (bun.timeout)';
+    }
+    const prefix = `Timeout waiting for inspector URL after ${inspectorTimeoutMs}ms (raise bun.inspectorTimeout if bun is slow to start)`;
+    return `${prefix}; bun test ${ended}; last stderr: ${stderrTail || '(empty)'}`;
+    // Stryker restore StringLiteral,ConditionalExpression,LogicalOperator
+}
+
+/**
+ * The abnormal conditions behind the single post-drain `warn` in
+ * {@link BunTestRunner.dryRun}. A healthy dry run — drain acknowledged
+ * ('ack'), no remaining found-id gaps, no duplicate found-id events — yields an
+ * empty list and therefore no warn at all (the detailed drain/close/collision
+ * numbers are logged at debug either way). Anything else is evidence the
+ * inspector stream may be incomplete or merged: the drain-request never
+ * arrived, the wait gave up ('silence'/'ceiling') or the round-trip was
+ * rejected ('send-rejected'), the inspector WebSocket closed uncleanly
+ * (wasClean === false, e.g. code 1006) even if the drain was acknowledged,
+ * found-id gaps remain, or the Bun TestReporter id-collision bug was observed
+ * (duplicate found-id events).
+ */
+function collectAbnormalDrainProblems(data: {
+    drainSettleReason:     DrainSettleReason | undefined
+    drainRejection:        string | undefined
+    finalGaps:             readonly number[]
+    duplicateFoundIdCount: number
+    closeInfo:             InspectorCloseInfo
+}): string[] {
+    const problems: string[] = [];
+    if(data.drainSettleReason !== 'ack') {
+        const rejection = data.drainRejection === undefined ? '' : ` (${data.drainRejection})`;
+        problems.push(`drain handshake ${formatDrainSettleReason(data.drainSettleReason)}${rejection}`);
+    }
+    // wasClean === false (not merely undefined: a close event that never carried the flag is
+    // not evidence of anything) means the socket dropped without a closing handshake, e.g. 1006.
+    if(data.closeInfo.wasClean === false) {
+        problems.push(`inspector WebSocket closed uncleanly (code ${String(data.closeInfo.code)}, reason ${JSON.stringify(data.closeInfo.reason ?? '')})`);
+    }
+    if(data.finalGaps.length > 0) {
+        problems.push(`${data.finalGaps.length} found-id gap(s) remaining${formatGapIdList(data.finalGaps)}`);
+    }
+    if(data.duplicateFoundIdCount > 0) {
+        problems.push(`${data.duplicateFoundIdCount} duplicate found-id event(s) (Bun TestReporter id-collision bug)`);
+    }
+    return problems;
 }
 
 /**
@@ -295,6 +374,8 @@ export class BunTestRunner implements TestRunner {
     private cachedEagerModules?:          string[];
     private cachedEagerModulesCwd?:       string;
     private lastRegistryTmpPath?:         string;
+    /** True once `<bunPath> --version` has passed the startup check; later init() calls skip it. */
+    private bunChecked = false;
 
     /**
    * AbortController for whichever `dryRun`/`mutantRun` child process is
@@ -529,6 +610,15 @@ export class BunTestRunner implements TestRunner {
     public async init(): Promise<void> {
         // Stryker disable next-line StringLiteral: logging message only
         this.logger.debug('BunTestRunner init starting...');
+
+        // Fail fast, with an actionable message, if bun cannot be run or is older than the
+        // supported floor — otherwise a missing binary only shows up later as a dry-run
+        // "Timeout waiting for inspector URL". Uses the same bunPath/env the real spawn uses.
+        // Done once per runner: the binary does not change between sandbox-rotation re-inits.
+        if(!this.bunChecked) {
+            await checkBunVersion(this.bunPath, this.env);
+            this.bunChecked = true;
+        }
 
         // If init() is called more than once (Stryker sandbox lifecycle rotation),
         // clean up the preload script and coverage file from the previous init()
@@ -1043,7 +1133,7 @@ export class BunTestRunner implements TestRunner {
                 );
                 return {
                     status:       DryRunStatus.Error,
-                    errorMessage: 'Timeout waiting for inspector URL',
+                    errorMessage: formatInspectorTimeoutMessage(this.inspectorTimeout, diagnosticResult),
                 };
             }
 
@@ -1117,7 +1207,9 @@ export class BunTestRunner implements TestRunner {
             }
 
             // undefined = drain-request never arrived (step 9 reports this distinctly).
-            let drainSettleReason: 'ack' | 'silence' | 'ceiling' | 'send-rejected' | undefined;
+            let drainSettleReason: DrainSettleReason | undefined;
+            // Error text when the drain round-trip itself was rejected ('send-rejected'); surfaced in the single abnormal-data warn.
+            let drainRejection: string | undefined;
 
             // 6.5 Register a drain handler: the preload's final afterAll blocks on a
             // 'drained' acknowledgment from the runner before closing its sync socket
@@ -1144,7 +1236,9 @@ export class BunTestRunner implements TestRunner {
                 const drainRequestReceivedAt = Date.now();
                 const countsAtRequest = inspector.getEventCounts();
                 const gapsAtRequest = inspector.getFoundIdGaps();
-                this.logger.warn(
+                // debug, not warn: every healthy dry run performs this handshake. The one
+                // abnormal-data warn (if any) is emitted at step 9 — see collectAbnormalDrainProblems.
+                this.logger.debug(
                     'Drain-request received: %d/%d/%d found/start/end events received so far; %d found-id gap(s)%s',
                     countsAtRequest.found, countsAtRequest.start, countsAtRequest.end,
                     gapsAtRequest.length, formatGapIdList(gapsAtRequest)
@@ -1168,8 +1262,8 @@ export class BunTestRunner implements TestRunner {
                 } catch (error) {
                     drainSettleReason = error instanceof DrainWaitTimeoutError ? error.reason : 'send-rejected';
                     if(drainSettleReason === 'send-rejected') {
-                        this.logger.warn('Inspector drain round-trip rejected before any wait bound was hit: %s',
-                            error instanceof Error ? error.message : String(error));
+                        drainRejection = error instanceof Error ? error.message : String(error);
+                        this.logger.debug('Inspector drain round-trip rejected before any wait bound was hit: %s', drainRejection);
                     }
                     // Swallowed on purpose: resolving makes SyncServer send 'drained' even on
                     // give-up, releasing the child immediately — otherwise the child would
@@ -1179,7 +1273,7 @@ export class BunTestRunner implements TestRunner {
                     const elapsedMs = Date.now() - drainRequestReceivedAt;
                     const countsAtSettle = inspector.getEventCounts();
                     const gapsAtSettle = inspector.getFoundIdGaps();
-                    this.logger.warn(
+                    this.logger.debug(
                         'Drain handler settled via %s after %dms; events during wait +%d/+%d/+%d found/start/end; found-id gaps %d -> %d%s',
                         drainSettleReason, elapsedMs,
                         countsAtSettle.found - countsAtRequest.found,
@@ -1222,7 +1316,7 @@ export class BunTestRunner implements TestRunner {
                 testHierarchy.length, executionOrder.length);
 
             const finalGaps = inspector.getFoundIdGaps();
-            this.logger.warn(
+            this.logger.debug(
                 'Post-drain inspector snapshot: %d found-id gap(s) remaining%s; drain handshake %s',
                 finalGaps.length, formatGapIdList(finalGaps),
                 formatDrainSettleReason(drainSettleReason)
@@ -1236,13 +1330,23 @@ export class BunTestRunner implements TestRunner {
             // which keeps ids dense while silently merging distinct tests under one shared id.
             const closeInfo = inspector.getCloseInfo();
             const collisionStats = inspector.getFoundIdCollisionStats();
-            this.logger.warn(
+            this.logger.debug(
                 'Post-drain inspector close/collision diagnostics: WS close code=%s reason=%s wasClean=%s msFromLastFrameToClose=%s; '
                 + 'found events %d raw / %d unique id(s) / %d duplicate id event(s) (nonzero duplicates = direct evidence of the Bun '
                 + 'TestReporter id-collision bug; the found-id-gap count above is density-only — it does NOT prove losslessness under collisions)',
                 String(closeInfo.code), String(closeInfo.reason), String(closeInfo.wasClean), String(closeInfo.msFromLastFrameToClose),
                 collisionStats.rawFoundCount, collisionStats.uniqueFoundIdCount, collisionStats.duplicateFoundIdCount
             );
+
+            // The ONE warn for this whole drain/post-drain block, and only when the data is
+            // actually abnormal; the four diagnostics above stay at debug so a healthy run is quiet.
+            this.warnOnAbnormalDrainData({
+                drainSettleReason,
+                drainRejection,
+                finalGaps,
+                duplicateFoundIdCount: collisionStats.duplicateFoundIdCount,
+                closeInfo,
+            });
 
             // 10–12. Handle timeout and process errors; parse output
             const parsed = parseBunTestOutput(result.stdout, result.stderr);
@@ -1266,6 +1370,21 @@ export class BunTestRunner implements TestRunner {
             }
             // 10 (always). Close sync server — idempotent, safe even after early-return paths
             await syncServer.close();
+        }
+    }
+
+    /**
+   * Emit the single post-drain `warn` iff {@link collectAbnormalDrainProblems}
+   * finds anything; a healthy dry run logs nothing at warn. Extracted from
+   * dryRun() to keep its complexity under the lint threshold.
+   */
+    private warnOnAbnormalDrainData(data: Parameters<typeof collectAbnormalDrainProblems>[0]): void {
+        const problems = collectAbnormalDrainProblems(data);
+        if(problems.length > 0) {
+            this.logger.warn(
+                'Inspector data looks abnormal after the dry run: %s — test results may be incomplete; enable debug logging for the full drain/close/collision diagnostics',
+                problems.join('; ')
+            );
         }
     }
 
@@ -1492,7 +1611,7 @@ export class BunTestRunner implements TestRunner {
         // When the covering set is too large to encode safely in a single argv entry
         // (kernel argv limits are in UTF-8 bytes), buildTestNamePattern returns undefined
         // and the full suite runs instead (see MAX_TEST_NAME_PATTERN_LENGTH).
-        // Sequential mode (--concurrency=1) is required to match dryRun's serialized
+        // Sequential mode (--max-concurrency=1) is required to match dryRun's serialized
         // execution semantics — parallel timing can cause mutants to escape detection.
         // IMPORTANT: Preload script IS needed to set globalThis.__stryker__.activeMutant
         // The preload script skips coverage collection when __STRYKER_ACTIVE_MUTANT__ is set
@@ -1585,6 +1704,16 @@ export class BunTestRunner implements TestRunner {
             };
         }
 
+        // The child failed to spawn (ENOENT, EACCES, …): bun test never ran, so exitCode is
+        // null and means nothing. Policy: Killed only when a failing test is seen — never
+        // score a run that executed no tests as a kill.
+        if(result.spawnError !== undefined) {
+            const errorMessage = formatSpawnErrorMessage(result.spawnError);
+            // Stryker disable next-line StringLiteral: diagnostic logging message
+            this.logger.warn('Mutant %s: %s — scoring as Error rather than Killed', options.activeMutant.id, errorMessage);
+            return { status: MutantRunStatus.Error, errorMessage };
+        }
+
         const parsed = parseBunTestOutput(result.stdout, result.stderr);
 
         // Stryker disable next-line StringLiteral: logging message only
@@ -1625,7 +1754,7 @@ export class BunTestRunner implements TestRunner {
    * Handles runtime error detection and killedBy resolution.
    */
     private buildMutantKilledResult(
-        result:         { exitCode: number | null, stdout: string, stderr: string },
+        result:         { exitCode: number | null, signal?: NodeJS.Signals | null, stdout: string, stderr: string },
         parsed:         { tests: { status: string, name: string, failureMessage?: string }[], totalTests: number },
         localRegistry:  Set<string>,
         localBaseIndex: Map<string, string[]>,
@@ -1634,6 +1763,16 @@ export class BunTestRunner implements TestRunner {
         const rawFailedNames = parsed.tests
             .filter(test => test.status === 'failed')
             .map(test => normalizeTestName(test.name));
+
+        // A child that died from a signal (SIGSEGV, SIGABRT, an external SIGKILL…) proves
+        // nothing about the mutant unless the output ALSO shows a failing test that we can
+        // attribute: a crash is Killed only with that evidence, otherwise it is an Error
+        // naming the signal. This path is only reached for runs the runner did not kill
+        // itself — executeMutantRun returns Timeout for result.timedOut first, which also
+        // covers the maxChildRss kill — so any signal seen here is the child's own.
+        if(result.signal && rawFailedNames.length === 0) {
+            return this.buildSignalErrorResult(result, mutantId, `bun test terminated by ${result.signal} before any test reported a failure`);
+        }
 
         // Check for runtime errors: tests couldn't run due to module/syntax errors
         // These should be RuntimeError, not Killed, and don't need killedBy for caching
@@ -1647,6 +1786,16 @@ export class BunTestRunner implements TestRunner {
         }
 
         const killedBy = this.resolveKilledBy(rawFailedNames, localRegistry, localBaseIndex, mutantId);
+
+        // Signal death with failing tests reported, but none attributable: still no evidence the
+        // mutant (rather than the crash) caused it. Error, not an unattributable Killed.
+        if(result.signal && killedBy.length === 0) {
+            return this.buildSignalErrorResult(
+                result,
+                mutantId,
+                `bun test terminated by ${result.signal}; the ${rawFailedNames.length} failing test(s) reported could not be attributed to a known test`
+            );
+        }
 
         // Genuinely unattributable kill (unparseable Bun output, or every failed
         // name dropped as unresolvable by resolveKilledBy): emit an EMPTY killedBy.
@@ -1684,6 +1833,33 @@ export class BunTestRunner implements TestRunner {
                 .join('\n\n') || `Tests failed with exit code ${result.exitCode}`,
             nrOfTests: parsed.totalTests || 1,
         };
+    }
+
+    /**
+   * Error result for a mutant run whose `bun test` child died from a signal
+   * without attributable failing-test evidence — see buildMutantKilledResult.
+   * Logged at warn (with the output head, like the unattributable-kill path) so
+   * a crashing suite is visible rather than silently scored.
+   */
+    private buildSignalErrorResult(
+        result:       { stdout: string, stderr: string },
+        mutantId:     string,
+        errorMessage: string
+    ): MutantRunResult {
+        // Stryker disable StringLiteral: diagnostic logging message format strings — not behaviorally tested
+        this.logger.warn(
+            'Mutant %s: %s — scoring as Error rather than Killed\n'
+            + '--- STDOUT (first 600 chars) ---\n%s\n'
+            + '--- STDERR (first 600 chars) ---\n%s',
+            mutantId,
+            errorMessage,
+            // Stryker restore StringLiteral
+            // Stryker disable next-line MethodExpression,ConditionalExpression,LogicalOperator,StringLiteral: equivalent mutant — slice(0,600) and '(empty)' are diagnostic only
+            result.stdout.slice(0, 600) || '(empty)',
+            // Stryker disable next-line MethodExpression,ConditionalExpression,LogicalOperator,StringLiteral: equivalent mutant — slice(0,600) and '(empty)' are diagnostic only
+            result.stderr.slice(0, 600) || '(empty)'
+        );
+        return { status: MutantRunStatus.Error, errorMessage };
     }
 
     /**
@@ -1745,7 +1921,7 @@ export class BunTestRunner implements TestRunner {
    * Returns a DryRunResult to short-circuit if the process failed, or null to proceed.
    */
     private checkDryRunProcessResult(
-        result:        { timedOut: boolean, exitCode: number | null, stderr: string },
+        result:        { timedOut: boolean, exitCode: number | null, signal?: NodeJS.Signals | null, stderr: string, spawnError?: string },
         parsed:        { failed: number },
         testHierarchy: TestInfo[]
     ): DryRunResult | null {
@@ -1753,6 +1929,14 @@ export class BunTestRunner implements TestRunner {
             // Stryker disable next-line StringLiteral: logging message only
             this.logger.warn('Dry run timed out');
             return { status: DryRunStatus.Timeout };
+        }
+        // A child 'error' event (exitCode and signal both null): name the spawn error rather
+        // than "exit code null". Status semantics unchanged — still an Error.
+        if(result.spawnError !== undefined) {
+            return {
+                status:       DryRunStatus.Error,
+                errorMessage: `${formatSpawnErrorMessage(result.spawnError)}\n${result.stderr}`,
+            };
         }
         // Non-zero exit with 0 parsed failures means the process itself failed
         // (e.g. misconfiguration, missing module) rather than a test failure —
@@ -1764,7 +1948,12 @@ export class BunTestRunner implements TestRunner {
             // when bun's own stdout/stderr recap is truncated or missing (the incident
             // this addresses), so it goes ahead of the raw stderr that may be useless.
             const failureDetails = this.formatInspectorFailureDetails(testHierarchy);
-            const messageParts = [`Bun test process failed with exit code ${result.exitCode}`];
+            // A signal death has exitCode null; name the signal rather than "exit code null".
+            // Status semantics are unchanged: still an Error (a dry run with no parsed
+            // failures has no kill to score, so there is no Killed/Error policy question here).
+            const messageParts = [result.signal
+                ? `Bun test process terminated by signal ${result.signal}`
+                : `Bun test process failed with exit code ${result.exitCode}`];
             if(failureDetails) {
                 messageParts.push(failureDetails);
             }

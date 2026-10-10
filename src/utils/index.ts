@@ -1,4 +1,5 @@
 export { getAvailablePort } from './port.js';
+export { checkBunVersion, MIN_BUN_VERSION } from './bun-version.js';
 export { SyncServer } from './sync-server.js';
 export type { SyncServerOptions } from './sync-server.js';
 export { generateSanitizedBunfig, cleanupSanitizedBunfig } from './bunfig-sanitizer.js';

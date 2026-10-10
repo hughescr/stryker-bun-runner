@@ -17,7 +17,7 @@ interface MockChildProcess extends Partial<ChildProcess> {
     stdoutHandler?: (data: Buffer) => void
     stderrHandler?: (data: Buffer) => void
     exitHandler?:   (code: number | null) => void
-    closeHandler?:  (code: number | null) => void
+    closeHandler?:  (code: number | null, signal?: NodeJS.Signals | null) => void
     errorHandler?:  (error: Error) => void
 }
 
@@ -192,6 +192,60 @@ describe('runBunTests', () => {
 
             expect(result.exitCode).toBe(1);
             expect(result.timedOut).toBe(false);
+            expect(result.signal).toBeNull();
+        });
+
+        it('reports the terminating signal when the child dies from a signal on its own', async () => {
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+            });
+
+            // Node reports a signal death as close(code = null, signal = 'SIGSEGV')
+            mockChildProcess.closeHandler?.(null, 'SIGSEGV');
+
+            const result = await resultPromise;
+
+            expect(result.exitCode).toBeNull();
+            expect(result.signal).toBe('SIGSEGV');
+            expect(result.timedOut).toBe(false);
+            expect(result.memoryLimitExceeded).toBe(false);
+        });
+
+        it('reports signal: null for a normal exit', async () => {
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+            });
+
+            mockChildProcess.closeHandler?.(0, null);
+
+            const result = await resultPromise;
+
+            expect(result.exitCode).toBe(0);
+            expect(result.signal).toBeNull();
+        });
+
+        it('keeps timedOut: true alongside the signal when the runner itself killed the child on timeout', async () => {
+            jest.useFakeTimers();
+            try {
+                const resultPromise = runBunTests({
+                    bunPath: 'bun',
+                    timeout: 100,
+                });
+
+                jest.advanceTimersByTime(150);
+                mockChildProcess.closeHandler?.(null, 'SIGTERM');
+
+                const result = await resultPromise;
+
+                // The runner-initiated kill is identified by timedOut, never by the signal alone.
+                expect(result.timedOut).toBe(true);
+                expect(result.exitCode).toBeNull();
+                expect(result.signal).toBe('SIGTERM');
+            } finally {
+                jest.useRealTimers();
+            }
         });
 
         it('should handle process errors', async () => {
@@ -207,7 +261,37 @@ describe('runBunTests', () => {
             const result = await resultPromise;
 
             expect(result.exitCode).toBeNull();
+            expect(result.signal).toBeNull();
             expect(result.stderr).toContain('ENOENT: no such file or directory');
+        });
+
+        it('exposes the spawn error text in an explicit spawnError field (not only in stderr)', async () => {
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+            });
+
+            mockChildProcess.errorHandler?.(new Error('spawn bun ENOENT'));
+
+            const result = await resultPromise;
+
+            expect(result.spawnError).toBe('spawn bun ENOENT');
+            expect(result.exitCode).toBeNull();
+            expect(result.signal).toBeNull();
+            expect(result.timedOut).toBe(false);
+        });
+
+        it('leaves spawnError undefined when the child closes normally', async () => {
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+            });
+
+            mockChildProcess.closeHandler?.(0);
+
+            const result = await resultPromise;
+
+            expect(result.spawnError).toBeUndefined();
         });
     });
 
@@ -539,7 +623,7 @@ describe('runBunTests', () => {
     });
 
     describe('sequentialMode option', () => {
-        it('should add --concurrency=1 flag when sequentialMode is true', async () => {
+        it('should add --max-concurrency=1 flag (a real bun test flag) when sequentialMode is true', async () => {
             const resultPromise = runBunTests({
                 bunPath:        'bun',
                 timeout:        5000,
@@ -552,10 +636,12 @@ describe('runBunTests', () => {
             const spawnCall = mockSpawn.mock.calls[0];
 
             const args = spawnCall[1];
-            expect(args).toContain('--concurrency=1');
+            expect(args).toContain('--max-concurrency=1');
+            // `--concurrency` is not a bun test flag; it must never be emitted.
+            expect(args).not.toContain('--concurrency=1');
         });
 
-        it('should not add --concurrency flag when sequentialMode is false', async () => {
+        it('should not add any concurrency flag when sequentialMode is false', async () => {
             const resultPromise = runBunTests({
                 bunPath:        'bun',
                 timeout:        5000,
@@ -568,6 +654,7 @@ describe('runBunTests', () => {
             const spawnCall = mockSpawn.mock.calls[0];
 
             const args = spawnCall[1];
+            expect(args).not.toContain('--max-concurrency=1');
             expect(args).not.toContain('--concurrency=1');
         });
     });
@@ -1358,6 +1445,7 @@ describe('runBunTests', () => {
             expect(result.timedOut).toBe(true);
             expect(result.exitCode).toBeNull();
             expect(result.memoryLimitExceeded).toBe(false);
+            expect(result.signal).toBeNull();
             expect(result.stdout).toBe('');
             expect(result.stderr).toBe('');
         });

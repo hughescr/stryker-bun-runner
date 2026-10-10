@@ -85,7 +85,7 @@ const createMockHttpServer = (): MockHttpServer => {
         on: mock((event: string, handler: (arg: unknown) => void) => {
             handlers.set(event, handler);
         }),
-        listen: mock((_port: number, callback: () => void) => {
+        listen: mock((_port: number, _host: string, callback: () => void) => {
             setImmediate(callback);
         }),
         close: mock((callback?: () => void) => {
@@ -244,7 +244,13 @@ describe('SyncServer', () => {
         it('starts listening on specified port', async () => {
             const server = createServer(3000);
             await server.start();
-            expect(mockHttpServer.listen).toHaveBeenCalledWith(3000, expect.any(Function));
+            expect(mockHttpServer.listen).toHaveBeenCalledWith(3000, expect.any(String), expect.any(Function));
+        });
+
+        it('binds loopback only (127.0.0.1), never all interfaces', async () => {
+            const server = createServer(3000);
+            await server.start();
+            expect(mockHttpServer.listen).toHaveBeenCalledWith(3000, '127.0.0.1', expect.any(Function));
         });
 
         it('resolves when listen completes', async () => {
@@ -254,7 +260,7 @@ describe('SyncServer', () => {
 
         it('rejects when server emits error', async () => {
             const errorServer = createMockHttpServer();
-            errorServer.listen = mock((_port: number, _callback: () => void) => {
+            errorServer.listen = mock((_port: number, _host: string, _callback: () => void) => {
                 // Don't call callback - let error happen first
             });
             const errorFactory = mock(() => errorServer);
@@ -845,5 +851,13 @@ describe('SyncServer', () => {
             mockWss.triggerConnection(createMockClient());
             expect(server.clientCount).toBe(2);
         });
+    });
+});
+
+describe('preload sync dial address', () => {
+    it('dials the literal loopback address the server binds (127.0.0.1), not "localhost"', async () => {
+        const template = await Bun.file(new URL('../../src/templates/coverage-preload.ts', import.meta.url)).text();
+        expect(template).not.toContain('ws://localhost:');
+        expect(template.match(/ws:\/\/127\.0\.0\.1:\$\{syncPort\}\/sync/g)).toHaveLength(2);
     });
 });

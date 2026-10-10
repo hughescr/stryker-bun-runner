@@ -19,6 +19,7 @@ import * as inspectorModule from '../../src/inspector/inspector-client.js';
 import type { UnexpectedCloseContext, RequestStallInfo } from '../../src/inspector/inspector-client.js';
 import type { TestInfo } from '../../src/inspector/types.js';
 import * as processRunner from '../../src/process-runner.js';
+import * as bunVersion from '../../src/utils/bun-version.js';
 import * as bunfigSanitizer from '../../src/utils/bunfig-sanitizer.js';
 import * as syncServerModule from '../../src/utils/sync-server.js';
 import * as testFileDiscovery from '../../src/utils/test-file-discovery.js';
@@ -106,6 +107,7 @@ describe('BunTestRunner', () => {
     let mapCoverageToInspectorIdsSpy: ReturnType<typeof spyOn>;
     let discoverTestFilesSpy: ReturnType<typeof spyOn>;
     let resolveEagerModulesFromGlobsSpy: ReturnType<typeof spyOn>;
+    let checkBunVersionSpy: ReturnType<typeof spyOn>;
 
     beforeEach(() => {
         // Note: Global fake timers cause tests to hang when running full suite
@@ -229,6 +231,10 @@ describe('BunTestRunner', () => {
         // Mock resolveEagerModulesFromGlobs so init() does not perform real filesystem I/O.
         // Returns an empty list by default; override locally when testing eager-module behaviour.
         resolveEagerModulesFromGlobsSpy = spyOn(preloadGenerator, 'resolveEagerModulesFromGlobs').mockResolvedValue([]);
+
+        // Mock the startup `bun --version` check so init() neither needs a real bun on
+        // PATH nor pays a process spawn per test. Tests of the check itself override this.
+        checkBunVersionSpy = spyOn(bunVersion, 'checkBunVersion').mockResolvedValue('1.4.2');
     });
 
     afterEach(async () => {
@@ -259,6 +265,8 @@ describe('BunTestRunner', () => {
         discoverTestFilesSpy.mockRestore();
 
         resolveEagerModulesFromGlobsSpy.mockRestore();
+
+        checkBunVersionSpy.mockRestore();
 
         // Safety net for ad-hoc spies created inline within individual test bodies
         jest.restoreAllMocks();
@@ -660,6 +668,62 @@ describe('BunTestRunner', () => {
     });
 
     describe('init', () => {
+        describe('startup bun check', () => {
+            it('checks the default "bun" with no env override', async () => {
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+
+                expect(checkBunVersionSpy).toHaveBeenCalledTimes(1);
+                expect(checkBunVersionSpy).toHaveBeenCalledWith('bun', undefined);
+            });
+
+            it('respects bun.bunPath and bun.env', async () => {
+                const runner = new BunTestRunner(mockLogger, {
+                    bun: { bunPath: '/opt/bun/bin/bun', env: { PATH: '/custom/bin' } },
+                } as unknown as StrykerOptions);
+                await runner.init();
+
+                expect(checkBunVersionSpy).toHaveBeenCalledWith('/opt/bun/bin/bun', { PATH: '/custom/bin' });
+            });
+
+            it('rejects init() with the checker error (bun missing) before generating any files', async () => {
+                const message = 'stryker-bun-runner: could not run "bun" (ENOENT). Install bun >= 1.3.7 or set bun.bunPath in your Stryker config.';
+                checkBunVersionSpy.mockRejectedValue(new Error(message));
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+
+                await expect(runner.init()).rejects.toThrow(message);
+                expect(mockGeneratePreloadScript).not.toHaveBeenCalled();
+            });
+
+            it('rejects init() with the checker error (bun too old)', async () => {
+                const message = 'stryker-bun-runner: bun 1.3.6 at "bun" is too old; version 1.3.7 or newer is required.';
+                checkBunVersionSpy.mockRejectedValue(new Error(message));
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+
+                await expect(runner.init()).rejects.toThrow(message);
+            });
+
+            it('runs the check only once per runner, even if init() is called again', async () => {
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.init();
+
+                expect(checkBunVersionSpy).toHaveBeenCalledTimes(1);
+            });
+
+            it('retries the check on a later init() after a failed one', async () => {
+                checkBunVersionSpy.mockRejectedValueOnce(new Error('boom'));
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await expect(runner.init()).rejects.toThrow('boom');
+                await runner.init();
+
+                expect(checkBunVersionSpy).toHaveBeenCalledTimes(2);
+            });
+        });
+
         it('should generate preload script', async () => {
             mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
 
@@ -1071,7 +1135,158 @@ tests/example.test.ts:
 
                 expect(result.status).toBe(DryRunStatus.Error);
                 if(result.status === DryRunStatus.Error) {
-                    expect(result.errorMessage).toBe('Timeout waiting for inspector URL');
+                    // Actionable diagnostics: the timeout value, the option that controls it,
+                    // the child's exit code, and the stderr tail.
+                    expect(result.errorMessage).toStartWith('Timeout waiting for inspector URL');
+                    expect(result.errorMessage).toContain('100ms');
+                    expect(result.errorMessage).toContain('bun.inspectorTimeout');
+                    expect(result.errorMessage).toContain('exit code 1');
+                    expect(result.errorMessage).toContain('preload crashed before inspector came up');
+                }
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('says the runner killed bun after bun.timeout (not an external signal) when the inspector-timeout child was timedOut', async () => {
+            jest.useFakeTimers();
+            try {
+                mockRunBunTests.mockImplementation(() => {
+                    return Promise.resolve({
+                        exitCode: null,
+                        signal:   'SIGTERM',
+                        stdout:   '',
+                        stderr:   'hung before printing the inspector URL',
+                        timedOut: true,
+                    });
+                });
+
+                const runner = new BunTestRunner(mockLogger, {
+                    bun: {
+                        inspectorTimeout: 100,
+                    },
+                } as unknown as StrykerOptions);
+                await runner.init();
+
+                const resultPromise = runner.dryRun();
+                for(let i = 0; i < 5; i++) {
+                    jest.advanceTimersByTime(50);
+                    // eslint-disable-next-line no-await-in-loop -- deliberate sequential microtask flush for fake-timer test
+                    await Promise.resolve();
+                }
+
+                const result = await resultPromise;
+
+                expect(result.status).toBe(DryRunStatus.Error);
+                if(result.status === DryRunStatus.Error) {
+                    expect(result.errorMessage).toStartWith('Timeout waiting for inspector URL');
+                    expect(result.errorMessage).toContain('killed by the runner after the run timeout (bun.timeout)');
+                    expect(result.errorMessage).not.toContain('terminated by signal');
+                    expect(result.errorMessage).toContain('hung before printing the inspector URL');
+                }
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('names the spawn error clearly in the dry-run error when bun could not be started', async () => {
+            jest.useFakeTimers();
+            try {
+                mockRunBunTests.mockImplementation(() => {
+                    return Promise.resolve({
+                        exitCode:   null,
+                        signal:     null,
+                        stdout:     '',
+                        stderr:     '\nProcess error: spawn bun ENOENT',
+                        timedOut:   false,
+                        spawnError: 'spawn bun ENOENT',
+                    });
+                });
+
+                const runner = new BunTestRunner(mockLogger, {
+                    bun: { inspectorTimeout: 100 },
+                } as unknown as StrykerOptions);
+                await runner.init();
+
+                const resultPromise = runner.dryRun();
+                for(let i = 0; i < 5; i++) {
+                    jest.advanceTimersByTime(50);
+                    // eslint-disable-next-line no-await-in-loop -- deliberate sequential microtask flush for fake-timer test
+                    await Promise.resolve();
+                }
+                const result = await resultPromise;
+
+                expect(result.status).toBe(DryRunStatus.Error);
+                if(result.status === DryRunStatus.Error) {
+                    expect(result.errorMessage).toStartWith('could not start bun test: spawn bun ENOENT');
+                    expect(result.errorMessage).not.toContain('exit code none');
+                }
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('includes only the LAST 1000 chars of stderr in the inspector-timeout error message', async () => {
+            jest.useFakeTimers();
+            try {
+                mockRunBunTests.mockImplementation(() => {
+                    return Promise.resolve({
+                        exitCode: 1,
+                        stdout:   '',
+                        stderr:   `HEAD-MARKER${'x'.repeat(1500)}TAIL-MARKER`,
+                        timedOut: false,
+                    });
+                });
+
+                const runner = new BunTestRunner(mockLogger, {
+                    bun: { inspectorTimeout: 100 },
+                } as unknown as StrykerOptions);
+                await runner.init();
+
+                const resultPromise = runner.dryRun();
+                for(let i = 0; i < 5; i++) {
+                    jest.advanceTimersByTime(50);
+                    // eslint-disable-next-line no-await-in-loop -- deliberate sequential microtask flush for fake-timer test
+                    await Promise.resolve();
+                }
+                const result = await resultPromise;
+
+                expect(result.status).toBe(DryRunStatus.Error);
+                if(result.status === DryRunStatus.Error) {
+                    expect(result.errorMessage).toContain('TAIL-MARKER');
+                    expect(result.errorMessage).not.toContain('HEAD-MARKER');
+                    const stderrPart = result.errorMessage.slice(result.errorMessage.indexOf('x'.repeat(10)));
+                    expect(stderrPart.length).toBeLessThanOrEqual(1000);
+                }
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
+        it('says so explicitly when the inspector-timeout child produced no stderr', async () => {
+            jest.useFakeTimers();
+            try {
+                mockRunBunTests.mockImplementation(() => {
+                    return Promise.resolve({ exitCode: null, stdout: '', stderr: '', timedOut: false });
+                });
+
+                const runner = new BunTestRunner(mockLogger, {
+                    bun: { inspectorTimeout: 100 },
+                } as unknown as StrykerOptions);
+                await runner.init();
+
+                const resultPromise = runner.dryRun();
+                for(let i = 0; i < 5; i++) {
+                    jest.advanceTimersByTime(50);
+                    // eslint-disable-next-line no-await-in-loop -- deliberate sequential microtask flush for fake-timer test
+                    await Promise.resolve();
+                }
+                const result = await resultPromise;
+
+                expect(result.status).toBe(DryRunStatus.Error);
+                if(result.status === DryRunStatus.Error) {
+                    expect(result.errorMessage).toContain('stderr: (empty)');
+                    expect(result.errorMessage).toContain('exit code none');
                 }
             } finally {
                 jest.useRealTimers();
@@ -1972,7 +2187,7 @@ tests/example.test.ts:
                 await runner.init();
                 await runner.dryRun();
 
-                expect(mockLogger.warn).toHaveBeenCalledWith(
+                expect(mockLogger.debug).toHaveBeenCalledWith(
                     'Post-drain inspector snapshot: %d found-id gap(s) remaining%s; drain handshake %s',
                     1, ' [3]', 'never requested'
                 );
@@ -2024,7 +2239,7 @@ tests/example.test.ts:
                 await runner.init();
                 await runner.dryRun();
 
-                expect(mockLogger.warn).toHaveBeenCalledWith(
+                expect(mockLogger.debug).toHaveBeenCalledWith(
                     'Post-drain inspector snapshot: %d found-id gap(s) remaining%s; drain handshake %s',
                     0, '', 'settled via ack'
                 );
@@ -2080,10 +2295,142 @@ tests/example.test.ts:
                     jest.useRealTimers();
                 }
 
-                expect(mockLogger.warn).toHaveBeenCalledWith(
+                expect(mockLogger.debug).toHaveBeenCalledWith(
                     'Post-drain inspector snapshot: %d found-id gap(s) remaining%s; drain handshake %s',
                     0, '', 'settled via silence'
                 );
+            });
+        });
+
+        describe('drain diagnostics log levels', () => {
+            // mockLogger is typed as Logger, whose methods have no `.mock`; the underlying fns are bun mocks.
+            const loggedCalls = (logFn: unknown): unknown[][] => (logFn as ReturnType<typeof mock>).mock.calls as unknown[][];
+
+            /**
+             * Runs one dryRun() whose mocked child invokes the registered drain
+             * handler (the real preload's drain-request) before exiting, so the
+             * handler settles BEFORE step 9 — same trick as the snapshot-log tests
+             * above. Pass `invokeHandler: false` for the "never requested" case.
+             */
+            async function runDryRunWithDrain(invokeHandler = true): Promise<void> {
+                mockSuccessfulBunTestRun();
+                let resolveRegistered!: (handler: () => Promise<void>) => void;
+                const handlerRegistered = new Promise<() => Promise<void>>((resolve) => {
+                    resolveRegistered = resolve;
+                });
+                mockSyncServer.setDrainHandler.mockImplementation((fn: () => Promise<void>) => {
+                    resolveRegistered(fn);
+                });
+                mockRunBunTests.mockImplementation((options: { onInspectorReady?: (url: string) => void }) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return (async () => {
+                        if(invokeHandler) {
+                            const handler = await handlerRegistered;
+                            await handler();
+                        }
+                        return {
+                            exitCode: 0,
+                            stdout:   '✓ test [0.12ms]\n 1 pass',
+                            stderr:   '',
+                            timedOut: false,
+                        };
+                    })();
+                });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+            }
+
+            it('logs nothing at warn on a healthy dry run (ack, no gaps, no duplicate ids)', async () => {
+                mockInspectorClient.getFoundIdGaps.mockReturnValue([]);
+                mockInspectorClient.send.mockResolvedValue(undefined);
+
+                await runDryRunWithDrain();
+
+                expect(mockLogger.warn).not.toHaveBeenCalled();
+            });
+
+            it('keeps the four drain/post-drain diagnostics available at debug on a healthy dry run', async () => {
+                mockInspectorClient.getFoundIdGaps.mockReturnValue([]);
+                mockInspectorClient.send.mockResolvedValue(undefined);
+
+                await runDryRunWithDrain();
+
+                const debugMessages = loggedCalls(mockLogger.debug).map(call => String(call[0]));
+                expect(debugMessages.some(m => m.includes('Drain-request received'))).toBe(true);
+                expect(debugMessages.some(m => m.includes('Drain handler settled via %s'))).toBe(true);
+                expect(debugMessages.some(m => m.includes('Post-drain inspector snapshot'))).toBe(true);
+                expect(debugMessages.some(m => m.includes('Post-drain inspector close/collision diagnostics'))).toBe(true);
+            });
+
+            it('emits exactly one warn when the drain-request never arrived', async () => {
+                mockInspectorClient.getFoundIdGaps.mockReturnValue([]);
+
+                await runDryRunWithDrain(false);
+
+                expect(mockLogger.warn).toHaveBeenCalledTimes(1);
+                expect(loggedCalls(mockLogger.warn)[0].map(String).join(' ')).toContain('never requested');
+            });
+
+            it('emits exactly one warn when the drain round-trip is rejected (send-rejected)', async () => {
+                mockInspectorClient.getFoundIdGaps.mockReturnValue([]);
+                // Step 6's initial TestReporter.enable must resolve; only the drain handler's own send() rejects.
+                mockInspectorClient.send.mockResolvedValueOnce(undefined).mockRejectedValue(new Error('socket exploded'));
+
+                await runDryRunWithDrain();
+
+                expect(mockLogger.warn).toHaveBeenCalledTimes(1);
+                const warnText = loggedCalls(mockLogger.warn)[0].map(String).join(' ');
+                expect(warnText).toContain('send-rejected');
+                expect(warnText).toContain('socket exploded');
+            });
+
+            it('emits exactly one warn when found-id gaps remain after the drain', async () => {
+                mockInspectorClient.getFoundIdGaps.mockReturnValue([3, 4]);
+                mockInspectorClient.send.mockResolvedValue(undefined);
+
+                await runDryRunWithDrain();
+
+                expect(mockLogger.warn).toHaveBeenCalledTimes(1);
+                expect(loggedCalls(mockLogger.warn)[0].map(String).join(' ')).toContain('[3,4]');
+            });
+
+            it('emits exactly one warn, including the close code, when the inspector WebSocket closed uncleanly despite an ack drain', async () => {
+                mockInspectorClient.getFoundIdGaps.mockReturnValue([]);
+                mockInspectorClient.send.mockResolvedValue(undefined);
+                mockInspectorClient.getCloseInfo.mockReturnValue({ code: 1006, reason: 'abnormal', wasClean: false, msFromLastFrameToClose: 42 });
+
+                await runDryRunWithDrain();
+
+                expect(mockLogger.warn).toHaveBeenCalledTimes(1);
+                const warnText = loggedCalls(mockLogger.warn)[0].map(String).join(' ');
+                expect(warnText).toContain('Inspector data looks abnormal after the dry run:');
+                expect(warnText).toContain('1006');
+                expect(warnText).toContain('unclean');
+            });
+
+            it('does not warn when the inspector WebSocket closed cleanly with an ack drain', async () => {
+                mockInspectorClient.getFoundIdGaps.mockReturnValue([]);
+                mockInspectorClient.send.mockResolvedValue(undefined);
+                mockInspectorClient.getCloseInfo.mockReturnValue({ code: 1000, reason: '', wasClean: true, msFromLastFrameToClose: 5 });
+
+                await runDryRunWithDrain();
+
+                expect(mockLogger.warn).not.toHaveBeenCalled();
+            });
+
+            it('emits exactly one warn when duplicate found-id events (id collisions) were seen', async () => {
+                mockInspectorClient.getFoundIdGaps.mockReturnValue([]);
+                mockInspectorClient.send.mockResolvedValue(undefined);
+                mockInspectorClient.getFoundIdCollisionStats.mockReturnValue({ rawFoundCount: 5, uniqueFoundIdCount: 4, duplicateFoundIdCount: 1 });
+
+                await runDryRunWithDrain();
+
+                expect(mockLogger.warn).toHaveBeenCalledTimes(1);
+                expect(loggedCalls(mockLogger.warn)[0].map(String).join(' ')).toContain('id-collision');
             });
         });
 
@@ -2194,7 +2541,7 @@ tests/example.test.ts:
                     resolveSend();
                     await drainPromise;
 
-                    expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect(mockLogger.debug).toHaveBeenCalledWith(
                         expect.stringContaining('Drain handler settled via %s'),
                         'ack', expect.any(Number),
                         expect.any(Number), expect.any(Number), expect.any(Number),
@@ -2245,7 +2592,7 @@ tests/example.test.ts:
 
                     await expect(settled).resolves.toBe('resolved');
 
-                    expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect(mockLogger.debug).toHaveBeenCalledWith(
                         expect.stringContaining('Drain handler settled via %s'),
                         'silence', expect.any(Number),
                         expect.any(Number), expect.any(Number), expect.any(Number),
@@ -2291,7 +2638,7 @@ tests/example.test.ts:
 
                     await expect(settled).resolves.toBe('resolved');
 
-                    expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect(mockLogger.debug).toHaveBeenCalledWith(
                         expect.stringContaining('Drain handler settled via %s'),
                         'ceiling', expect.any(Number),
                         expect.any(Number), expect.any(Number), expect.any(Number),
@@ -2319,11 +2666,11 @@ tests/example.test.ts:
                 // socket-death rejection — otherwise SyncServer would never send 'drained'.
                 await expect(drainHandler()).resolves.toBeUndefined();
 
-                expect(mockLogger.warn).toHaveBeenCalledWith(
+                expect(mockLogger.debug).toHaveBeenCalledWith(
                     'Inspector drain round-trip rejected before any wait bound was hit: %s',
                     'Connection closed unexpectedly'
                 );
-                expect(mockLogger.warn).toHaveBeenCalledWith(
+                expect(mockLogger.debug).toHaveBeenCalledWith(
                     expect.stringContaining('Drain handler settled via %s'),
                     'send-rejected', expect.any(Number),
                     expect.any(Number), expect.any(Number), expect.any(Number),
@@ -2423,7 +2770,7 @@ tests/example.test.ts:
                     await Promise.resolve();
 
                     await expect(settled).resolves.toBe('resolved');
-                    expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect(mockLogger.debug).toHaveBeenCalledWith(
                         expect.stringContaining('Drain handler settled via %s'),
                         'silence', expect.any(Number),
                         expect.any(Number), expect.any(Number), expect.any(Number),
@@ -2438,7 +2785,7 @@ tests/example.test.ts:
 
             it('does not even LOG a settle at the first poll tick when already-stale silence has not yet cleared the elapsed-since-call bound', async () => {
                 // Same P1 regression scenario as the test above, but asserts directly on the
-                // synchronous side effect (the "Drain handler settled" warn call) instead of
+                // synchronous side effect (the "Drain handler settled" debug call) instead of
                 // through drainPromise's own .then()/.catch() chain: a spurious settle inside
                 // the catch/finally block logs synchronously as soon as the async function is
                 // resumed, so this is observable after far fewer microtask ticks than
@@ -2474,7 +2821,7 @@ tests/example.test.ts:
                         await Promise.resolve();
                     }
 
-                    expect(mockLogger.warn).not.toHaveBeenCalledWith(
+                    expect(mockLogger.debug).not.toHaveBeenCalledWith(
                         expect.stringContaining('Drain handler settled via %s'),
                         expect.anything(), expect.anything(),
                         expect.anything(), expect.anything(), expect.anything(),
@@ -2519,7 +2866,7 @@ tests/example.test.ts:
                     await Promise.resolve();
 
                     await expect(settled).resolves.toBe('resolved');
-                    expect(mockLogger.warn).toHaveBeenCalledWith(
+                    expect(mockLogger.debug).toHaveBeenCalledWith(
                         expect.stringContaining('Drain handler settled via %s'),
                         'ceiling', expect.any(Number),
                         expect.any(Number), expect.any(Number), expect.any(Number),
@@ -2558,7 +2905,7 @@ tests/example.test.ts:
                     await Promise.resolve();
 
                     await expect(settled).resolves.toBe('resolved');
-                    expect(mockLogger.warn).not.toHaveBeenCalledWith(
+                    expect(mockLogger.debug).not.toHaveBeenCalledWith(
                         'Inspector drain round-trip rejected before any wait bound was hit: %s',
                         expect.anything()
                     );
@@ -2583,7 +2930,7 @@ tests/example.test.ts:
 
                 await drainHandler();
 
-                expect(mockLogger.warn).toHaveBeenCalledWith(
+                expect(mockLogger.debug).toHaveBeenCalledWith(
                     expect.stringContaining('Drain-request received'),
                     7, 6, 6, 2, ' [2,5]'
                 );
@@ -2608,7 +2955,7 @@ tests/example.test.ts:
 
                 await drainHandler();
 
-                expect(mockLogger.warn).toHaveBeenCalledWith(
+                expect(mockLogger.debug).toHaveBeenCalledWith(
                     expect.stringContaining('Drain handler settled via %s'),
                     'ack', expect.any(Number),
                     3, 3, 3,
@@ -2631,7 +2978,7 @@ tests/example.test.ts:
 
                 await drainHandler();
 
-                expect(mockLogger.warn).toHaveBeenCalledWith(
+                expect(mockLogger.debug).toHaveBeenCalledWith(
                     expect.stringContaining('Drain handler settled via %s'),
                     'ack', expect.any(Number),
                     expect.any(Number), expect.any(Number), expect.any(Number),
@@ -2656,7 +3003,7 @@ tests/example.test.ts:
                 await drainHandler();
 
                 const expectedList = ` [${Array.from({ length: 20 }, (_, i) => i + 1).join(',')},…]`;
-                expect(mockLogger.warn).toHaveBeenCalledWith(
+                expect(mockLogger.debug).toHaveBeenCalledWith(
                     expect.stringContaining('Drain-request received'),
                     expect.any(Number), expect.any(Number), expect.any(Number),
                     25, expectedList
@@ -2682,7 +3029,7 @@ tests/example.test.ts:
                 // list one entry LONGER than the cap collapses the remainder. Distinguishes
                 // formatGapIdList's `gaps.length > MAX_GAP_IDS_LISTED` from `>=`.
                 const expectedList = ` [${exactlyTwentyGaps.join(',')}]`;
-                expect(mockLogger.warn).toHaveBeenCalledWith(
+                expect(mockLogger.debug).toHaveBeenCalledWith(
                     expect.stringContaining('Drain-request received'),
                     expect.any(Number), expect.any(Number), expect.any(Number),
                     20, expectedList
@@ -3341,6 +3688,63 @@ tests/example.test.ts:
                 }
             });
 
+            it('ERROR branch: names the terminating signal instead of "exit code null" when bun was killed by a signal', async () => {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({
+                        exitCode: null,
+                        signal:   'SIGSEGV',
+                        stdout:   '',
+                        stderr:   'panic: segfault',
+                        timedOut: false,
+                    });
+                });
+                mockInspectorClient.getTests.mockReturnValue([]);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([]);
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                const result = await runner.dryRun();
+
+                expect(result.status).toBe(DryRunStatus.Error);
+                if(result.status === DryRunStatus.Error) {
+                    expect(result.errorMessage).toBe('Bun test process terminated by signal SIGSEGV\npanic: segfault');
+                    expect(result.errorMessage).not.toContain('exit code null');
+                }
+            });
+
+            it('ERROR branch: names the spawn error instead of "exit code null" when the child process emitted an error', async () => {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({
+                        exitCode:   null,
+                        signal:     null,
+                        stdout:     '',
+                        stderr:     '\nProcess error: spawn bun EACCES',
+                        timedOut:   false,
+                        spawnError: 'spawn bun EACCES',
+                    });
+                });
+                mockInspectorClient.getTests.mockReturnValue([]);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([]);
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                const result = await runner.dryRun();
+
+                expect(result.status).toBe(DryRunStatus.Error);
+                if(result.status === DryRunStatus.Error) {
+                    expect(result.errorMessage).toStartWith('could not start bun test: spawn bun EACCES');
+                    expect(result.errorMessage).not.toContain('exit code null');
+                }
+            });
+
             it('COMPLETE branch: appends the inspector error stack to a failed test\'s failureMessage', async () => {
                 mockProcessResult({ exitCode: 1, stdout: '✗ my test\n 1 fail' });
                 const testHierarchy: TestInfo[] = [
@@ -3742,6 +4146,146 @@ tests/example.test.ts:
             if(result.status === MutantRunStatus.Killed) {
                 expect(result.killedBy).toContain('tests/foo.test.ts > my test');
             }
+        });
+
+        describe('bun test child killed by a signal', () => {
+            // Policy: a signal death is scored Killed ONLY when the output shows at least one
+            // failing test that resolves to killedBy; otherwise it is Error naming the signal.
+            // The runner's own kills (timeout, maxChildRss) stay Timeout.
+            async function runWithChildResult(
+                childResult: { exitCode: number | null, stdout: string, stderr: string, timedOut: boolean, memoryLimitExceeded?: boolean, signal?: NodeJS.Signals | null, spawnError?: string },
+                testFilter: string[] = []
+            ): Promise<Awaited<ReturnType<BunTestRunner['mutantRun']>>> {
+                mockRunBunTests.mockImplementation(() => Promise.resolve(childResult));
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+
+                return runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '77' } as any,
+                    testFilter,
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+            }
+
+            it('returns Error (not Killed) when bun dies from SIGSEGV and no failing test is in the output', async () => {
+                const result = await runWithChildResult({
+                    exitCode: null,
+                    signal:   'SIGSEGV',
+                    stdout:   'bun test v1.4.2\n\ntests/foo.test.ts:\n✓ my test [1ms]\n',
+                    stderr:   '',
+                    timedOut: false,
+                });
+
+                expect(result.status).toBe(MutantRunStatus.Error);
+                if(result.status === MutantRunStatus.Error) {
+                    expect(result.errorMessage).toBe('bun test terminated by SIGSEGV before any test reported a failure');
+                }
+            });
+
+            it('names the signal in the Error even when stderr contains runtime-error keywords and no tests ran', async () => {
+                const result = await runWithChildResult({
+                    exitCode: null,
+                    signal:   'SIGABRT',
+                    stdout:   '',
+                    stderr:   'TypeError: something at panic',
+                    timedOut: false,
+                });
+
+                expect(result.status).toBe(MutantRunStatus.Error);
+                if(result.status === MutantRunStatus.Error) {
+                    expect(result.errorMessage).toContain('SIGABRT');
+                }
+            });
+
+            it('still returns Killed when bun dies from a signal AFTER a failing test that resolves to killedBy was reported', async () => {
+                const result = await runWithChildResult({
+                    exitCode: null,
+                    signal:   'SIGSEGV',
+                    stdout:   'tests/foo.test.ts:\n✗ my test [1ms]\n  error: fail\n\n 0 pass\n 1 fail\n',
+                    stderr:   '',
+                    timedOut: false,
+                }, ['tests/foo.test.ts > my test']);
+
+                expect(result.status).toBe(MutantRunStatus.Killed);
+                if(result.status === MutantRunStatus.Killed) {
+                    expect(result.killedBy).toContain('tests/foo.test.ts > my test');
+                }
+            });
+
+            it('returns Error naming the signal when a failing test was reported but none resolves to killedBy', async () => {
+                const result = await runWithChildResult({
+                    exitCode: null,
+                    signal:   'SIGBUS',
+                    stdout:   'tests/other.test.ts:\n✗ unknown test [1ms]\n  error: fail\n\n 0 pass\n 1 fail\n',
+                    stderr:   '',
+                    timedOut: false,
+                }, ['tests/foo.test.ts > my test']);
+
+                expect(result.status).toBe(MutantRunStatus.Error);
+                if(result.status === MutantRunStatus.Error) {
+                    expect(result.errorMessage).toContain('SIGBUS');
+                }
+            });
+
+            it('keeps the runner\'s own timeout kill as Timeout even though a signal is reported', async () => {
+                const result = await runWithChildResult({
+                    exitCode: null,
+                    signal:   'SIGTERM',
+                    stdout:   '',
+                    stderr:   '',
+                    timedOut: true,
+                });
+
+                expect(result.status).toBe(MutantRunStatus.Timeout);
+            });
+
+            it('keeps the runner\'s own maxChildRss kill as Timeout even though a signal is reported', async () => {
+                const result = await runWithChildResult({
+                    exitCode:            null,
+                    signal:              'SIGKILL',
+                    stdout:              '',
+                    stderr:              '',
+                    timedOut:            true,
+                    memoryLimitExceeded: true,
+                });
+
+                expect(result.status).toBe(MutantRunStatus.Timeout);
+            });
+
+            it('returns Error (not Killed) naming the spawn error when bun could not be started', async () => {
+                // Mirrors process-runner's 'error' event result: no exit code, no signal, not timed out.
+                const result = await runWithChildResult({
+                    exitCode:   null,
+                    signal:     null,
+                    stdout:     '',
+                    stderr:     '\nProcess error: spawn bun ENOENT',
+                    timedOut:   false,
+                    spawnError: 'spawn bun ENOENT',
+                });
+
+                expect(result.status).toBe(MutantRunStatus.Error);
+                if(result.status === MutantRunStatus.Error) {
+                    expect(result.errorMessage).toBe('could not start bun test: spawn bun ENOENT');
+                }
+            });
+
+            it('does not change the no-signal behaviour: a plain non-zero exit with no parsed failures is still Killed with empty killedBy', async () => {
+                const result = await runWithChildResult({
+                    exitCode: 1,
+                    signal:   null,
+                    stdout:   'bun test v1.4.2\n\n',
+                    stderr:   '',
+                    timedOut: false,
+                });
+
+                expect(result.status).toBe(MutantRunStatus.Killed);
+                if(result.status === MutantRunStatus.Killed) {
+                    expect(result.killedBy).toEqual([]);
+                }
+            });
         });
 
         describe('zero-match retry (defect 2)', () => {

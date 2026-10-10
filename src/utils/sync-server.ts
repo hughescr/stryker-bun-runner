@@ -148,9 +148,13 @@ export class SyncServer {
                 // Handle server errors
                 this.httpServer.on('error', reject);
 
-                // Start listening
+                // Start listening. Bind to loopback only (never all interfaces): the
+                // sync channel is a local control signal and must not be reachable from
+                // other hosts. 127.0.0.1 matches the port probe (utils/port.ts) and the
+                // inspector (--inspect=127.0.0.1:<port>), and the preload dials the same
+                // literal address.
                 // Stryker disable next-line BlockStatement: removing listen callback body means resolve() never called → start() never resolves → Timeout
-                this.httpServer.listen(this.port, () => {
+                this.httpServer.listen(this.port, '127.0.0.1', () => {
                     resolve();
                 });
             // eslint-disable-next-line @stylistic/brace-style -- required for Stryker disable to work

@@ -121,7 +121,7 @@ export interface BunTestRunOptions {
 
     /**
    * Whether to force sequential test execution
-   * When true, adds --concurrency=1 flag
+   * When true, adds --max-concurrency=1 flag
    */
     sequentialMode?: boolean
 
@@ -207,10 +207,31 @@ export interface BunProcessResult {
     timedOut: boolean
 
     /**
+   * The signal that terminated the child, as reported by the 'close' event
+   * (e.g. `'SIGSEGV'` for a crash), or null when it exited normally, never
+   * ran, or failed to spawn. When the runner itself killed the child
+   * (`timedOut` — which also covers a {@link BunTestRunOptions.maxChildRss}
+   * kill) this is the signal the runner sent, so callers must check `timedOut`
+   * first to tell a runner-initiated kill from a crash.
+   */
+    signal: NodeJS.Signals | null
+
+    /**
    * True when the child was killed because it exceeded {@link BunTestRunOptions.maxChildRss}.
    * Always false when `maxChildRss` was not set.
    */
     memoryLimitExceeded: boolean
+
+    /**
+   * The message of the error the child process emitted via its `'error'` event
+   * (e.g. `spawn bun ENOENT`, `spawn bun EACCES`), or undefined when none was
+   * emitted. When set, `bun test` never ran (or could not be managed), so
+   * `exitCode` and `signal` are both null and carry no information about the
+   * tests — callers must not score such a run as a kill. The same text is also
+   * appended to `stderr` as `Process error: ...` for human-readable logs; use
+   * this field, not stderr matching, to detect the condition.
+   */
+    spawnError?: string
 }
 
 /**
@@ -382,6 +403,7 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
             stdout:              '',
             stderr:              `stryker-bun-runner: invalid maxSpawnDepth=${String(maxSpawnDepth)}; expected a positive integer.`,
             exitCode:            1,
+            signal:              null,
             timedOut:            false,
             memoryLimitExceeded: false,
         };
@@ -392,6 +414,7 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
             stdout:              '',
             stderr:              `stryker-bun-runner: refusing to spawn \`bun test\` at nesting depth ${spawnDepth} (maxSpawnDepth=${maxSpawnDepth}). A test run spawned by this runner tried to spawn another one; this is almost always runaway recursion. See the bun.maxSpawnDepth option.`,
             exitCode:            1,
+            signal:              null,
             timedOut:            false,
             memoryLimitExceeded: false,
         };
@@ -432,7 +455,7 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
     // thresholds and onlyFailures from interfering with mutation testing.
     // NOTE: bun requires the equals form here; `--config PATH` is silently
     // ignored and PATH is then consumed as a positional test-file filter.
-    // Stryker disable StringLiteral: mutating --config=/--preload/--test-name-pattern/--concurrency removes required flags → coverage/filter broken → Timeout
+    // Stryker disable StringLiteral: mutating --config=/--preload/--test-name-pattern/--max-concurrency removes required flags → coverage/filter broken → Timeout
     if(options.bunfigPath) {
         args.push(`--config=${options.bunfigPath}`);
     }
@@ -454,7 +477,7 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
 
     // Force sequential execution if requested
     if(options.sequentialMode) {
-        args.push('--concurrency=1');
+        args.push('--max-concurrency=1');
     }
     // Stryker restore StringLiteral
 
@@ -525,7 +548,7 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
         // If an AbortSignal was provided and is already aborted, resolve immediately
         // Stryker disable next-line ConditionalExpression,BlockStatement: abort-before-spawn guard; mutation caught by 'aborts child process when signal fires'
         if(options.signal?.aborted) {
-            resolve({ stdout: '', stderr: '', exitCode: null, timedOut: true, memoryLimitExceeded: false });
+            resolve({ stdout: '', stderr: '', exitCode: null, signal: null, timedOut: true, memoryLimitExceeded: false });
             return;
         }
 
@@ -688,7 +711,7 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
 
         // Handle process exit
         // Stryker disable next-line BlockStatement,StringLiteral: Promise.resolve never called without 'close' handler → Timeout
-        childProcess.on('close', (code) => {
+        childProcess.on('close', (code, signal) => {
             hasClosed = true;
             onLeaderExitDuringTermination?.();
             liveChildren.delete(childProcess);
@@ -705,6 +728,8 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
                 stdout:   Buffer.concat(stdoutChunks).toString(),
                 stderr:   Buffer.concat(stderrChunks).toString(),
                 exitCode: processKilled ? null : code,
+                // `?? null`: a normal exit reports a null signal, but be tolerant of mocks/older callers passing none.
+                signal:   signal ?? null,
                 timedOut,
                 memoryLimitExceeded,
             });
@@ -727,11 +752,13 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
             const stderrOutput = Buffer.concat(stderrChunks).toString();
 
             resolve({
-                stdout:   Buffer.concat(stdoutChunks).toString(),
-                stderr:   `${stderrOutput}\nProcess error: ${error.message}`,
-                exitCode: null,
+                stdout:     Buffer.concat(stdoutChunks).toString(),
+                stderr:     `${stderrOutput}\nProcess error: ${error.message}`,
+                exitCode:   null,
+                signal:     null,
                 timedOut,
                 memoryLimitExceeded,
+                spawnError: error.message,
             });
         });
     });
