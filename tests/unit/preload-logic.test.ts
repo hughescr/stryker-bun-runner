@@ -2,7 +2,7 @@ import { once } from 'node:events';
 import * as fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { PassThrough } from 'node:stream';
+import { PassThrough, type Readable } from 'node:stream';
 import type { MutantCoverage } from '@stryker-mutator/api/core';
 import { describe, it, expect, spyOn, beforeEach, afterEach, test, mock, jest } from 'bun:test';
 import {
@@ -14,7 +14,11 @@ import {
     detectGapWindowBleed,
     writeCoverageToFile,
     watchParentLifeline,
+    startOrphanWatchdog,
+    guardAgainstOrphaning,
+    orphanDebugLog,
     LIFELINE_FD_ENV,
+    ORPHAN_DEBUG_ENV,
     parseHitLimit,
     installHitLimit,
     formatHitLimitSentinel,
@@ -24,6 +28,7 @@ import {
     type StrykerNamespace
 } from '../../src/coverage/preload-logic';
 import type { LateHitEntry } from '../../src/coverage/types';
+import { trackTimers } from '../helpers/fake-clock.js';
 
 /** The coverage file is opened for appending, created if absent, and never through a symlink at its path (O_NOFOLLOW). */
 // eslint-disable-next-line no-bitwise -- open(2) flags are a bitmask
@@ -877,26 +882,46 @@ describe('preload-logic', () => {
             ['stdout', '1'],
             ['stderr', '2'],
             ['beyond a safe integer', '9007199254740993'],
-        ])('does not arm when the descriptor is %s', (_label, fdValue) => {
+        ])('reports the lifeline unavailable, without opening anything, when the descriptor is %s', (_label, fdValue) => {
             const open = mock(() => new PassThrough());
             const onOrphaned = mock();
+            const onUnavailable = mock();
 
-            expect(watchParentLifeline({ fdValue, onOrphaned, open })).toBe(false);
+            watchParentLifeline({ fdValue, onOrphaned, onUnavailable, open });
+
             expect(open).not.toHaveBeenCalled();
             expect(onOrphaned).not.toHaveBeenCalled();
+            expect(onUnavailable).toHaveBeenCalledTimes(1);
+            expect(onUnavailable).toHaveBeenCalledWith(`${LIFELINE_FD_ENV}=${fdValue ?? '(unset)'} names no lifeline descriptor`);
         });
 
-        it.each([['3', 3], ['17', 17]])('opens descriptor %s and arms', (fdValue, fd) => {
+        it.each([['3', 3], ['17', 17]])('opens descriptor %s without reporting it unavailable', (fdValue, fd) => {
             const open = mock(() => new PassThrough());
+            const onUnavailable = mock();
 
-            expect(watchParentLifeline({ fdValue, onOrphaned: mock(), open })).toBe(true);
+            watchParentLifeline({ fdValue, onOrphaned: mock(), onUnavailable, open });
+
             expect(open).toHaveBeenCalledWith(fd);
+            expect(onUnavailable).not.toHaveBeenCalled();
+        });
+
+        it('reports the lifeline unavailable when opening the descriptor throws', () => {
+            const onUnavailable = mock();
+            const open = (): Readable => {
+                throw Object.assign(new Error('operation not supported'), { code: 'ENOTSUP' });
+            };
+
+            watchParentLifeline({ fdValue: '3', onOrphaned: mock(), onUnavailable, open });
+
+            expect(onUnavailable).toHaveBeenCalledTimes(1);
+            expect(onUnavailable).toHaveBeenCalledWith('opening fd 3 failed: ENOTSUP');
         });
 
         it('reports the parent gone once the lifeline reaches end-of-file', async () => {
             const lifeline = new PassThrough();
             const { onOrphaned, orphaned } = orphanedSignal();
-            watchParentLifeline({ fdValue: '3', onOrphaned, open: () => lifeline });
+            const onUnavailable = mock();
+            watchParentLifeline({ fdValue: '3', onOrphaned, onUnavailable, open: () => lifeline });
 
             // The kernel closes every descriptor of a dead process, so the
             // parent's write end closing is what EOF on the read end means.
@@ -904,12 +929,13 @@ describe('preload-logic', () => {
             await orphaned;
 
             expect(onOrphaned).toHaveBeenCalledTimes(1);
+            expect(onUnavailable).not.toHaveBeenCalled();
         });
 
         it('keeps reading, without reporting, while the parent is alive', async () => {
             const lifeline = new PassThrough();
             const onOrphaned = mock();
-            watchParentLifeline({ fdValue: '3', onOrphaned, open: () => lifeline });
+            watchParentLifeline({ fdValue: '3', onOrphaned, onUnavailable: mock(), open: () => lifeline });
 
             // Anything the parent writes is drained rather than left to fill the pipe.
             const drained = once(lifeline, 'data');
@@ -920,38 +946,61 @@ describe('preload-logic', () => {
             expect(lifeline.readableFlowing).toBe(true);
         });
 
-        it('swallows an error on the descriptor without reporting the parent gone', async () => {
+        it.each([
+            ['a code', Object.assign(new Error('bad file descriptor'), { code: 'EBADF' }), 'reading fd 3 failed: EBADF'],
+            ['no code', new Error('it broke'), 'reading fd 3 failed: it broke'],
+        ])('reports an error before end-of-file (with %s) as the lifeline unavailable, once, not as the parent gone', async (_label, error, reason) => {
             const lifeline = new PassThrough();
             const onOrphaned = mock();
-            watchParentLifeline({ fdValue: '3', onOrphaned, open: () => lifeline });
+            const onUnavailable = mock();
+            watchParentLifeline({ fdValue: '3', onOrphaned, onUnavailable, open: () => lifeline });
 
-            // A descriptor that is not open (EBADF) errors and then closes, with
-            // no end-of-file: that says nothing about the parent. An 'error'
-            // without a listener would be thrown as an uncaught exception.
+            // A descriptor that is not open (EBADF), or one this platform cannot
+            // read this way, errors and then closes, with no end-of-file: that
+            // says nothing about the parent. An 'error' without a listener would
+            // be thrown as an uncaught exception.
             // (events.once would reject on that 'error', so wait on 'close' directly.)
             const closed = new Promise<void>((resolve) => {
                 lifeline.once('close', resolve);
             });
-            lifeline.destroy(Object.assign(new Error('bad file descriptor'), { code: 'EBADF' }));
+            lifeline.emit('error', error);
+            lifeline.destroy(error);
             await closed;
 
             expect(onOrphaned).not.toHaveBeenCalled();
+            expect(onUnavailable).toHaveBeenCalledTimes(1);
+            expect(onUnavailable).toHaveBeenCalledWith(reason);
+        });
+
+        it('does not report an error after end-of-file as the lifeline unavailable', async () => {
+            const lifeline = new PassThrough();
+            const { onOrphaned, orphaned } = orphanedSignal();
+            const onUnavailable = mock();
+            watchParentLifeline({ fdValue: '3', onOrphaned, onUnavailable, open: () => lifeline });
+
+            lifeline.end();
+            await orphaned;
+            lifeline.emit('error', new Error('late'));
+
+            expect(onUnavailable).not.toHaveBeenCalled();
         });
 
         it('arms no timer, so a suite that installs fake timers cannot capture it', () => {
             jest.useFakeTimers();
-            const before = jest.getTimerCount();
-
-            watchParentLifeline({ fdValue: '3', onOrphaned: mock(), open: () => new PassThrough() });
-
-            expect(jest.getTimerCount()).toBe(before);
+            const timers = trackTimers();
+            try {
+                watchParentLifeline({ fdValue: '3', onOrphaned: mock(), onUnavailable: mock(), open: () => new PassThrough() });
+                expect(timers.delays).toEqual([]);
+            } finally {
+                timers.restore();
+            }
         });
 
         it('reports the parent gone while fake timers are installed', async () => {
             jest.useFakeTimers();
             const lifeline = new PassThrough();
             const { onOrphaned, orphaned } = orphanedSignal();
-            watchParentLifeline({ fdValue: '3', onOrphaned, open: () => lifeline });
+            watchParentLifeline({ fdValue: '3', onOrphaned, onUnavailable: mock(), open: () => lifeline });
 
             lifeline.end();
             await orphaned;
@@ -966,10 +1015,241 @@ describe('preload-logic', () => {
             const fd = fs.openSync('/dev/null', 'r');
             const { onOrphaned, orphaned } = orphanedSignal();
 
-            expect(watchParentLifeline({ fdValue: String(fd), onOrphaned })).toBe(true);
+            const onUnavailable = mock();
+            watchParentLifeline({ fdValue: String(fd), onOrphaned, onUnavailable });
             await orphaned;
 
             expect(onOrphaned).toHaveBeenCalledTimes(1);
+            expect(onUnavailable).not.toHaveBeenCalled();
+        });
+    });
+
+    describe('startOrphanWatchdog', () => {
+        afterEach(() => {
+            jest.useRealTimers();
+        });
+
+        it('does not invoke onOrphaned while the parent PID is unchanged', () => {
+            jest.useFakeTimers();
+            const onOrphaned = mock();
+            const stop = startOrphanWatchdog({ getPpid: () => 1000, onOrphaned, intervalMs: 1000 });
+
+            jest.advanceTimersByTime(5000);
+
+            expect(onOrphaned).not.toHaveBeenCalled();
+            stop();
+        });
+
+        it('invokes onOrphaned once the parent PID changes (reparented to a subreaper)', () => {
+            jest.useFakeTimers();
+            let ppid = 1000;
+            const onOrphaned = mock();
+            const stop = startOrphanWatchdog({ getPpid: () => ppid, onOrphaned, intervalMs: 1000 });
+
+            jest.advanceTimersByTime(1000);
+            expect(onOrphaned).not.toHaveBeenCalled();
+
+            // Original parent has died — the OS reparents this process, e.g. to PID 1.
+            ppid = 1;
+            jest.advanceTimersByTime(1000);
+
+            expect(onOrphaned).toHaveBeenCalledTimes(1);
+            stop();
+        });
+
+        it('compares against the parent PID it is given, when the parent may already have changed', () => {
+            jest.useFakeTimers();
+            const onOrphaned = mock();
+            // Started after the parent died: the PID it reads now is already the subreaper's.
+            const stop = startOrphanWatchdog({ getPpid: () => 1, originalPpid: 1000, onOrphaned, intervalMs: 1000 });
+
+            jest.advanceTimersByTime(1000);
+
+            expect(onOrphaned).toHaveBeenCalledTimes(1);
+            stop();
+        });
+
+        it('invokes onOrphaned only once even if the interval ticks again before being stopped', () => {
+            jest.useFakeTimers();
+            let ppid = 1000;
+            const onOrphaned = mock();
+            const stop = startOrphanWatchdog({ getPpid: () => ppid, onOrphaned, intervalMs: 1000 });
+
+            ppid = 1;
+            jest.advanceTimersByTime(3000);
+
+            expect(onOrphaned).toHaveBeenCalledTimes(1);
+            stop();
+        });
+
+        it('defaults intervalMs to 1000ms when not provided', () => {
+            jest.useFakeTimers();
+            let ppid = 1000;
+            const onOrphaned = mock();
+            const stop = startOrphanWatchdog({ getPpid: () => ppid, onOrphaned });
+
+            ppid = 1;
+            jest.advanceTimersByTime(999);
+            expect(onOrphaned).not.toHaveBeenCalled();
+
+            jest.advanceTimersByTime(1);
+            expect(onOrphaned).toHaveBeenCalledTimes(1);
+            stop();
+        });
+
+        it('stops polling once stop() is called', () => {
+            jest.useFakeTimers();
+            let ppid = 1000;
+            const onOrphaned = mock();
+            const stop = startOrphanWatchdog({ getPpid: () => ppid, onOrphaned, intervalMs: 1000 });
+
+            stop();
+            ppid = 1;
+            jest.advanceTimersByTime(10_000);
+
+            expect(onOrphaned).not.toHaveBeenCalled();
+        });
+
+        it('does not keep the process alive, and stop() clears its timer', () => {
+            jest.useFakeTimers();
+            const timers = trackTimers();
+            const trackedSetInterval = globalThis.setInterval;
+            const handles: ReturnType<typeof setInterval>[] = [];
+            globalThis.setInterval = ((callback: () => void, delay?: number) => {
+                const handle = trackedSetInterval(callback, delay);
+                handles.push(handle);
+                return handle;
+            }) as typeof setInterval;
+            try {
+                const stop = startOrphanWatchdog({ getPpid: () => 1000, onOrphaned: mock() });
+                expect(handles).toHaveLength(1);
+                expect(handles[0].hasRef()).toBe(false);
+                stop();
+                expect(timers.pending()).toBe(0);
+            } finally {
+                globalThis.setInterval = trackedSetInterval;
+                timers.restore();
+            }
+        });
+    });
+
+    describe('guardAgainstOrphaning', () => {
+        afterEach(() => {
+            jest.useRealTimers();
+        });
+
+        it('watches the lifeline alone when it is available: no timer, no log', async () => {
+            jest.useFakeTimers();
+            const timers = trackTimers();
+            try {
+                const lifeline = new PassThrough();
+                let signal!: () => void;
+                const orphaned = new Promise<void>((resolve) => {
+                    signal = resolve;
+                });
+                const onOrphaned = mock(() => signal());
+                const log = mock();
+                guardAgainstOrphaning({ fdValue: '3', getPpid: () => 1000, onOrphaned, log, open: () => lifeline });
+
+                expect(timers.delays).toEqual([]);
+                lifeline.end();
+                await orphaned;
+
+                expect(onOrphaned).toHaveBeenCalledTimes(1);
+                expect(log).not.toHaveBeenCalled();
+            } finally {
+                timers.restore();
+            }
+        });
+
+        it('falls back to the timer watchdog, logging once, when the lifeline errors', async () => {
+            jest.useFakeTimers();
+            let ppid = 1000;
+            const lifeline = new PassThrough();
+            const onOrphaned = mock();
+            const log = mock();
+            guardAgainstOrphaning({ fdValue: '3', getPpid: () => ppid, onOrphaned, log, open: () => lifeline });
+
+            const closed = new Promise<void>((resolve) => {
+                lifeline.once('close', resolve);
+            });
+            lifeline.destroy(Object.assign(new Error('operation not supported'), { code: 'ENOTSUP' }));
+            await closed;
+
+            expect(log).toHaveBeenCalledTimes(1);
+            expect(log).toHaveBeenCalledWith('[Stryker] parent lifeline unavailable (reading fd 3 failed: ENOTSUP); polling the parent PID on a timer instead');
+
+            jest.advanceTimersByTime(5000);
+            expect(onOrphaned).not.toHaveBeenCalled();
+
+            ppid = 1;
+            jest.advanceTimersByTime(1000);
+            expect(onOrphaned).toHaveBeenCalledTimes(1);
+        });
+
+        it('falls back at once when the runner named no lifeline', () => {
+            jest.useFakeTimers();
+            let ppid = 1000;
+            const onOrphaned = mock();
+            const log = mock();
+            guardAgainstOrphaning({ fdValue: undefined, getPpid: () => ppid, onOrphaned, log, intervalMs: 500 });
+
+            expect(log).toHaveBeenCalledWith(`[Stryker] parent lifeline unavailable (${LIFELINE_FD_ENV}=(unset) names no lifeline descriptor); polling the parent PID on a timer instead`);
+            ppid = 1;
+            jest.advanceTimersByTime(499);
+            expect(onOrphaned).not.toHaveBeenCalled();
+            jest.advanceTimersByTime(1);
+            expect(onOrphaned).toHaveBeenCalledTimes(1);
+        });
+
+        it('compares against the parent PID read when it started, even if the parent died before the fallback', async () => {
+            jest.useFakeTimers();
+            let ppid = 1000;
+            const lifeline = new PassThrough();
+            const onOrphaned = mock();
+            guardAgainstOrphaning({ fdValue: '3', getPpid: () => ppid, onOrphaned, open: () => lifeline });
+
+            // The parent dies, and only then does the lifeline turn out to be unreadable.
+            ppid = 1;
+            const closed = new Promise<void>((resolve) => {
+                lifeline.once('close', resolve);
+            });
+            lifeline.destroy(new Error('unreadable'));
+            await closed;
+
+            jest.advanceTimersByTime(1000);
+            expect(onOrphaned).toHaveBeenCalledTimes(1);
+        });
+
+        it('falls back silently when no log is given', () => {
+            jest.useFakeTimers();
+            const timers = trackTimers();
+            try {
+                expect(() => guardAgainstOrphaning({ fdValue: '', getPpid: () => 1000, onOrphaned: mock() })).not.toThrow();
+                expect(timers.delays).toEqual([1000]);
+            } finally {
+                timers.restore();
+            }
+        });
+    });
+
+    describe('orphanDebugLog', () => {
+        it('names the environment variable that turns it on', () => {
+            expect(ORPHAN_DEBUG_ENV).toBe('STRYKER_BUN_RUNNER_DEBUG');
+        });
+
+        it.each([undefined, '', '0', 'false'])('is off when the variable is %p', (value) => {
+            expect(orphanDebugLog(value, mock())).toBeUndefined();
+        });
+
+        it.each(['1', 'true', 'yes'])('writes a line through the given writer when the variable is %p', (value) => {
+            const write = mock();
+            const log = orphanDebugLog(value, write);
+
+            log?.('hello');
+
+            expect(write).toHaveBeenCalledTimes(1);
+            expect(write).toHaveBeenCalledWith('hello\n');
         });
     });
 

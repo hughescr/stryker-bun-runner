@@ -15,8 +15,10 @@ import {
     formatCoverageData,
     detectGapWindowBleed,
     writeCoverageToFile,
-    watchParentLifeline,
+    guardAgainstOrphaning,
+    orphanDebugLog,
     LIFELINE_FD_ENV,
+    ORPHAN_DEBUG_ENV,
     type StrykerNamespace,
     type LateHitEntry
 } from '__PRELOAD_LOGIC_PATH__';
@@ -30,10 +32,15 @@ import {
 // SIGKILL, which gives it no chance to kill its children), this process would
 // otherwise run forever, or until its own --timeout is reached — see README
 // "Orphan prevention". The watch is left in place for the life of the process:
-// it arms no timer and does not keep bun test from exiting.
-watchParentLifeline({
+// it arms no timer and does not keep bun test from exiting. Only if the
+// lifeline is unavailable does it fall back to polling process.ppid on an
+// unref'd interval, saying so on stderr when STRYKER_BUN_RUNNER_DEBUG is set.
+guardAgainstOrphaning({
     // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- LIFELINE_FD_ENV from placeholder import
     fdValue:    process.env[LIFELINE_FD_ENV],
+    getPpid:    () => process.ppid,
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call -- from placeholder import
+    log:        orphanDebugLog(process.env[ORPHAN_DEBUG_ENV], (text: string) => process.stderr.write(text)),
     onOrphaned: () => {
         console.warn('[Stryker] Parent process is no longer running — terminating to avoid an orphaned bun test process');
         // eslint-disable-next-line n/no-process-exit, unicorn/no-process-exit -- deliberate self-termination once orphaned; nothing else can stop this process from running forever

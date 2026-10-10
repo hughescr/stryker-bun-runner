@@ -288,11 +288,22 @@ export const LIFELINE_FD_ENV = '__STRYKER_LIFELINE_FD__';
 /** Dependencies of {@link watchParentLifeline}. */
 export interface ParentLifelineDeps {
     /** The descriptor as the runner named it: `process.env[LIFELINE_FD_ENV]`. */
-    fdValue:    string | undefined
+    fdValue:       string | undefined
     /** Called once the parent is gone. */
-    onOrphaned: () => void
+    onOrphaned:    () => void
+    /**
+     * Called, at most once, when the lifeline cannot tell this process anything
+     * about its parent, with the reason.
+     */
+    onUnavailable: (reason: string) => void
     /** Opens the descriptor for reading. Defaults to an fs read stream on it. */
-    open?:      (fd: number) => Readable
+    open?:         (fd: number) => Readable
+}
+
+/** An error's code when it has one (EBADF, ENOTSUP), else its message. */
+function describeError(error: unknown): string {
+    const { code, message } = error as { code?: unknown, message?: unknown };
+    return String(code ?? message);
 }
 
 /**
@@ -324,23 +335,138 @@ function parseLifelineFd(value: string | undefined): number | undefined {
  * (bun 1.4.2). Capturing the real timer functions does not avoid that: the
  * timer itself is moved. Reading also drains anything the parent writes.
  *
- * Only end-of-file counts. A descriptor that is not open errors and closes
- * without one, and says nothing about the parent.
- *
- * @returns true when the lifeline is being watched, false when `fdValue`
- *   names no usable descriptor (the process was not spawned by the runner).
+ * Only end-of-file counts. A descriptor that is not open (EBADF), or one this
+ * platform cannot read this way, errors and closes without one, and says
+ * nothing about the parent: that, an unusable `fdValue`, or an `open` that
+ * throws is reported through `onUnavailable` instead, so the caller can watch
+ * the parent some other way (see {@link guardAgainstOrphaning}).
  */
-export function watchParentLifeline(deps: ParentLifelineDeps): boolean {
+export function watchParentLifeline(deps: ParentLifelineDeps): void {
+    let settled = false;
+    const unavailable = (reason: string): void => {
+        if(!settled) {
+            settled = true;
+            deps.onUnavailable(reason);
+        }
+    };
     const fd = parseLifelineFd(deps.fdValue);
     if(fd === undefined) {
-        return false;
+        unavailable(`${LIFELINE_FD_ENV}=${deps.fdValue ?? '(unset)'} names no lifeline descriptor`);
+        return;
     }
     const open = deps.open ?? ((lifelineFd: number) => createReadStream('', { fd: lifelineFd }));
-    const lifeline = open(fd);
-    lifeline.once('end', deps.onOrphaned);
-    lifeline.on('error', () => {
-        // Not end-of-file: see above.
+    let lifeline: Readable;
+    try {
+        lifeline = open(fd);
+    } catch (error) {
+        unavailable(`opening fd ${fd} failed: ${describeError(error)}`);
+        return;
+    }
+    lifeline.once('end', () => {
+        settled = true;
+        deps.onOrphaned();
+    });
+    lifeline.on('error', (error) => {
+        unavailable(`reading fd ${fd} failed: ${describeError(error)}`);
     });
     lifeline.resume();
-    return true;
+}
+
+/**
+ * Dependencies injected into {@link startOrphanWatchdog}, so the polling
+ * logic is testable without real timers or a real process tree.
+ */
+export interface OrphanWatchdogDeps {
+    /** Returns the current parent PID, e.g. `() => process.ppid`. */
+    getPpid:       () => number
+    /** Called (once) the first time a parent-PID change is observed. */
+    onOrphaned:    () => void
+    /** Poll interval in milliseconds. @default 1000 */
+    intervalMs?:   number
+    /**
+     * The parent PID to compare against. @default the PID `getPpid` returns
+     * when the watchdog starts, which is already wrong if the parent died first.
+     */
+    originalPpid?: number
+}
+
+/**
+ * Detects that this process's original parent has died by polling
+ * `process.ppid`: POSIX reparents an orphan to the nearest subreaper (commonly
+ * PID 1) as soon as its parent exits. Only the fallback for a lifeline this
+ * platform cannot provide (see {@link guardAgainstOrphaning}), because the
+ * interval is lost to a suite that installs bun's fake timers (see
+ * {@link watchParentLifeline}).
+ *
+ * @returns A function that stops the watchdog.
+ */
+export function startOrphanWatchdog(deps: OrphanWatchdogDeps): () => void {
+    const originalPpid = deps.originalPpid ?? deps.getPpid();
+    let fired = false;
+    const intervalId = setInterval(() => {
+        if(fired || deps.getPpid() === originalPpid) {
+            return;
+        }
+        fired = true;
+        deps.onOrphaned();
+    }, deps.intervalMs ?? 1000);
+    // Never let the watchdog itself keep the process alive once real work
+    // (the test run) has otherwise finished.
+    intervalId.unref();
+    return () => {
+        clearInterval(intervalId);
+    };
+}
+
+/** Dependencies of {@link guardAgainstOrphaning}. */
+export interface OrphanGuardDeps {
+    /** The lifeline descriptor as the runner named it: `process.env[LIFELINE_FD_ENV]`. */
+    fdValue:     string | undefined
+    /** Returns the current parent PID, e.g. `() => process.ppid`. */
+    getPpid:     () => number
+    /** Called once the parent is gone. */
+    onOrphaned:  () => void
+    /** Receives the one line saying the lifeline was unavailable; see {@link orphanDebugLog}. */
+    log?:        (message: string) => void
+    /** Opens the lifeline descriptor; see {@link ParentLifelineDeps.open}. */
+    open?:       (fd: number) => Readable
+    /** Fallback watchdog poll interval in milliseconds. @default 1000 */
+    intervalMs?: number
+}
+
+/**
+ * Exits this process (through `onOrphaned`) when its parent dies: by the
+ * timer-free lifeline when it works, and otherwise by the timer-based
+ * {@link startOrphanWatchdog}, which still covers every suite that does not
+ * use fake timers. The parent PID is read here, before the lifeline is even
+ * opened, so a parent that dies before a late lifeline error is still noticed.
+ */
+export function guardAgainstOrphaning(deps: OrphanGuardDeps): void {
+    const originalPpid = deps.getPpid();
+    watchParentLifeline({
+        fdValue:       deps.fdValue,
+        onOrphaned:    deps.onOrphaned,
+        open:          deps.open,
+        onUnavailable: (reason) => {
+            deps.log?.(`[Stryker] parent lifeline unavailable (${reason}); polling the parent PID on a timer instead`);
+            startOrphanWatchdog({ getPpid: deps.getPpid, onOrphaned: deps.onOrphaned, intervalMs: deps.intervalMs, originalPpid });
+        },
+    });
+}
+
+/** Environment variable that turns on the child's orphan-prevention debug line. */
+export const ORPHAN_DEBUG_ENV = 'STRYKER_BUN_RUNNER_DEBUG';
+
+/**
+ * A line logger for {@link guardAgainstOrphaning} when `value` (the
+ * {@link ORPHAN_DEBUG_ENV} setting) turns debugging on, else undefined: a
+ * fallback that still works is not worth a line in every child's output.
+ */
+export function orphanDebugLog(value: string | undefined, write: (text: string) => void): ((message: string) => void) | undefined {
+    if(value === undefined || value === '' || value === '0' || value === 'false') {
+        return undefined;
+    }
+    return (message) => {
+        write(`${message}\n`);
+    };
 }
