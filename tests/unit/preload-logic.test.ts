@@ -17,8 +17,13 @@ import {
 } from '../../src/coverage/preload-logic';
 import type { LateHitEntry } from '../../src/coverage/types';
 
-/** The coverage file is created owner-only: it sits in the runner's private temp dir and must stay unreadable to other users. */
-const PRIVATE_APPEND_OPTIONS = { encoding: 'utf8', mode: 0o600 };
+/** The coverage file is opened for appending, created if absent, and never through a symlink at its path (O_NOFOLLOW). */
+// eslint-disable-next-line no-bitwise -- open(2) flags are a bitmask
+const COVERAGE_OPEN_FLAGS = fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW;
+/** It is created owner-only: it sits in the runner's private temp dir and must stay unreadable to other users. */
+const COVERAGE_FILE_MODE = 0o600;
+/** The descriptor the mocked openSync hands out. */
+const FAKE_FD = 4242;
 
 describe('preload-logic', () => {
     describe('getPreloadConfig', () => {
@@ -523,25 +528,50 @@ describe('preload-logic', () => {
     });
 
     describe('writeCoverageToFile', () => {
+        let openSyncSpy: ReturnType<typeof spyOn>;
         let appendFileSyncSpy: ReturnType<typeof spyOn>;
+        let closeSyncSpy: ReturnType<typeof spyOn>;
 
         beforeEach(() => {
+            openSyncSpy = spyOn(fs, 'openSync').mockImplementation(() => FAKE_FD);
             appendFileSyncSpy = spyOn(fs, 'appendFileSync').mockImplementation(() => {});
+            closeSyncSpy = spyOn(fs, 'closeSync').mockImplementation(() => {});
         });
 
-        it('calls appendFileSync with correct arguments', () => {
+        afterEach(() => {
+            openSyncSpy.mockRestore();
+            appendFileSyncSpy.mockRestore();
+            closeSyncSpy.mockRestore();
+        });
+
+        /** Use the real fs in this test. */
+        function restoreRealFs(): void {
+            openSyncSpy.mockRestore();
+            appendFileSyncSpy.mockRestore();
+            closeSyncSpy.mockRestore();
+        }
+
+        it('opens the file for appending without following symlinks, creating it 0600, writes the line to it and closes it', () => {
             const data = { perTest: {}, 'static': [] };
             writeCoverageToFile('/tmp/coverage.json', data);
 
-            expect(appendFileSyncSpy).toHaveBeenCalledWith(
-                '/tmp/coverage.json',
-                `${JSON.stringify(data)}\n`,
-                PRIVATE_APPEND_OPTIONS
-            );
+            expect(openSyncSpy).toHaveBeenCalledWith('/tmp/coverage.json', COVERAGE_OPEN_FLAGS, COVERAGE_FILE_MODE);
+            expect(appendFileSyncSpy).toHaveBeenCalledWith(FAKE_FD, `${JSON.stringify(data)}\n`, 'utf8');
+            expect(closeSyncSpy).toHaveBeenCalledWith(FAKE_FD);
+            expect(closeSyncSpy.mock.invocationCallOrder[0]).toBeGreaterThan(appendFileSyncSpy.mock.invocationCallOrder[0]);
+        });
+
+        it('closes the file even when the write fails', () => {
+            appendFileSyncSpy.mockImplementation(() => {
+                throw new Error('ENOSPC: no space left on device');
+            });
+
+            expect(() => writeCoverageToFile('/tmp/coverage.json', { perTest: {}, 'static': [] })).toThrow('ENOSPC');
+            expect(closeSyncSpy).toHaveBeenCalledWith(FAKE_FD);
         });
 
         it('creates the coverage file owner-only (mode 0600) so other users cannot read it', async () => {
-            appendFileSyncSpy.mockRestore();
+            restoreRealFs();
             const dir = await fs.promises.mkdtemp(path.join(tmpdir(), 'stryker-coverage-mode-'));
             // A permissive umask must not widen it
             // eslint-disable-next-line sonarjs/file-permissions -- deliberately permissive umask, restored in finally
@@ -566,22 +596,7 @@ describe('preload-logic', () => {
             writeCoverageToFile('/tmp/coverage.json', data);
 
             const expectedJson = `${JSON.stringify(data)}\n`;
-            expect(appendFileSyncSpy).toHaveBeenCalledWith(
-                expect.any(String),
-                expectedJson,
-                PRIVATE_APPEND_OPTIONS
-            );
-        });
-
-        it('uses utf-8 encoding', () => {
-            const data = { perTest: {}, 'static': [] };
-            writeCoverageToFile('/tmp/coverage.json', data);
-
-            expect(appendFileSyncSpy).toHaveBeenCalledWith(
-                expect.any(String),
-                expect.any(String),
-                expect.objectContaining({ encoding: 'utf8' })
-            );
+            expect(appendFileSyncSpy).toHaveBeenCalledWith(FAKE_FD, expectedJson, 'utf8');
         });
 
         it('writes to specified file path', () => {
@@ -589,11 +604,7 @@ describe('preload-logic', () => {
             const filePath = '/custom/path/to/coverage.json';
             writeCoverageToFile(filePath, data);
 
-            expect(appendFileSyncSpy).toHaveBeenCalledWith(
-                filePath,
-                expect.any(String),
-                PRIVATE_APPEND_OPTIONS
-            );
+            expect(openSyncSpy).toHaveBeenCalledWith(filePath, COVERAGE_OPEN_FLAGS, COVERAGE_FILE_MODE);
         });
 
         it('serializes complex coverage data', () => {
@@ -606,22 +617,45 @@ describe('preload-logic', () => {
             };
             writeCoverageToFile('/tmp/coverage.json', data);
 
-            expect(appendFileSyncSpy).toHaveBeenCalledWith(
-                expect.any(String),
-                `${JSON.stringify(data)}\n`,
-                PRIVATE_APPEND_OPTIONS
-            );
+            expect(appendFileSyncSpy).toHaveBeenCalledWith(FAKE_FD, `${JSON.stringify(data)}\n`, 'utf8');
         });
 
         it('handles empty data', () => {
             const data = { perTest: {}, 'static': [] };
             writeCoverageToFile('/tmp/coverage.json', data);
 
-            expect(appendFileSyncSpy).toHaveBeenCalledWith(
-                expect.any(String),
-                '{"perTest":{},"static":[]}\n',
-                PRIVATE_APPEND_OPTIONS
-            );
+            expect(appendFileSyncSpy).toHaveBeenCalledWith(FAKE_FD, '{"perTest":{},"static":[]}\n', 'utf8');
+        });
+
+        describe('real filesystem', () => {
+            let dir: string;
+
+            beforeEach(async () => {
+                restoreRealFs();
+                dir = await fs.promises.mkdtemp(path.join(tmpdir(), 'stryker-coverage-append-'));
+            });
+
+            afterEach(async () => {
+                await fs.promises.rm(dir, { recursive: true, force: true });
+            });
+
+            it('appends one line per call to the same file (one per test file of the run)', async () => {
+                const file = path.join(dir, 'coverage.json');
+                writeCoverageToFile(file, { perTest: { a: ['1'] }, 'static': [] });
+                writeCoverageToFile(file, { perTest: { b: ['2'] }, 'static': ['3'] });
+
+                expect(await fs.promises.readFile(file, 'utf8')).toBe('{"perTest":{"a":["1"]},"static":[]}\n{"perTest":{"b":["2"]},"static":["3"]}\n');
+            });
+
+            it('refuses to write through a symlink planted at the coverage file path', async () => {
+                const victim = path.join(dir, 'victim.txt');
+                await fs.promises.writeFile(victim, 'untouched');
+                const file = path.join(dir, 'coverage.json');
+                await fs.promises.symlink(victim, file);
+
+                expect(() => writeCoverageToFile(file, { perTest: {}, 'static': [] })).toThrow('ELOOP');
+                expect(await fs.promises.readFile(victim, 'utf8')).toBe('untouched');
+            });
         });
     });
 

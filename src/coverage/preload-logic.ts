@@ -6,7 +6,7 @@
  * uses these functions.
  */
 
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, closeSync, constants, openSync } from 'node:fs';
 import type { MutantCoverage } from '@stryker-mutator/api/core';
 import type { CoverageFileData, LateHitEntry } from './types.js';
 
@@ -140,11 +140,21 @@ export function formatCoverageData(
 // File Writing
 // ============================================================================
 
+/** Append (one line per test file of the run), creating if absent, and never through a symlink planted at the path (O_NOFOLLOW fails with ELOOP). */
+// eslint-disable-next-line no-bitwise -- open(2) flags are a bitmask
+const COVERAGE_APPEND_FLAGS = constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW;
+
+/* eslint-disable n/no-sync -- sync required in afterAll hook to ensure write completes before process exit */
 export function writeCoverageToFile(coverageFile: string, data: CoverageFileData): void {
-    // mode applies only when the append creates the file: owner-only, like everything else in the runner's private temp dir.
-    // eslint-disable-next-line n/no-sync -- sync required in afterAll hook to ensure write completes before process exit
-    appendFileSync(coverageFile, `${JSON.stringify(data)}\n`, { encoding: 'utf8', mode: 0o600 });
+    // mode applies only when the open creates the file: owner-only, like everything else in the runner's private temp dir.
+    const fd = openSync(coverageFile, COVERAGE_APPEND_FLAGS, 0o600);
+    try {
+        appendFileSync(fd, `${JSON.stringify(data)}\n`, 'utf8');
+    } finally {
+        closeSync(fd);
+    }
 }
+/* eslint-enable n/no-sync -- end of writeCoverageToFile */
 
 // ============================================================================
 // Orphan prevention: parent-liveness watchdog
