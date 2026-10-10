@@ -1705,6 +1705,11 @@ export class BunTestRunner implements TestRunner {
                 // scripts that fail to resolve) can make Bun exit before the inspector
                 // banner is printed; without this diagnostic the user only sees a
                 // useless "Timeout waiting for inspector URL".
+                // Close the sync server first: the preload waits for 'ready' with no
+                // deadline, so a child still running would otherwise sit there until the
+                // run timeout kills it. Seeing its sync socket fail or close, it exits at
+                // once and says why on stderr, which the diagnostics below include.
+                await syncServer.close();
                 const diagnosticResult = await testProcess;
                 // Stryker disable next-line MethodExpression: equivalent mutant — slice(0,1000) vs full string is only observable in diagnostic log output, not in test behavior
                 const stdoutPreview = diagnosticResult.stdout.slice(0, 1000);

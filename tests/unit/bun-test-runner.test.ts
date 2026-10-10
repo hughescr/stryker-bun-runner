@@ -1445,6 +1445,44 @@ tests/example.test.ts:
             }
         });
 
+        it('closes the sync server before waiting for a child whose inspector URL never came, so its preload exits at once', async () => {
+            // The preload waits for 'ready' with no deadline. Without the close, the
+            // diagnostic wait below would last until the run timeout killed the child.
+            jest.useFakeTimers();
+            try {
+                const order: string[] = [];
+                let exitChild: () => void = () => {};
+                mockRunBunTests.mockImplementation(() => new Promise((resolve) => {
+                    exitChild = () => {
+                        order.push('child exited');
+                        resolve({
+                            exitCode: 1,
+                            stdout:   '',
+                            stderr:   '[Stryker] stryker-bun-runner: the dry run\'s sync connection to the runner closed',
+                            timedOut: false,
+                        });
+                    };
+                }));
+                mockSyncServer.close.mockImplementation(() => {
+                    order.push('sync closed');
+                    // The preload sees its sync socket close and exits.
+                    exitChild();
+                    return Promise.resolve();
+                });
+
+                const runner = new BunTestRunner(mockLogger, { bun: { inspectorTimeout: 100 } } as unknown as StrykerOptions);
+                await runner.init();
+                const { value: result, fakeMs } = await runUntilSettled(runner.dryRun());
+
+                expect(order.slice(0, 2)).toEqual(['sync closed', 'child exited']);
+                expect(fakeMs).toBeLessThan(1000);
+                expect(result.status).toBe(DryRunStatus.Error);
+                expect(result.status === DryRunStatus.Error ? result.errorMessage : '').toContain('sync connection to the runner closed');
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
         async function inspectorTimeoutMessageFor(child: { exitCode: number | null, signal: NodeJS.Signals | null, stderr: string }): Promise<string> {
             jest.useFakeTimers();
             try {

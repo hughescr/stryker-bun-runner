@@ -509,9 +509,12 @@ the coverage it collected before handing it to Stryker:
   runner sends it only once its inspector is connected, `TestReporter.enable`
   has been answered, and its drain handler is registered, so every test event
   from then on is observed. The preload waits for `ready` with no deadline of
-  its own, however slow the machine: the runner's side is bounded instead (the
-  inspector connection and `TestReporter.enable` by `bun.inspectorTimeout`,
-  after which the dry run fails and the child is killed). If the sync socket
+  its own, however slow the machine: the runner's side is bounded instead.
+  Waiting for bun's inspector URL, connecting the inspector, and
+  `TestReporter.enable` are each bounded by `bun.inspectorTimeout`; when one of
+  them fails, the dry run fails at once and the child is stopped (killed, or,
+  while the runner collects its output for the error message, told to exit by
+  closing the sync socket). If the sync socket
   fails or closes before `ready`, the preload exits without running a test and
   the dry run fails with an error that says so (`the dry run's sync connection
   to the runner ... closed ... before the runner signalled that it is ready to
