@@ -3,7 +3,7 @@
  * Parses Bun's console output to extract test results
  */
 
-import { TEST_FILE_EXT_PATTERN } from '../utils/test-name-pattern.js';
+import { TEST_FILE_SUFFIX_PATTERN } from '../utils/test-name-pattern.js';
 
 export interface TestResult {
     name:            string
@@ -57,10 +57,10 @@ export interface ParsedTestResults {
  * The path may contain any character EXCEPT `:` and both ends are anchored, so
  * stack-trace lines (`at tests/foo.test.ts:12:5`) and line-number-suffixed
  * lines (`tests/foo.test.ts:12:`) can never match. The extension alternation
- * is the shared TEST_FILE_EXT_PATTERN so this grammar can never drift from the
+ * is the shared TEST_FILE_SUFFIX_PATTERN so this grammar can never drift from the
  * prefix-stripping in buildTestNamePattern.
  */
-const fileHeaderRe = new RegExp(String.raw`^(?:::group::)?([^:]+\.${TEST_FILE_EXT_PATTERN}):$`);
+const fileHeaderRe = new RegExp(String.raw`^(?:::group::)?([^:]+${TEST_FILE_SUFFIX_PATTERN}):$`, 'i');
 
 /**
  * GitHub Actions workflow-command lines (`::group::Section`, `::endgroup::`,

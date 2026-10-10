@@ -3532,6 +3532,22 @@ tests/example.test.ts:
             });
         });
 
+        it.each(['tests/foo_test.ts', 'tests/foo_spec.cts', 'tests/foo.test.cjs', 'tests/foo.Test.TS'])('recognises the file header %s (any name form bun runs)', (file) => {
+            const output = [
+                `${file}:`,
+                '(fail) Suite > kills the mutant [0.42ms]',
+                '',
+                ' 0 pass',
+                ' 1 fail',
+            ].join('\n');
+            const result = parseBunTestOutput(output, '');
+
+            expect(result.tests[0]).toMatchObject({
+                name: `${file} > Suite > kills the mutant`,
+                file,
+            });
+        });
+
         it('parses ✓/✗ lines under a ::group:: header with the full prefixed name', () => {
             const output = [
                 '::group::tests/bar.test.ts:',

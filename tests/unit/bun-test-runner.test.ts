@@ -668,6 +668,55 @@ describe('BunTestRunner', () => {
     });
 
     describe('init', () => {
+        describe('bun.bunArgs validation', () => {
+            it('rejects init() naming the flag and why, before the bun check or any file generation', async () => {
+                const runner = new BunTestRunner(mockLogger, {
+                    bun: { bunArgs: ['--only', '--concurrent'] },
+                } as unknown as StrykerOptions);
+
+                await expect(runner.init()).rejects.toThrow(
+                    'stryker-bun-runner: bun.bunArgs contains "--concurrent", which breaks per-test coverage attribution. Remove it.'
+                );
+                expect(checkBunVersionSpy).not.toHaveBeenCalled();
+                expect(mockGeneratePreloadScript).not.toHaveBeenCalled();
+            });
+
+            it.each([
+                ['--max-concurrency=5'],
+                ['--parallel'],
+                ['--shard=1/2'],
+                ['--test-name-pattern=foo'],
+                ['-t'],
+                ['--update-snapshots'],
+                ['--pass-with-no-tests'],
+                ['--cwd=/elsewhere'],
+            ])('rejects init() for bunArgs containing %s', async (flag) => {
+                const runner = new BunTestRunner(mockLogger, {
+                    bun: { bunArgs: [flag] },
+                } as unknown as StrykerOptions);
+
+                await expect(runner.init()).rejects.toThrow(`bun.bunArgs contains "${flag}"`);
+            });
+
+            it('accepts flags that do not affect attribution or selection', async () => {
+                const runner = new BunTestRunner(mockLogger, {
+                    bun: { bunArgs: ['--only', '--randomize', '--seed=1', '--isolate', '--rerun-each=2', '--timeout=20000'] },
+                } as unknown as StrykerOptions);
+
+                await runner.init();
+
+                expect(checkBunVersionSpy).toHaveBeenCalledTimes(1);
+            });
+
+            it('still strips (rather than rejects) bail flags', async () => {
+                const runner = new BunTestRunner(mockLogger, {
+                    bun: { bunArgs: ['--bail=2'] },
+                } as unknown as StrykerOptions);
+
+                await runner.init();
+            });
+        });
+
         describe('startup bun check', () => {
             it('checks the default "bun" with no env override', async () => {
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);

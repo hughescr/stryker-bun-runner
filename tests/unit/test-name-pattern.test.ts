@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect } from 'bun:test';
-import { buildTestNamePattern, MAX_TEST_NAME_PATTERN_LENGTH, TEST_FILE_EXT_PATTERN } from '../../src/utils/test-name-pattern.js';
+import { buildTestNamePattern, MAX_TEST_NAME_PATTERN_LENGTH, TEST_FILE_SUFFIX_PATTERN, TEST_FILE_SUFFIX_RE } from '../../src/utils/test-name-pattern.js';
 
 // ── buildTestNamePattern unit tests ────────────────────────────────────────
 
@@ -288,28 +288,42 @@ describe('buildTestNamePattern — testNameIndex fast path', () => {
     });
 });
 
-// ── TEST_FILE_EXT_PATTERN (shared extension alternation) ───────────────────
+// ── TEST_FILE_SUFFIX_PATTERN (shared test-file name grammar) ───────────────
 //
-// Single source of truth for the recognised test-file extension grammar,
-// shared with console-parser's file-header regex so the two ends can never
+// Single source of truth for the recognised test-file name grammar (what
+// `bun test` itself picks up), shared with discovery, console-parser's
+// file-header regex and the preload's test-file exclusion so they can never
 // drift apart.
 
-describe('TEST_FILE_EXT_PATTERN', () => {
-    it('matches every recognised test-file extension suffix', () => {
-        const re = new RegExp(`^${TEST_FILE_EXT_PATTERN}$`);
+describe('TEST_FILE_SUFFIX_PATTERN', () => {
+    it('matches every recognised test-file suffix (. or _ separator, test or spec, all extensions)', () => {
+        const re = new RegExp(`^${TEST_FILE_SUFFIX_PATTERN}$`);
+        const seps = ['.', '_'];
         const kinds = ['test', 'spec'];
         const exts = ['ts', 'tsx', 'js', 'jsx', 'mts', 'mjs', 'cts', 'cjs'];
-        for(const kind of kinds) {
-            for(const ext of exts) {
-                expect(re.test(`${kind}.${ext}`)).toBe(true);
+        for(const sep of seps) {
+            for(const kind of kinds) {
+                for(const ext of exts) {
+                    expect(re.test(`${sep}${kind}.${ext}`)).toBe(true);
+                }
             }
         }
     });
 
     it('rejects non-test-file suffixes', () => {
-        const re = new RegExp(`^${TEST_FILE_EXT_PATTERN}$`);
-        for(const bad of ['tests.ts', 'test.tsxx', 'test.mtsx', 'test.d.ts', 'spec.md', 'test_ts', 'foo.ts']) {
+        const re = new RegExp(`^${TEST_FILE_SUFFIX_PATTERN}$`);
+        for(const bad of ['tests.ts', '.test.tsxx', '.test.mtsx', '.test.d.ts', '.spec.md', '.test_ts', 'foo.ts', '-test.ts', 'test.ts', 'spec.ts']) {
             expect(re.test(bad)).toBe(false);
         }
+    });
+
+    it('TEST_FILE_SUFFIX_RE is anchored and case-insensitive like bun', () => {
+        expect(TEST_FILE_SUFFIX_RE.test('tests/a.Test.TS')).toBe(true);
+        expect(TEST_FILE_SUFFIX_RE.test('tests/a_SPEC.cjs')).toBe(true);
+        expect(TEST_FILE_SUFFIX_RE.test('tests/a.test.ts.map')).toBe(false);
+    });
+
+    it('buildTestNamePattern strips a _test/_spec file prefix from ids', () => {
+        expect(buildTestNamePattern(['tests/a_test.ts > Suite > works', 'tests/b.spec.cts > Other > fine'])).toBe('^(?:Suite works|Other fine)$');
     });
 });

@@ -38,7 +38,7 @@ import type { TestInfo } from './inspector/types.js';
 import type { StrykerBunOptions } from './options.js';
 import { parseBunTestOutput, type ParsedTestResults } from './parsers/console-parser.js';
 import { runBunTests } from './process-runner.js';
-import { checkBunVersion, getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, discoverTestFiles, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery } from './utils/index.js';
+import { assertSupportedBunArgs, checkBunVersion, getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, discoverTestFiles, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery } from './utils/index.js';
 
 /**
  * Sleep for the given number of milliseconds.
@@ -610,6 +610,10 @@ export class BunTestRunner implements TestRunner {
     public async init(): Promise<void> {
         // Stryker disable next-line StringLiteral: logging message only
         this.logger.debug('BunTestRunner init starting...');
+
+        // Reject bunArgs that fight the runner's own flags (concurrency, test selection, ...)
+        // before doing any work — a loud config error beats silently wrong mutant scores.
+        assertSupportedBunArgs(this.bunArgs);
 
         // Fail fast, with an actionable message, if bun cannot be run or is older than the
         // supported floor — otherwise a missing binary only shows up later as a dry-run

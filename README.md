@@ -88,12 +88,22 @@ A second full-suite fallback happens at run time: a `--test-name-pattern` that m
 | `bun.timeout` | `number` | `10000` | Wall-clock limit in milliseconds for one whole `bun test` child process (an entire dry run, or one mutant run); the child is killed when it expires. This is **not** Bun's per-test `[test].timeout` from `bunfig.toml`, which is independent. Set it comfortably above your full test suite's run time: mutants that need the whole suite (static mutants) are bounded by this limit. The dry run gets an extra 30 s on top of this limit for the coverage drain handshake. |
 | `bun.inspectorTimeout` | `number` | `5000` | Timeout for Inspector WebSocket connection in milliseconds |
 | `bun.env` | `object` | `undefined` | Additional environment variables to pass to bun test |
-| `bun.bunArgs` | `string[]` | `undefined` | Additional bun test flags (e.g., `['--only']`). Bail flags (`--bail`, `--bail=<N>`, or a space-separated `--bail <N>`) are ignored here — bail is fully managed by the runner via Stryker's `disableBail` option (see [How It Works](#how-it-works)). |
-| `bun.testFiles` | `string[]` | `undefined` | Explicit list of test file paths (absolute or relative to cwd). When provided, skips auto-discovery and uses this list verbatim. Relative paths resolve against the bun subprocess's cwd. Useful for restricting mutation testing to a subset of test files. |
+| `bun.bunArgs` | `string[]` | `undefined` | Additional bun test flags (e.g., `['--only']`). Bail flags (`--bail`, `--bail=<N>`, or a space-separated `--bail <N>`) are ignored here — bail is fully managed by the runner via Stryker's `disableBail` option (see [How It Works](#how-it-works)). Flags that fight the runner's own command line are **rejected at startup with an error** rather than silently producing wrong scores: `--concurrent` and `--max-concurrency` (break per-test coverage attribution), `--parallel`, `--shard` and `--changed` (run only part of the suite or split it across processes), `-t`/`--test-name-pattern` (the runner builds its own per mutant), `-u`/`--update-snapshots` (snapshot tests could never fail), `--pass-with-no-tests` (a zero-match selection would be scored as survived), `--watch`, `--coverage*`, `-c`/`--config`, `--cwd` and `--inspect*` (collide with the runner's sandbox, sanitized bunfig and inspector). `--only` is fine: only the `.only` tests then count as the suite (and the dry run fails if none is marked `.only`). |
+| `bun.testFiles` | `string[]` | `undefined` | Explicit list of test file paths (absolute or relative to cwd). When provided, skips auto-discovery (see [Test file discovery](#test-file-discovery)) and uses this list verbatim. Relative paths resolve against the bun subprocess's cwd. Useful for restricting mutation testing to a subset of test files. |
 | `bun.smol` | `boolean` | `false` | Pass Bun's `--smol` flag to every child: a smaller JavaScriptCore heap at some cost to speed. Recommended on memory-constrained machines — see [Memory model](#memory-model). |
 | `bun.maxChildRss` | `number` | `undefined` | Soft memory ceiling in bytes for each child's RSS. A child that exceeds it is killed and the run reported as a clean timeout for that mutant. See [Memory containment](#memory-containment). |
 | `bun.rssCheckIntervalMs` | `number` | `1000` | Poll interval in milliseconds for the `maxChildRss` check. |
 | `bun.maxSpawnDepth` | `number` | `1` | Maximum `bun test` spawn nesting depth before the runner refuses to spawn. Guards against runaway recursion — see [Recursion containment](#recursion-containment). Raise to `2` only if your own tests drive this runner. |
+
+### Test file discovery
+
+Unless `bun.testFiles` is set, the runner finds test files itself and hands bun an explicit, sorted list (this keeps the order stable across runs). Discovery follows `bun test`'s own rules, so it picks up exactly what a plain `bun test` would:
+
+- File names ending in `.test.`, `_test.`, `.spec.` or `_spec.` followed by `js`, `jsx`, `ts`, `tsx`, `mjs`, `cjs`, `mts` or `cts` (case-insensitive).
+- `node_modules` and dot-directories (`.git`, `.stryker-tmp`, …) are skipped; other directories such as `dist` and `build` are searched.
+- `[test].root` from your `bunfig.toml` is respected: the search starts there (resolved against the project directory), so test files outside `root` are not run. Bun ignores `root` for files passed on the command line, which is why the runner applies it itself. `pathIgnorePatterns` is applied by bun even to explicitly listed files, so it keeps working.
+
+To run something else, set `bun.testFiles`.
 
 ### Example with all options
 
@@ -237,7 +247,7 @@ them) flag a mutant scored as an Error instead of Killed:
   value interpolated into an `it.each` title). The runner retries once with the
   full suite rather than reporting a false kill, so the eventual verdict is still
   genuine — if the retry itself also matches zero tests (or the zero-match came
-  from a user-supplied `--test-name-pattern` in `bunArgs`, which is never retried),
+  because the mutant's covering-test list was empty, so there was no pattern to retry),
   the mutant is classified as an infrastructure `Error`, never a kill. Every
   occurrence is worth spot-checking that it's explained by an interpolated-title
   change, not a real pattern gap.
