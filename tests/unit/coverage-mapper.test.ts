@@ -1473,8 +1473,8 @@ describe('mapCoverageToInspectorIds', () => {
 
             const { coverage: result } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
 
-            // '99' must remain in static (unchanged)
-            expect(result!.static).toMatchObject({ '99': 1 });
+            // '99' must remain in static, its stripped perTest hit folded into its count
+            expect(result!.static).toMatchObject({ '99': 2 });
             // '99' must NOT appear in perTest (stripped because it's already static)
             for(const counts of Object.values(result!.perTest)) {
                 expect(Object.keys(counts)).not.toContain('99');
@@ -1528,8 +1528,9 @@ describe('mapCoverageToInspectorIds', () => {
 
             const { coverage: result } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
 
-            // '10' and '20' are already static; test-2 entry disappears — exactly 1 perTest entry remains
-            expect(result!.static).toEqual({ '10': 1, '20': 1 });
+            // '10' and '20' are already static (their 2 stripped perTest hits each folded into
+            // the static count); test-2 entry disappears — exactly 1 perTest entry remains
+            expect(result!.static).toEqual({ '10': 3, '20': 3 });
             // Only test-1 entry (which owns '30') should remain
             expect(Object.keys(result!.perTest)).toHaveLength(1);
             // '30' is unique to test-1 so test-1 entry still exists
@@ -1589,7 +1590,8 @@ describe('mapCoverageToInspectorIds', () => {
 
             // All mutants already static; perTest must be an empty object, not undefined
             expect(result!.perTest).toEqual({});
-            expect(result!.static).toEqual({ '100': 1, '200': 1, '300': 1 });
+            // Static keeps each mutant's total hits (1 static + 2 stripped perTest)
+            expect(result!.static).toEqual({ '100': 3, '200': 3, '300': 3 });
         });
 
         it('should produce identical coverage regardless of which test first triggered module import (simulates drift)', () => {
@@ -1659,8 +1661,8 @@ describe('mapCoverageToInspectorIds', () => {
 
             const { coverage: result } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
 
-            // '99' remains static; '42' must NOT be promoted
-            expect(result!.static).toEqual({ '99': 1 });
+            // '99' remains static (with its stripped perTest hit); '42' must NOT be promoted
+            expect(result!.static).toEqual({ '99': 2 });
             expect(Object.keys(result!.perTest)).toHaveLength(2);
             // '99' must NOT appear in any perTest entry (already static); '42' stays with count 1
             for(const counts of Object.values(result!.perTest)) {
@@ -1673,8 +1675,8 @@ describe('mapCoverageToInspectorIds', () => {
         });
 
         it('preserves existing static hit counts (does not overwrite)', () => {
-            // Raw-static hit counts must survive stabilization unchanged — static is
-            // returned by reference, never rebuilt with default counts.
+            // Raw-static hit counts must survive stabilization — never rebuilt with
+            // default counts; the stripped perTest hit is added on top.
             const rawCoverage: MutantCoverage = {
                 'static': { '99': 5 },  // pre-existing hit count of 5
                 perTest:  {
@@ -1688,8 +1690,8 @@ describe('mapCoverageToInspectorIds', () => {
 
             const { coverage: result } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
 
-            // '99' is already in static with count 5 — must NOT be overwritten to 1
-            expect(result!.static['99']).toBe(5);
+            // '99' is already in static with count 5 — must NOT be overwritten to 1 (5 + 1 stripped)
+            expect(result!.static['99']).toBe(6);
         });
 
         it('preserves existing static entries when stripping perTest', () => {
@@ -1710,8 +1712,9 @@ describe('mapCoverageToInspectorIds', () => {
 
             const { coverage: result } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
 
-            // '10' is already in static AND appears in 2+ tests — must remain in static with original count
-            expect(result!.static['10']).toBe(1);
+            // '10' is already in static AND appears in 2+ tests — must remain in static, its
+            // original count plus the 2 stripped perTest hits
+            expect(result!.static['10']).toBe(3);
             // '20' and '30' appear in only one test each — they stay in perTest
             expect(Object.values(result!.perTest).some(c => '20' in c)).toBe(true);
             expect(Object.values(result!.perTest).some(c => '30' in c)).toBe(true);
@@ -1738,7 +1741,7 @@ describe('mapCoverageToInspectorIds', () => {
 
             const { coverage: result } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
 
-            expect(result!.static).toEqual({ '66': 1 });
+            expect(result!.static).toEqual({ '66': 2 });
             expect(Object.keys(result!.perTest)).toHaveLength(2);
             for(const counts of Object.values(result!.perTest)) {
                 expect(counts['77']).toBe(1);
@@ -2125,5 +2128,168 @@ describe('duplicate-suffix reconciliation (buildDuplicateNameIndex / resolveEach
             'a.test.ts > dup [1]': { '200': 1 }, // id 2, line 20
             'a.test.ts > dup [2]': { '100': 1 }, // id 1, line 30
         });
+    });
+});
+
+describe('hit totals (what Stryker sizes each mutant\'s hitLimit from)', () => {
+    // Stryker core (mutants/test-coverage.js) sums, per mutant, the counts in `static`
+    // and in EVERY perTest entry, and gives the mutant run a hitLimit of 100 × that sum.
+    // Whatever the mapper strips or drops for attribution, that per-mutant sum must not
+    // shrink — an understated limit stops a legitimately hot mutant as a false Timeout.
+    function strykerHitTotals(coverage: MutantCoverage): Record<string, number> {
+        const totals: Record<string, number> = {};
+        for(const counts of [coverage.static, ...Object.values(coverage.perTest)]) {
+            for(const [id, n] of Object.entries(counts)) {
+                totals[id] = (totals[id] ?? 0) + n;
+            }
+        }
+        return totals;
+    }
+
+    const fileUrl = (file: string) => `file:///.stryker-tmp/sandbox-X/${file}`;
+
+    it('folds a static mutant\'s stripped perTest hits into its static count ("static wins" keeps attribution, not just the count)', () => {
+        // Mutant 99 runs once at module load and 1000 times inside the test. Static wins
+        // attribution, but a static count of 1 would give it a hitLimit of 100, and its
+        // full-suite mutant run would hit it 1001 times: a false Timeout.
+        const rawCoverage: MutantCoverage = {
+            'static': { '99': 1 },
+            perTest:  { 'tests/b.test.ts@@test-1': { '99': 1000, '7': 3 } },
+        };
+        const testHierarchy = new Map<number, TestInfo>([
+            [1, { id: 1, name: 'sole-test', fullName: 'sole-test', type: 'test', url: fileUrl('tests/b.test.ts') }],
+        ]);
+
+        const { coverage } = mapCoverageToInspectorIds(rawCoverage, [1], testHierarchy);
+
+        expect(coverage).toEqual({
+            'static': { '99': 1001 },
+            perTest:  { 'tests/b.test.ts > sole-test': { '7': 3 } },
+        });
+    });
+
+    it('keeps every mapped mutant\'s raw total through retries, static wins and dropped entries', () => {
+        const rawCoverage: MutantCoverage = {
+            'static': { '10': 2 },
+            perTest:  {
+                'tests/a.test.ts@@test-1': { '10': 5, '20': 7 },
+                'tests/a.test.ts@@test-2': { '20': 11, '30': 13 },
+                // excess key: a retry of the last test, folded into it
+                'tests/a.test.ts@@test-3': { '10': 17, '30': 19 },
+            },
+        };
+        const testHierarchy = new Map<number, TestInfo>([
+            [1, { id: 1, name: 'one', fullName: 'one', type: 'test', url: fileUrl('tests/a.test.ts') }],
+            [2, { id: 2, name: 'two', fullName: 'two', type: 'test', url: fileUrl('tests/a.test.ts') }],
+        ]);
+
+        const { coverage } = mapCoverageToInspectorIds(rawCoverage, [1, 2], testHierarchy);
+
+        expect(strykerHitTotals(coverage!)).toEqual(strykerHitTotals(rawCoverage));
+        expect(strykerHitTotals(coverage!)).toEqual({ '10': 24, '20': 18, '30': 32 });
+        // Attribution is unchanged: 10 is static and in no perTest entry.
+        expect(Object.values(coverage!.perTest).some(counts => '10' in counts)).toBe(false);
+    });
+
+    it('adds the hits of an orphaned test to the entry that still holds the mutant, without changing attribution', () => {
+        // b.test.ts never reached the inspector, so its keys are orphaned and dropped.
+        // Mutant 3 is still covered by a.test.ts's test; its total keeps b's 40 hits too
+        // (a full-suite run would execute b's test as well). Mutant 5 is ONLY in the
+        // orphaned file: it stays uncovered — the mapper adds no coverage of its own.
+        const rawCoverage: MutantCoverage = {
+            'static': {},
+            perTest:  {
+                'a.test.ts@@test-1': { '1': 2, '3': 5 },
+                'b.test.ts@@test-1': { '3': 40, '5': 9 },
+            },
+        };
+        const testHierarchy = new Map<number, TestInfo>([
+            [10, { id: 10, name: 'a1', fullName: 'a1', type: 'test', status: 'pass' }],
+        ]);
+
+        const { coverage } = mapCoverageToInspectorIds(rawCoverage, [10, 20], testHierarchy);
+
+        expect(coverage).toEqual({
+            'static': {},
+            perTest:  { 'a.test.ts > a1': { '1': 2, '3': 45 } },
+        });
+    });
+
+    it('credits a dropped hit to static first when the mutant is static', () => {
+        const rawCoverage: MutantCoverage = {
+            'static': { '3': 1 },
+            perTest:  {
+                'a.test.ts@@test-1': { '3': 5, '4': 1 },
+                'b.test.ts@@test-1': { '3': 40 },
+            },
+        };
+        const testHierarchy = new Map<number, TestInfo>([
+            [10, { id: 10, name: 'a1', fullName: 'a1', type: 'test', status: 'pass' }],
+        ]);
+
+        const { coverage } = mapCoverageToInspectorIds(rawCoverage, [10, 20], testHierarchy);
+
+        expect(coverage).toEqual({
+            'static': { '3': 46 },
+            perTest:  { 'a.test.ts > a1': { '4': 1 } },
+        });
+    });
+
+    it('credits a dropped hit to exactly one perTest entry (the first holding the mutant), not every one', () => {
+        const rawCoverage: MutantCoverage = {
+            'static': {},
+            perTest:  {
+                'a.test.ts@@test-1': { '3': 1 },
+                'a.test.ts@@test-2': { '3': 2 },
+                'b.test.ts@@test-1': { '3': 100 },
+            },
+        };
+        const testHierarchy = new Map<number, TestInfo>([
+            [10, { id: 10, name: 'a1', fullName: 'a1', type: 'test', status: 'pass' }],
+            [11, { id: 11, name: 'a2', fullName: 'a2', type: 'test', status: 'pass' }],
+        ]);
+
+        const { coverage } = mapCoverageToInspectorIds(rawCoverage, [10, 11, 20], testHierarchy);
+
+        expect(coverage!.perTest).toEqual({
+            'a.test.ts > a1': { '3': 101 },
+            'a.test.ts > a2': { '3': 2 },
+        });
+    });
+
+    it('keeps the totals on the legacy (test-N) path when there are more coverage keys than tests', () => {
+        const rawCoverage: MutantCoverage = {
+            'static': { '1': 1 },
+            perTest:  {
+                'test-1': { '1': 4, '2': 3 },
+                'test-2': { '2': 50 },
+            },
+        };
+        const testHierarchy = new Map<number, TestInfo>([
+            [42, { id: 42, name: 'only', fullName: 'only', type: 'test', url: fileUrl('tests/foo.test.ts') }],
+        ]);
+
+        const { coverage } = mapCoverageToInspectorIds(rawCoverage, [42], testHierarchy, { warn: mock(() => {}), debug: mock(() => {}) });
+
+        expect(coverage).toEqual({
+            'static': { '1': 5 },
+            perTest:  { 'tests/foo.test.ts > only': { '2': 53 } },
+        });
+    });
+
+    it('never writes into the raw coverage it was given', () => {
+        const rawCoverage: MutantCoverage = {
+            'static': { '99': 1 },
+            perTest:  { 'test-1': { '99': 9, '7': 3 } },
+        };
+        const snapshot = structuredClone(rawCoverage);
+        const testHierarchy = new Map<number, TestInfo>([
+            [42, { id: 42, name: 'only', fullName: 'only', type: 'test', url: fileUrl('tests/foo.test.ts') }],
+        ]);
+
+        const { coverage } = mapCoverageToInspectorIds(rawCoverage, [42], testHierarchy);
+
+        expect(coverage!.static).toEqual({ '99': 10 });
+        expect(rawCoverage).toEqual(snapshot);
     });
 });

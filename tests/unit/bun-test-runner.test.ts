@@ -5491,6 +5491,138 @@ tests/example.test.ts:
             });
         });
 
+        describe('hit limit (Stryker\'s infinite-loop protection)', () => {
+            // Stryker passes MutantRunOptions.hitLimit (100 × the mutant's dry-run hits); the
+            // preload arms the instrumenter with it and, the first time the active mutant is
+            // hit past it, writes "__STRYKER_HIT_LIMIT_REACHED__ <count>" on its own stderr line.
+            const covering = ['tests/alpha.test.ts > handles alpha'];
+            const killedLookingRun = {
+                exitCode: 1,
+                stdout:   '',
+                stderr:   'tests/alpha.test.ts:\n(fail) handles alpha [2.00ms]\nerror: Stryker: Hit count limit reached (1101)\n\n__STRYKER_HIT_LIMIT_REACHED__ 1101\n 0 pass\n 1 fail\n',
+                timedOut: false,
+            };
+
+            async function mutantRunWith(
+                runOptions: { hitLimit?: number, timeout?: number, testFilter?: string[] }
+            ): Promise<Awaited<ReturnType<BunTestRunner['mutantRun']>>> {
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                return runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '31' } as any,
+                    testFilter:      runOptions.testFilter ?? covering,
+                    sandboxFileName: 'sandbox',
+                    timeout:         runOptions.timeout,
+                    hitLimit:        runOptions.hitLimit,
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+            }
+
+            it('passes Stryker\'s hitLimit to the bun child', async () => {
+                mockRunBunTests.mockResolvedValue({ exitCode: 0, stdout: ' 1 pass\n', stderr: '', timedOut: false });
+
+                await mutantRunWith({ hitLimit: 1100 });
+                await mutantRunWith({});
+
+                expect(mockRunBunTests.mock.calls[0][0].hitLimit).toBe(1100);
+                expect(mockRunBunTests.mock.calls[1][0].hitLimit).toBeUndefined();
+            });
+
+            it('scores Timeout with Stryker\'s reason when the preload reports the limit exceeded, not Killed by the failing test', async () => {
+                mockRunBunTests.mockResolvedValue(killedLookingRun);
+
+                const result = await mutantRunWith({ hitLimit: 1100 });
+
+                expect(result).toEqual({ status: MutantRunStatus.Timeout, reason: 'Hit limit reached (1101/1100)' });
+            });
+
+            it('scores Timeout even when every test passed — a test caught the instrumenter\'s error', async () => {
+                mockRunBunTests.mockResolvedValue({
+                    exitCode: 0,
+                    stdout:   ' 3 pass\n',
+                    stderr:   'bun test v1.4.2\n__STRYKER_HIT_LIMIT_REACHED__ 2001\n',
+                    timedOut: false,
+                });
+
+                const result = await mutantRunWith({ hitLimit: 2000 });
+
+                expect(result).toEqual({ status: MutantRunStatus.Timeout, reason: 'Hit limit reached (2001/2000)' });
+            });
+
+            it('scores Timeout when a run the runner had to kill had already exceeded the limit (conclusive, even for a full-suite fallback)', async () => {
+                // Without the sentinel this kill would be the inconclusive full-suite-fallback
+                // Error; the hit limit is direct evidence the mutant ran away.
+                mockRunBunTests.mockResolvedValue({
+                    exitCode: null,
+                    signal:   'SIGTERM',
+                    stdout:   '',
+                    stderr:   '\n__STRYKER_HIT_LIMIT_REACHED__ 301\n',
+                    timedOut: true,
+                });
+                const hugeFilter = Array.from({ length: 3000 }, (_, i) => `tests/alpha.test.ts > a test with a fairly long descriptive title number ${i}`);
+
+                const result = await mutantRunWith({ hitLimit: 300, timeout: 20_000, testFilter: hugeFilter });
+
+                expect(result).toEqual({ status: MutantRunStatus.Timeout, reason: 'Hit limit reached (301/300)' });
+            });
+
+            it('ignores the sentinel when Stryker gave no hitLimit', async () => {
+                mockRunBunTests.mockResolvedValue({ exitCode: 0, stdout: ' 1 pass\n', stderr: '__STRYKER_HIT_LIMIT_REACHED__ 5000\n', timedOut: false });
+
+                const result = await mutantRunWith({});
+
+                expect(result.status).toBe(MutantRunStatus.Survived);
+            });
+
+            it('does not call a count at the limit "reached" (Stryker\'s rule is count > limit)', async () => {
+                mockRunBunTests.mockResolvedValue({ exitCode: 0, stdout: ' 1 pass\n', stderr: '__STRYKER_HIT_LIMIT_REACHED__ 1100\n', timedOut: false });
+
+                const result = await mutantRunWith({ hitLimit: 1100 });
+
+                expect(result.status).toBe(MutantRunStatus.Survived);
+            });
+
+            it.each([
+                ['in the middle of a line', 'console.log says __STRYKER_HIT_LIMIT_REACHED__ 5000\n'],
+                ['followed by more text', '__STRYKER_HIT_LIMIT_REACHED__ 5000 and more\n'],
+                ['without a count', '__STRYKER_HIT_LIMIT_REACHED__ \n'],
+                ['with a non-numeric count', '__STRYKER_HIT_LIMIT_REACHED__ many\n'],
+            ])('only accepts the sentinel on a line of its own (not %s)', async (_label, stderr) => {
+                mockRunBunTests.mockResolvedValue({ exitCode: 0, stdout: ' 1 pass\n', stderr, timedOut: false });
+
+                const result = await mutantRunWith({ hitLimit: 100 });
+
+                expect(result.status).toBe(MutantRunStatus.Survived);
+            });
+
+            it('reads a multi-digit count that is preceded by other output', async () => {
+                mockRunBunTests.mockResolvedValue({
+                    exitCode: 0,
+                    stdout:   ' 1 pass\n',
+                    stderr:   'first line\nsecond line\n__STRYKER_HIT_LIMIT_REACHED__ 123457\nlast line\n',
+                    timedOut: false,
+                });
+
+                const result = await mutantRunWith({ hitLimit: 123_456 });
+
+                expect(result).toEqual({ status: MutantRunStatus.Timeout, reason: 'Hit limit reached (123457/123456)' });
+            });
+
+            it('leaves an ordinary kill alone when no sentinel was written', async () => {
+                mockRunBunTests.mockResolvedValue({
+                    exitCode: 1,
+                    stdout:   'tests/alpha.test.ts:\n✗ handles alpha [1ms]\n  error: expected 1\n\n 0 pass\n 1 fail\n',
+                    stderr:   '',
+                    timedOut: false,
+                });
+
+                const result = await mutantRunWith({ hitLimit: 1100 });
+
+                expect(result.status).toBe(MutantRunStatus.Killed);
+            });
+        });
+
         describe('zero-match retry (defect 2)', () => {
             it('retries once with the full suite when --test-name-pattern matches 0 tests, and reports Survived from the retry', async () => {
                 // First call: the covering-set pattern matches nothing — real bun 1.3.14

@@ -10,6 +10,7 @@ import {
     shouldCollectCoverage as shouldCollect,
     initializeStrykerNamespace,
     setActiveMutant,
+    installHitLimit,
     formatCoverageData,
     detectGapWindowBleed,
     writeCoverageToFile,
@@ -68,7 +69,7 @@ const EAGER_MODULES: string[] = __EAGER_MODULES__;
 // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
 const config = getPreloadConfig();
 // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- Config from placeholder import
-const { syncPort, coverageFile, activeMutant } = config;
+const { syncPort, coverageFile, activeMutant, hitLimit } = config;
 
 // Skip coverage collection during mutant runs (only need pass/fail)
 // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
@@ -229,6 +230,13 @@ const mutantCoverage = strykerGlobal.mutantCoverage!;
 if(activeMutant) {
     // eslint-disable-next-line @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
     setActiveMutant(strykerGlobal, activeMutant);
+    // Stryker's infinite-loop protection: arm the instrumenter's hit limit before any
+    // instrumented code loads. One bun child runs one mutant, so the count starts at 0
+    // here and never needs resetting. See installHitLimit.
+    if(hitLimit !== undefined) {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
+        installHitLimit(strykerGlobal, hitLimit);
+    }
 }
 
 // ============================================================================

@@ -4,12 +4,12 @@
 
 /**
  * Raw coverage data collected during test execution
- * Maps test ID -> array of mutant IDs that were executed
+ * Maps test ID -> (mutant ID -> number of times that mutant was hit during the test)
  *
- * Note: This is the simplified format we collect in the preload script.
- * It gets converted to CoverageData (Record<string, number>) later.
+ * The counts are the instrumenter's own, unchanged: Stryker sums them per
+ * mutant to size each mutant run's hitLimit (infinite-loop protection).
  */
-export type PerTestCoverageData = Record<string, string[]>;
+export type PerTestCoverageData = Record<string, Record<string, number>>;
 
 /**
  * A single gap-window coverage-bleed observation: mutant coverage that was
@@ -31,8 +31,8 @@ export interface LateHitEntry {
 export interface CoverageFileData {
     /** Coverage data per test */
     perTest:   PerTestCoverageData
-    /** Mutants executed outside of tests (during module load) */
-    'static':  string[]
+    /** Mutants executed outside of tests (during module load), with their hit counts */
+    'static':  Record<string, number>
     /** Cross-test async coverage-bleed observations detected during this run (dry-run only); omitted when none were observed */
     lateHits?: LateHitEntry[]
 }

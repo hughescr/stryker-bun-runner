@@ -12,6 +12,10 @@ import {
     detectGapWindowBleed,
     writeCoverageToFile,
     startOrphanWatchdog,
+    parseHitLimit,
+    installHitLimit,
+    formatHitLimitSentinel,
+    HIT_LIMIT_SENTINEL,
     type PreloadConfig,
     type StrykerNamespace
 } from '../../src/coverage/preload-logic';
@@ -82,6 +86,39 @@ describe('preload-logic', () => {
             expect(config).toHaveProperty('syncPort');
             expect(config).toHaveProperty('coverageFile');
             expect(config).toHaveProperty('activeMutant');
+            expect(config).toHaveProperty('hitLimit');
+        });
+
+        it('reads __STRYKER_HIT_LIMIT__ from env as a number', () => {
+            process.env.__STRYKER_HIT_LIMIT__ = '1100';
+            expect(getPreloadConfig().hitLimit).toBe(1100);
+        });
+
+        it('returns undefined hitLimit when __STRYKER_HIT_LIMIT__ is unset', () => {
+            delete process.env.__STRYKER_HIT_LIMIT__;
+            expect(getPreloadConfig().hitLimit).toBeUndefined();
+        });
+    });
+
+    describe('parseHitLimit', () => {
+        it.each([
+            ['100', 100],
+            ['1', 1],
+            ['250000', 250_000],
+        ])('accepts the positive integer %p', (raw, expected) => {
+            expect(parseHitLimit(raw)).toBe(expected);
+        });
+
+        it.each([
+            [undefined],
+            [''],
+            ['0'],
+            ['-100'],
+            ['12.5'],
+            ['abc'],
+            ['Infinity'],
+        ])('rejects %p (no limit rather than a limit that could never or always trip)', (raw) => {
+            expect(parseHitLimit(raw)).toBeUndefined();
         });
     });
 
@@ -357,7 +394,7 @@ describe('preload-logic', () => {
             const result = formatCoverageData(undefined, new Map());
             expect(result).toEqual({
                 perTest:  {},
-                'static': [],
+                'static': {},
             });
         });
 
@@ -371,9 +408,31 @@ describe('preload-logic', () => {
             };
             const result = formatCoverageData(coverage, new Map());
             expect(result.perTest).toEqual({
-                'test-1': ['1', '2'],
-                'test-2': ['3'],
+                'test-1': { '1': 1, '2': 1 },
+                'test-2': { '3': 1 },
             });
+        });
+
+        it('keeps the real hit counts — Stryker sizes each mutant\'s hitLimit from them', () => {
+            const coverage: MutantCoverage = {
+                'static': { '1': 5, '2': 10 },
+                perTest:  { 'test-1': { '3': 100, '4': 200 } },
+            };
+            const result = formatCoverageData(coverage, new Map());
+            expect(result.static).toEqual({ '1': 5, '2': 10 });
+            expect(result.perTest).toEqual({ 'test-1': { '3': 100, '4': 200 } });
+        });
+
+        it('snapshots the counts — hits recorded after formatting do not leak into the written data', () => {
+            const coverage: MutantCoverage = {
+                'static': { '1': 1 },
+                perTest:  { 'test-1': { '2': 1 } },
+            };
+            const result = formatCoverageData(coverage, new Map());
+            coverage.static['1'] = 99;
+            coverage.perTest['test-1']['2'] = 99;
+            expect(result.static).toEqual({ '1': 1 });
+            expect(result.perTest).toEqual({ 'test-1': { '2': 1 } });
         });
 
         it('remaps counter IDs to names using counterToName map', () => {
@@ -390,8 +449,8 @@ describe('preload-logic', () => {
             ]);
             const result = formatCoverageData(coverage, counterToName);
             expect(result.perTest).toEqual({
-                'should test feature A': ['1'],
-                'should test feature B': ['2'],
+                'should test feature A': { '1': 1 },
+                'should test feature B': { '2': 1 },
             });
         });
 
@@ -406,18 +465,18 @@ describe('preload-logic', () => {
             const counterToName = new Map([['test-1', 'named test']]);
             const result = formatCoverageData(coverage, counterToName);
             expect(result.perTest).toEqual({
-                'named test': ['1'],
-                'test-2':     ['2'],
+                'named test': { '1': 1 },
+                'test-2':     { '2': 1 },
             });
         });
 
-        it('converts static coverage to array of keys', () => {
+        it('copies static coverage with its counts', () => {
             const coverage: MutantCoverage = {
-                'static': { '1': 1, '2': 1, '3': 1 },
+                'static': { '1': 1, '2': 3, '3': 7 },
                 perTest:  {},
             };
             const result = formatCoverageData(coverage, new Map());
-            expect(result.static).toEqual(['1', '2', '3']);
+            expect(result.static).toEqual({ '1': 1, '2': 3, '3': 7 });
         });
 
         it('handles empty perTest', () => {
@@ -427,7 +486,7 @@ describe('preload-logic', () => {
             };
             const result = formatCoverageData(coverage, new Map());
             expect(result.perTest).toEqual({});
-            expect(result.static).toEqual(['1']);
+            expect(result.static).toEqual({ '1': 1 });
         });
 
         it('handles empty static', () => {
@@ -436,8 +495,8 @@ describe('preload-logic', () => {
                 perTest:  { 'test-1': { '1': 1 } },
             };
             const result = formatCoverageData(coverage, new Map());
-            expect(result.perTest).toEqual({ 'test-1': ['1'] });
-            expect(result.static).toEqual([]);
+            expect(result.perTest).toEqual({ 'test-1': { '1': 1 } });
+            expect(result.static).toEqual({});
         });
 
         it('handles both empty perTest and static', () => {
@@ -448,7 +507,7 @@ describe('preload-logic', () => {
             const result = formatCoverageData(coverage, new Map());
             expect(result).toEqual({
                 perTest:  {},
-                'static': [],
+                'static': {},
             });
         });
 
@@ -467,18 +526,7 @@ describe('preload-logic', () => {
                 perTest:  { 'test-1': { '1': 1 } },
             };
             const result = formatCoverageData(coverage, new Map());
-            expect(result.static).toEqual([]);
-        });
-
-        it('preserves mutant coverage count values', () => {
-            const coverage: MutantCoverage = {
-                'static': { '1': 5, '2': 10 },
-                perTest:  { 'test-1': { '3': 100, '4': 200 } },
-            };
-            const result = formatCoverageData(coverage, new Map());
-            // Only keys are returned, not values
-            expect(result.static).toEqual(['1', '2']);
-            expect(result.perTest['test-1']).toEqual(['3', '4']);
+            expect(result.static).toEqual({});
         });
 
         describe('lateHits (3rd arg)', () => {
@@ -530,7 +578,7 @@ describe('preload-logic', () => {
         });
 
         it('calls appendFileSync with correct arguments', () => {
-            const data = { perTest: {}, 'static': [] };
+            const data = { perTest: {}, 'static': {} };
             writeCoverageToFile('/tmp/coverage.json', data);
 
             expect(appendFileSyncSpy).toHaveBeenCalledWith(
@@ -548,7 +596,7 @@ describe('preload-logic', () => {
             const previous = process.umask(0);
             try {
                 const file = path.join(dir, 'coverage.json');
-                writeCoverageToFile(file, { perTest: {}, 'static': [] });
+                writeCoverageToFile(file, { perTest: {}, 'static': {} });
                 const st = await fs.promises.stat(file);
                 // Low nine bits (rwxrwxrwx) of the mode
                 expect(st.mode % 0o1000).toBe(0o600);
@@ -560,8 +608,8 @@ describe('preload-logic', () => {
 
         it('appends JSON with newline', () => {
             const data = {
-                perTest:  { 'test-1': ['1', '2'] },
-                'static': ['3'],
+                perTest:  { 'test-1': { '1': 1, '2': 4 } },
+                'static': { '3': 2 },
             };
             writeCoverageToFile('/tmp/coverage.json', data);
 
@@ -574,7 +622,7 @@ describe('preload-logic', () => {
         });
 
         it('uses utf-8 encoding', () => {
-            const data = { perTest: {}, 'static': [] };
+            const data = { perTest: {}, 'static': {} };
             writeCoverageToFile('/tmp/coverage.json', data);
 
             expect(appendFileSyncSpy).toHaveBeenCalledWith(
@@ -585,7 +633,7 @@ describe('preload-logic', () => {
         });
 
         it('writes to specified file path', () => {
-            const data = { perTest: {}, 'static': [] };
+            const data = { perTest: {}, 'static': {} };
             const filePath = '/custom/path/to/coverage.json';
             writeCoverageToFile(filePath, data);
 
@@ -599,10 +647,10 @@ describe('preload-logic', () => {
         it('serializes complex coverage data', () => {
             const data = {
                 perTest: {
-                    'should test A': ['1', '2', '3'],
-                    'should test B': ['4', '5'],
+                    'should test A': { '1': 1, '2': 2, '3': 3 },
+                    'should test B': { '4': 1, '5': 5 },
                 },
-                'static': ['6', '7', '8'],
+                'static': { '6': 1, '7': 1, '8': 9 },
             };
             writeCoverageToFile('/tmp/coverage.json', data);
 
@@ -614,14 +662,113 @@ describe('preload-logic', () => {
         });
 
         it('handles empty data', () => {
-            const data = { perTest: {}, 'static': [] };
+            const data = { perTest: {}, 'static': {} };
             writeCoverageToFile('/tmp/coverage.json', data);
 
             expect(appendFileSyncSpy).toHaveBeenCalledWith(
                 expect.any(String),
-                '{"perTest":{},"static":[]}\n',
+                '{"perTest":{},"static":{}}\n',
                 PRIVATE_APPEND_OPTIONS
             );
+        });
+    });
+
+    describe('hit limit (Stryker infinite-loop protection)', () => {
+        /**
+         * The runtime logic of `stryMutAct_9fa48`, the helper every mutant switch in
+         * Stryker-instrumented code calls — transcribed from
+         * @stryker-mutator/instrumenter 10.0.0, dist/src/util/syntax-helpers.js:
+         *
+         *     if (ns.activeMutant === id) {
+         *       if (ns.hitCount !== void 0 && ++ns.hitCount > ns.hitLimit) {
+         *         throw new Error('Stryker: Hit count limit reached (' + ns.hitCount + ')');
+         *       }
+         *       return true;
+         *     }
+         *     return false;
+         */
+        function isActive(ns: StrykerNamespace, id: string): boolean {
+            if(ns.activeMutant === id) {
+                if(ns.hitCount !== undefined && ++ns.hitCount > ns.hitLimit!) {
+                    throw new Error(`Stryker: Hit count limit reached (${ns.hitCount})`);
+                }
+                return true;
+            }
+            return false;
+        }
+
+        it('HIT_LIMIT_SENTINEL is the marker the runner looks for on the child\'s stderr', () => {
+            expect(HIT_LIMIT_SENTINEL).toBe('__STRYKER_HIT_LIMIT_REACHED__');
+        });
+
+        it('formatHitLimitSentinel puts the sentinel and the hit count on a line of their own', () => {
+            // Leading newline: bun may have written a partial line just before.
+            expect(formatHitLimitSentinel(1101)).toBe('\n__STRYKER_HIT_LIMIT_REACHED__ 1101\n');
+        });
+
+        it('starts the count at 0 and records the limit in the instrumenter\'s fields', () => {
+            const ns: StrykerNamespace = { activeMutant: '7' };
+            installHitLimit(ns, 5, () => {});
+            expect(ns.hitCount).toBe(0);
+            expect(ns.hitLimit).toBe(5);
+        });
+
+        it('lets the active mutant be hit up to the limit without throwing or reporting', () => {
+            const ns: StrykerNamespace = { activeMutant: '7' };
+            const report = mock((_line: string) => {});
+            installHitLimit(ns, 5, report);
+
+            for(let i = 0; i < 5; i++) {
+                expect(isActive(ns, '7')).toBe(true);
+            }
+
+            expect(ns.hitCount).toBe(5);
+            expect(report).not.toHaveBeenCalled();
+        });
+
+        it('reports the sentinel once, synchronously, on the first hit past the limit — the instrumenter then throws', () => {
+            const ns: StrykerNamespace = { activeMutant: '7' };
+            const report = mock((_line: string) => {});
+            installHitLimit(ns, 5, report);
+            for(let i = 0; i < 5; i++) {
+                isActive(ns, '7');
+            }
+
+            expect(() => isActive(ns, '7')).toThrow('Stryker: Hit count limit reached (6)');
+            // Reported before the throw unwinds: under --bail bun exits without running
+            // afterAll hooks or exit handlers, so this is the only reliable moment.
+            expect(report).toHaveBeenCalledTimes(1);
+            expect(report).toHaveBeenCalledWith(formatHitLimitSentinel(6));
+
+            // Every later hit keeps throwing (that is what ends the loop), but is not re-reported.
+            expect(() => isActive(ns, '7')).toThrow('Stryker: Hit count limit reached (7)');
+            expect(() => isActive(ns, '7')).toThrow('Stryker: Hit count limit reached (8)');
+            expect(report).toHaveBeenCalledTimes(1);
+            expect(ns.hitCount).toBe(8);
+        });
+
+        it('does not count hits of other mutants', () => {
+            const ns: StrykerNamespace = { activeMutant: '7' };
+            installHitLimit(ns, 1, () => {});
+            for(let i = 0; i < 10; i++) {
+                expect(isActive(ns, '8')).toBe(false);
+            }
+            expect(ns.hitCount).toBe(0);
+        });
+
+        it('writes the sentinel straight to fd 2 by default (no buffered console that bun\'s bail exit could drop)', () => {
+            const writeSyncSpy = spyOn(fs, 'writeSync').mockImplementation(() => 0);
+            try {
+                const ns: StrykerNamespace = { activeMutant: '7' };
+                installHitLimit(ns, 1);
+                isActive(ns, '7');
+                expect(writeSyncSpy).not.toHaveBeenCalled();
+                expect(() => isActive(ns, '7')).toThrow();
+                expect(writeSyncSpy).toHaveBeenCalledTimes(1);
+                expect(writeSyncSpy).toHaveBeenCalledWith(2, formatHitLimitSentinel(2));
+            } finally {
+                writeSyncSpy.mockRestore();
+            }
         });
     });
 
