@@ -3,7 +3,7 @@
  * Tests preload script generation and cleanup
  */
 
-import { chmod, lstat, mkdir, mkdtemp, readFile as fsReadFile, symlink, writeFile as fsWriteFile, rm } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile as fsReadFile, realpath, symlink, writeFile as fsWriteFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
@@ -18,7 +18,8 @@ describe('generatePreloadScript', () => {
     let coverageFile: string;
 
     beforeEach(async () => {
-        root = await mkdtemp(path.join(tmpdir(), 'stryker-preload-test-'));
+        // Resolved: the directory checks refuse a symlink above the directory (macOS's /var -> /private/var).
+        root = await realpath(await mkdtemp(path.join(tmpdir(), 'stryker-preload-test-')));
         tempDir = path.join(root, 'run');
         coverageFile = path.join(tempDir, 'coverage.json');
 

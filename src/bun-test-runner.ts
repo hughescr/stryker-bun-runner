@@ -38,7 +38,7 @@ import type { TestInfo } from './inspector/types.js';
 import type { StrykerBunOptions } from './options.js';
 import { parseBunTestOutput, type ParsedTestResults } from './parsers/console-parser.js';
 import { runBunTests, stripAnsi } from './process-runner.js';
-import { type DroppedBunfigKey, assertSupportedBunArgs, splitBunConfigArg, checkBunVersion, getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, TEST_FILE_SUFFIX_RE, discoverTestFiles, findBuildOutputTestFiles, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery, ensurePrivateDir, runTempDirPath, writePrivateFile } from './utils/index.js';
+import { type DroppedBunfigKey, assertSupportedBunArgs, splitBunConfigArg, checkBunVersion, getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, TEST_FILE_SUFFIX_RE, discoverTestFiles, findBuildOutputTestFiles, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery, resolveRunTempDir, writePrivateFile } from './utils/index.js';
 
 /**
  * Poll (every 50ms) until `getUrl()` reports the inspector URL, `timeoutMs`
@@ -616,19 +616,22 @@ export class BunTestRunner implements TestRunner {
      * deliberately never unlinks the registry itself — see its doc comment).
      * The temp directory is OS-managed instead. Specifically it is the run's
      * private directory (src/utils/private-temp-dir.ts): owned by the current
-     * user, mode 0700, verified before every write and before the lazy load,
-     * so another local user can neither plant nor read a registry.
+     * user, mode 0700, re-resolved (and so re-verified) before every write and
+     * before the lazy load, so another local user can neither plant nor read a
+     * registry.
      *
      * Keyed by sha256(cwd + ':' + ppid) (plus the uid, in the directory name): every worker process Stryker spawns
      * for one run is a direct child of that run's single Stryker main
      * process, so all of them share BOTH process.cwd() (the sandbox
      * directory) AND process.ppid (the main process's pid) — and therefore
-     * independently derive this SAME path with no coordination required. A
+     * independently resolve this SAME path with no coordination required
+     * (resolveRunTempDir's numbered slots converge too: each call takes the
+     * lowest slot that is already ours). A
      * worker recycled mid-run is still a child of the same main process, so
      * it re-derives the same path too (README documents recycled instances
      * lazily loading the registry). This is the entire sharing contract:
      * writer (buildAndPersistTestRegistry) and reader (loadRegistryFile) both
-     * go through this one getter rather than reimplementing the formula, so
+     * go through this one method rather than reimplementing the formula, so
      * they can never disagree by construction.
      *
      * process.ppid is what makes this safe for this repo's own dogfooding:
@@ -649,17 +652,13 @@ export class BunTestRunner implements TestRunner {
      * syscall (and a new ENOENT failure mode if the sandbox dir is mid-
      * teardown) for no benefit.
      *
-     * Using a getter that reads process.cwd()/process.ppid at call time
+     * Reading process.cwd()/process.ppid at call time
      * (rather than caching at construction) ensures the path resolves against
      * Stryker's sandbox directory — which is set by the time these are
      * invoked — rather than the orchestrator's cwd at module-load time.
      */
-    private get registryPath(): string {
-        return path.join(runTempDirPath(), 'registry.json');
-    }
-
-    private get registryTmpPath(): string {
-        return `${this.registryPath}.tmp`;
+    private async resolveRegistryPath(): Promise<string> {
+        return path.join(await resolveRunTempDir(), 'registry.json');
     }
 
     /**
@@ -974,7 +973,7 @@ export class BunTestRunner implements TestRunner {
 
     /** Create/verify the run's private temp directory (see src/utils/private-temp-dir.ts) and remember it as this worker's tempDir. */
     private async ensureRunTempDir(): Promise<string> {
-        this.tempDir = await ensurePrivateDir(runTempDirPath());
+        this.tempDir = await resolveRunTempDir();
         return this.tempDir;
     }
 
@@ -1039,13 +1038,13 @@ export class BunTestRunner implements TestRunner {
    * worker falls back to raw console names and the lossy pattern reconstruction,
    * and a warning is logged so the issue is visible.
    *
-   * The one failure that is NOT tolerated is an unsafe registry directory: it is
-   * verified private first, outside the try, so a registry another user could
-   * have planted is never trusted and the mutant run fails loudly instead.
+   * The registry is only ever read from a verified private directory: it is
+   * resolved first, outside the try, so a registry another user could have
+   * planted is never trusted, and an unsafe temp area (a directory above the
+   * run directory) fails the mutant run loudly instead.
    */
     private async loadRegistryFile(): Promise<void> {
-        const registryPath = this.registryPath;
-        await ensurePrivateDir(path.dirname(registryPath));
+        const registryPath = await this.resolveRegistryPath();
         try {
             const raw = await fsPromises.readFile(registryPath, 'utf8');
             const parsed = JSON.parse(raw) as RegistryFileV2;
@@ -1948,8 +1947,11 @@ export class BunTestRunner implements TestRunner {
         this.testNameIndex = testNameIndex;
 
         try {
-            const registryPath = this.registryPath;
-            const tmpPath = this.registryTmpPath;
+            // registryPath lives in the run's private temp directory, resolved (created/verified)
+            // now rather than reused from init (cwd may differ from init's). Safe to call
+            // concurrently: an existing directory is re-verified, not an error.
+            const registryPath = await this.resolveRegistryPath();
+            const tmpPath = `${registryPath}.tmp`;
             const registryData = JSON.stringify({
                 version:         2,
                 writtenAt:       Date.now(),
@@ -1960,11 +1962,7 @@ export class BunTestRunner implements TestRunner {
                 // Omitted (JSON drops undefined) when Stryker selected no files.
                 testFiles:       this.selectedTestFilesFor(process.cwd()),
             } satisfies RegistryFileV2);
-            // registryPath lives in the run's private temp directory; create/verify it
-            // before writing (cwd may differ from init's). Safe to call concurrently:
-            // an existing directory is re-verified, not an error. The tmp file is
-            // created owner-only and exclusively, replacing anything at its path.
-            await ensurePrivateDir(path.dirname(registryPath));
+            // The tmp file is created owner-only and exclusively, replacing anything at its path.
             await writePrivateFile(tmpPath, registryData);
             this.lastRegistryTmpPath = tmpPath;
             await fsPromises.rename(tmpPath, registryPath);

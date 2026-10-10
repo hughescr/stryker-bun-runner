@@ -183,12 +183,14 @@ When the plugin initialises it reads your project's `bunfig.toml` (if present; o
 The runner's temporary files (the coverage preload script every `bun test` child executes, the coverage data file, the sanitized bunfig and the dry-run test registry) live in one directory per Stryker run, private to the user running Stryker:
 
 ```
-$TMPDIR/stryker-bun-runner-<uid>-<hash>/
+$TMPDIR/stryker-bun-runner-<uid>-<hash>-<n>/
 ```
 
-`$TMPDIR` is the OS temp directory (`os.tmpdir()`, usually `/tmp`). `<hash>` is derived from the Stryker sandbox directory and the Stryker main process's pid, so every worker of one run finds the same directory, including workers recycled by `maxTestRunnerReuse`, while separate runs get separate directories. The directory is created with mode `0700` and its files with mode `0600`.
+`$TMPDIR` is the OS temp directory (`os.tmpdir()`, usually `/tmp`), resolved to its real path if it is a symlink. `<hash>` is derived from the Stryker sandbox directory and the Stryker main process's pid, so every worker of one run finds the same directory, including workers recycled by `maxTestRunnerReuse`, while separate runs get separate directories. The directory is created with mode `0700` and its files with mode `0600`.
 
-The runner checks the directory before every use and **refuses to run** if it is a symlink, is owned by another user, or is accessible to group or others, or if its parent lets other users rename it (the parent is owned by someone other than you or root, or is writable by others without the sticky bit `/tmp` has). Another local user could otherwise plant the directory and swap the preload script, which would run their code as you. If you see `stryker-bun-runner: refusing to use temporary directory ...`, delete that directory if you trust it, or point `TMPDIR` at a directory only you can write to.
+The name is predictable (the pid shows in `ps`, and with `--inPlace` the sandbox directory is your project), so another local user can create it before you. The runner never uses a directory that is not yours: it is a symlink, is owned by another user, or is accessible to group or others. Such a directory is skipped rather than refused. `<n>` is the first of 16 numbered candidates (`-0` to `-15`) that is yours or that the runner could create, and all workers of a run settle on the same one. Only if all 16 are unusable does the run stop.
+
+The runner also checks every directory above it, up to `/`, and **refuses to run** if any of them would let another user rename the run directory away and put their own in its place: one owned by someone other than you or root, one writable by group or others without the sticky bit `/tmp` has, or a symlink. Another local user could otherwise swap the preload script, which would run their code as you. This matters when `TMPDIR` points somewhere other than `/tmp`, for example a directory under a shared scratch area. If you see `stryker-bun-runner: refusing to use temporary directory ...`, the message names the directory at fault. Delete it if it is a stale run directory you trust, or set `TMPDIR` to a directory that only you and root control.
 
 Each worker removes its own files on `dispose()`. The directory and its `registry.json` stay behind after the run: Stryker gives a worker no way to tell whether it is the last one, and a worker recycled mid-run still needs the registry. Each run leaves one small directory, which is safe to delete once the run has finished.
 

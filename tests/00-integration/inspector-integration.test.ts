@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import * as fsPromises from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -7,6 +6,7 @@ import type { Logger } from '@stryker-mutator/api/logging';
 import { DryRunStatus, MutantRunStatus, type MutantRunOptions } from '@stryker-mutator/api/test-runner';
 import { describe, test, expect, beforeAll, afterAll, afterEach, jest } from 'bun:test';
 import { BunTestRunner } from '../../src/bun-test-runner.js';
+import { resolveRunTempDir } from '../../src/utils/private-temp-dir.js';
 import { resetAllMocks } from '../test-preload.js';
 
 /**
@@ -212,14 +212,9 @@ describe('Inspector Integration', () => {
         }
 
         await fsPromises.rm(tempDir, { recursive: true, force: true });
-        // Clean up the dryRun registry file that BunTestRunner writes to the OS temp
-        // directory, keyed by sha256(cwd + ':' + ppid) — mirrors the production
-        // registryPath getter in src/bun-test-runner.ts so this cleans up the exact
-        // file this integration run would have written.
-        const registryHash = createHash('sha256').update(`${process.cwd()}:${process.ppid}`).digest('hex').slice(0, 16);
-        const registryPath = path.join(tmpdir(), 'stryker-bun-runner', `registry-${registryHash}.json`);
-        await fsPromises.rm(registryPath, { force: true });
-        await fsPromises.rm(`${registryPath}.tmp`, { force: true });
+        // Clean up the run's private temp directory (and the dryRun registry the runner
+        // leaves in it), resolved exactly as the runner resolves it for this process.
+        await fsPromises.rm(await resolveRunTempDir(), { recursive: true, force: true });
     });
 
     test('collects test names via inspector', async () => {

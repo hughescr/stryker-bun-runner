@@ -17,17 +17,26 @@
  *   worker of a run is a direct child of that run's Stryker main process and
  *   runs in the same sandbox cwd, so uid + sha256(cwd:ppid) is identical across
  *   a run's workers — including ones recycled by maxTestRunnerReuse — and
- *   differs between runs. The cwd half also keeps the name unguessable to other
- *   users in practice (the sandbox directory name is random), so pre-creating it
- *   to block a run is impractical.
- * - It is created with mode 0700 and then VERIFIED on every use with lstat: a
+ *   differs between runs. The name is NOT secret: the ppid shows in `ps`, and
+ *   with --inPlace the cwd is the real project. Anyone can therefore pre-create
+ *   it, which is why it is verified before use (below) and why a squatted name
+ *   costs nothing: see {@link resolveRunTempDir}'s numbered slots.
+ * - The base directory (os.tmpdir()) is resolved with realpath once, and every
+ *   later path is built from the resolved one, so retargeting a symlinked
+ *   TMPDIR cannot redirect the runner.
+ * - Every directory above it, up to `/`, must be safe from other users (OpenSSH
+ *   safe_path rules): owned by the current user or root, and if group or others
+ *   can write to it, it must have the sticky bit (as /tmp has), and it must not
+ *   be a symlink. Otherwise another user could rename an ancestor away and
+ *   rebuild the path with a planted preload, after the checks.
+ * - The directory itself is created with mode 0700 and VERIFIED with lstat: a
  *   real directory (a symlink is refused, never followed), owned by the current
- *   uid, with no group/other permission bits. Anything else is refused loudly —
- *   a directory planted by someone else must never be used, even if writable.
- * - Its parent must not let other users rename entries out from under us: it
- *   must belong to the current user or to root, and if group or others can
- *   write to it, it must have the sticky bit (as /tmp has). Otherwise a
- *   verified directory could be swapped after the check.
+ *   uid, with no group/other permission bits. Anything else is refused — a
+ *   directory planted by someone else must never be used, even if writable.
+ *
+ * Once verified, the directory stays safe for the run: only its owner (us) or
+ * root can change it or any directory above it, so it is not re-verified
+ * before every mutant run.
  *
  * Files are written with {@link writePrivateFile}: mode 0600, created
  * exclusively (O_EXCL), after removing whatever was at the path — a stale file
@@ -37,18 +46,17 @@
 /* eslint-disable no-bitwise -- file modes are bitmasks; testing permission bits is the point of this module */
 
 import { createHash } from 'node:crypto';
-import { lstat, mkdir, rm, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-/** Thrown when the runner's temporary directory, or its parent, is not safe to use. */
+/** Thrown when the runner's temporary directory, or a directory above it, is not safe to use. */
 export class UnsafeTempDirError extends Error {
     constructor(dir: string, problem: string) {
         super(
             `stryker-bun-runner: refusing to use temporary directory ${dir}: ${problem}. `
-            + 'The runner writes a script there that every bun test child executes, so the directory must be private to you. '
-            + 'Another user may have created it to tamper with those files: remove it if you trust it, '
-            + 'or point TMPDIR at a directory only you can write to.'
+            + 'The runner writes a script there that every bun test child executes, so neither the directory nor any directory above it may be changeable by other users. '
+            + 'Remove the directory if you trust it, or set TMPDIR to a directory that only you and root control.'
         );
         this.name = 'UnsafeTempDirError';
     }
@@ -66,6 +74,20 @@ export interface RunTempDirKey {
     uid?:     number
 }
 
+/** The parts of an lstat result the checks read. */
+export interface DirStat {
+    readonly uid:  number
+    readonly mode: number
+    isDirectory(): boolean
+    isSymbolicLink(): boolean
+}
+
+/** The lstat the checks use; injectable so tests can simulate other owners without root. */
+export type LstatFn = (p: string) => Promise<DirStat>;
+
+/** How many numbered directories {@link resolveRunTempDir} tries before giving up. */
+export const RUN_TEMP_DIR_SLOTS = 16;
+
 /** The current process's user id. */
 export function currentUid(): number {
     const uid = process.getuid?.();
@@ -76,10 +98,11 @@ export function currentUid(): number {
 }
 
 /**
- * The path of this run's private directory: `<baseDir>/stryker-bun-runner-<uid>-<hash>`,
- * where hash is the first 16 hex chars of sha256(`<cwd>:<ppid>`). Pure: creates nothing.
+ * The name prefix of this run's private directory: `<baseDir>/stryker-bun-runner-<uid>-<hash>`,
+ * where hash is the first 16 hex chars of sha256(`<cwd>:<ppid>`). The directory
+ * itself is `<prefix>-<slot>` (see {@link resolveRunTempDir}). Pure: creates nothing.
  */
-export function runTempDirPath(key: RunTempDirKey = {}): string {
+export function runTempDirPrefix(key: RunTempDirKey = {}): string {
     const cwd = key.cwd ?? process.cwd();
     const ppid = key.ppid ?? process.ppid;
     const hash = createHash('sha256').update(`${cwd}:${ppid}`).digest('hex').slice(0, 16);
@@ -90,22 +113,73 @@ function octal(mode: number): string {
     return (mode & 0o7777).toString(8).padStart(4, '0');
 }
 
-/**
- * Create `dir` (mode 0700) if absent, then verify it is a private directory of
- * `uid`: not a symlink, a directory, owned by `uid`, no group/other permission
- * bits, in a parent other users cannot rename entries in (owned by `uid` or
- * root; sticky if group/other-writable). Throws
- * {@link UnsafeTempDirError} otherwise. Returns `dir`.
- */
-export async function ensurePrivateDir(dir: string, uid: number = currentUid()): Promise<string> {
-    const parent = path.dirname(dir);
-    // stat, not lstat: the base (e.g. $TMPDIR) may legitimately be a symlink; what matters is the directory it resolves to.
-    const parentStat = await stat(parent);
-    const parentMode = parentStat.mode;
-    if((parentMode & 0o022) !== 0 && (parentMode & 0o1000) === 0) {
-        throw new UnsafeTempDirError(dir, `its parent ${parent} is writable by other users and lacks the sticky bit (mode ${octal(parentMode)})`);
+/** Why `st` is not a private directory of `uid`, or undefined if it is one. */
+function dirProblem(st: DirStat, uid: number): string | undefined {
+    if(st.isSymbolicLink()) {
+        return 'it is a symbolic link';
     }
+    if(!st.isDirectory()) {
+        return 'it is not a directory';
+    }
+    if(st.uid !== uid) {
+        return `it is owned by uid ${st.uid}, not the current user (uid ${uid})`;
+    }
+    if((st.mode & 0o077) !== 0) {
+        return `it has mode ${octal(st.mode)}; it must not be accessible to group or others (0700)`;
+    }
+    return undefined;
+}
 
+/** Why another user could replace the entries of the directory `st` describes, or undefined if none can. */
+function ancestorProblem(st: DirStat, uid: number): string | undefined {
+    if(st.isSymbolicLink()) {
+        return 'is a symbolic link; the path must be fully resolved';
+    }
+    // The owner of a directory can rename its entries whatever its mode or sticky bit.
+    if(st.uid !== uid && st.uid !== 0) {
+        return `is owned by uid ${st.uid}, who could replace it; every directory above it must belong to you or to root`;
+    }
+    if((st.mode & 0o022) !== 0 && (st.mode & 0o1000) === 0) {
+        return `is writable by other users and lacks the sticky bit (mode ${octal(st.mode)}), so they could replace it`;
+    }
+    return undefined;
+}
+
+/**
+ * Verify `top` and every directory above it, up to `/`, with {@link ancestorProblem}.
+ * Throws {@link UnsafeTempDirError} for `dir` naming the first offending directory.
+ */
+async function verifyAncestors(top: string, dir: string, uid: number, lstatFn: LstatFn): Promise<void> {
+    for(let component = top; ; component = path.dirname(component)) {
+        // eslint-disable-next-line no-await-in-loop -- one directory at a time, from the bottom up, stopping at the first unsafe one
+        const problem = ancestorProblem(await lstatFn(component), uid);
+        if(problem !== undefined) {
+            throw new UnsafeTempDirError(dir, `${component} (a directory above it) ${problem}`);
+        }
+        if(component === path.dirname(component)) {
+            return;
+        }
+    }
+}
+
+/** lstat `p`, or undefined if it does not exist. */
+async function lstatIfExists(p: string, lstatFn: LstatFn): Promise<DirStat | undefined> {
+    try {
+        return await lstatFn(p);
+    } catch (err) {
+        if((err as NodeJS.ErrnoException).code === 'ENOENT') {
+            return undefined;
+        }
+        throw err;
+    }
+}
+
+/**
+ * Create `dir` (mode 0700) if absent, then check it with {@link dirProblem}.
+ * Returns why it is unusable, or undefined if it is a private directory of `uid`.
+ * Does not check the directories above it.
+ */
+async function createPrivateDir(dir: string, uid: number, lstatFn: LstatFn): Promise<string | undefined> {
     try {
         await mkdir(dir, { mode: 0o700 });
     } catch (err) {
@@ -113,25 +187,80 @@ export async function ensurePrivateDir(dir: string, uid: number = currentUid()):
             throw err;
         }
     }
+    const st = await lstatIfExists(dir, lstatFn);
+    return st === undefined ? 'it disappeared while being checked' : dirProblem(st, uid);
+}
 
-    const st = await lstat(dir);
-    if(st.isSymbolicLink()) {
-        throw new UnsafeTempDirError(dir, 'it is a symbolic link');
-    }
-    if(!st.isDirectory()) {
-        throw new UnsafeTempDirError(dir, 'it is not a directory');
-    }
-    if(st.uid !== uid) {
-        throw new UnsafeTempDirError(dir, `it is owned by uid ${st.uid}, not the current user (uid ${uid})`);
-    }
-    if((st.mode & 0o077) !== 0) {
-        throw new UnsafeTempDirError(dir, `it has mode ${octal(st.mode)}; it must not be accessible to group or others (0700)`);
-    }
-    // The owner of the parent can rename entries in it whatever its mode or sticky bit.
-    if(parentStat.uid !== uid && parentStat.uid !== 0) {
-        throw new UnsafeTempDirError(dir, `its parent ${parent} is owned by uid ${parentStat.uid}, who could replace it; the parent must belong to you or to root`);
+/**
+ * Create `dir` (mode 0700) if absent, then verify it is a private directory of
+ * `uid` — not a symlink, a directory, owned by `uid`, no group/other permission
+ * bits — and that no directory above it can be changed by other users (each
+ * owned by `uid` or root, sticky if group/other-writable, not a symlink, so
+ * `dir` must be a resolved path). Throws {@link UnsafeTempDirError} otherwise.
+ * Returns `dir`.
+ */
+export async function ensurePrivateDir(dir: string, uid: number = currentUid(), lstatFn: LstatFn = lstat): Promise<string> {
+    await verifyAncestors(path.dirname(dir), dir, uid, lstatFn);
+    const problem = await createPrivateDir(dir, uid, lstatFn);
+    if(problem !== undefined) {
+        throw new UnsafeTempDirError(dir, problem);
     }
     return dir;
+}
+
+/**
+ * Find or create this run's private directory and return its path:
+ * `<realpath(baseDir)>/stryker-bun-runner-<uid>-<hash>-<slot>`, slot 0 to
+ * {@link RUN_TEMP_DIR_SLOTS} - 1.
+ *
+ * The base directory and every directory above it are verified first (see
+ * {@link ensurePrivateDir}); an unsafe one is refused with {@link UnsafeTempDirError}.
+ *
+ * Because the name can be guessed, another user may have created it first. Such
+ * a slot is skipped rather than refused, so squatting a name blocks nothing.
+ * All workers of a run still converge on one directory:
+ *
+ * 1. The lowest slot that already is a private directory of ours is used. Only
+ *    we (or root) can create or change one, so every worker agrees on it.
+ * 2. If there is none, each slot in turn is created if absent and used if it is
+ *    then ours. Workers racing to create the same slot both end up with it (one
+ *    creates it, the other finds it). Slots another user holds fail the check
+ *    for every worker alike and are skipped by all.
+ *
+ * Step 1 coming first also covers a squatter who removes their slot after a
+ * worker has skipped it: later workers find the worker's slot instead of
+ * creating the freed one. If no slot is usable, it refuses, listing why.
+ */
+export async function resolveRunTempDir(key: RunTempDirKey = {}, lstatFn: LstatFn = lstat): Promise<string> {
+    const uid = key.uid ?? currentUid();
+    const baseDir = await realpath(key.baseDir ?? tmpdir());
+    const prefix = runTempDirPrefix({ ...key, baseDir, uid });
+    const slots = Array.from({ length: RUN_TEMP_DIR_SLOTS }, (_, n) => `${prefix}-${n}`);
+
+    await verifyAncestors(baseDir, `${prefix}-<n>`, uid, lstatFn);
+
+    /* eslint-disable no-await-in-loop -- slots are probed in order: the lowest usable one must win, for every worker alike */
+    for(const slot of slots) {
+        const st = await lstatIfExists(slot, lstatFn);
+        if(st !== undefined && dirProblem(st, uid) === undefined) {
+            return slot;
+        }
+    }
+
+    const problems: string[] = [];
+    for(const slot of slots) {
+        const problem = await createPrivateDir(slot, uid, lstatFn);
+        if(problem === undefined) {
+            return slot;
+        }
+        problems.push(`${path.basename(slot)}: ${problem}`);
+    }
+    /* eslint-enable no-await-in-loop -- end of the ordered slot probing */
+
+    throw new UnsafeTempDirError(
+        `${prefix}-<n>`,
+        `all ${RUN_TEMP_DIR_SLOTS} candidates (-0 to -${RUN_TEMP_DIR_SLOTS - 1}) are unusable (${problems.join('; ')})`
+    );
 }
 
 /**
