@@ -1,4 +1,6 @@
 import * as fs from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import type { MutantCoverage } from '@stryker-mutator/api/core';
 import { describe, it, expect, spyOn, beforeEach, afterEach, test, mock, jest } from 'bun:test';
 import {
@@ -14,6 +16,9 @@ import {
     type StrykerNamespace
 } from '../../src/coverage/preload-logic';
 import type { LateHitEntry } from '../../src/coverage/types';
+
+/** The coverage file is created owner-only: it sits in the runner's private temp dir and must stay unreadable to other users. */
+const PRIVATE_APPEND_OPTIONS = { encoding: 'utf8', mode: 0o600 };
 
 describe('preload-logic', () => {
     describe('getPreloadConfig', () => {
@@ -531,8 +536,26 @@ describe('preload-logic', () => {
             expect(appendFileSyncSpy).toHaveBeenCalledWith(
                 '/tmp/coverage.json',
                 `${JSON.stringify(data)}\n`,
-                'utf8'
+                PRIVATE_APPEND_OPTIONS
             );
+        });
+
+        it('creates the coverage file owner-only (mode 0600) so other users cannot read it', async () => {
+            appendFileSyncSpy.mockRestore();
+            const dir = await fs.promises.mkdtemp(path.join(tmpdir(), 'stryker-coverage-mode-'));
+            // A permissive umask must not widen it
+            // eslint-disable-next-line sonarjs/file-permissions -- deliberately permissive umask, restored in finally
+            const previous = process.umask(0);
+            try {
+                const file = path.join(dir, 'coverage.json');
+                writeCoverageToFile(file, { perTest: {}, 'static': [] });
+                const st = await fs.promises.stat(file);
+                // Low nine bits (rwxrwxrwx) of the mode
+                expect(st.mode % 0o1000).toBe(0o600);
+            } finally {
+                process.umask(previous);
+                await fs.promises.rm(dir, { recursive: true, force: true });
+            }
         });
 
         it('appends JSON with newline', () => {
@@ -546,7 +569,7 @@ describe('preload-logic', () => {
             expect(appendFileSyncSpy).toHaveBeenCalledWith(
                 expect.any(String),
                 expectedJson,
-                expect.any(String)
+                PRIVATE_APPEND_OPTIONS
             );
         });
 
@@ -557,7 +580,7 @@ describe('preload-logic', () => {
             expect(appendFileSyncSpy).toHaveBeenCalledWith(
                 expect.any(String),
                 expect.any(String),
-                'utf8'
+                expect.objectContaining({ encoding: 'utf8' })
             );
         });
 
@@ -569,7 +592,7 @@ describe('preload-logic', () => {
             expect(appendFileSyncSpy).toHaveBeenCalledWith(
                 filePath,
                 expect.any(String),
-                expect.any(String)
+                PRIVATE_APPEND_OPTIONS
             );
         });
 
@@ -586,7 +609,7 @@ describe('preload-logic', () => {
             expect(appendFileSyncSpy).toHaveBeenCalledWith(
                 expect.any(String),
                 `${JSON.stringify(data)}\n`,
-                expect.any(String)
+                PRIVATE_APPEND_OPTIONS
             );
         });
 
@@ -597,7 +620,7 @@ describe('preload-logic', () => {
             expect(appendFileSyncSpy).toHaveBeenCalledWith(
                 expect.any(String),
                 '{"perTest":{},"static":[]}\n',
-                expect.any(String)
+                PRIVATE_APPEND_OPTIONS
             );
         });
     });

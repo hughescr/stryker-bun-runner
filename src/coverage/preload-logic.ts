@@ -141,8 +141,9 @@ export function formatCoverageData(
 // ============================================================================
 
 export function writeCoverageToFile(coverageFile: string, data: CoverageFileData): void {
+    // mode applies only when the append creates the file: owner-only, like everything else in the runner's private temp dir.
     // eslint-disable-next-line n/no-sync -- sync required in afterAll hook to ensure write completes before process exit
-    appendFileSync(coverageFile, `${JSON.stringify(data)}\n`, 'utf8');
+    appendFileSync(coverageFile, `${JSON.stringify(data)}\n`, { encoding: 'utf8', mode: 0o600 });
 }
 
 // ============================================================================

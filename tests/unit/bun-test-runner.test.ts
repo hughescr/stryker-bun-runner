@@ -21,9 +21,10 @@ import type { TestInfo } from '../../src/inspector/types.js';
 import * as processRunner from '../../src/process-runner.js';
 import * as bunVersion from '../../src/utils/bun-version.js';
 import * as bunfigSanitizer from '../../src/utils/bunfig-sanitizer.js';
+import * as privateTempDir from '../../src/utils/private-temp-dir.js';
 import * as syncServerModule from '../../src/utils/sync-server.js';
 import * as testFileDiscovery from '../../src/utils/test-file-discovery.js';
-import { mockGetAvailablePort, mockRename, mockWriteFile, resetAllMocks } from '../test-preload.js';
+import { mockGetAvailablePort, mockRename, mockWriteFile, resetAllMocks, resetFsMocks } from '../test-preload.js';
 
 // Captured at module load time, BEFORE any `spyOn(coverageMapper, 'mapCoverageToInspectorIds')`
 // runs in a beforeEach below — a plain function-value snapshot, immune to the later spy's
@@ -34,14 +35,27 @@ import { mockGetAvailablePort, mockRename, mockWriteFile, resetAllMocks } from '
 const realMapCoverageToInspectorIds = coverageMapper.mapCoverageToInspectorIds;
 
 /**
+ * Mirrors the run's private temp directory formula (src/utils/private-temp-dir.ts
+ * runTempDirPath) independently, so tests assert against the real directory the
+ * runner uses without calling the code under test to compute the expectation.
+ */
+function expectedRunTempDir(cwd: string = process.cwd(), ppid: number = process.ppid, baseDir: string = tmpdir()): string {
+    const hash = createHash('sha256').update(`${cwd}:${ppid}`).digest('hex').slice(0, 16);
+    return path.join(baseDir, `stryker-bun-runner-${process.getuid!()}-${hash}`);
+}
+
+// The real runTempDirPath, captured before any spy replaces the namespace export, so
+// the real-fs tests can inject a base directory while keeping the real formula.
+const realRunTempDirPath = privateTempDir.runTempDirPath;
+
+/**
  * Mirrors BunTestRunner's private `registryPath` getter formula exactly, so tests
  * can assert against the real file the runner reads/writes without hard-coding a
  * path the production code doesn't actually derive. Keep in sync with
  * src/bun-test-runner.ts's registryPath getter.
  */
 function expectedRegistryPath(cwd: string = process.cwd(), ppid: number = process.ppid): string {
-    const hash = createHash('sha256').update(`${cwd}:${ppid}`).digest('hex').slice(0, 16);
-    return path.join(tmpdir(), 'stryker-bun-runner', `registry-${hash}.json`);
+    return path.join(expectedRunTempDir(cwd, ppid), 'registry.json');
 }
 
 /**
@@ -54,10 +68,10 @@ function setPpid(value: number): void {
     (process as unknown as { ppid: number }).ppid = value;
 }
 
-/** Matches any (cwd, ppid) registry file name — used where the exact hash doesn't matter. */
-const REGISTRY_FILE_RE = /registry-[0-9a-f]{16}\.json$/;
-/** Matches any (cwd, ppid) registry .tmp file name — used where the exact hash doesn't matter. */
-const REGISTRY_TMP_FILE_RE = /registry-[0-9a-f]{16}\.json\.tmp$/;
+/** Matches any (uid, cwd, ppid) registry file path — used where the exact hash doesn't matter. */
+const REGISTRY_FILE_RE = /stryker-bun-runner-\d+-[0-9a-f]{16}\/registry\.json$/;
+/** Matches any (uid, cwd, ppid) registry .tmp file path — used where the exact hash doesn't matter. */
+const REGISTRY_TMP_FILE_RE = /stryker-bun-runner-\d+-[0-9a-f]{16}\/registry\.json\.tmp$/;
 
 describe('BunTestRunner', () => {
     let mockLogger: Logger;
@@ -108,6 +122,8 @@ describe('BunTestRunner', () => {
     let discoverTestFilesSpy: ReturnType<typeof spyOn>;
     let resolveEagerModulesFromGlobsSpy: ReturnType<typeof spyOn>;
     let checkBunVersionSpy: ReturnType<typeof spyOn>;
+    let ensurePrivateDirSpy: ReturnType<typeof spyOn>;
+    let writePrivateFileSpy: ReturnType<typeof spyOn>;
 
     beforeEach(() => {
         // Note: Global fake timers cause tests to hang when running full suite
@@ -235,6 +251,17 @@ describe('BunTestRunner', () => {
         // Mock the startup `bun --version` check so init() neither needs a real bun on
         // PATH nor pays a process spawn per test. Tests of the check itself override this.
         checkBunVersionSpy = spyOn(bunVersion, 'checkBunVersion').mockResolvedValue('1.4.2');
+
+        // The private temp directory's checks are real-fs syscalls (stat/mkdir/lstat/rm),
+        // which hang under fake timers just like the writes above. Unit tests here see
+        // the directory as already verified, and private writes go through the
+        // (controllable) mocked writeFile with the same flags. The real behaviour is
+        // covered by tests/unit/private-temp-dir.test.ts and by the 'private temp
+        // directory (real fs)' tests below, which restore both spies.
+        ensurePrivateDirSpy = spyOn(privateTempDir, 'ensurePrivateDir').mockImplementation((dir: string) => Promise.resolve(dir));
+        writePrivateFileSpy = spyOn(privateTempDir, 'writePrivateFile').mockImplementation(
+            (file: string, data: string) => fsPromises.writeFile(file, data, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
+        );
     });
 
     afterEach(async () => {
@@ -267,6 +294,10 @@ describe('BunTestRunner', () => {
         resolveEagerModulesFromGlobsSpy.mockRestore();
 
         checkBunVersionSpy.mockRestore();
+
+        ensurePrivateDirSpy.mockRestore();
+
+        writePrivateFileSpy.mockRestore();
 
         // Safety net for ad-hoc spies created inline within individual test bodies
         jest.restoreAllMocks();
@@ -853,11 +884,35 @@ describe('BunTestRunner', () => {
             await runner.init();
 
             expect(mockGeneratePreloadScript).toHaveBeenCalledWith(
-                expect.objectContaining({
-
-                    tempDir: expect.stringContaining('stryker-bun-runner'),
-                })
+                expect.objectContaining({ tempDir: expectedRunTempDir() })
             );
+            const { coverageFile } = mockGeneratePreloadScript.mock.calls[0][0] as { coverageFile: string };
+            // The coverage data file lives in the same private directory
+            expect(path.dirname(coverageFile)).toBe(expectedRunTempDir());
+            expect(path.basename(coverageFile)).toMatch(/^coverage-\d+\.json$/);
+        });
+
+        it('verifies the run\'s private temp directory before generating the preload or the sanitized bunfig', async () => {
+            mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+
+            // Once: the sanitized bunfig reuses the directory init just verified
+            expect(ensurePrivateDirSpy).toHaveBeenCalledTimes(1);
+            expect(ensurePrivateDirSpy).toHaveBeenCalledWith(expectedRunTempDir());
+            expect(ensurePrivateDirSpy.mock.invocationCallOrder[0]).toBeLessThan(mockGeneratePreloadScript.mock.invocationCallOrder[0]);
+            expect(mockGenerateSanitizedBunfig).toHaveBeenCalledWith(process.cwd(), expectedRunTempDir(), undefined);
+        });
+
+        it('fails init loudly, generating nothing, when the private temp directory is unsafe', async () => {
+            ensurePrivateDirSpy.mockRejectedValue(new privateTempDir.UnsafeTempDirError('/tmp/x', 'it is owned by uid 1, not the current user (uid 0)'));
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+
+            await expect(runner.init()).rejects.toThrow('refusing to use temporary directory /tmp/x');
+            expect(mockGeneratePreloadScript).not.toHaveBeenCalled();
+            expect(mockGenerateSanitizedBunfig).not.toHaveBeenCalled();
         });
 
         it('should log exact init debug messages', async () => {
@@ -3722,7 +3777,7 @@ tests/example.test.ts:
                 expect(result.status).toBe(DryRunStatus.Error);
                 if(result.status === DryRunStatus.Error) {
                     // Names the file it looked for, the consequence, and the likely causes.
-                    expect(result.errorMessage).toMatch(/stryker-bun-runner[/\\]coverage-\d+\.json/);
+                    expect(result.errorMessage).toMatch(/stryker-bun-runner-\d+-[0-9a-f]{16}\/coverage-\d+\.json/);
                     expect(result.errorMessage).toContain('full test suite for every mutant');
                     expect(result.errorMessage).toContain('preload');
                     expect(result.errorMessage).toContain('not writable');
@@ -7094,27 +7149,25 @@ tests/example.test.ts:
             });
         });
 
-        // ── Registry path derivation (tmpdir + sha256(cwd, ppid) scheme) ────────────
+        // ── Registry path derivation (tmpdir + uid + sha256(cwd, ppid) scheme) ──────
         //
         // The registry path is the entire cross-worker sharing contract: every worker
         // process of one Stryker run is a direct child of that run's single Stryker
         // main process, so they all share process.cwd() (the sandbox dir) AND
         // process.ppid (the main process's pid) — and must independently derive the
         // SAME file with no coordination. These tests pin that formula down directly
-        // so a mutation to the hash input, the tmpdir()/'stryker-bun-runner' join, or
-        // the mkdir call is caught rather than only incidentally covered by the
+        // so a mutation to the hash input, the private run directory join, or the
+        // directory check is caught rather than only incidentally covered by the
         // shape/content tests above.
         describe('registry path derivation', () => {
             let writeFileSpy:  ReturnType<typeof spyOn>;
             let renameSpy:     ReturnType<typeof spyOn>;
-            let mkdirSpy:      ReturnType<typeof spyOn>;
             let originalPpid:  number;
 
             beforeEach(() => {
                 mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
                 writeFileSpy = spyOn(fsPromises, 'writeFile').mockResolvedValue(undefined);
                 renameSpy    = spyOn(fsPromises, 'rename').mockResolvedValue(undefined);
-                mkdirSpy     = spyOn(fsPromises, 'mkdir').mockResolvedValue(undefined);
                 originalPpid = process.ppid;
 
                 mockInspectorClient.getTests.mockReturnValue([
@@ -7135,8 +7188,6 @@ tests/example.test.ts:
                 writeFileSpy.mockRestore();
 
                 renameSpy.mockRestore();
-
-                mkdirSpy.mockRestore();
                 // Restore process.ppid unconditionally — several tests below reassign it,
                 // and a leaked override would corrupt every other test file's registry
                 // path (including this file's own afterEach cleanup).
@@ -7156,7 +7207,7 @@ tests/example.test.ts:
                 return renameCall![1] as string;
             }
 
-            it('derives the same path formula as sha256(cwd + ":" + ppid), sliced to 16 hex chars, under tmpdir()/stryker-bun-runner', async () => {
+            it('derives registry.json inside tmpdir()/stryker-bun-runner-<uid>-<sha256(cwd + ":" + ppid) sliced to 16 hex chars>', async () => {
                 const actual = await runDryRunAndGetRegistryPath();
                 expect(actual).toBe(expectedRegistryPath());
             });
@@ -7197,18 +7248,23 @@ tests/example.test.ts:
                 const actual = await runDryRunAndGetRegistryPath();
 
                 expect(actual.startsWith(process.cwd())).toBe(false);
-                expect(actual.startsWith(path.join(tmpdir(), 'stryker-bun-runner'))).toBe(true);
+                expect(path.dirname(path.dirname(actual))).toBe(tmpdir());
             });
 
-            it('creates the registry directory with recursive mkdir before writing the tmp file', async () => {
+            it('verifies the registry\'s private directory, then writes the tmp file privately, before the rename', async () => {
                 await runDryRunAndGetRegistryPath();
+                const registryDir = expectedRunTempDir();
+                const tmpPath = `${expectedRegistryPath()}.tmp`;
 
-                expect(mkdirSpy).toHaveBeenCalledWith(
-                    path.join(tmpdir(), 'stryker-bun-runner'),
-                    { recursive: true }
-                );
-                // mkdir must precede the write, not follow it
-                expect(mkdirSpy.mock.invocationCallOrder[0]).toBeLessThan(writeFileSpy.mock.invocationCallOrder[0]);
+                const verifyCall = ensurePrivateDirSpy.mock.calls.findLastIndex((args: unknown[]) => args[0] === registryDir);
+                const writeCall = writePrivateFileSpy.mock.calls.findIndex((args: unknown[]) => args[0] === tmpPath);
+                expect(verifyCall).toBeGreaterThanOrEqual(0);
+                expect(writeCall).toBeGreaterThanOrEqual(0);
+                // The directory check must precede the write, and the write the rename
+                expect(ensurePrivateDirSpy.mock.invocationCallOrder[verifyCall]).toBeLessThan(writePrivateFileSpy.mock.invocationCallOrder[writeCall]);
+                expect(writePrivateFileSpy.mock.invocationCallOrder[writeCall]).toBeLessThan(renameSpy.mock.invocationCallOrder[0]);
+                // Exclusive, owner-only create
+                expect(writeFileSpy).toHaveBeenCalledWith(tmpPath, expect.any(String), { encoding: 'utf8', flag: 'wx', mode: 0o600 });
             });
         });
 
@@ -8535,6 +8591,136 @@ tests/example.test.ts:
                 renameSpy.mockRestore();
                 readFileSpy.mockRestore();
             }
+        });
+    });
+
+    describe('private temp directory (real fs)', () => {
+        // The run's temp directory under a base directory injected per test (a
+        // mkdtemp root, never the real OS temp dir), with the real
+        // ensurePrivateDir/writePrivateFile and real fs writes/renames: what another
+        // local user could plant there is exactly what these tests plant.
+        let root: string;
+        let runTempDirPathSpy: ReturnType<typeof spyOn>;
+        /** This run's directory, under the injected root. */
+        const runDir = (): string => expectedRunTempDir(process.cwd(), process.ppid, root);
+        const registryFile = (): string => path.join(runDir(), 'registry.json');
+
+        beforeEach(async () => {
+            ensurePrivateDirSpy.mockRestore();
+            writePrivateFileSpy.mockRestore();
+            resetFsMocks();
+            root = await fsPromises.mkdtemp(path.join(tmpdir(), 'sbr-runner-tmpdir-test-'));
+            runTempDirPathSpy = spyOn(privateTempDir, 'runTempDirPath').mockImplementation(
+                (key: privateTempDir.RunTempDirKey = {}) => realRunTempDirPath({ ...key, baseDir: root })
+            );
+
+            mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+            mockInspectorClient.getTests.mockReturnValue([]);
+            mockInspectorClient.getExecutionOrder.mockReturnValue([]);
+            mockCollectCoverage.mockResolvedValue(undefined);
+        });
+
+        afterEach(async () => {
+            runTempDirPathSpy.mockRestore();
+            await fsPromises.rm(root, { recursive: true, force: true });
+            // Re-arm the file-wide spies so the outer afterEach's mockRestore has something to restore
+            ensurePrivateDirSpy = spyOn(privateTempDir, 'ensurePrivateDir');
+            writePrivateFileSpy = spyOn(privateTempDir, 'writePrivateFile');
+        });
+
+        it('creates the run directory 0700 during init', async () => {
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+
+            expect(path.dirname(runDir())).toBe(root);
+            const st = await fsPromises.lstat(runDir());
+            expect(st.isDirectory()).toBe(true);
+            expect(st.uid).toBe(process.getuid!());
+            // Low nine bits (rwxrwxrwx) of the mode
+            expect(st.mode % 0o1000).toBe(0o700);
+        });
+
+        it('fails init when the run directory already exists with group/other access (planted by someone else)', async () => {
+            await fsPromises.mkdir(runDir());
+            // eslint-disable-next-line sonarjs/file-permissions -- deliberately unsafe: the test plants a world-writable directory
+            await fsPromises.chmod(runDir(), 0o777);
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+
+            await expect(runner.init()).rejects.toBeInstanceOf(privateTempDir.UnsafeTempDirError);
+            expect(mockGeneratePreloadScript).not.toHaveBeenCalled();
+        });
+
+        it('fails init when the run directory path is a symlink', async () => {
+            const elsewhere = path.join(root, 'elsewhere');
+            await fsPromises.mkdir(elsewhere, { mode: 0o700 });
+            await fsPromises.symlink(elsewhere, runDir());
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+
+            await expect(runner.init()).rejects.toThrow('is a symbolic link');
+            expect(mockGeneratePreloadScript).not.toHaveBeenCalled();
+        });
+
+        it('writes the dry-run registry owner-only, keeps it past dispose, and a recycled worker loads it from the same directory', async () => {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+            mockRunBunTests.mockImplementation((options: any) => {
+                if(options.onInspectorReady) {
+                    options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                }
+                return Promise.resolve({ exitCode: 0, stdout: 'tests/foo.test.ts:\n✓ my test [1ms]\n\n 1 pass\n', stderr: '', timedOut: false });
+            });
+            const runner1 = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner1.init();
+            const dryRunResult = await runner1.dryRun();
+            expect(dryRunResult.status).toBe(DryRunStatus.Complete);
+            await runner1.dispose();
+
+            const registryStat = await fsPromises.stat(registryFile());
+            expect(registryStat.mode % 0o1000).toBe(0o600);
+            // dispose removed the worker's own files but left the registry for its successors
+            expect(await fsPromises.readdir(runDir())).toEqual(['registry.json']);
+
+            // maxTestRunnerReuse: a brand-new worker of the same run derives the same directory
+            mockRunBunTests.mockImplementation(() => Promise.resolve({
+                exitCode: 1,
+                stdout:   'tests/foo.test.ts:\n✗ my test [1ms]\n  error: fail\n\n 0 pass\n 1 fail\n',
+                stderr:   '',
+                timedOut: false,
+            }));
+            const runner2 = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner2.init();
+            const result = await runner2.mutantRun({
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                activeMutant:    { id: '7' } as any,
+                testFilter:      [],
+                sandboxFileName: 'sandbox',
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+            } as any);
+            await runner2.dispose();
+
+            expect(result.status).toBe(MutantRunStatus.Killed);
+            if(result.status === MutantRunStatus.Killed) {
+                expect(result.killedBy).toEqual(['tests/foo.test.ts > my test']);
+            }
+        });
+
+        it('refuses to load the registry from a directory that is no longer private', async () => {
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            await fsPromises.writeFile(registryFile(), JSON.stringify({ version: 2, writtenAt: 0, cachedTestNames: [], baseNameIndex: [], testNameIndex: [] }));
+            // eslint-disable-next-line sonarjs/file-permissions -- deliberately unsafe: the directory stops being private
+            await fsPromises.chmod(runDir(), 0o755);
+            mockRunBunTests.mockImplementation(() => Promise.resolve({ exitCode: 0, stdout: ' 1 pass\n', stderr: '', timedOut: false }));
+
+            await expect(runner.mutantRun({
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                activeMutant:    { id: '8' } as any,
+                testFilter:      [],
+                sandboxFileName: 'sandbox',
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+            } as any)).rejects.toThrow('has mode 0755');
+            expect(mockRunBunTests).not.toHaveBeenCalled();
         });
     });
 

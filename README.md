@@ -176,6 +176,20 @@ bunx stryker run
 
 When the plugin initialises it reads your project's `bunfig.toml` (if present; or the file named by `--config=<path>` in `bun.bunArgs`, which must then exist) and writes a sanitized copy that is passed to every `bun test` invocation via `--config`. The sanitizer forwards only an explicit allowlist of `[test]` keys; everything else is stripped. The forwarded keys are: `preload`, `root`, `pathIgnorePatterns`, `timeout`, `smol`, `rerunEach`, `retry`, `randomize`, `seed`. The `[install]` table is copied verbatim. Two keys are always forced: `coverage = false` and `onlyFailures = false`. This prevents `coverageThreshold` misses (which cause Bun to exit 1 even when no test actually fails) from being mistaken for mutant kills. If you need additional `[test]` settings forwarded, add their key names to the `SAFE_TEST_KEYS` set in `src/utils/bunfig-sanitizer.ts`.
 
+## Temporary files
+
+The runner's temporary files (the coverage preload script every `bun test` child executes, the coverage data file, the sanitized bunfig and the dry-run test registry) live in one directory per Stryker run, private to the user running Stryker:
+
+```
+$TMPDIR/stryker-bun-runner-<uid>-<hash>/
+```
+
+`$TMPDIR` is the OS temp directory (`os.tmpdir()`, usually `/tmp`). `<hash>` is derived from the Stryker sandbox directory and the Stryker main process's pid, so every worker of one run finds the same directory, including workers recycled by `maxTestRunnerReuse`, while separate runs get separate directories. The directory is created with mode `0700` and its files with mode `0600`.
+
+The runner checks the directory before every use and **refuses to run** if it is a symlink, is owned by another user, or is accessible to group or others, or if its parent lets other users rename it (the parent is owned by someone other than you or root, or is writable by others without the sticky bit `/tmp` has). Another local user could otherwise plant the directory and swap the preload script, which would run their code as you. If you see `stryker-bun-runner: refusing to use temporary directory ...`, delete that directory if you trust it, or point `TMPDIR` at a directory only you can write to.
+
+Each worker removes its own files on `dispose()`. The directory and its `registry.json` stay behind after the run: Stryker gives a worker no way to tell whether it is the last one, and a worker recycled mid-run still needs the registry. Each run leaves one small directory, which is safe to delete once the run has finished.
+
 ## Memory model
 
 Every `dryRun` and `mutantRun` spawns a **brand-new `bun test` OS process** and waits for it to fully exit before returning a result — the plugin never reuses a `bun test` child across runs. This is deliberate: it's what makes per-run isolation and coverage correlation reliable, and it means a child process's memory is always fully reclaimed by the OS the moment that one run ends. There is no cross-mutant memory accumulation to "fix" in the spawned child — each mutant gets a clean process.
@@ -242,7 +256,7 @@ Stryker core's own [`maxTestRunnerReuse`](https://stryker-mutator.io/docs/stryke
 This plugin is designed to tolerate that recycling cleanly:
 
 - `dispose()` cleans up its preload script, coverage file, sanitized bunfig, and registry temp file, and aborts any run still in flight (see [Orphan prevention](#orphan-prevention)).
-- A fresh `BunTestRunner` instance that never ran its own `dryRun` (as happens after a recycle) still resolves `killedBy` names correctly: it lazily loads the shared, file-backed dry-run test registry written by whichever instance *did* run `dryRun`, exactly as it already does for any other multi-worker Stryker run. The registry lives in the OS temp directory, not the project directory, keyed to this Stryker run so it can't collide with another run's registry or a different project's — a recycled instance is still a child of the same Stryker main process, so it derives the same key and finds the same file.
+- A fresh `BunTestRunner` instance that never ran its own `dryRun` (as happens after a recycle) still resolves `killedBy` names correctly: it lazily loads the shared, file-backed dry-run test registry written by whichever instance *did* run `dryRun`, exactly as it already does for any other multi-worker Stryker run. The registry lives in the run's private temp directory (see [Temporary files](#temporary-files)), not the project directory, keyed to this Stryker run so it can't collide with another run's registry or a different project's — a recycled instance is still a child of the same Stryker main process, so it derives the same key and finds the same file.
 
 ```javascript
 // stryker.conf.mjs

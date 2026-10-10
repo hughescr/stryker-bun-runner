@@ -3,15 +3,17 @@
  * Generates the preload script for coverage collection
  */
 
-import { mkdir, unlink, readFile, writeFile } from 'node:fs/promises';
+import { unlink, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { glob } from 'tinyglobby';
+import { ensurePrivateDir, writePrivateFile } from '../utils/private-temp-dir.js';
 import { TEST_FILE_SUFFIX_RE } from '../utils/test-name-pattern.js';
 
 export interface PreloadOptions {
     /**
-   * Directory to write the preload script to
+   * Directory to write the preload script to. Created if absent and verified to be
+   * private to the current user (see {@link ensurePrivateDir}); an unsafe directory is refused.
    */
     tempDir: string
 
@@ -118,13 +120,16 @@ export async function resolveEagerModulesFromGlobs(
  * The preload script is copied from the templates directory to a temp location
  * so it can be used with Bun's --preload flag.
  *
+ * Every `bun test` child EXECUTES this file, so it is only ever written into a
+ * directory verified private to the current user, as a fresh owner-only file
+ * that replaces (never writes through) whatever was at the path.
+ *
  * @returns Path to the generated preload script
  */
 export async function generatePreloadScript(options: PreloadOptions): Promise<string> {
     const preloadPath = path.join(options.tempDir, `stryker-coverage-preload-${process.pid}.ts`);
 
-    // Ensure temp directory exists (mkdir with recursive is idempotent)
-    await mkdir(options.tempDir, { recursive: true });
+    await ensurePrivateDir(options.tempDir);
 
     // Get the path to the template file
     // Path differs between source and bundled builds:
@@ -165,7 +170,7 @@ export async function generatePreloadScript(options: PreloadOptions): Promise<st
         .replace('__EAGER_MODULES__', JSON.stringify(eagerModules));
 
     // Write the template to the temp location
-    await writeFile(preloadPath, content, 'utf8');
+    await writePrivateFile(preloadPath, content);
 
     return preloadPath;
 }

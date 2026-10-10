@@ -9,3 +9,4 @@ export { buildTestNamePattern, TEST_FILE_SUFFIX_RE } from './test-name-pattern.j
 export { discoverTestFiles, findBuildOutputTestFiles } from './test-file-discovery.js';
 export { getProcessRssBytes, parseVmRss, parsePsRssOutput } from './process-rss.js';
 export { buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery } from './duplicate-suffix.js';
+export { ensurePrivateDir, runTempDirPath, writePrivateFile, UnsafeTempDirError } from './private-temp-dir.js';
