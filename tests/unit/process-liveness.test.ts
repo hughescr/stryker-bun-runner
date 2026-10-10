@@ -9,9 +9,9 @@
 
 import type { ChildProcess } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import type { Writable } from 'node:stream';
+import type { Readable, Writable } from 'node:stream';
 import { describe, it, expect, afterEach } from 'bun:test';
-import { isProcessRunning, parseProcStatState, parsePsState } from '../helpers/process-liveness.js';
+import { isProcessRunning, lifelineCut, parseProcStatState, parsePsState, settlesDead } from '../helpers/process-liveness.js';
 import { realSpawn as spawn } from '../test-preload.js';
 
 describe('parseProcStatState', () => {
@@ -53,20 +53,6 @@ afterEach(() => {
         spawned.pop()?.kill('SIGKILL');
     }
 });
-
-async function waitUntil(predicate: () => boolean, timeoutMs = 2000): Promise<boolean> {
-    const deadline = Date.now() + timeoutMs;
-    while(Date.now() < deadline) {
-        if(predicate()) {
-            return true;
-        }
-        // eslint-disable-next-line no-await-in-loop -- polling loop: each tick must complete before the next check
-        await new Promise((resolve) => {
-            setTimeout(resolve, 5);
-        });
-    }
-    return predicate();
-}
 
 /** True when kill(pid, 0) says the pid exists (zombies included). */
 function existsInProcessTable(pid: number): boolean {
@@ -112,12 +98,16 @@ describe('isProcessRunning', () => {
         // from the process table instead of a zombie. So the child blocks reading fd 3 until
         // the test writes to it, and the test writes only after cat has echoed a line back:
         // only the exec()ed cat reads stdin, so that echo proves the shell is gone.
-        const parent = spawn('/bin/sh', ['-c', '{ read -r _ <&3; } & echo $!; exec cat'], { stdio: ['pipe', 'pipe', 'ignore', 'pipe'] });
+        //
+        // Fd 4 is the child's lifeline (see lifelineCut): cat runs with it closed, so its EOF
+        // means the child has exited — the event this test waits on, instead of polling.
+        const parent = spawn('/bin/sh', ['-c', '{ read -r _ <&3; } & echo $!; exec cat 4>&-'], { stdio: ['pipe', 'pipe', 'ignore', 'pipe', 'pipe'] });
         spawned.push(parent);
         // The stdio option above guarantees these pipes; spawn's typings cannot see that.
         const stdin = parent.stdio[0]!;
         const stdout = parent.stdio[1]!;
         const release = parent.stdio[3] as Writable;
+        const childGone = lifelineCut(parent.stdio[4] as Readable);
         const lines = createInterface({ input: stdout })[Symbol.asyncIterator]();
         const nextLine = async (): Promise<string> => {
             const line = await lines.next();
@@ -130,9 +120,10 @@ describe('isProcessRunning', () => {
         stdin.write('exec-check\n');
         expect(await nextLine()).toBe('exec-check');
         release.write('exit\n');
+        await childGone;
 
         // Still in the process table (the zombie) ...
-        expect(await waitUntil(() => !isProcessRunning(zombiePid))).toBe(true);
+        expect(await settlesDead(zombiePid)).toBe(true);
         expect(existsInProcessTable(zombiePid)).toBe(true);
         // ... and dead by both platform probes.
         expect(isProcessRunning(zombiePid, 'linux')).toBe(false);
