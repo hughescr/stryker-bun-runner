@@ -1882,7 +1882,7 @@ export class BunTestRunner implements TestRunner {
         try {
             result = await runBunTests({
                 bunPath:               this.bunPath,
-                // Stryker disable next-line MethodExpression: the 1 ms floor only matters once the deadline has already passed (a retry after a slow first spawn); any non-positive timer fires immediately either way
+                // The 1 ms floor only matters once the deadline has passed (a retry after a slow first spawn).
                 timeout:               Math.max(1, ctx.deadline - Date.now()),
                 env:                   this.env,
                 bunArgs:               this.bunArgs,
@@ -2169,7 +2169,6 @@ export class BunTestRunner implements TestRunner {
             };
         }
 
-        // Stryker disable next-line EqualityOperator: the > 0 boundaries are the whole predicate; covered by the load-failure Killed tests (fail-count, bail, and error-count-only fixtures) and the no-summary Error tests
         if(parsed.failed > 0 || parsed.summaryErrors > 0) {
             // Stryker disable next-line StringLiteral: diagnostic logging message
             this.logger.debug(
@@ -2181,7 +2180,7 @@ export class BunTestRunner implements TestRunner {
             return null;
         }
 
-        // Stryker disable next-line StringLiteral,MethodExpression,ConditionalExpression,LogicalOperator: diagnostic text — the exit code and output head are pinned with toContain by the no-summary Error tests
+        // Stryker disable next-line MethodExpression: the trim() calls and the slice(0, 500) cap only shape diagnostic text
         const output = (stripAnsi(stderr).trim() || stripAnsi(result.stdout).trim()).slice(0, 500) || '(no output)';
         // Stryker disable next-line StringLiteral: diagnostic logging message
         this.logger.warn(
@@ -2490,9 +2489,9 @@ export class BunTestRunner implements TestRunner {
         const testMap = new Map(testHierarchy.map(t => [t.id, t]));
 
         // A wholly-absent coverage file (no path configured, or the child crashed before
-        // its afterAll write) is a distinct, already-tolerated degraded mode — Stryker
-        // degrades gracefully to running the full suite per mutant when mutantCoverage is
-        // undefined — and must NOT itself be gate-material, so both counts default to 0.
+        // its afterAll write) is not truncation evidence for the completeness gate, so
+        // both counts default to 0. It is judged separately, by checkCoverageData: Stryker
+        // would otherwise silently run the full suite for every mutant.
         if(!this.coverageFilePath) {
             return { coverage: undefined, inspectorIdToProjectFile: new Map(), rawKeyCount: 0, orphanedKeyCount: 0 };
         }
