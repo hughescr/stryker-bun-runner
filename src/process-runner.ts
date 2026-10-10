@@ -435,7 +435,6 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
  * and the `__STRYKER_*` variables the coverage preload reads.
  */
 function buildChildEnv(options: BunTestRunOptions, spawnDepth: number): Record<string, string | undefined> {
-    // Stryker disable next-line ObjectLiteral: removing env spreads means bun runs with empty env → no PATH/HOME → bun cannot initialize → Timeout
     const env: Record<string, string | undefined> = {
         ...process.env,
         ...options.env,

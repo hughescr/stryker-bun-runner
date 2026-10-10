@@ -62,7 +62,6 @@ async function waitForInspectorUrl(getUrl: () => string | null, child: Promise<u
     child.then(markSettled).catch(markSettled);
 
     const waitStart = Date.now();
-    // Stryker disable next-line EqualityOperator: `<` vs `<=` only moves the timeout boundary by a single millisecond, which no test can pin; every other mutant of this loop (the && operator, either operand, the body) is pinned by the dryRun wait-loop tests
     while(!getUrl() && Date.now() - waitStart < timeoutMs) {
         // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- childSettled is set by an async callback; TypeScript cannot track cross-await mutations
         if(childSettled) {
@@ -2436,7 +2435,6 @@ export class BunTestRunner implements TestRunner {
         if(isFullSuiteFallback && ctx.strykerTimeoutMs !== undefined && result.memoryLimitExceeded !== true) {
             return this.buildInconclusiveFallbackTimeout(ctx.options.activeMutant.id, ctx.coveringTestCount, ctx.strykerTimeoutMs);
         }
-        // Stryker disable next-line all: Logging statement
         this.logger.debug('Mutant run timed out');
         return {
             status: MutantRunStatus.Timeout,

@@ -1597,6 +1597,43 @@ tests/example.test.ts:
             expect(mockInspectorClient.connect).not.toHaveBeenCalled();
         });
 
+        it('stops waiting once elapsed time equals the timeout, ignoring a URL that arrives on the next poll (fake clock)', async () => {
+            // inspectorTimeout 100 with 50ms polls: the loop checks at t=0, 50 and 100.
+            // At t=100 elapsed === timeout, so the wait ends there; the URL printed at
+            // t=120 must be ignored. An inclusive bound would sleep once more and see it.
+            jest.useFakeTimers();
+            try {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    return new Promise((resolve) => {
+                        setTimeout(() => {
+                            options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                        }, 120);
+                        setTimeout(() => {
+                            resolve({ exitCode: 0, stdout: '', stderr: 'late', timedOut: false });
+                        }, 1000);
+                    });
+                });
+                const runner = new BunTestRunner(mockLogger, {
+                    bun: { inspectorTimeout: 100 },
+                } as unknown as StrykerOptions);
+                await runner.init();
+                const resultPromise = runner.dryRun();
+                for(let i = 0; i < 40; i++) {
+                    jest.advanceTimersByTime(50);
+                    // eslint-disable-next-line no-await-in-loop -- let the wait loop's sleep continuation run between ticks
+                    await Promise.resolve();
+                    // eslint-disable-next-line no-await-in-loop -- second microtask hop for the awaited sleep
+                    await Promise.resolve();
+                }
+                const result = await resultPromise;
+                expect(result.status).toBe(DryRunStatus.Error);
+                expect(mockInspectorClient.connect).not.toHaveBeenCalled();
+            } finally {
+                jest.useRealTimers();
+            }
+        });
+
         it('includes only the LAST 1000 chars of stderr in the inspector-timeout error message', async () => {
             jest.useFakeTimers();
             try {
@@ -5095,6 +5132,7 @@ tests/example.test.ts:
                 });
 
                 expect(result.status).toBe(MutantRunStatus.Timeout);
+                expect(mockLogger.debug).toHaveBeenCalledWith('Mutant run timed out');
             });
 
             it('keeps the runner\'s own maxChildRss kill as Timeout even though a signal is reported', async () => {
