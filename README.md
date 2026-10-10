@@ -179,6 +179,32 @@ export default {
 
 The tradeoff is that those mutants are never tested, so they are left out of your mutation score. Leave it off if module-load behavior matters to you; turn it on if run time matters more.
 
+### Speeding up runs: keep tests out of the TypeScript checker
+
+`@stryker-mutator/typescript-checker` type-checks every mutant against the program of its `tsconfigFile` (default `tsconfig.json`) and re-checks every file that imports the mutated one. If that tsconfig includes your tests, a mutant in a widely imported module re-checks much of the test suite too. Wrap your config in `withTestFilesExcludedFromTypeCheck` to have the checker check only the code under test:
+
+```javascript
+import { withTestFilesExcludedFromTypeCheck } from '@hughescr/stryker-bun-runner';
+
+export default await withTestFilesExcludedFromTypeCheck({
+  appendPlugins: ['@hughescr/stryker-bun-runner', '@stryker-mutator/typescript-checker'],
+  testRunner: 'bun',
+  checkers: ['typescript'],
+});
+```
+
+Each time Stryker loads the config, it reads your tsconfig with your project's TypeScript (honouring `extends`, `files`, `include` and `exclude`) and writes `tsconfig.stryker-checker.json` next to it. That file extends yours and lists everything your tsconfig covers except:
+
+- test files, found the way this runner finds them: Bun's naming rules under bunfig's `[test].root`, plus `bun.testFiles` and Stryker's `testFiles` patterns;
+- your bunfig's `[test].preload` scripts;
+- files that only those import, such as test helpers, unless a `mutate` pattern covers them.
+
+Anything the remaining code imports still comes in through the import, so the checker sees a program that compiles exactly as before. The returned config has `tsconfigFile` pointing at the new file and, if you set `ignorePatterns`, a negation for it appended so Stryker copies it into the sandbox. Add `*.stryker-checker.json` to your `.gitignore`.
+
+The config comes back unchanged when TypeScript cannot be loaded from the project, the tsconfig is missing, has errors or uses project references, or there is nothing to exclude.
+
+The tradeoff: a mutant that only breaks the types your tests use, and that no test then fails at run time, now survives instead of counting as a compile error. On this repository, with the checker alone, it cut the checkers' CPU time by about a quarter (4,445 s to 3,398 s) and found exactly the same 1,012 compile errors.
+
 ## Running Stryker
 
 ```bash
@@ -645,5 +671,9 @@ Apache-2.0
 ## Contributing
 
 Issues and pull requests welcome at [github.com/hughescr/stryker-bun-runner](https://github.com/hughescr/stryker-bun-runner)
+
+Run `bun run build && bun run mutate` incrementally: the default local config reuses `reports/stryker-incremental.json` and only re-tests what changed. Use `bun run mutate --force` (or delete the incremental file) only when the cached results look wrong, that is, when they do not reflect a change you made.
+
+Tests never wait on the real clock: Stryker re-runs a mutant's covering tests for every mutant, so any real wait is paid thousands of times. Use bun:test's fake timers (`jest.useFakeTimers()`, with helpers in `tests/helpers/fake-clock.ts`) or wait on events (exit, close, a line of output) instead. `tests/real-clock-guard.ts`, loaded by `tests/test-preload.ts`, fails any test whose real timer with a delay above zero fires, and ESLint rejects timer imports in tests.
 
 This project's own mutation score (`bun run mutate`) is held at 100%. A `// Stryker disable` comment in `src/` needs an independently confirmed reason, and its scope needs care: Stryker only honours a `// Stryker disable` or `// Stryker restore` comment that comes directly before a statement or expression it visits. A comment that is the last line before a closing brace (the end of an `if` block, a `catch` clause or a function body) is ignored without any warning. When that comment is a `// Stryker restore`, the range disable it was meant to end stays active to the end of the file and silently marks every later mutant of those mutators as Ignored. Put the restore before the next statement after the block, prefer `// Stryker disable next-line` on the exact line, or better, write the test that kills the mutant. `tests/unit/stryker-disable-scopes.test.ts` fails on any directive Stryker would ignore and on any range disable that has no matching restore.

@@ -1,5 +1,7 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+// The built plugin (run `bun run build` first, as `plugins` below needs it too).
+import { withTestFilesExcludedFromTypeCheck } from './dist/index.js';
 
 const isCI = Boolean(process.env.GITHUB_SHA);
 
@@ -40,4 +42,7 @@ const config = {
     tempDirName:      '.stryker-tmp',
 };
 
-export default config;
+// Type-check mutants against src only: writes tsconfig.stryker-checker.json (tsconfig.json
+// minus the tests, test-preload.ts and the helpers only tests import), points tsconfigFile
+// at it and appends its negation to ignorePatterns.
+export default await withTestFilesExcludedFromTypeCheck(config);

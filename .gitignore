@@ -36,6 +36,7 @@ yarn-error.log*
 
 # Stryker
 /.stryker-tmp/
+*.stryker-checker.json
 /reports/
 /.serena/
 .claude/settings.local.json
