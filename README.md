@@ -645,3 +645,5 @@ Apache-2.0
 ## Contributing
 
 Issues and pull requests welcome at [github.com/hughescr/stryker-bun-runner](https://github.com/hughescr/stryker-bun-runner)
+
+This project's own mutation score (`bun run mutate`) is held at 100%. A `// Stryker disable` comment in `src/` needs an independently confirmed reason, and its scope needs care: Stryker only honours a `// Stryker disable` or `// Stryker restore` comment that comes directly before a statement or expression it visits. A comment that is the last line before a closing brace (the end of an `if` block, a `catch` clause or a function body) is ignored without any warning. When that comment is a `// Stryker restore`, the range disable it was meant to end stays active to the end of the file and silently marks every later mutant of those mutators as Ignored. Put the restore before the next statement after the block, prefer `// Stryker disable next-line` on the exact line, or better, write the test that kills the mutant. `tests/unit/stryker-disable-scopes.test.ts` fails on any directive Stryker would ignore and on any range disable that has no matching restore.
