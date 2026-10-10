@@ -349,17 +349,18 @@ export class InspectorClient {
             // cannot possibly run before this synchronous assignment completes.
             const stallTimer = this.handlers.onRequestStall
                 ? setTimeout(() => {
-                    // Guard: an already-settled request must not fire a stall warning —
-                    // see 'does not fire onRequestStall once the request has already resolved'.
-                    if(this.pendingRequests.has(id)) {
-                        const msSinceLastFrame = this.getMsSinceLastFrame();
-                        // Distinguishes "other traffic still arriving" (this signal) from total
-                        // silence (a DIFFERENT signal, already covered by raceAgainstSilence in
-                        // bun-test-runner.ts) — see 'does not fire onRequestStall when no frames
-                        // have arrived at all'.
-                        if(msSinceLastFrame < REQUEST_STALL_WARN_MS) {
-                            this.handlers.onRequestStall!({ method, id, msUnanswered: REQUEST_STALL_WARN_MS, msSinceLastFrame });
-                        }
+                    // No "is the request still pending?" guard is needed here: every
+                    // settlement path (response, request timeout, send failure, close,
+                    // unexpected close) clears this timer, so it can only fire while the
+                    // request is still pending — see 'does not fire onRequestStall once the
+                    // request has already resolved' and the dangling-timer tests.
+                    const msSinceLastFrame = this.getMsSinceLastFrame();
+                    // Distinguishes "other traffic still arriving" (this signal) from total
+                    // silence (a DIFFERENT signal, already covered by raceAgainstSilence in
+                    // bun-test-runner.ts) — see 'does not fire onRequestStall when no frames
+                    // have arrived at all'.
+                    if(msSinceLastFrame < REQUEST_STALL_WARN_MS) {
+                        this.handlers.onRequestStall!({ method, id, msUnanswered: REQUEST_STALL_WARN_MS, msSinceLastFrame });
                     }
                 }, REQUEST_STALL_WARN_MS)
                 : undefined;
@@ -367,9 +368,8 @@ export class InspectorClient {
             // Stryker disable next-line BlockStatement: removing setTimeout body means requests never timeout → Promise waits forever → Timeout
             const timer = setTimeout(() => {
                 this.pendingRequests.delete(id);
-                if(stallTimer) {
-                    clearTimeout(stallTimer);
-                }
+                // clearTimeout(undefined) is a no-op, so no "was it scheduled?" check is needed.
+                clearTimeout(stallTimer);
                 reject(new InspectorTimeoutError(`Request timeout after ${effectiveTimeoutMs}ms: ${method}`));
             }, effectiveTimeoutMs);
 
@@ -380,9 +380,7 @@ export class InspectorClient {
             } catch (error) {
                 this.pendingRequests.delete(id);
                 clearTimeout(timer);
-                if(stallTimer) {
-                    clearTimeout(stallTimer);
-                }
+                clearTimeout(stallTimer);
                 reject(error instanceof Error ? error : new Error(String(error)));
             }
         });
@@ -396,9 +394,7 @@ export class InspectorClient {
    */
     private clearPendingTimers(pending: PendingRequest): void {
         clearTimeout(pending.timer);
-        if(pending.stallTimer) {
-            clearTimeout(pending.stallTimer);
-        }
+        clearTimeout(pending.stallTimer);
     }
 
     /**
@@ -580,27 +576,19 @@ export class InspectorClient {
    * ids densely in discovery order — plausible from observed traces but NOT
    * verified against Bun internals, so treat a non-empty result as a diagnostic
    * signal (possible producer-side event drop), not ground truth. Derives
-   * purely from testHierarchy; O(maxId-minId), no spread.
+   * purely from testHierarchy; O(n log n + maxId-minId).
    */
     getFoundIdGaps(): number[] {
-        if(this.testHierarchy.size === 0) {
-            return [];
-        }
-        let min = Infinity;
-        let max = -Infinity;
-        for(const id of this.testHierarchy.keys()) {
-            if(id < min) {
-                min = id;
-            }
-            if(id > max) {
-                max = id;
-            }
-        }
+        // Walk the received ids in ascending order, emitting every id strictly between
+        // each consecutive pair. An empty hierarchy yields no iterations, hence [].
+        const ids = [...this.testHierarchy.keys()].toSorted((a, b) => a - b);
         const gaps: number[] = [];
-        for(let id = min + 1; id < max; id++) {
-            if(!this.testHierarchy.has(id)) {
-                gaps.push(id);
+        let previous = ids[0];
+        for(const id of ids) {
+            for(let gap = previous + 1; gap < id; gap++) {
+                gaps.push(gap);
             }
+            previous = id;
         }
         return gaps;
     }
