@@ -10396,6 +10396,397 @@ error: Third failure message
             ]);
         });
     });
+
+    describe('Stryker\'s testFiles option (DryRunOptions.testFiles)', () => {
+        // Verified against @stryker-mutator/core 10.0.0 (3-dry-run-executor.js): dryRun gets
+        // `testFiles = project.testFiles.map(sandbox.sandboxFileFor)` — ABSOLUTE paths of the test
+        // files inside the sandbox — or undefined when the option is not set. Precedence for the
+        // files bun is handed: Stryker's testFiles > bun.testFiles > auto-discovery.
+        const SANDBOX = '/work/proj/.stryker-tmp/sandbox-ABC';
+        const alpha = `${SANDBOX}/tests/alpha.test.ts`;
+        const gamma = `${SANDBOX}/tests/gamma.test.ts`;
+        const delta = `${SANDBOX}/tests/delta.test.ts`;
+        let cwdSpy: ReturnType<typeof spyOn>;
+
+        beforeEach(() => {
+            cwdSpy = spyOn(process, 'cwd').mockReturnValue(SANDBOX);
+            mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+            mockRunBunTests.mockImplementation((options: any) => {
+                if(options.onInspectorReady) {
+                    options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                }
+                return Promise.resolve({ exitCode: 0, stdout: '1 pass', stderr: '', timedOut: false });
+            });
+            mockCollectCoverage.mockResolvedValue(undefined);
+        });
+
+        afterEach(() => {
+            cwdSpy.mockRestore();
+        });
+
+        function dryRunOptions(testFiles: string[] | undefined): Parameters<BunTestRunner['dryRun']>[0] {
+            // 'off': these tests collect no coverage, and the completeness gate would otherwise fail the run before the registry is written.
+            return { timeout: 60_000, disableBail: false, coverageAnalysis: 'off', testFiles };
+        }
+
+        function dryRunSpawn(): { testFiles?: string[] } {
+            return mockRunBunTests.mock.calls[0][0];
+        }
+
+        function warnMessages(): string[] {
+            return (mockLogger.warn as ReturnType<typeof mock>).mock.calls.map(call => String(call[0]));
+        }
+
+        /** Each debug call as one string: the format and its arguments joined. */
+        function debugMessages(): string[] {
+            return (mockLogger.debug as ReturnType<typeof mock>).mock.calls.map(call => call.map(String).join(' '));
+        }
+
+        async function initAndDryRun(
+            testFiles: string[] | undefined,
+            bun?: { testFiles?: string[] }
+        ): Promise<BunTestRunner> {
+            const runner = new BunTestRunner(mockLogger, { bun } as unknown as StrykerOptions);
+            await runner.init();
+            mockRunBunTests.mockClear();
+            await runner.dryRun(dryRunOptions(testFiles));
+            return runner;
+        }
+
+        async function mutantRunWithFilter(runner: BunTestRunner, testFilter: string[]): Promise<void> {
+            mockRunBunTests.mockClear();
+            await runner.mutantRun({
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                activeMutant:    { id: '1' } as any,
+                testFilter,
+                sandboxFileName: 'sandbox',
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+            } as any);
+        }
+
+        describe('dryRun', () => {
+            it('hands bun exactly Stryker\'s files, not the discovered ones', async () => {
+                await initAndDryRun([gamma, alpha]);
+
+                expect(dryRunSpawn().testFiles).toEqual([alpha, gamma]);
+            });
+
+            it('logs at debug that the files came from Stryker\'s testFiles option', async () => {
+                await initAndDryRun([alpha, gamma]);
+
+                expect(debugMessages().filter(m => m.startsWith('Dry run test files:') && m.endsWith(' 2 Stryker\'s testFiles option'))).toHaveLength(1);
+                expect(debugMessages().filter(m => m.includes('Stryker\'s testFiles option'))).toHaveLength(1);
+            });
+
+            it('de-duplicates repeated entries', async () => {
+                await initAndDryRun([alpha, gamma, alpha]);
+
+                expect(dryRunSpawn().testFiles).toEqual([alpha, gamma]);
+            });
+
+            it('resolves a relative entry against the working directory so bun gets an exact path, not a substring filter', async () => {
+                await initAndDryRun(['tests/gamma.test.ts', './tests/alpha.test.ts']);
+
+                expect(dryRunSpawn().testFiles).toEqual([alpha, gamma]);
+            });
+
+            it('keeps an absolute path outside the working directory as given', async () => {
+                await initAndDryRun(['/elsewhere/other.test.ts']);
+
+                expect(dryRunSpawn().testFiles).toEqual(['/elsewhere/other.test.ts']);
+            });
+
+            it('does not warn about absolute paths for Stryker\'s files (they are sandbox paths already)', async () => {
+                await initAndDryRun([alpha]);
+
+                expect(warnMessages().filter(m => m.includes('absolute path'))).toEqual([]);
+            });
+
+            it('beats bun.testFiles and warns once that Stryker\'s option wins when the two differ', async () => {
+                await initAndDryRun([alpha, gamma], { testFiles: ['tests/beta.test.ts'] });
+
+                expect(dryRunSpawn().testFiles).toEqual([alpha, gamma]);
+                const conflicts = warnMessages().filter(m => m.includes('bun.testFiles') && m.includes('Stryker'));
+                expect(conflicts).toHaveLength(1);
+                expect(conflicts[0]).toContain('takes precedence');
+            });
+
+            it('does not warn when bun.testFiles names the same files (relative vs absolute, any order)', async () => {
+                await initAndDryRun([gamma, alpha], { testFiles: ['tests/alpha.test.ts', './tests/gamma.test.ts'] });
+
+                expect(dryRunSpawn().testFiles).toEqual([alpha, gamma]);
+                expect(warnMessages().filter(m => m.includes('takes precedence'))).toEqual([]);
+            });
+
+            it('warns when bun.testFiles is a strict subset of Stryker\'s files', async () => {
+                await initAndDryRun([alpha, gamma], { testFiles: ['tests/alpha.test.ts'] });
+
+                expect(warnMessages().filter(m => m.includes('takes precedence'))).toHaveLength(1);
+            });
+
+            it('warns when bun.testFiles is a strict superset of Stryker\'s files', async () => {
+                await initAndDryRun([alpha], { testFiles: ['tests/alpha.test.ts', 'tests/gamma.test.ts'] });
+
+                expect(warnMessages().filter(m => m.includes('takes precedence'))).toHaveLength(1);
+            });
+
+            it('warns at most once per runner even when dryRun runs again', async () => {
+                const runner = await initAndDryRun([alpha], { testFiles: ['tests/beta.test.ts'] });
+                await runner.dryRun(dryRunOptions([alpha]));
+
+                expect(warnMessages().filter(m => m.includes('takes precedence'))).toHaveLength(1);
+            });
+
+            it('ignores an empty array: bun.testFiles is used, with a debug log and no conflict warning', async () => {
+                await initAndDryRun([], { testFiles: ['tests/beta.test.ts'] });
+
+                expect(dryRunSpawn().testFiles).toEqual(['tests/beta.test.ts']);
+                expect(debugMessages().filter(m => m.includes('empty'))).toHaveLength(1);
+                expect(warnMessages().filter(m => m.includes('takes precedence'))).toEqual([]);
+            });
+
+            it('ignores an empty array: auto-discovery is used when bun.testFiles is not set either', async () => {
+                await initAndDryRun([]);
+
+                expect(dryRunSpawn().testFiles).toEqual(['tests/alpha.test.ts', 'tests/beta.test.ts']);
+            });
+
+            it('does not warn when bun.testFiles repeats a file that Stryker selected', async () => {
+                await initAndDryRun([alpha], { testFiles: ['tests/alpha.test.ts', 'tests/alpha.test.ts'] });
+
+                expect(warnMessages().filter(m => m.includes('takes precedence'))).toEqual([]);
+            });
+
+            it('uses bun.testFiles when Stryker passes no testFiles, and says so at debug', async () => {
+                await initAndDryRun(undefined, { testFiles: ['tests/beta.test.ts'] });
+
+                expect(dryRunSpawn().testFiles).toEqual(['tests/beta.test.ts']);
+                expect(debugMessages().filter(m => m.startsWith('Dry run test files:') && m.endsWith(' 1 bun.testFiles'))).toHaveLength(1);
+                expect(debugMessages().filter(m => m.includes('Stryker\'s testFiles option'))).toEqual([]);
+                expect(warnMessages().filter(m => m.includes('takes precedence'))).toEqual([]);
+            });
+
+            it('uses auto-discovery when nothing is set, and says so at debug', async () => {
+                await initAndDryRun(undefined);
+
+                expect(dryRunSpawn().testFiles).toEqual(['tests/alpha.test.ts', 'tests/beta.test.ts']);
+                expect(debugMessages().filter(m => m.startsWith('Dry run test files:') && m.endsWith(' 2 auto-discovery'))).toHaveLength(1);
+                expect(debugMessages().filter(m => m.includes('empty'))).toEqual([]);
+                // Nothing was selected, so the pre-warmed discovery is reused rather than redone.
+                expect(discoverTestFilesSpy).toHaveBeenCalledTimes(1);
+            });
+
+            it('does not rediscover for the dry run when Stryker selected the files', async () => {
+                await initAndDryRun([alpha]);
+
+                // init() pre-warms discovery once; the selection itself costs no extra glob.
+                expect(discoverTestFilesSpy).toHaveBeenCalledTimes(1);
+            });
+
+            it('a later dryRun without testFiles goes back to the discovered files', async () => {
+                const runner = await initAndDryRun([alpha]);
+                mockRunBunTests.mockClear();
+                await runner.dryRun(dryRunOptions(undefined));
+
+                expect(dryRunSpawn().testFiles).toEqual(['tests/alpha.test.ts', 'tests/beta.test.ts']);
+            });
+        });
+
+        describe('mutant runs after a dryRun with Stryker\'s testFiles', () => {
+            it('uses the selected files, not the discovered ones, where the full suite runs (no testFilter)', async () => {
+                const runner = await initAndDryRun([gamma, alpha]);
+
+                await mutantRunWithFilter(runner, []);
+
+                expect(mockRunBunTests.mock.calls[0][0].testFiles).toEqual([alpha, gamma]);
+            });
+
+            it('narrows covering tests to the selected files they live in, as exact paths', async () => {
+                const runner = await initAndDryRun([alpha, gamma]);
+
+                await mutantRunWithFilter(runner, ['tests/gamma.test.ts > suite > covers this mutant']);
+
+                expect(mockRunBunTests.mock.calls[0][0].testFiles).toEqual([gamma]);
+            });
+
+            it('narrows to exactly the covered selected file when another selected file has no covering test', async () => {
+                const runner = await initAndDryRun([alpha, delta]);
+
+                await mutantRunWithFilter(runner, ['tests/alpha.test.ts > suite > a']);
+
+                expect(mockRunBunTests.mock.calls[0][0].testFiles).toEqual([alpha]);
+            });
+
+            it('narrows to exactly the covered file when another selected file has no covering test', async () => {
+                const runner = await initAndDryRun([alpha, delta]);
+
+                await mutantRunWithFilter(runner, ['tests/alpha.test.ts > suite > a']);
+
+                expect(mockRunBunTests.mock.calls[0][0].testFiles).toEqual([alpha]);
+            });
+
+            it('falls back to the selected files, not the discovered ones, when a covering id names a file outside the selection', async () => {
+                const runner = await initAndDryRun([alpha, gamma]);
+
+                await mutantRunWithFilter(runner, ['tests/beta.test.ts > suite > not selected']);
+
+                expect(mockRunBunTests.mock.calls[0][0].testFiles).toEqual([alpha, gamma]);
+            });
+
+            it('falls back to the selected files when the covering id has no file prefix', async () => {
+                const runner = await initAndDryRun([alpha, gamma]);
+
+                await mutantRunWithFilter(runner, ['a bare test name with no file prefix']);
+
+                expect(mockRunBunTests.mock.calls[0][0].testFiles).toEqual([alpha, gamma]);
+            });
+
+            it('retries a zero-match pattern with the selected files, not the discovered ones', async () => {
+                const runner = await initAndDryRun([alpha, gamma]);
+                mockRunBunTests.mockReset();
+                mockRunBunTests
+                    .mockResolvedValueOnce({ exitCode: 1, stdout: '', stderr: 'error: regex "x" matched 0 tests. Searched 2 files', timedOut: false })
+                    .mockResolvedValue({ exitCode: 0, stdout: '1 pass', stderr: '', timedOut: false });
+
+                await runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '1' } as any,
+                    testFilter:      ['tests/alpha.test.ts > suite > covers this mutant'],
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+
+                expect(mockRunBunTests).toHaveBeenCalledTimes(2);
+                expect(mockRunBunTests.mock.calls[1][0].testNamePattern).toBeUndefined();
+                expect(mockRunBunTests.mock.calls[1][0].testFiles).toEqual([alpha, gamma]);
+            });
+
+            it('beats bun.testFiles in mutant runs too', async () => {
+                const runner = await initAndDryRun([alpha], { testFiles: ['tests/beta.test.ts'] });
+
+                await mutantRunWithFilter(runner, []);
+
+                expect(mockRunBunTests.mock.calls[0][0].testFiles).toEqual([alpha]);
+            });
+
+            it('leaves a runner whose dryRun got no testFiles on the discovered files', async () => {
+                const runner = await initAndDryRun(undefined);
+
+                await mutantRunWithFilter(runner, []);
+
+                expect(mockRunBunTests.mock.calls[0][0].testFiles).toEqual(['tests/alpha.test.ts', 'tests/beta.test.ts']);
+            });
+
+            it('goes back to the discovered files when a later dryRun carries no testFiles', async () => {
+                const runner = await initAndDryRun([alpha]);
+                await runner.dryRun(dryRunOptions(undefined));
+
+                await mutantRunWithFilter(runner, []);
+
+                expect(mockRunBunTests.mock.calls[0][0].testFiles).toEqual(['tests/alpha.test.ts', 'tests/beta.test.ts']);
+            });
+
+            it('recognises selected files under an inPlace run (cwd is the project root, no sandbox segment)', async () => {
+                cwdSpy.mockReturnValue('/work/proj');
+                const runner = await initAndDryRun(['/work/proj/tests/alpha.test.ts', '/work/proj/tests/gamma.test.ts']);
+
+                await mutantRunWithFilter(runner, ['tests/alpha.test.ts > suite > covers this mutant']);
+
+                expect(mockRunBunTests.mock.calls[0][0].testFiles).toEqual(['/work/proj/tests/alpha.test.ts']);
+            });
+        });
+
+        describe('another worker that never ran dryRun (shared registry)', () => {
+            let storedRegistry: string | undefined;
+            let writeFileSpy: ReturnType<typeof spyOn>;
+            let renameSpy: ReturnType<typeof spyOn>;
+            let readFileSpy: ReturnType<typeof spyOn>;
+
+            beforeEach(() => {
+                storedRegistry = undefined;
+                writeFileSpy = spyOn(fsPromises, 'writeFile').mockImplementation(((_path: string, data: string) => {
+                    storedRegistry = data;
+                    return Promise.resolve();
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock signature narrower than fsPromises.writeFile's real overloads
+                }) as any);
+                renameSpy = spyOn(fsPromises, 'rename').mockResolvedValue(undefined);
+                readFileSpy = spyOn(fsPromises, 'readFile').mockImplementation((() => {
+                    if(storedRegistry === undefined) {
+                        return Promise.reject(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+                    }
+                    return Promise.resolve(storedRegistry);
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- mock signature narrower than fsPromises.readFile's real overloads
+                }) as any);
+            });
+
+            afterEach(() => {
+                writeFileSpy.mockRestore();
+                renameSpy.mockRestore();
+                readFileSpy.mockRestore();
+            });
+
+            it('persists the selected files in the registry file', async () => {
+                await initAndDryRun([gamma, alpha]);
+
+                expect(JSON.parse(storedRegistry ?? '{}').testFiles).toEqual([alpha, gamma]);
+            });
+
+            it('omits testFiles from the registry when Stryker selected none', async () => {
+                await initAndDryRun(undefined);
+
+                expect(storedRegistry).toBeDefined();
+                expect(JSON.parse(storedRegistry ?? '{}')).not.toHaveProperty('testFiles');
+            });
+
+            it('runs the selected files in its full-suite runs and narrows within them', async () => {
+                const dryRunner = await initAndDryRun([alpha, gamma]);
+                await dryRunner.dispose();
+
+                const other = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await other.init();
+
+                await mutantRunWithFilter(other, []);
+                expect(mockRunBunTests.mock.calls[0][0].testFiles).toEqual([alpha, gamma]);
+
+                await mutantRunWithFilter(other, ['tests/gamma.test.ts > suite > covers this mutant']);
+                expect(mockRunBunTests.mock.calls[0][0].testFiles).toEqual([gamma]);
+            });
+
+            it('beats its own bun.testFiles with the registry\'s selection', async () => {
+                const dryRunner = await initAndDryRun([alpha]);
+                await dryRunner.dispose();
+
+                const other = new BunTestRunner(mockLogger, { bun: { testFiles: ['tests/beta.test.ts'] } } as unknown as StrykerOptions);
+                await other.init();
+                await mutantRunWithFilter(other, []);
+
+                expect(mockRunBunTests.mock.calls[0][0].testFiles).toEqual([alpha]);
+            });
+
+            it.each([
+                ['not an array', 'tests/alpha.test.ts'],
+                ['an array holding a non-string', [alpha, 42]],
+                ['an empty array', []],
+                ['absent', undefined],
+            ])('falls back to the discovered files when the registry\'s testFiles field is %s', async (_name, bogus) => {
+                storedRegistry = JSON.stringify({
+                    version:         2,
+                    writtenAt:       Date.now(),
+                    cachedTestNames: [],
+                    baseNameIndex:   [],
+                    testNameIndex:   [],
+                    testFiles:       bogus,
+                });
+                const other = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await other.init();
+
+                await mutantRunWithFilter(other, []);
+
+                expect(mockRunBunTests.mock.calls[0][0].testFiles).toEqual(['tests/alpha.test.ts', 'tests/beta.test.ts']);
+            });
+        });
+    });
 });
 
 // ── mutantRun testFilter integration tests ─────────────────────────────────

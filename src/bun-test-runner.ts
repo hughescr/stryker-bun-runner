@@ -248,6 +248,13 @@ interface RegistryFileV2 {
     cachedTestNames: string[]
     baseNameIndex:   [string, string[]][]
     testNameIndex:   [string, string][]
+    /**
+     * The exact (absolute) test files Stryker's `testFiles` option selected for the
+     * dry run, so workers that never ran dryRun keep to the same selection in their
+     * full-suite runs. Optional and additive: absent when Stryker selected none, and
+     * ignored when not a non-empty array of strings.
+     */
+    testFiles?:      string[]
 }
 
 /** Union of the per-test result shapes the runner produces for Stryker. */
@@ -469,6 +476,15 @@ export class BunTestRunner implements TestRunner {
     private testNameIndex?:               Map<string, string>;
     private cachedTestFiles?:             string[];
     private cachedTestFilesCwd?:          string;
+    /**
+     * The test files Stryker's own `testFiles` option selected (DryRunOptions.testFiles), as
+     * exact absolute paths, valid for `cwd`. Set by dryRun (or loaded from the shared registry
+     * by a worker that never ran dryRun). While set it wins over bun.testFiles and
+     * auto-discovery, for the dry run and for every "run all tests" fallback after it.
+     */
+    private strykerTestFiles?:            { cwd: string, files: string[] };
+    /** True once the "Stryker's testFiles overrides bun.testFiles" warning has been logged. */
+    private warnedTestFilesConflict = false;
     /** True once the dist/build-discovery warning has been logged; it is shown once per runner. */
     private warnedBuildOutputTests = false;
     private cachedEagerModules?:          string[];
@@ -641,7 +657,13 @@ export class BunTestRunner implements TestRunner {
         if(!discovered || discovered.length === 0) {
             return undefined;
         }
-        const discoveredSet = new Set(discovered);
+        // Ids carry the project-relative file, but the list may hold absolute entries
+        // (Stryker's own testFiles arrive as absolute sandbox paths): match on the
+        // relative form and hand bun the entry exactly as listed.
+        const listedByProjectFile = new Map<string, string>();
+        for(const listed of discovered) {
+            listedByProjectFile.set(normalizeTestFilePath(listed) ?? listed, listed);
+        }
         const files = new Set<string>();
         for(const id of filterIds) {
             const sepIdx = id.indexOf(TEST_ID_FILE_SEPARATOR);
@@ -650,11 +672,12 @@ export class BunTestRunner implements TestRunner {
                 return undefined;
             }
             const file = id.slice(0, sepIdx);
-            // Stryker disable next-line ConditionalExpression,BlockStatement,UnaryOperator: an unrecognised prefix means the id is not file-qualified; covered by 'keeps the full file list when a derived file was never discovered'
-            if(!discoveredSet.has(file)) {
+            const listed = listedByProjectFile.get(file);
+            // Stryker disable next-line ConditionalExpression,BlockStatement,EqualityOperator: an unrecognised prefix means the id is not file-qualified; covered by 'keeps the full file list when a derived file was never discovered'
+            if(listed === undefined) {
                 return undefined;
             }
-            files.add(file);
+            files.add(listed);
         }
         // Stryker disable next-line MethodExpression: sort is for deterministic argv only; unsorted would still run the same files
         return [...files].toSorted((a, b) => a.localeCompare(b));
@@ -670,13 +693,97 @@ export class BunTestRunner implements TestRunner {
     }
 
     /**
+   * The files Stryker's own `testFiles` option selected, when they apply to `cwd`.
+   * A selection recorded under another cwd (a different sandbox) names files that
+   * are not there, so it is ignored rather than trusted.
+   */
+    private selectedTestFilesFor(cwd: string): string[] | undefined {
+        return this.strykerTestFiles?.cwd === cwd ? this.strykerTestFiles.files : undefined;
+    }
+
+    /**
+   * Record (or clear) the selection from DryRunOptions.testFiles for this dry run.
+   *
+   * Stryker (core 9.6+, also 10) fills `testFiles` with the sandbox-absolute paths of
+   * the files matching its `testFiles` option, or leaves it undefined. Only a
+   * non-empty array counts; an empty one is treated as unset. Relative entries are
+   * resolved against the cwd, so bun gets exact paths (a bare relative argument is a
+   * substring filter to `bun test`, which would also run e.g. a `dist/` copy).
+   *
+   * Precedence for the files bun is handed: Stryker's testFiles > bun.testFiles >
+   * auto-discovery. When both Stryker's and bun.testFiles select files and they
+   * differ, one warning says Stryker's wins.
+   */
+    private applyDryRunTestFiles(options: DryRunOptions | undefined): void {
+        const requested = options?.testFiles;
+        const cwd = process.cwd();
+        const previous = this.strykerTestFiles;
+        if(requested === undefined || requested.length === 0) {
+            this.strykerTestFiles = undefined;
+            if(requested !== undefined) {
+                // Stryker disable next-line StringLiteral: logging message only
+                this.logger.debug('Stryker passed an empty testFiles array; ignoring it');
+            }
+        } else {
+            const files = [...new Set(requested.map(file => path.resolve(cwd, file)))].toSorted((a, b) => a.localeCompare(b));
+            this.strykerTestFiles = { cwd, files };
+            this.warnIfTestFilesOverridden(files, cwd);
+        }
+        // cachedTestFiles may hold the previous selection (mutantRun stores the effective
+        // list there); drop it so a changed or cleared selection is never read back as the discovered set.
+        if(previous !== undefined) {
+            this.cachedTestFiles = undefined;
+        }
+    }
+
+    /** Debug-log how many test files the dry run uses and where they came from. Same precedence as {@link getOrDiscoverTestFiles}. */
+    private logTestFilesSource(testFiles: readonly string[] | undefined, cwd: string): void {
+        let source = 'auto-discovery';
+        if(this.selectedTestFilesFor(cwd) !== undefined) {
+            source = 'Stryker\'s testFiles option';
+        } else if(this.testFilesOverride !== undefined) {
+            source = 'bun.testFiles';
+        }
+        // Stryker disable next-line StringLiteral,LogicalOperator,OptionalChaining: logging only; the format string and the count of an (in practice never undefined) list are not asserted, the source argument is by the 'dryRun' tests of Stryker's testFiles option
+        this.logger.debug('Dry run test files: %d from %s', testFiles?.length ?? 0, source);
+    }
+
+    /**
+   * Warn, once per runner, that Stryker's testFiles option replaces a differing
+   * bun.testFiles. Both are compared as sets of resolved absolute paths, so the same
+   * files spelled relative vs absolute, or in another order, are not a conflict.
+   */
+    private warnIfTestFilesOverridden(selected: readonly string[], cwd: string): void {
+        if(this.warnedTestFilesConflict || this.testFilesOverride === undefined) {
+            return;
+        }
+        const configured = [...new Set(this.testFilesOverride.map(file => path.resolve(cwd, file)))];
+        const selectedSet = new Set(selected);
+        if(configured.length === selectedSet.size && configured.every(file => selectedSet.has(file))) {
+            return;
+        }
+        this.warnedTestFilesConflict = true;
+        // Stryker disable next-line StringLiteral: diagnostic warning message
+        this.logger.warn(
+            'Both Stryker\'s testFiles option and bun.testFiles are set and select different test files; '
+            + 'Stryker\'s testFiles option takes precedence and bun.testFiles is ignored. '
+            + 'Remove bun.testFiles, or make the two agree, to silence this warning.'
+        );
+    }
+
+    /**
    * Return the test file list to use for this run.
-   * When `bun.testFiles` was provided it is returned verbatim and
-   * auto-discovery is skipped entirely.  Otherwise the result is cached after
-   * the first real discovery call so that subsequent callers (dryRun, mutantRun)
+   * Precedence: the files Stryker's own `testFiles` option selected (see
+   * {@link applyDryRunTestFiles}), then `bun.testFiles` (returned verbatim), then
+   * auto-discovery; the first two skip discovery entirely. A discovery result is
+   * cached after the first real call so that subsequent callers (dryRun, mutantRun)
    * do not re-glob the filesystem.
    */
     private async getOrDiscoverTestFiles(): Promise<string[] | undefined> {
+        const selected = this.selectedTestFilesFor(process.cwd());
+        if(selected !== undefined) {
+            return selected;
+        }
         // Stryker disable next-line EqualityOperator,BlockStatement: EqualityOperator: inverts condition, ignoring override → discovery runs on wrong files → Timeout; BlockStatement: removes early return, override ignored → Timeout
         if(this.testFilesOverride !== undefined) {
             return this.testFilesOverride;
@@ -728,7 +835,11 @@ export class BunTestRunner implements TestRunner {
    * Used by dryRun() to avoid introducing a microtask yield on the hot path.
    */
     private testFilesCacheHit(cwd: string): string[] | undefined | null {
-        // Stryker disable next-line EqualityOperator,BlockStatement,ConditionalExpression: mutating to false (ConditionalExpression) causes a null cache-miss that falls through to getOrDiscoverTestFiles(), which re-checks testFilesOverride and returns the same value — equivalent; BlockStatement (removing early-return) and EqualityOperator (flipping guard) mutants are caught by 'should use testFiles override and skip discoverTestFiles'; the ConditionalExpression→true mutant (always returns the override) is equivalent because whenever testFilesOverride is defined it is returned either way
+        const selected = this.selectedTestFilesFor(cwd);
+        if(selected !== undefined) {
+            return selected;
+        }
+        // Stryker disable next-line EqualityOperator,BlockStatement,ConditionalExpression: mutating to false (ConditionalExpression) causes a null cache-miss that falls through to getOrDiscoverTestFiles(), which re-checks testFilesOverride and returns the same value — equivalent; BlockStatement (removing early-return) and EqualityOperator (flipping guard) mutants are caught by 'should use testFiles override and skip discoverTestFiles'; the ConditionalExpression→true mutant (always returns the override) is equivalent because whenever testFilesOverride is defined and Stryker selected nothing it is returned either way
         if(this.testFilesOverride !== undefined) {
             return this.testFilesOverride;
         }
@@ -895,6 +1006,13 @@ export class BunTestRunner implements TestRunner {
             this.cachedTestNames = new Set<string>(parsed.cachedTestNames);
             this.baseNameIndex   = new Map<string, string[]>(parsed.baseNameIndex);
             this.testNameIndex   = new Map<string, string>(parsed.testNameIndex);
+            // The selection Stryker's testFiles option made for the dry run. The field is
+            // optional and only advisory (an unusable value just means "no selection"), so it
+            // never invalidates the rest of the registry.
+            const selectedFiles: unknown = parsed.testFiles;
+            if(Array.isArray(selectedFiles) && selectedFiles.length > 0 && selectedFiles.every((file: unknown) => typeof file === 'string')) {
+                this.strykerTestFiles = { cwd: process.cwd(), files: selectedFiles };
+            }
             // Stryker disable next-line StringLiteral: diagnostic logging message
             this.logger.debug('Loaded dryRun registry from %s (%d entries)', registryPath, this.cachedTestNames.size);
         } catch (err) {
@@ -1137,6 +1255,9 @@ export class BunTestRunner implements TestRunner {
    */
     public async dryRun(options?: DryRunOptions): Promise<DryRunResult> {
         const coverageAnalysis = this.resolveCoverageAnalysis(options);
+        // Stryker's own `testFiles` option, when set, decides which files this dry run (and the
+        // "run everything" fallbacks of later mutant runs) cover; see applyDryRunTestFiles.
+        this.applyDryRunTestFiles(options);
         // Stryker disable next-line StringLiteral: logging message only
         this.logger.debug('Running dry run with inspector-based coverage collection...');
 
@@ -1196,6 +1317,7 @@ export class BunTestRunner implements TestRunner {
             // Stryker disable next-line ConditionalExpression,BlockStatement: cache-miss path covered by 'rediscovers test files when cwd changes between init() and dryRun()'
             const testFilesCached = this.testFilesCacheHit(cwd);
             const testFiles = testFilesCached === null ? await this.getOrDiscoverTestFiles() : testFilesCached;
+            this.logTestFilesSource(testFiles, cwd);
 
             // Start test process with callback to get inspector URL
             const testProcess = runBunTests({
@@ -1771,7 +1893,9 @@ export class BunTestRunner implements TestRunner {
                 cachedTestNames: [...this.cachedTestNames],
                 baseNameIndex:   [...this.baseNameIndex.entries()],
                 testNameIndex:   [...testNameIndex.entries()],
-            });
+                // Omitted (JSON drops undefined) when Stryker selected no files.
+                testFiles:       this.selectedTestFilesFor(process.cwd()),
+            } satisfies RegistryFileV2);
             // registryPath now lives under tmpdir()/stryker-bun-runner/, which may not
             // exist yet on a fresh machine/CI runner — create it before writing.
             // Safe to call unconditionally/concurrently: recursive mkdir is a no-op
@@ -1900,7 +2024,9 @@ export class BunTestRunner implements TestRunner {
         // Reuse the sorted test-file list cached during dryRun.
         // If this worker never ran dryRun (cachedTestFiles is undefined), discover
         // the files now and cache them for subsequent mutantRun calls on this worker.
-        // When testFilesOverride is set, use it directly without globbing.
+        // The files Stryker's testFiles option selected (kept from this worker's dryRun, or
+        // loaded from the shared registry above) and then bun.testFiles are used directly
+        // without globbing; either way this is the list every "run all tests" fallback uses.
         this.cachedTestFiles = await this.getOrDiscoverTestFiles();
 
         // Kill limit: Stryker's per-mutant timeout less a margin, so the runner reports

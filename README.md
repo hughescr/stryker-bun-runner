@@ -101,7 +101,7 @@ Stryker's own `testFiles` option (Stryker 9.6+) is handled separately. With it s
 | `bun.inspectorTimeout` | `number` | `5000` | Timeout for Inspector WebSocket connection in milliseconds |
 | `bun.env` | `object` | `undefined` | Additional environment variables to pass to bun test |
 | `bun.bunArgs` | `string[]` | `undefined` | Additional bun test flags (e.g., `['--only']`). Bail flags (`--bail`, `--bail=<N>`, or a space-separated `--bail <N>`) are ignored here — bail is fully managed by the runner via Stryker's `disableBail` option (see [How It Works](#how-it-works)). Flags that fight the runner's own command line are **rejected at startup with an error** rather than silently producing wrong scores: `--concurrent` and `--max-concurrency` (break per-test coverage attribution), `--parallel`, `--shard` and `--changed` (run only part of the suite or split it across processes), `-t`/`--test-name-pattern` (the runner builds its own per mutant), `-u`/`--update-snapshots` (snapshot tests could never fail), `--pass-with-no-tests` (a zero-match selection would be scored as survived), `--watch`, `--coverage*`, `--cwd` and `--inspect*` (collide with the runner's sandbox and inspector). `--config=<path>` (also `--config <path>` and `-c <path>`) is accepted but works differently from plain bun: the runner always passes bun its own sanitized `--config`, so the flag is removed from the bun command line and your file is instead the source the runner sanitizes (see [How the sandboxed config works](#how-the-sandboxed-config-works)) and reads `[test].root` from. The path is resolved against the project directory (the Stryker sandbox), and the file must exist there; a `--config` or `-c` without a path is rejected. `--only` is fine: only the `.only` tests then count as the suite (and the dry run fails if none is marked `.only`). |
-| `bun.testFiles` | `string[]` | `undefined` | Explicit list of test file paths (absolute or relative to cwd). When provided, skips auto-discovery (see [Test file discovery](#test-file-discovery)) and uses this list verbatim. Relative paths resolve against the bun subprocess's cwd. Useful for restricting mutation testing to a subset of test files. |
+| `bun.testFiles` | `string[]` | `undefined` | Explicit list of test file paths (absolute or relative to cwd). When provided, skips auto-discovery (see [Test file discovery](#test-file-discovery)) and uses this list verbatim. Relative paths resolve against the bun subprocess's cwd. Stryker's own `testFiles` option, when set, takes precedence. Useful for restricting mutation testing to a subset of test files. |
 | `bun.smol` | `boolean` | `false` | Pass Bun's `--smol` flag to every child: a smaller JavaScriptCore heap at some cost to speed. Recommended on memory-constrained machines — see [Memory model](#memory-model). |
 | `bun.maxChildRss` | `number` | `undefined` | Soft memory ceiling in bytes for each child's RSS. A child that exceeds it is killed and the run reported as a clean timeout for that mutant. See [Memory containment](#memory-containment). |
 | `bun.rssCheckIntervalMs` | `number` | `1000` | Poll interval in milliseconds for the `maxChildRss` check. |
@@ -109,7 +109,15 @@ Stryker's own `testFiles` option (Stryker 9.6+) is handled separately. With it s
 
 ### Test file discovery
 
-Unless `bun.testFiles` is set, the runner finds test files itself and hands bun an explicit, sorted list (this keeps the order stable across runs). Discovery follows `bun test`'s own rules, so it picks up exactly what a plain `bun test` would:
+The test files the runner hands bun are chosen in this order; the first source that applies wins:
+
+1. **Stryker's own `testFiles` option** (Stryker 9.6+, also 10). Stryker passes the matching files to the dry run, and the runner runs exactly those. Every later "run all tests" fallback (a mutant with no coverage information, a static mutant, a pattern that matched nothing) runs those same files, and a targeted run is narrowed to the covering tests' files among them, so tests outside your selection never run. An empty list counts as not set.
+2. **`bun.testFiles`**, used verbatim.
+3. **Auto-discovery**, described below.
+
+If both Stryker's `testFiles` and `bun.testFiles` are set and select different files, the runner logs one warning and uses Stryker's. Run with Stryker's debug logging to see which source the dry run used.
+
+When neither of the first two is set, the runner finds test files itself and hands bun an explicit, sorted list (this keeps the order stable across runs). Discovery follows `bun test`'s own rules, so it picks up exactly what a plain `bun test` would:
 
 - File names ending in `.test.`, `_test.`, `.spec.` or `_spec.` followed by `js`, `jsx`, `ts`, `tsx`, `mjs`, `cjs`, `mts` or `cts` (case-insensitive).
 - `node_modules` and dot-directories (`.git`, `.stryker-tmp`, …) are skipped; other directories such as `dist` and `build` are searched.
