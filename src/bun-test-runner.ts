@@ -142,13 +142,15 @@ class DrainWaitTimeoutError extends Error {
  * ceiling), the more severe bound is the one reported.
  *
  * `cancel()` MUST be called once the caller's race is decided: an uncleared
- * interval keeps the event loop alive indefinitely.
+ * interval keeps the event loop alive indefinitely. The interval is cleared
+ * ONLY there, not on rejection: the caller awaits the race and reaches
+ * `cancel()` in the same microtask chain as the rejection, before the next
+ * poll tick can fire, so a second clearing site could never be observed.
  */
 function raceAgainstSilence(
     inspector: InspectorClient,
     silenceMs: number,
-    absoluteCeilingMs: number,
-    message: string
+    absoluteCeilingMs: number
 ): { promise: Promise<never>, cancel: () => void } {
     const startedAt = Date.now();
     let timer: ReturnType<typeof setInterval>;
@@ -157,13 +159,9 @@ function raceAgainstSilence(
             const sinceLastFrame = inspector.getMsSinceLastFrame();
             const totalElapsed = Date.now() - startedAt;
             if(totalElapsed >= absoluteCeilingMs) {
-                clearInterval(timer);
-                // Stryker disable next-line StringLiteral: the message TEMPLATE (not the 'ceiling' literal, which is separately defended by the reason: 'silence'|'ceiling' type — an invalid string here is a TypeScript compile error, killed by the checker) is never read anywhere; only DrainWaitTimeoutError.reason (via drainSettleReason) drives behavior — .message content is not functionally observable
-                reject(new DrainWaitTimeoutError(`${message}: ${absoluteCeilingMs}ms absolute ceiling reached`, 'ceiling'));
+                reject(new DrainWaitTimeoutError(`${absoluteCeilingMs}ms absolute ceiling reached`, 'ceiling'));
             } else if(totalElapsed >= silenceMs && sinceLastFrame >= silenceMs) {
-                clearInterval(timer);
-                // Stryker disable next-line StringLiteral: same reasoning as the ceiling branch above — message TEMPLATE only, not the type-defended 'silence' literal
-                reject(new DrainWaitTimeoutError(`${message}: ${sinceLastFrame}ms of inspector silence (limit ${silenceMs}ms)`, 'silence'));
+                reject(new DrainWaitTimeoutError(`${sinceLastFrame}ms of inspector silence (limit ${silenceMs}ms)`, 'silence'));
             }
         }, DRAIN_SILENCE_POLL_INTERVAL_MS);
     });
@@ -1672,8 +1670,7 @@ export class BunTestRunner implements TestRunner {
                 );
 
                 const { promise: silencePromise, cancel: cancelSilence } = raceAgainstSilence(
-                    inspector, DRAIN_ACK_SILENCE_TIMEOUT_MS, DRAIN_ACK_ABSOLUTE_CEILING_MS,
-                    'Inspector drain wait gave up'
+                    inspector, DRAIN_ACK_SILENCE_TIMEOUT_MS, DRAIN_ACK_ABSOLUTE_CEILING_MS
                 );
                 try {
                     // silencePromise is Promise<never> — it only ever rejects, so a
@@ -1687,8 +1684,12 @@ export class BunTestRunner implements TestRunner {
                     ]);
                     drainSettleReason = 'ack';
                 } catch (error) {
-                    drainSettleReason = error instanceof DrainWaitTimeoutError ? error.reason : 'send-rejected';
-                    if(drainSettleReason === 'send-rejected') {
+                    if(error instanceof DrainWaitTimeoutError) {
+                        drainSettleReason = error.reason;
+                        // Which bound fired and what it observed (e.g. how long the stream had been silent).
+                        this.logger.debug('Inspector drain wait gave up: %s', error.message);
+                    } else {
+                        drainSettleReason = 'send-rejected';
                         drainRejection = error instanceof Error ? error.message : String(error);
                         this.logger.debug('Inspector drain round-trip rejected before any wait bound was hit: %s', drainRejection);
                     }
@@ -2029,13 +2030,9 @@ export class BunTestRunner implements TestRunner {
             } else {
                 this.baseNameIndex.set(base, [id]);
             }
-            // Also add identity entry for already-suffixed names so callers that somehow
-            // produce a suffixed name still get a hit without going through the base lookup.
-            // Stryker disable ConditionalExpression,EqualityOperator,BlockStatement,ArrayDeclaration: edge-case identity entries for suffixed names — only used when Bun output includes [N] suffixes (doesn't happen in practice); mutations here cause incorrect identity lookups but are not exercised by tests
-            if(base !== id) {
-                this.baseNameIndex.set(id, [id]);
-            }
-            // Stryker restore ConditionalExpression,EqualityOperator,BlockStatement,ArrayDeclaration
+            // No identity entry for an already-suffixed id: resolveKilledBy tests
+            // cachedTestNames.has(name) before it consults this index, and every id is in
+            // cachedTestNames, so a suffixed name can never reach a lookup here.
         }
         // Stryker disable next-line StringLiteral: diagnostic logging message
         this.logger.debug('Cached %d test names from dry run for killedBy resolution', this.cachedTestNames.size);
