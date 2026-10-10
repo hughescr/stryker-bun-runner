@@ -3,19 +3,23 @@
  * Tests preload script generation and cleanup
  */
 
-import { mkdir, writeFile as fsWriteFile, rm } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile as fsReadFile, symlink, writeFile as fsWriteFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { generatePreloadScript, cleanupPreloadScript, resolveEagerModulesFromGlobs } from '../../src/coverage/preload-generator.js';
+import { UnsafeTempDirError } from '../../src/utils/private-temp-dir.js';
 import { mockMkdir, mockReadFile, mockWriteFile, mockUnlink, resetFsMocks } from '../test-preload.js';
 
 describe('generatePreloadScript', () => {
+    /** A private mkdtemp root per test; the preload's tempDir is created inside it for real. */
+    let root: string;
     let tempDir: string;
     let coverageFile: string;
 
-    beforeEach(() => {
-        tempDir = path.join(tmpdir(), `stryker-test-${Date.now()}`);
+    beforeEach(async () => {
+        root = await mkdtemp(path.join(tmpdir(), 'stryker-preload-test-'));
+        tempDir = path.join(root, 'run');
         coverageFile = path.join(tempDir, 'coverage.json');
 
         // Clear the mock state before each test
@@ -23,30 +27,70 @@ describe('generatePreloadScript', () => {
         mockReadFile.mockClear();
         mockWriteFile.mockClear();
 
-        // Setup default return values
-        mockMkdir.mockResolvedValue(undefined);
+        // Setup default return values. mkdir stays real: the directory checks run against the kernel.
         mockReadFile.mockResolvedValue('// preload script content');
         mockWriteFile.mockResolvedValue(undefined);
     });
 
-    afterEach(() => {
+    afterEach(async () => {
         // Reset all fs mocks to pass-through state for next test
         resetFsMocks();
+        await rm(root, { recursive: true, force: true });
     });
 
     describe('directory creation', () => {
-        it('should create temp directory with recursive option', async () => {
+        it('should create the temp directory privately (mode 0700, non-recursive) before writing', async () => {
             await generatePreloadScript({ tempDir, coverageFile });
 
-            expect(mockMkdir).toHaveBeenCalledWith(tempDir, { recursive: true });
+            expect(mockMkdir).toHaveBeenCalledWith(tempDir, { mode: 0o700 });
+            const st = await lstat(tempDir);
+            expect(st.isDirectory()).toBe(true);
+            // Low nine bits (rwxrwxrwx) of the mode
+            expect(st.mode % 0o1000).toBe(0o700);
+            expect(mockMkdir.mock.invocationCallOrder[0]).toBeLessThan(mockWriteFile.mock.invocationCallOrder[0]);
         });
 
-        it('should handle nested directory creation', async () => {
-            const nestedTempDir = path.join(tmpdir(), 'a', 'b', 'c', 'stryker');
+        it('should refuse a temp directory that other users can access, writing nothing', async () => {
+            await mkdir(tempDir);
+            await chmod(tempDir, 0o777);
 
-            await generatePreloadScript({ tempDir: nestedTempDir, coverageFile });
+            const err = await generatePreloadScript({ tempDir, coverageFile }).catch((e: unknown) => e);
 
-            expect(mockMkdir).toHaveBeenCalledWith(nestedTempDir, { recursive: true });
+            expect(err).toBeInstanceOf(UnsafeTempDirError);
+            expect(mockWriteFile).not.toHaveBeenCalled();
+        });
+
+        it('should refuse a symlink in place of the temp directory, writing nothing', async () => {
+            const elsewhere = path.join(root, 'elsewhere');
+            await mkdir(elsewhere, { mode: 0o700 });
+            await symlink(elsewhere, tempDir);
+
+            const err = await generatePreloadScript({ tempDir, coverageFile }).catch((e: unknown) => e);
+
+            expect(err).toBeInstanceOf(UnsafeTempDirError);
+            expect(mockWriteFile).not.toHaveBeenCalled();
+        });
+    });
+
+    describe('private file write (real fs)', () => {
+        it('should write the preload with mode 0600, replacing a planted symlink instead of following it', async () => {
+            mockWriteFile.mockReset();
+            resetFsMocks();
+            mockReadFile.mockImplementationOnce(() => Promise.resolve('// real preload'));
+            await mkdir(tempDir, { mode: 0o700 });
+            const victim = path.join(root, 'victim.ts');
+            await fsWriteFile(victim, '// victim');
+            const preloadPath = path.join(tempDir, `stryker-coverage-preload-${process.pid}.ts`);
+            await symlink(victim, preloadPath);
+
+            const result = await generatePreloadScript({ tempDir, coverageFile });
+
+            expect(result).toBe(preloadPath);
+            const st = await lstat(preloadPath);
+            expect(st.isSymbolicLink()).toBe(false);
+            expect(st.mode % 0o1000).toBe(0o600);
+            expect(await fsReadFile(preloadPath, 'utf8')).toBe('// real preload');
+            expect(await fsReadFile(victim, 'utf8')).toBe('// victim');
         });
     });
 
@@ -95,10 +139,11 @@ describe('generatePreloadScript', () => {
 
             expect(mockWriteFile).toHaveBeenCalled();
 
-            const [targetPath, content, encoding] = mockWriteFile.mock.calls[0];
+            const [targetPath, content, options] = mockWriteFile.mock.calls[0];
             expect(targetPath).toBe(path.join(tempDir, `stryker-coverage-preload-${process.pid}.ts`));
             expect(content).toBe(templateContent);
-            expect(encoding).toBe('utf8');
+            // Exclusive create (never through an existing file or symlink), owner-only
+            expect(options).toEqual({ encoding: 'utf8', flag: 'wx', mode: 0o600 });
         });
 
         it('should return path to generated preload script', async () => {
@@ -150,7 +195,7 @@ describe('generatePreloadScript', () => {
 
     describe('options handling', () => {
         it('should write preload script to custom tempDir', async () => {
-            const customTempDir = '/custom/temp/dir';
+            const customTempDir = path.join(root, 'custom');
             const templateContent = '// preload template';
             mockReadFile.mockResolvedValue(templateContent);
 

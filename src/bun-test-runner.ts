@@ -3,7 +3,6 @@
  * Implements the Stryker TestRunner API
  */
 
-import { createHash } from 'node:crypto';
 import * as fsPromises from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -39,7 +38,7 @@ import type { TestInfo } from './inspector/types.js';
 import type { StrykerBunOptions } from './options.js';
 import { parseBunTestOutput, type ParsedTestResults } from './parsers/console-parser.js';
 import { runBunTests, stripAnsi } from './process-runner.js';
-import { type DroppedBunfigKey, assertSupportedBunArgs, splitBunConfigArg, checkBunVersion, getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, TEST_FILE_SUFFIX_RE, discoverTestFiles, findBuildOutputTestFiles, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery } from './utils/index.js';
+import { type DroppedBunfigKey, assertSupportedBunArgs, splitBunConfigArg, checkBunVersion, getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, TEST_FILE_SUFFIX_RE, discoverTestFiles, findBuildOutputTestFiles, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery, ensurePrivateDir, runTempDirPath, writePrivateFile } from './utils/index.js';
 
 /**
  * Poll (every 50ms) until `getUrl()` reports the inspector URL, `timeoutMs`
@@ -615,9 +614,12 @@ export class BunTestRunner implements TestRunner {
      * cwd IS the user's real project root, and writing there would both
      * pollute the user's project and never get cleaned up (dispose()
      * deliberately never unlinks the registry itself — see its doc comment).
-     * The temp directory is OS-managed instead.
+     * The temp directory is OS-managed instead. Specifically it is the run's
+     * private directory (src/utils/private-temp-dir.ts): owned by the current
+     * user, mode 0700, verified before every write and before the lazy load,
+     * so another local user can neither plant nor read a registry.
      *
-     * Keyed by sha256(cwd + ':' + ppid): every worker process Stryker spawns
+     * Keyed by sha256(cwd + ':' + ppid) (plus the uid, in the directory name): every worker process Stryker spawns
      * for one run is a direct child of that run's single Stryker main
      * process, so all of them share BOTH process.cwd() (the sandbox
      * directory) AND process.ppid (the main process's pid) — and therefore
@@ -653,9 +655,7 @@ export class BunTestRunner implements TestRunner {
      * invoked — rather than the orchestrator's cwd at module-load time.
      */
     private get registryPath(): string {
-        const key = `${process.cwd()}:${process.ppid}`;
-        const hash = createHash('sha256').update(key).digest('hex').slice(0, 16);
-        return path.join(tmpdir(), 'stryker-bun-runner', `registry-${hash}.json`);
+        return path.join(runTempDirPath(), 'registry.json');
     }
 
     private get registryTmpPath(): string {
@@ -929,9 +929,11 @@ export class BunTestRunner implements TestRunner {
             this.coverageFilePath = undefined;
         }
 
-        // Generate preload script for coverage collection
-        const tempDir = path.join(tmpdir(), 'stryker-bun-runner');
-        this.tempDir = tempDir;
+        // Every temp file of this worker (preload script, coverage data, sanitized
+        // bunfig) goes in the run's private directory, verified before anything is
+        // written: an unsafe directory (another user's, a symlink, group/other
+        // access) fails init loudly rather than letting the preload be swapped.
+        const tempDir = await this.ensureRunTempDir();
         this.coverageFilePath = path.join(tempDir, `coverage-${Date.now()}.json`);
 
         // Stryker disable next-line StringLiteral: logging message only
@@ -968,6 +970,12 @@ export class BunTestRunner implements TestRunner {
         // getOrDiscoverTestFiles() will detect the stale cachedTestFilesCwd key and
         // re-glob from the new cwd before returning.
         await this.getOrDiscoverTestFiles();
+    }
+
+    /** Create/verify the run's private temp directory (see src/utils/private-temp-dir.ts) and remember it as this worker's tempDir. */
+    private async ensureRunTempDir(): Promise<string> {
+        this.tempDir = await ensurePrivateDir(runTempDirPath());
+        return this.tempDir;
     }
 
     /**
@@ -1009,8 +1017,7 @@ export class BunTestRunner implements TestRunner {
         if(this.sanitizedBunfigPath) {
             await cleanupSanitizedBunfig(this.sanitizedBunfigPath);
         }
-        // Stryker disable next-line StringLiteral: equivalent mutant — mutating 'stryker-bun-runner' to '' still produces a valid writable directory under tmpdir(); sanitized bunfig generation succeeds either way
-        const tempDir = this.tempDir ?? path.join(tmpdir(), 'stryker-bun-runner');
+        const tempDir = this.tempDir ?? await this.ensureRunTempDir();
         this.sanitizedBunfigPath = await generateSanitizedBunfig(cwd, tempDir, this.sourceBunfig, (drops) => {
             this.reportDroppedBunfigKeys(drops);
         });
@@ -1031,9 +1038,14 @@ export class BunTestRunner implements TestRunner {
    * whole file (never a half-initialised registry). Failures are non-fatal — the
    * worker falls back to raw console names and the lossy pattern reconstruction,
    * and a warning is logged so the issue is visible.
+   *
+   * The one failure that is NOT tolerated is an unsafe registry directory: it is
+   * verified private first, outside the try, so a registry another user could
+   * have planted is never trusted and the mutant run fails loudly instead.
    */
     private async loadRegistryFile(): Promise<void> {
         const registryPath = this.registryPath;
+        await ensurePrivateDir(path.dirname(registryPath));
         try {
             const raw = await fsPromises.readFile(registryPath, 'utf8');
             const parsed = JSON.parse(raw) as RegistryFileV2;
@@ -1948,12 +1960,12 @@ export class BunTestRunner implements TestRunner {
                 // Omitted (JSON drops undefined) when Stryker selected no files.
                 testFiles:       this.selectedTestFilesFor(process.cwd()),
             } satisfies RegistryFileV2);
-            // registryPath now lives under tmpdir()/stryker-bun-runner/, which may not
-            // exist yet on a fresh machine/CI runner — create it before writing.
-            // Safe to call unconditionally/concurrently: recursive mkdir is a no-op
-            // (not an EEXIST throw) when the directory is already there.
-            await fsPromises.mkdir(path.dirname(registryPath), { recursive: true });
-            await fsPromises.writeFile(tmpPath, registryData, 'utf8');
+            // registryPath lives in the run's private temp directory; create/verify it
+            // before writing (cwd may differ from init's). Safe to call concurrently:
+            // an existing directory is re-verified, not an error. The tmp file is
+            // created owner-only and exclusively, replacing anything at its path.
+            await ensurePrivateDir(path.dirname(registryPath));
+            await writePrivateFile(tmpPath, registryData);
             this.lastRegistryTmpPath = tmpPath;
             await fsPromises.rename(tmpPath, registryPath);
             // Clear lastRegistryTmpPath now that the rename succeeded — the .tmp file
@@ -3005,6 +3017,13 @@ export class BunTestRunner implements TestRunner {
 
     /**
    * Cleanup resources
+   *
+   * Removes only this worker's own files. The registry, and so the run's private
+   * temp directory holding it, is deliberately left in place: Stryker gives a
+   * worker no signal that it is the last one, and maxTestRunnerReuse /
+   * crash recovery dispose a worker mid-run and start a fresh process that must
+   * still find the registry (with concurrency 1, the disposing worker IS the
+   * only one, so a "last one out" check would delete it from under its successor).
    */
     public async dispose(): Promise<void> {
         // Stryker disable next-line StringLiteral: logging message only
