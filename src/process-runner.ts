@@ -55,7 +55,7 @@ export function stripAnsi(text: string): string {
 
 export function readSpawnDepth(raw: string | undefined): number {
     const parsed = Number(raw);
-    return Number.isInteger(parsed) && parsed > 0 ? parsed : 0;
+    return Number.isInteger(parsed) ? Math.max(parsed, 0) : 0;
 }
 
 export interface BunTestRunOptions {
@@ -307,7 +307,6 @@ export function killAllLiveChildren(): void {
 /** Signals worth reaping on. SIGKILL is absent because it cannot be trapped. */
 const CLEANUP_SIGNALS: readonly NodeJS.Signals[] = ['SIGINT', 'SIGTERM', 'SIGHUP'];
 
-// Stryker disable next-line BlockStatement,ArrowFunction,CallExpression,MethodExpression: the body ends by re-raising the signal at this very process, which terminates it — it cannot run under test without killing the test runner. Its testable half is killAllLiveChildren(), which IS covered; what remains is deregistration and the re-raise.
 const onCleanupSignal = (signal: NodeJS.Signals): void => {
     killAllLiveChildren();
     removeSignalCleanup();
@@ -620,8 +619,9 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
         // with timedOut:true to signal the caller that we stopped early.
         // Stryker disable next-line ConditionalExpression,BlockStatement: abort-signal wiring; mutation caught by 'aborts child process when signal fires'
         if(options.signal) {
+            // The timeout timer is left running: beginTermination() makes its
+            // later firing a no-op, and close/error clear it.
             onAbort = (): void => {
-                clearTimeout(timeoutHandle);
                 beginTermination();
             };
             // Stryker disable next-line ObjectLiteral,BooleanLiteral: AbortSignal 'abort' fires at most once per controller (spec guarantee — WHATWG DOM §9.1), so { once: true } is semantically redundant; mutating to {} or { once: false } is equivalent
@@ -655,7 +655,7 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
                 const rssBytes = await getProcessRssBytes(pid);
                 // Stryker disable next-line ConditionalExpression,EqualityOperator,BlockStatement,LogicalOperator: null probe result (unknown RSS) must not be treated as exceeding the ceiling; covered by 'does not kill when the RSS probe returns null'; the hasClosed re-check guards against the process closing while the probe awaited
                 // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- hasClosed is set by the 'close'/'error' handlers, a different closure; TypeScript cannot track that cross-await mutation
-                if(rssBytes === null || hasClosed || processKilled) {
+                if(rssBytes === null || hasClosed) {
                     return;
                 }
                 if(rssBytes > rssLimit) {
