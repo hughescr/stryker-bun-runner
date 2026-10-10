@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { parse } from 'smol-toml';
-import { generateSanitizedBunfig, cleanupSanitizedBunfig } from '../../src/utils/bunfig-sanitizer.js';
+import { generateSanitizedBunfig, cleanupSanitizedBunfig, readBunfigTestRoot } from '../../src/utils/bunfig-sanitizer.js';
 import { mockMkdir, mockReadFile, mockWriteFile, mockUnlink, resetFsMocks } from '../test-preload.js';
 
 describe('generateSanitizedBunfig', () => {
@@ -359,6 +359,44 @@ describe('generateSanitizedBunfig', () => {
             expect(test.timeout).toBe(20_000);
             expect(test.coverageThreshold).toBeUndefined();
         });
+    });
+});
+
+describe('readBunfigTestRoot', () => {
+    afterEach(() => {
+        resetFsMocks();
+    });
+
+    it('resolves a relative [test].root against the project cwd', async () => {
+        mockReadFile.mockResolvedValue('[test]\nroot = "./src"\n');
+        expect(await readBunfigTestRoot('/project')).toBe('/project/src');
+    });
+
+    it('keeps an absolute root as-is', async () => {
+        mockReadFile.mockResolvedValue('[test]\nroot = "/elsewhere/tests"\n');
+        expect(await readBunfigTestRoot('/project')).toBe('/elsewhere/tests');
+    });
+
+    it('returns undefined when there is no bunfig', async () => {
+        mockReadFile.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+        expect(await readBunfigTestRoot('/project')).toBeUndefined();
+    });
+
+    it('returns undefined when [test] has no root, no [test] table exists, or root is not a string', async () => {
+        mockReadFile.mockResolvedValue('[test]\ntimeout = 5\n');
+        expect(await readBunfigTestRoot('/project')).toBeUndefined();
+        mockReadFile.mockResolvedValue('[install]\nexact = true\n');
+        expect(await readBunfigTestRoot('/project')).toBeUndefined();
+        mockReadFile.mockResolvedValue('test = 3\n');
+        expect(await readBunfigTestRoot('/project')).toBeUndefined();
+        mockReadFile.mockResolvedValue('[test]\nroot = 5\n');
+        expect(await readBunfigTestRoot('/project')).toBeUndefined();
+    });
+
+    it('throws a clear error for non-ENOENT read errors', async () => {
+        mockReadFile.mockRejectedValue(Object.assign(new Error('Permission denied'), { code: 'EACCES' }));
+        const err = await readBunfigTestRoot('/project').catch((e: unknown) => e);
+        expect((err as Error).message).toMatch(/Failed to read bunfig\.toml/);
     });
 });
 

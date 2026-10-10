@@ -394,6 +394,18 @@ describe('resolveEagerModulesFromGlobs', () => {
         expect(result).toEqual([path.resolve(source)]);
     });
 
+    it('never eager-imports _test/_spec modules or cts/cjs/uppercase test modules (bun runs them too)', async () => {
+        const source = await mkfile('src/calculator.ts');
+        await mkfile('src/calculator_test.ts');
+        await mkfile('src/calculator_spec.ts');
+        await mkfile('src/calculator.test.cjs');
+        await mkfile('src/calculator.Spec.TS');
+
+        const result = await resolveEagerModulesFromGlobs(['src/**/*'], fixtureDir);
+
+        expect(result).toEqual([path.resolve(source)]);
+    });
+
     it('should filter out .json files', async () => {
         const absA = await mkfile('src/a.ts');
         await mkfile('src/config.json');

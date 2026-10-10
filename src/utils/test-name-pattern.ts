@@ -24,20 +24,22 @@
 export const MAX_TEST_NAME_PATTERN_LENGTH = 100_000;
 
 /**
- * Recognised test-file extension grammar — matches `test.ts`, `spec.tsx`,
- * `test.mjs`, `spec.cts`, etc. ([jt]sx? = ts/tsx/js/jsx; [mc][jt]s =
- * mts/mjs/cts/cjs).
+ * Test-file name suffix grammar — exactly the files `bun test` itself picks up
+ * (measured on bun 1.4.2): a `.` or `_` separator, `test` or `spec`, a dot and
+ * one of ts/tsx/js/jsx/mts/mjs/cts/cjs. Bun matches case-insensitively, so
+ * every regex built from this pattern must use the `i` flag.
  *
- * Single source of truth shared with the console parser's file-header regex
- * (src/parsers/console-parser.ts), so the id prefix-stripping here and the
- * header recognition there can never drift apart: a file the parser prefixes
- * onto console test names is always a file whose prefix this module strips
- * when rebuilding --test-name-pattern alternatives.
+ * Single source of truth shared by file discovery
+ * (src/utils/test-file-discovery.ts), the console parser's file-header regex
+ * (src/parsers/console-parser.ts), the preload's test-file exclusion
+ * (src/coverage/preload-generator.ts) and the id prefix-stripping below, so
+ * they can never drift apart: a file bun runs is always a file the runner
+ * discovers, attributes console output to, and strips from test ids.
  */
-export const TEST_FILE_EXT_PATTERN = String.raw`(?:test|spec)\.(?:[jt]sx?|[mc][jt]s)`;
+export const TEST_FILE_SUFFIX_PATTERN = String.raw`[._](?:test|spec)\.(?:[jt]sx?|[mc][jt]s)`;
 
-// File-extension suffixes that mark the first path segment as a file prefix.
-const fileExtRe = new RegExp(String.raw`\.${TEST_FILE_EXT_PATTERN}$`);
+/** Anchored, case-insensitive matcher for a file name or path ending in a test-file suffix. */
+export const TEST_FILE_SUFFIX_RE = new RegExp(`${TEST_FILE_SUFFIX_PATTERN}$`, 'i');
 
 // Stryker disable next-line Regex: suffix regex is anchored and defensive
 const dedupSuffixRe = / \[\d+\]$/;
@@ -114,8 +116,9 @@ export function buildTestNamePattern(testFilter: readonly string[], testNameInde
         // Strip the leading file-path prefix when the first component ends in a
         // recognised test-file extension.  The separator is " > ".
         const firstSepIdx = id.indexOf(' > ');
-        // Stryker disable next-line ConditionalExpression,UnaryOperator: equivalent mutants — when firstSepIdx===-1 or ===1, id.slice(0,N) won't match fileExtRe for realistic test IDs (path prefix is >1 char), so behavior is unchanged
-        let name: string = (firstSepIdx !== -1 && fileExtRe.test(id.slice(0, firstSepIdx)))
+        // Stryker disable next-line ConditionalExpression,UnaryOperator: equivalent mutants — when firstSepIdx===-1 or ===1, id.slice(0,N) won't match TEST_FILE_SUFFIX_RE for realistic test IDs (path prefix is >1 char), so behavior is unchanged
+        // A recognised test-file suffix on the first path segment marks it as a file prefix.
+        let name: string = (firstSepIdx !== -1 && TEST_FILE_SUFFIX_RE.test(id.slice(0, firstSepIdx)))
             ? id.slice(firstSepIdx + 3)
             : id;
 

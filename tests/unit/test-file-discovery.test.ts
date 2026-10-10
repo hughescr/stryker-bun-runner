@@ -384,3 +384,158 @@ describe('discoverTestFiles (symlink handling)', () => {
         expect(result![1]).toMatch(/z\.test\.ts$/);
     });
 });
+
+// ── Bun's own discovery rules ───────────────────────────────────────────────
+// Measured on bun 1.4.2 with fixture trees: `bun test` picks up files whose
+// name ends in `.test.` / `_test.` / `.spec.` / `_spec.` plus one of
+// js, jsx, ts, tsx, mjs, cjs, mts, cts (case-insensitive), walks into `dist`
+// and `build`, and skips `node_modules` (case-insensitive) and every
+// dot-directory. Discovery must agree, otherwise the explicit positional file
+// list silently drops files bun would run.
+
+describe('discoverTestFiles (matches bun discovery rules)', () => {
+    let tmpDir: string;
+
+    beforeEach(async () => {
+        tmpDir = await mkdtemp(path.join(process.env.TMPDIR ?? '/tmp', 'stryker-bunrules-test-'));
+    });
+
+    afterEach(async () => {
+        await rm(tmpDir, { recursive: true, force: true });
+    });
+
+    it('discovers _test and _spec name forms for every extension', async () => {
+        const names: string[] = [];
+        for(const form of ['_test', '_spec']) {
+            for(const ext of ['js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'mts', 'cts']) {
+                names.push(`a${form}.${ext}`);
+            }
+        }
+        await Promise.all(names.map(n => writeFile(path.join(tmpDir, n), '')));
+
+        const result = await discoverTestFiles(tmpDir);
+        expect(result).toEqual([...names].toSorted((a, b) => a.localeCompare(b)));
+    });
+
+    it('discovers .test/.spec files with .cts, .cjs and .mts extensions', async () => {
+        for(const n of ['a.test.cts', 'b.spec.cjs', 'c.test.mts', 'd.spec.mjs']) {
+            // eslint-disable-next-line no-await-in-loop -- tiny fixture
+            await writeFile(path.join(tmpDir, n), '');
+        }
+        const result = await discoverTestFiles(tmpDir);
+        expect(result).toEqual(['a.test.cts', 'b.spec.cjs', 'c.test.mts', 'd.spec.mjs']);
+    });
+
+    it('matches the name form and extension case-insensitively, like bun', async () => {
+        await writeFile(path.join(tmpDir, 'b.Test.ts'), '');
+        await writeFile(path.join(tmpDir, 'c.SPEC.TS'), '');
+        const result = await discoverTestFiles(tmpDir);
+        expect(result).toEqual(['b.Test.ts', 'c.SPEC.TS']);
+    });
+
+    it('discovers dotfile-style and empty-stem names bun accepts', async () => {
+        await writeFile(path.join(tmpDir, '.dot.test.ts'), '');
+        await writeFile(path.join(tmpDir, '_test.ts'), '');
+        await writeFile(path.join(tmpDir, '.test.ts'), '');
+        const result = await discoverTestFiles(tmpDir);
+        expect(result).toEqual(['.dot.test.ts', '.test.ts', '_test.ts'].toSorted((a, b) => a.localeCompare(b)));
+    });
+
+    it('does not match names bun ignores', async () => {
+        for(const n of ['a-test.ts', 'atest.ts', 'test.ts', 'spec.ts', 'a.tests.ts', 'a.test.d.ts', 'a.test.json', 'a.test.mdx', 'a.test.ts.map']) {
+            // eslint-disable-next-line no-await-in-loop -- tiny fixture
+            await writeFile(path.join(tmpDir, n), '');
+        }
+        await writeFile(path.join(tmpDir, 'ok.test.ts'), '');
+        const result = await discoverTestFiles(tmpDir);
+        expect(result).toEqual(['ok.test.ts']);
+    });
+
+    it('descends into dist and build (bun does)', async () => {
+        await mkdir(path.join(tmpDir, 'dist'));
+        await mkdir(path.join(tmpDir, 'build'));
+        await writeFile(path.join(tmpDir, 'dist', 'a.test.js'), '');
+        await writeFile(path.join(tmpDir, 'build', 'b.test.js'), '');
+        const result = await discoverTestFiles(tmpDir);
+        expect(result).toEqual([path.join('build', 'b.test.js'), path.join('dist', 'a.test.js')]);
+    });
+
+    it('skips every dot-directory, not just a fixed list', async () => {
+        await mkdir(path.join(tmpDir, '.hidden', 'deep'), { recursive: true });
+        await writeFile(path.join(tmpDir, '.hidden', 'deep', 'h.test.ts'), '');
+        await writeFile(path.join(tmpDir, 'ok.test.ts'), '');
+        const result = await discoverTestFiles(tmpDir);
+        expect(result).toEqual(['ok.test.ts']);
+    });
+
+    it('skips node_modules case-insensitively at any depth', async () => {
+        await mkdir(path.join(tmpDir, 'Node_Modules'));
+        await mkdir(path.join(tmpDir, 'sub', 'node_modules', 'x'), { recursive: true });
+        await writeFile(path.join(tmpDir, 'Node_Modules', 'n.test.ts'), '');
+        await writeFile(path.join(tmpDir, 'sub', 'node_modules', 'x', 's.test.ts'), '');
+        await writeFile(path.join(tmpDir, 'ok.test.ts'), '');
+        const result = await discoverTestFiles(tmpDir);
+        expect(result).toEqual(['ok.test.ts']);
+    });
+});
+
+// ── [test].root from bunfig.toml ────────────────────────────────────────────
+// Verified on bun 1.4.2: passing files positionally bypasses `[test].root`
+// (an `e2e/c.test.ts` outside root = "./src" still ran), while
+// `pathIgnorePatterns` IS honoured even for positional files. So discovery
+// must start its walk at root; ignore patterns need no reimplementation.
+
+describe('discoverTestFiles (bunfig [test].root)', () => {
+    let tmpDir: string;
+
+    beforeEach(async () => {
+        tmpDir = await mkdtemp(path.join(process.env.TMPDIR ?? '/tmp', 'stryker-root-test-'));
+        await mkdir(path.join(tmpDir, 'src', 'sub'), { recursive: true });
+        await mkdir(path.join(tmpDir, 'e2e'));
+        await writeFile(path.join(tmpDir, 'src', 'a.test.ts'), '');
+        await writeFile(path.join(tmpDir, 'src', 'sub', 'b.test.ts'), '');
+        await writeFile(path.join(tmpDir, 'e2e', 'c.test.ts'), '');
+        await writeFile(path.join(tmpDir, 'top.test.ts'), '');
+    });
+
+    afterEach(async () => {
+        await rm(tmpDir, { recursive: true, force: true });
+    });
+
+    const allFiles = ['e2e/c.test.ts', 'src/a.test.ts', 'src/sub/b.test.ts', 'top.test.ts'];
+
+    it('without a bunfig walks the whole cwd (default behaviour unchanged)', async () => {
+        expect(await discoverTestFiles(tmpDir)).toEqual(allFiles);
+    });
+
+    it('without a [test].root key walks the whole cwd', async () => {
+        await writeFile(path.join(tmpDir, 'bunfig.toml'), '[test]\ntimeout = 5\n');
+        expect(await discoverTestFiles(tmpDir)).toEqual(allFiles);
+    });
+
+    it('starts the walk at a relative root ("./src") and leaves files outside it out', async () => {
+        await writeFile(path.join(tmpDir, 'bunfig.toml'), '[test]\nroot = "./src"\n');
+        // Paths stay relative to cwd (bun reports them that way and positional args resolve against cwd).
+        expect(await discoverTestFiles(tmpDir)).toEqual(['src/a.test.ts', 'src/sub/b.test.ts']);
+    });
+
+    it('accepts a root without a leading "./"', async () => {
+        await writeFile(path.join(tmpDir, 'bunfig.toml'), '[test]\nroot = "src"\n');
+        expect(await discoverTestFiles(tmpDir)).toEqual(['src/a.test.ts', 'src/sub/b.test.ts']);
+    });
+
+    it('accepts an absolute root', async () => {
+        await writeFile(path.join(tmpDir, 'bunfig.toml'), `[test]\nroot = "${path.join(tmpDir, 'e2e')}"\n`);
+        expect(await discoverTestFiles(tmpDir)).toEqual(['e2e/c.test.ts']);
+    });
+
+    it('returns undefined (bun-native fallback) when the root does not exist', async () => {
+        await writeFile(path.join(tmpDir, 'bunfig.toml'), '[test]\nroot = "./nope"\n');
+        expect(await discoverTestFiles(tmpDir)).toBeUndefined();
+    });
+
+    it('ignores a non-string root', async () => {
+        await writeFile(path.join(tmpDir, 'bunfig.toml'), '[test]\nroot = 5\n');
+        expect(await discoverTestFiles(tmpDir)).toEqual(allFiles);
+    });
+});

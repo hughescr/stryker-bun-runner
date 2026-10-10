@@ -6,19 +6,30 @@ import type { Dirent } from 'node:fs';
 import * as fsPromises from 'node:fs/promises';
 import path from 'node:path';
 import type { Logger } from '@stryker-mutator/api/logging';
+import { readBunfigTestRoot } from './bunfig-sanitizer.js';
+import { TEST_FILE_SUFFIX_RE } from './test-name-pattern.js';
 
-// Stryker disable next-line Regex: pattern enumerates known test-file extensions
-const testFileRe = /\.(?:test|spec)\.(?:[jt]sx?|m[jt]s)$/;
+// Directory names bun's own walker skips (measured on bun 1.4.2): `node_modules`
+// (case-insensitively) and every dot-directory (.git, .stryker-tmp, ...).
+// `dist` and `build` are NOT skipped by bun, so they are not skipped here.
+// Entries below the walk root only — the root itself is never name-checked.
+function isExcludedDirName(name: string): boolean {
+    return name.startsWith('.') || name.toLowerCase() === 'node_modules';
+}
 
-// Directories that should never contain test files for the purpose of this run.
-const excludedDirs = new Set(['node_modules', '.stryker-tmp', 'dist', 'build', '.git']);
+// Path segments that disqualify a symlink's RESOLVED target. This is stricter
+// than bun (which follows such links) on purpose: a "vendor" link into
+// node_modules would otherwise pull third-party tests into the mutation run.
+// Dot-directories are not all excluded here because the project itself may
+// legitimately live under one (e.g. ~/.work/proj).
+const excludedTargetSegments = new Set(['node_modules', '.stryker-tmp', '.git']);
 
 /**
  * Returns true when any path segment of absolutePath is an excluded directory.
  * Used for symlink targets to catch e.g. a "vendor" link pointing into node_modules.
  */
 function hasExcludedAncestor(absolutePath: string): boolean {
-    return absolutePath.split('/').some(seg => excludedDirs.has(seg));
+    return absolutePath.split('/').some(seg => excludedTargetSegments.has(seg));
 }
 
 /**
@@ -59,7 +70,7 @@ async function handleSymlinkDir(
     entryName: string,
     ctx: WalkContext
 ): Promise<void> {
-    if(excludedDirs.has(entryName)) {
+    if(isExcludedDirName(entryName)) {
         return;
     }
     const resolvedTarget = await tryRealpath(fullPath);
@@ -83,7 +94,7 @@ async function handleSymlinkFile(
     entryName: string,
     ctx: WalkContext
 ): Promise<void> {
-    if(!testFileRe.test(entryName)) {
+    if(!TEST_FILE_SUFFIX_RE.test(entryName)) {
         return;
     }
     const resolvedTarget = await tryRealpath(fullPath);
@@ -128,32 +139,42 @@ async function processEntry(
 ): Promise<void> {
     const fullPath = path.join(dir, entry.name);
     if(entry.isDirectory()) {
-        if(!excludedDirs.has(entry.name)) {
+        if(!isExcludedDirName(entry.name)) {
             await ctx.walk(fullPath);
         }
     } else if(entry.isSymbolicLink()) {
         await handleSymlink(fullPath, entry.name, ctx);
         // Stryker disable ConditionalExpression: equivalent mutant — entry.isFile() → true in the else-if means only the extension check matters; non-file entries (devices, FIFOs) are already excluded by earlier branches and never have .test.ts extensions
-    } else if(entry.isFile() && testFileRe.test(entry.name)) {
+    } else if(entry.isFile() && TEST_FILE_SUFFIX_RE.test(entry.name)) {
         ctx.results.push(path.relative(ctx.cwd, fullPath));
     }
     // Stryker restore ConditionalExpression
 }
 
 /**
- * Glob the current working directory for test files and return them sorted
+ * Walk for test files exactly as `bun test` would and return them sorted
  * lexicographically.  Passing an explicit, sorted list to `bun test` as
  * positional arguments removes Bun's reliance on readdir ordering (which is
  * non-deterministic on macOS APFS) and ensures mutantCoverage.perTest is
  * identical across runs.
  *
- * Excluded directories: node_modules, .stryker-tmp, dist, build, .git.
+ * Matches Bun's rules (measured on bun 1.4.2): file names ending in
+ * `.test.`, `_test.`, `.spec.` or `_spec.` plus js/jsx/ts/tsx/mjs/cjs/mts/cts
+ * (case-insensitive); `node_modules` (case-insensitive) and dot-directories
+ * are skipped; `dist` and `build` are walked.
+ *
+ * The walk starts at `[test].root` from `<cwd>/bunfig.toml` when set (resolved
+ * against cwd, as bun does) and the whole of cwd otherwise. Bun ignores
+ * `root` for positional file arguments, so honouring it has to happen here.
+ * `pathIgnorePatterns` needs no handling: bun applies it to positional
+ * arguments too.  Returned paths are always relative to cwd.
  *
  * Returns undefined (not an empty array) when no files are found so callers
  * can fall back to Bun's built-in discovery rather than invoking `bun test`
  * with no files (which would match nothing and exit 0 with 0 tests run).
  *
- * @param cwd - Root directory to walk (defaults to process.cwd())
+ * @param cwd - Project directory: holds bunfig.toml and anchors the returned
+ *          relative paths (defaults to process.cwd())
  * @param logger - Optional logger for diagnostic messages
  */
 export async function discoverTestFiles(
@@ -197,11 +218,12 @@ export async function discoverTestFiles(
         }
     }
 
-    await walk(cwd);
+    const walkRoot = (await readBunfigTestRoot(cwd)) ?? cwd;
+    await walk(walkRoot);
 
     if(results.length === 0) {
         // Stryker disable next-line StringLiteral: diagnostic logging message
-        logger?.warn('discoverTestFiles: no test files found in %s; falling back to Bun discovery', cwd);
+        logger?.warn('discoverTestFiles: no test files found in %s; falling back to Bun discovery', walkRoot);
         return undefined;
     }
 

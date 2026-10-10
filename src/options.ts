@@ -48,15 +48,22 @@ export interface BunTestRunnerOptions {
    * Stryker's `disableBail` option, so a bail flag configured here would
    * otherwise silently override that decision.
    *
+   * Flags that would break per-test coverage attribution or the runner's own
+   * test selection (`--concurrent`, `--max-concurrency`, `--parallel`,
+   * `--shard`, `--changed`, `-t`/`--test-name-pattern`,
+   * `-u`/`--update-snapshots`, `--pass-with-no-tests`, `--watch`,
+   * `--coverage*`, `-c`/`--config`, `--cwd`, `--inspect*`) make `init()` throw
+   * instead of being passed through — see src/utils/bun-args.ts.
+   *
    * @example ['--only', '--verbose']
    */
     bunArgs?: string[]
 
     /**
    * Explicit list of test file paths (must be non-empty when provided).
-   * When provided, BunTestRunner skips auto-discovery (which globs
-   * `**\/*.test.ts` from the current working directory) and uses exactly this
-   * list. Useful for restricting mutation testing to a subset, or for callers
+   * When provided, BunTestRunner skips auto-discovery (which walks the project
+   * the way `bun test` does — `.test`/`_test`/`.spec`/`_spec` files, starting at
+   * `[test].root` from bunfig.toml when set) and uses exactly this list. Useful for restricting mutation testing to a subset, or for callers
    * that run outside Stryker's sandboxed cwd and need to point at a specific
    * file set. Relative paths resolve against the bun subprocess's cwd.
    *

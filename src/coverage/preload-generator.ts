@@ -7,7 +7,7 @@ import { mkdir, unlink, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { glob } from 'tinyglobby';
-import { TEST_FILE_EXT_PATTERN } from '../utils/test-name-pattern.js';
+import { TEST_FILE_SUFFIX_RE } from '../utils/test-name-pattern.js';
 
 export interface PreloadOptions {
     /**
@@ -102,10 +102,7 @@ export async function resolveEagerModulesFromGlobs(
     // any config mistake — a CLI `--mutate "src/**/*.ts"` REPLACES the config's
     // mutate array, silently dropping its `!**/*.spec.ts` negations — so the
     // guard belongs here rather than in the caller's globs.
-    // Stryker disable next-line Regex: shares TEST_FILE_EXT_PATTERN with the discovery/pattern code so the two can never drift
-    const testFileRe = new RegExp(String.raw`\.${TEST_FILE_EXT_PATTERN}$`);
-
-    const filtered = paths.filter(p => sourceFileRe.test(p) && !dtsRe.test(p) && !testFileRe.test(p));
+    const filtered = paths.filter(p => sourceFileRe.test(p) && !dtsRe.test(p) && !TEST_FILE_SUFFIX_RE.test(p));
 
     // Resolve to absolute paths (glob returns absolute when absolute: true, but
     // be defensive in case cwd is relative).
