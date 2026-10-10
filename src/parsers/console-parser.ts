@@ -241,6 +241,21 @@ interface SummaryCounts {
 }
 
 /**
+ * The count captured by the LAST match of `pattern` (capture group 1) in
+ * `text`, or `undefined` when nothing matches. `pattern` must carry the `g`
+ * flag.
+ *
+ * Bun prints its summary after everything else, so when a test's own console
+ * output contains a line shaped like a summary line (` 3 pass`, `0 errors`,
+ * `Ran 9 tests`), the last match is the real one. Every summary count shares
+ * this helper so that none of them can drift back to first-match.
+ */
+function lastCount(text: string, pattern: RegExp): number | undefined {
+    const last = [...text.matchAll(pattern)].at(-1);
+    return last ? Number.parseInt(last[1], 10) : undefined;
+}
+
+/**
  * Parse summary lines from output
  */
 function parseSummaryLines(output: string): SummaryCounts {
@@ -250,28 +265,28 @@ function parseSummaryLines(output: string): SummaryCounts {
     // Bun outputs lines like: " 2840 pass" or " 10 fail"
     // Or in bail mode: "Bailed out after 1 failure"
     // Stryker disable next-line Regex: word boundaries are defensive for summary parsing
-    const passSummary = /\s(\d+)\s+pass\b/.exec(output);
+    const passSummary = lastCount(output, /\s(\d+)\s+pass\b/g);
     // Stryker disable next-line Regex: word boundaries are defensive for summary parsing
-    const failSummary = /\s(\d+)\s+fail\b/.exec(output);
+    const failSummary = lastCount(output, /\s(\d+)\s+fail\b/g);
     // Stryker disable next-line Regex: word boundaries are defensive for summary parsing
-    const skipSummary = /\s(\d+)\s+skip\b/.exec(output);
+    const skipSummary = lastCount(output, /\s(\d+)\s+skip\b/g);
     // Stryker disable next-line Regex: character classes are defensive for optional plural
-    const bailSummary = /Bailed out after (\d+) failures?/.exec(output);
+    const bailSummary = lastCount(output, /Bailed out after (\d+) failures?/g);
 
-    if(passSummary) {
-        counts.passed = Number.parseInt(passSummary[1], 10);
+    if(passSummary !== undefined) {
+        counts.passed = passSummary;
     }
 
-    if(failSummary) {
-        counts.failed = Number.parseInt(failSummary[1], 10);
+    if(failSummary !== undefined) {
+        counts.failed = failSummary;
     }
 
-    if(skipSummary) {
-        counts.skipped = Number.parseInt(skipSummary[1], 10);
+    if(skipSummary !== undefined) {
+        counts.skipped = skipSummary;
     }
 
-    if(bailSummary) {
-        counts.failed = Math.max(counts.failed, Number.parseInt(bailSummary[1], 10));
+    if(bailSummary !== undefined) {
+        counts.failed = Math.max(counts.failed, bailSummary);
     }
 
     // Snapshot the genuine-only counts NOW, before the 'Ran N tests' fallback below can
@@ -285,9 +300,8 @@ function parseSummaryLines(output: string): SummaryCounts {
 
     // Also try to parse from "Ran N tests" line as ultimate fallback
     // Stryker disable next-line Regex: character classes are defensive for optional plural
-    const ranTestsSummary = /Ran\s+(\d+)\s+tests?/.exec(output);
-    if(ranTestsSummary) {
-        const totalFromRan = Number.parseInt(ranTestsSummary[1], 10);
+    const totalFromRan = lastCount(output, /Ran\s+(\d+)\s+tests?/g);
+    if(totalFromRan !== undefined) {
         // Use this as source of truth for total, and derive passed if needed
         // Stryker disable next-line ArithmeticOperator: condition requires passed=0 and failed=0, making arithmetic mutations equivalent
         const totalParsed = counts.passed + counts.failed + counts.skipped;
@@ -316,9 +330,7 @@ function parseSummaryLines(output: string): SummaryCounts {
  */
 function parseSummaryErrors(output: string): number {
     // Stryker disable next-line Regex: anchors and the optional plural are pinned by the summaryErrors parser tests (whole-line match, plural, prose rejection)
-    const matches = [...stripAnsi(output).matchAll(/^[\t ]*(\d+)[\t ]+errors?[\t ]*$/gm)];
-    const last = matches.at(-1);
-    return last ? Number.parseInt(last[1], 10) : 0;
+    return lastCount(stripAnsi(output), /^[\t ]*(\d+)[\t ]+errors?[\t ]*$/gm) ?? 0;
 }
 
 /**
