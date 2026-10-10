@@ -247,13 +247,41 @@ describe('mapCoverageToInspectorIds', () => {
             });
         });
 
-        it('should fold extra coverage keys into the last inspector test (test retry / extra attempt)', () => {
-            // When there are MORE coverage keys than non-skipped inspector tests, the excess keys
-            // are treated as retry attempts and their coverage data is merged (folded) into the
-            // last inspector test for that file. No warning is emitted.
-            //
-            // This handles the case where a test uses { retry: N } — each attempt fires beforeEach
-            // (producing a new counter key) but TestReporter.start fires only once (one inspector ID).
+        it('merges every attempt of a retried test into its one entry: bun starts it once per attempt, and each attempt records a key', () => {
+            // Observed with bun 1.3.7, 1.3.14 and 1.4.2: a { retry: 2 } test that fails twice
+            // fires TestReporter.start three times for the same id, and the preload's
+            // beforeEach records three keys.
+            const rawCoverage: MutantCoverage = {
+                'static': {},
+                perTest:  {
+                    'tests/a.test.ts@@test-1': { '1': 1 },
+                    'tests/a.test.ts@@test-2': { '2': 1 },
+                    'tests/a.test.ts@@test-3': { '3': 1 },
+                    'tests/a.test.ts@@test-4': { '4': 1 },
+                },
+            };
+            const executionOrder = [10, 10, 10, 11];
+            const testHierarchy = new Map<number, TestInfo>([
+                [10, { id: 10, name: 'flaky',  fullName: 'flaky',  type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/a.test.ts', status: 'pass' }],
+                [11, { id: 11, name: 'second', fullName: 'second', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/a.test.ts', status: 'pass' }],
+            ]);
+
+            const logger = makeLogger();
+            const { coverage: result, rawKeyCount, orphanedKeyCount } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy, logger);
+
+            expect(result!.perTest).toEqual({
+                'tests/a.test.ts > flaky':  { '1': 1, '2': 1, '3': 1 },
+                'tests/a.test.ts > second': { '4': 1 },
+            });
+            expect(rawKeyCount).toBe(4);
+            expect(orphanedKeyCount).toBe(0);
+            expect(logger.warn).not.toHaveBeenCalled();
+        });
+
+        it('never folds a coverage key that has no test start of its own into another test: it is counted as orphaned', () => {
+            // More keys than starts is not a retry (a retry starts the test again): it means a
+            // start event was lost. Crediting the extra key to the file's last test would hand
+            // that test coverage it never produced, so it is left unmatched for the gate.
             const rawCoverage: MutantCoverage = {
                 'static': {},
                 perTest:  {
@@ -262,34 +290,23 @@ describe('mapCoverageToInspectorIds', () => {
                     'tests/a.test.ts@@test-3': { '3': 1 },
                 },
             };
-
-            // Only 2 non-skipped inspector tests — coverage has 3 keys (e.g. one test retried once)
             const executionOrder = [10, 11];
             const testHierarchy = new Map<number, TestInfo>([
                 [10, { id: 10, name: 'first',  fullName: 'first',  type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/a.test.ts', status: 'pass' }],
                 [11, { id: 11, name: 'second', fullName: 'second', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/a.test.ts', status: 'pass' }],
             ]);
 
-            const logger = makeLogger();
-            const { coverage: result } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy, logger);
+            const { coverage: result, rawKeyCount, orphanedKeyCount } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy, makeLogger());
 
-            // test-1 → first, test-2 → second, test-3 → second (clamped, merged)
             expect(result!.perTest).toEqual({
                 'tests/a.test.ts > first':  { '1': 1 },
-                'tests/a.test.ts > second': { '2': 1, '3': 1 },
+                'tests/a.test.ts > second': { '2': 1 },
             });
-
-            // No warning — extra keys are handled gracefully via retry folding
-            expect(logger.warn).not.toHaveBeenCalled();
+            expect(rawKeyCount).toBe(3);
+            expect(orphanedKeyCount).toBe(1);
         });
 
-        it('should warn (and NOT fold) when there are fewer coverage keys than non-skipped inspector tests', () => {
-            // When keys < nonSkipped (data loss case), warn and map as many as possible.
-            // This is the OPPOSITE of the retry-folding case (keys > nonSkipped):
-            //   - keys > nonSkipped → retry, no warning, fold excess into last inspector
-            //   - keys < nonSkipped → data loss, warn, partial map
-            //
-            // Killing ConditionalExpression and BlockStatement mutants at pairKeysWithInspectorIds line ~240.
+        it('maps the keys it has when there are fewer coverage keys than test starts, without a warning (the dry-run gate reports the shortfall)', () => {
             const rawCoverage: MutantCoverage = {
                 'static': {},
                 perTest:  {
@@ -298,7 +315,7 @@ describe('mapCoverageToInspectorIds', () => {
                 },
             };
 
-            // 3 non-skipped inspector tests, only 1 counter key
+            // 3 test starts, only 1 counter key
             const executionOrder = [10, 11, 12];
             const testHierarchy = new Map<number, TestInfo>([
                 [10, { id: 10, name: 'first',  fullName: 'first',  type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/a.test.ts', status: 'pass' }],
@@ -307,29 +324,23 @@ describe('mapCoverageToInspectorIds', () => {
             ]);
 
             const logger = makeLogger();
-            const { coverage: result } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy, logger);
+            const { coverage: result, rawKeyCount, orphanedKeyCount } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy, logger);
 
             // Only the first key can be mapped
             expect(result!.perTest).toEqual({
                 'tests/a.test.ts > first': { '1': 1 },
             });
-
-            // Warn: 1 key < 3 non-skipped inspectors
-            expect(logger.warn).toHaveBeenCalledTimes(1);
-            expect(logger.warn).toHaveBeenCalledWith(
-                expect.stringContaining('Coverage/execution count mismatch'),
-                1, // coverage entries
-                3, // non-skipped tests
-                1  // partial mapping count
-            );
+            expect(rawKeyCount).toBe(1);
+            expect(orphanedKeyCount).toBe(0);
+            expect(logger.warn).not.toHaveBeenCalled();
         });
 
-        it('should NOT run interior-gap check when global counts are unbalanced (retry excess case)', () => {
-            // When keys > nonSkipped (retry-excess), checkInteriorGap must remain false.
+        it('should NOT run interior-gap check when global counts are unbalanced (more keys than starts)', () => {
+            // When keys > starts, checkInteriorGap must remain false.
             // If the ConditionalExpression mutant (always-true) survived, the interior-gap check
-            // would fire for the retry scenario and produce a false-positive warning.
+            // would fire here and produce a false-positive warning.
             //
-            // Setup: 3 keys from file a (test-1, test-2, test-3) with only 2 non-skipped inspectors.
+            // Setup: 3 keys from file a (test-1, test-2, test-3) with only 2 test starts.
             // Pairs: a@@test-1→10, a@@test-2→11. checkInteriorGap = (3 === 2) → false.
             //
             // However, inspector 11 has url='tests/b.test.ts' (simulates a cross-file scenario).
@@ -342,11 +353,11 @@ describe('mapCoverageToInspectorIds', () => {
                 perTest:  {
                     'tests/a.test.ts@@test-1': { '1': 1 },
                     'tests/a.test.ts@@test-2': { '2': 1 },
-                    'tests/a.test.ts@@test-3': { '3': 1 }, // excess key → retry (no warning)
+                    'tests/a.test.ts@@test-3': { '3': 1 }, // excess key → orphaned
                 },
             };
 
-            // Only 2 non-skipped inspectors → global excess (3 keys > 2 inspectors)
+            // Only 2 test starts → global excess (3 keys > 2 starts)
             // Inspector 11 has b.test.ts URL — if interior-gap check ran, pair[1] would trigger warn
             const executionOrder = [10, 11];
             const testHierarchy = new Map<number, TestInfo>([
@@ -357,8 +368,10 @@ describe('mapCoverageToInspectorIds', () => {
             const logger = makeLogger();
             mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy, logger);
 
-            // No interior-gap warning — the check must NOT run when keys > inspectors
-            expect(logger.warn).not.toHaveBeenCalled();
+            // No interior-gap warning — the check must NOT run when keys > starts
+            // (the only warn is the orphaned-key one for the excess key).
+            expect(logger.warn).not.toHaveBeenCalledWith(expect.stringContaining('Interior coverage gap'), expect.anything(), expect.anything());
+            expect(logger.warn).toHaveBeenCalledTimes(1);
         });
 
         it('sorts file-prefixed counter IDs numerically within a file after positional pairing', () => {
@@ -460,13 +473,13 @@ describe('mapCoverageToInspectorIds', () => {
             // suffix index (the `existingIndex !== undefined` branch) so that coverage is merged
             // into the same perTest entry as the first attempt.
             //
-            // Setup: 2 it.each inspectors (10, 20) sharing the same fullName, plus 1 excess
-            // key (test-3 → clamped to inspector 20 since N=3 > fileIds.length=2).
+            // Setup: 2 it.each inspectors (10, 20) sharing the same fullName; inspector 20 is
+            // retried once, so it starts twice and records two keys (test-2 and test-3).
             //
             // nameInspectorIds['Suite > shared'] = {10, 20} → count=2 → dedup enabled
             // test-1 → inspector 10 → key_="10/..." → existingIndex=undefined → assign [0]
             // test-2 → inspector 20 → key_="20/..." → existingIndex=undefined → assign [1]
-            // test-3 → inspector 20 (clamped) → key_="20/..." → existingIndex=1 → reuse [1]
+            // test-3 → inspector 20 (retry) → key_="20/..." → existingIndex=1 → reuse [1]
             //   • Mutant (always-true): assigns NEW index [2] → wrong key, test-3 lost
             //   • Mutant (empty string): returns "" → wrong key, test-3 lost
             const rawCoverage: MutantCoverage = {
@@ -474,11 +487,11 @@ describe('mapCoverageToInspectorIds', () => {
                 perTest:  {
                     'tests/c.test.ts@@test-1': { '1': 1 },
                     'tests/c.test.ts@@test-2': { '2': 1 },
-                    'tests/c.test.ts@@test-3': { '3': 1 }, // excess → clamped to inspector 20
+                    'tests/c.test.ts@@test-3': { '3': 1 }, // second attempt of inspector 20
                 },
             };
 
-            const executionOrder = [10, 20];
+            const executionOrder = [10, 20, 20];
             const testHierarchy = new Map<number, TestInfo>([
                 [10, { id: 10, name: 'shared', fullName: 'Suite > shared', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/c.test.ts', status: 'pass' }],
                 [20, { id: 20, name: 'shared', fullName: 'Suite > shared', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/c.test.ts', status: 'pass' }],
@@ -585,21 +598,18 @@ describe('mapCoverageToInspectorIds', () => {
             expect(logger.warn).not.toHaveBeenCalled();
         });
 
-        it('should skip skipped tests when pairing coverage keys with inspector tests', () => {
-            // Bun fires TestReporter.start for skipped tests, so they appear in executionOrder.
-            // However, beforeEach does NOT run for skipped tests, so no counter key is created.
-            // The positional pairing must skip over skipped inspector tests.
+        it('pairs around a skipped test, which bun never starts (it gets only an end event and no beforeEach)', () => {
+            // Observed with bun 1.3.7, 1.3.14 and 1.4.2: test.skip, skipIf, if(false),
+            // describe.skip and pending tests fire no TestReporter.start, so they are not in
+            // executionOrder at all.
             const rawCoverage: MutantCoverage = {
                 'static': {},
                 perTest:  {
-                    'tests/a.test.ts@@test-1': { '1': 1 }, // first non-skipped test
-                    'tests/a.test.ts@@test-2': { '2': 1 }, // second non-skipped test (skip is in between)
+                    'tests/a.test.ts@@test-1': { '1': 1 },
+                    'tests/a.test.ts@@test-2': { '2': 1 },
                 },
             };
-
-            // executionOrder includes the skipped test (inspector fires start for all)
-            // test 10: run (pass), test 11: skip, test 12: run (pass)
-            const executionOrder = [10, 11, 12];
+            const executionOrder = [10, 12];
             const testHierarchy = new Map<number, TestInfo>([
                 [10, { id: 10, name: 'first',   fullName: 'first',   type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/a.test.ts', status: 'pass' }],
                 [11, { id: 11, name: 'skipped', fullName: 'skipped', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/a.test.ts', status: 'skip' }],
@@ -609,9 +619,6 @@ describe('mapCoverageToInspectorIds', () => {
             const logger = makeLogger();
             const { coverage: result } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy, logger);
 
-            // Positional pairing skips inspector 11 (status=skip) → no counter key for it
-            // test-1 → pos 0 of non-skipped → inspector 10 (first)
-            // test-2 → pos 1 of non-skipped → inspector 12 (third, not skipped)
             expect(result!.perTest).toEqual({
                 'tests/a.test.ts > first': { '1': 1 },
                 'tests/a.test.ts > third': { '2': 1 },
@@ -619,30 +626,34 @@ describe('mapCoverageToInspectorIds', () => {
             expect(logger.warn).not.toHaveBeenCalled();
         });
 
-        it('should skip pending tests (status="todo") when pairing coverage keys with inspector tests', () => {
-            // Pending tests (created via the pending-test API) appear in executionOrder but have no beforeEach
+        it('pairs a todo test that bun --todo started with its own coverage key, never a neighbour\'s', () => {
+            // Observed with bun 1.4.2: bun's include-pending flag runs a pending test that has a
+            // body. It fires TestReporter.start, the preload's beforeEach records a key, and it
+            // still ends with the pending status. Every start is paired, whatever its status.
             const rawCoverage: MutantCoverage = {
                 'static': {},
                 perTest:  {
                     'tests/a.test.ts@@test-1': { '1': 1 },
                     'tests/a.test.ts@@test-2': { '2': 1 },
+                    'tests/a.test.ts@@test-3': { '3': 1 },
                 },
             };
-
             const executionOrder = [10, 11, 12];
             const testHierarchy = new Map<number, TestInfo>([
                 [10, { id: 10, name: 'first', fullName: 'first', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/a.test.ts', status: 'pass' }],
                 [11, { id: 11, name: 'todo',  fullName: 'todo',  type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/a.test.ts', status: 'todo' }],
-                [12, { id: 12, name: 'third', fullName: 'third', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/a.test.ts', status: 'pass' }],
+                [12, { id: 12, name: 'third', fullName: 'third', type: 'test', url: 'file:///.stryker-tmp/sandbox-X/tests/a.test.ts', status: 'skip' }],
             ]);
 
             const logger = makeLogger();
-            const { coverage: result } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy, logger);
+            const { coverage: result, orphanedKeyCount } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy, logger);
 
             expect(result!.perTest).toEqual({
                 'tests/a.test.ts > first': { '1': 1 },
-                'tests/a.test.ts > third': { '2': 1 },
+                'tests/a.test.ts > todo':  { '2': 1 },
+                'tests/a.test.ts > third': { '3': 1 },
             });
+            expect(orphanedKeyCount).toBe(0);
             expect(logger.warn).not.toHaveBeenCalled();
         });
 
@@ -1762,13 +1773,8 @@ describe('buildInspectorIdToProjectFile', () => {
             'tests/a.test.ts@@test-2',
         ];
         const executionOrder = [10, 20, 11];
-        const testHierarchy = new Map<number, TestInfo>([
-            [10, { id: 10, name: 'a-first',  fullName: 'a-first',  type: 'test', status: 'pass' }],
-            [11, { id: 11, name: 'a-second', fullName: 'a-second', type: 'test', status: 'pass' }],
-            [20, { id: 20, name: 'b-first',  fullName: 'b-first',  type: 'test', status: 'pass' }],
-        ]);
 
-        const result = buildInspectorIdToProjectFile(perTestKeys, executionOrder, testHierarchy);
+        const result = buildInspectorIdToProjectFile(perTestKeys, executionOrder);
 
         expect(result.get(10)).toBe('tests/a.test.ts');
         expect(result.get(20)).toBe('tests/b.test.ts');
@@ -1776,62 +1782,39 @@ describe('buildInspectorIdToProjectFile', () => {
     });
 
     it('skips skipped tests when building the mapping', () => {
+        // Bun never starts a skipped test (id 11 here), so it is not in executionOrder at all.
         const perTestKeys = ['tests/a.test.ts@@test-1', 'tests/a.test.ts@@test-2'];
-        // test 11 is skip — no counter key for it
-        const executionOrder = [10, 11, 12];
-        const testHierarchy = new Map<number, TestInfo>([
-            [10, { id: 10, name: 'first',   fullName: 'first',   type: 'test', status: 'pass' }],
-            [11, { id: 11, name: 'skipped', fullName: 'skipped', type: 'test', status: 'skip' }],
-            [12, { id: 12, name: 'third',   fullName: 'third',   type: 'test', status: 'pass' }],
-        ]);
+        const executionOrder = [10, 12];
 
-        const result = buildInspectorIdToProjectFile(perTestKeys, executionOrder, testHierarchy);
+        const result = buildInspectorIdToProjectFile(perTestKeys, executionOrder);
 
         expect(result.get(10)).toBe('tests/a.test.ts');
         expect(result.has(11)).toBe(false); // skipped, not in mapping
         expect(result.get(12)).toBe('tests/a.test.ts');
     });
 
-    it('skips pending tests when building the mapping', () => {
-        // Bun fires TestReporter.start for pending tests but does NOT run beforeEach,
-        // so no counter key is produced. Pending tests must be excluded from the
-        // positional pairing — exercising the status !== pending guard.
-        const perTestKeys = ['tests/a.test.ts@@test-1', 'tests/a.test.ts@@test-2'];
-        // test 11 is pending — no counter key for it
+    it('maps every started test, in start order', () => {
+        const perTestKeys = ['tests/a.test.ts@@test-1', 'tests/b.test.ts@@test-1', 'tests/b.test.ts@@test-2'];
         const executionOrder = [10, 11, 12];
-        const testHierarchy = new Map<number, TestInfo>([
-            [10, { id: 10, name: 'first',   fullName: 'first',   type: 'test', status: 'pass' }],
-            [11, { id: 11, name: 'pending', fullName: 'pending', type: 'test', status: 'todo' }],
-            [12, { id: 12, name: 'third',   fullName: 'third',   type: 'test', status: 'pass' }],
-        ]);
 
-        const result = buildInspectorIdToProjectFile(perTestKeys, executionOrder, testHierarchy);
+        const result = buildInspectorIdToProjectFile(perTestKeys, executionOrder);
 
-        expect(result.get(10)).toBe('tests/a.test.ts');
-        expect(result.has(11)).toBe(false); // pending, not in mapping
-        expect(result.get(12)).toBe('tests/a.test.ts');
+        expect([...result]).toEqual([[10, 'tests/a.test.ts'], [11, 'tests/b.test.ts'], [12, 'tests/b.test.ts']]);
     });
 
     it('maps test with node_modules url to user project file from counter key', () => {
         // RuleTester-style: testInfo.url points to node_modules but counter key is the user's file
         const perTestKeys = ['tests/my-rule.test.ts@@test-1', 'tests/my-rule.test.ts@@test-2'];
         const executionOrder = [10, 11];
-        const testHierarchy = new Map<number, TestInfo>([
-            [10, { id: 10, name: 'valid 0',   fullName: 'valid 0',   type: 'test', url: 'node_modules/eslint/lib/rule-tester/rule-tester.js', status: 'pass' }],
-            [11, { id: 11, name: 'invalid 0', fullName: 'invalid 0', type: 'test', url: 'node_modules/eslint/lib/rule-tester/rule-tester.js', status: 'pass' }],
-        ]);
 
-        const result = buildInspectorIdToProjectFile(perTestKeys, executionOrder, testHierarchy);
+        const result = buildInspectorIdToProjectFile(perTestKeys, executionOrder);
 
         expect(result.get(10)).toBe('tests/my-rule.test.ts');
         expect(result.get(11)).toBe('tests/my-rule.test.ts');
     });
 
     it('returns empty map when there are no counter keys', () => {
-        const result = buildInspectorIdToProjectFile([], [10, 11], new Map([
-            [10, { id: 10, name: 'a', fullName: 'a', type: 'test' as const, status: 'pass' as const }],
-            [11, { id: 11, name: 'b', fullName: 'b', type: 'test' as const, status: 'pass' as const }],
-        ]));
+        const result = buildInspectorIdToProjectFile([], [10, 11]);
 
         expect(result.size).toBe(0);
     });
@@ -1839,13 +1822,8 @@ describe('buildInspectorIdToProjectFile', () => {
     it('handles partial mapping when counter keys are fewer than inspector tests', () => {
         const perTestKeys = ['tests/a.test.ts@@test-1'];
         const executionOrder = [10, 11, 12];
-        const testHierarchy = new Map<number, TestInfo>([
-            [10, { id: 10, name: 'first',  fullName: 'first',  type: 'test', status: 'pass' }],
-            [11, { id: 11, name: 'second', fullName: 'second', type: 'test', status: 'pass' }],
-            [12, { id: 12, name: 'third',  fullName: 'third',  type: 'test', status: 'pass' }],
-        ]);
 
-        const result = buildInspectorIdToProjectFile(perTestKeys, executionOrder, testHierarchy);
+        const result = buildInspectorIdToProjectFile(perTestKeys, executionOrder);
 
         // Only 1 counter key → only the first test is mapped
         expect(result.get(10)).toBe('tests/a.test.ts');
@@ -1864,12 +1842,8 @@ describe('buildInspectorIdToProjectFile', () => {
             'malformed-key',            // no @@ — whole key should be the prefix
         ];
         const executionOrder = [10, 11];
-        const testHierarchy = new Map<number, TestInfo>([
-            [10, { id: 10, name: 'first',  fullName: 'first',  type: 'test', status: 'pass' }],
-            [11, { id: 11, name: 'second', fullName: 'second', type: 'test', status: 'pass' }],
-        ]);
 
-        const result = buildInspectorIdToProjectFile(perTestKeys, executionOrder, testHierarchy);
+        const result = buildInspectorIdToProjectFile(perTestKeys, executionOrder);
 
         // The well-formed key extracts the correct prefix
         expect(result.get(10)).toBe('tests/a.test.ts');
@@ -1995,16 +1969,31 @@ describe('orphaned-key reporting', () => {
         expect(mapCoverageToInspectorIds({ 'static': {}, perTest: {} }, [], new Map())).toMatchObject({ rawKeyCount: 0, orphanedKeyCount: 0 });
     });
 
-    it('legacy ("test-N") format populates rawKeyCount but stays gate-blind: orphanedKeyCount is always 0', () => {
-        // Legacy format has no per-file pairing to orphan against — Signal A (which does not
-        // depend on coverage format) is the only protection for this path; see A6.
+    it('legacy ("test-N") format counts as orphaned every key it could not credit to a test', () => {
         const rawCoverage: MutantCoverage = {
             'static': {},
             perTest:  {
                 'test-1': { '1': 1 },
-                // test-2 missing — a genuine mismatch, but still not counted as "orphaned"
-                // for this format.
+                'test-2': { '2': 1 }, // its test start (11) has no found event
+                'test-3': { '3': 1 }, // no test start at all
             },
+        };
+        const executionOrder = [10, 11];
+        const testHierarchy = new Map<number, TestInfo>([
+            [10, { id: 10, name: 'first', fullName: 'first', type: 'test' }],
+        ]);
+
+        const { coverage, rawKeyCount, orphanedKeyCount } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy, makeLogger());
+
+        expect(coverage!.perTest).toEqual({ first: { '1': 1 } });
+        expect(rawKeyCount).toBe(3);
+        expect(orphanedKeyCount).toBe(2);
+    });
+
+    it('legacy ("test-N") format orphans nothing when every key is credited, and leaves the shortfall to the gate', () => {
+        const rawCoverage: MutantCoverage = {
+            'static': {},
+            perTest:  { 'test-1': { '1': 1 } },
         };
         const executionOrder = [10, 11];
         const testHierarchy = new Map<number, TestInfo>([
@@ -2012,7 +2001,7 @@ describe('orphaned-key reporting', () => {
             [11, { id: 11, name: 'second', fullName: 'second', type: 'test' }],
         ]);
 
-        const { rawKeyCount, orphanedKeyCount } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy);
+        const { rawKeyCount, orphanedKeyCount } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testHierarchy, makeLogger());
 
         expect(rawKeyCount).toBe(1);
         expect(orphanedKeyCount).toBe(0);
@@ -2174,7 +2163,7 @@ describe('hit totals (what Stryker sizes each mutant\'s hitLimit from)', () => {
             perTest:  {
                 'tests/a.test.ts@@test-1': { '10': 5, '20': 7 },
                 'tests/a.test.ts@@test-2': { '20': 11, '30': 13 },
-                // excess key: a retry of the last test, folded into it
+                // a retry of the last test (its second start), merged into it
                 'tests/a.test.ts@@test-3': { '10': 17, '30': 19 },
             },
         };
@@ -2183,7 +2172,7 @@ describe('hit totals (what Stryker sizes each mutant\'s hitLimit from)', () => {
             [2, { id: 2, name: 'two', fullName: 'two', type: 'test', url: fileUrl('tests/a.test.ts') }],
         ]);
 
-        const { coverage } = mapCoverageToInspectorIds(rawCoverage, [1, 2], testHierarchy);
+        const { coverage } = mapCoverageToInspectorIds(rawCoverage, [1, 2, 2], testHierarchy);
 
         expect(strykerHitTotals(coverage!)).toEqual(strykerHitTotals(rawCoverage));
         expect(strykerHitTotals(coverage!)).toEqual({ '10': 24, '20': 18, '30': 32 });

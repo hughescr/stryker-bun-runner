@@ -3501,7 +3501,49 @@ tests/example.test.ts:
             expect(result.summaryPassed).toBe(0);
             expect(result.summaryFailed).toBe(0);
             expect(result.summarySkipped).toBe(0);
+            expect(result.summaryTodo).toBe(0);
             expect(result.summaryErrors).toBe(0);
+        });
+
+        it('reads bun\'s " N todo" summary line, which counts todo tests apart from skipped ones', () => {
+            // Real bun 1.4.2 summary for 17 passing, 5 skipped and 2 pending tests.
+            const result = parseBunTestOutput('', ' 17 pass\n 5 skip\n 2 todo\n 0 fail\nRan 24 tests across 3 files. [49.00ms]\n');
+
+            expect(result.summaryPassed).toBe(17);
+            expect(result.summarySkipped).toBe(5);
+            expect(result.summaryTodo).toBe(2);
+            expect(result.summaryFailed).toBe(0);
+        });
+
+        it('takes the last " N todo" line', () => {
+            const result = parseBunTestOutput(' 9 todo\n', ' 1 pass\n 3 todo\n 0 fail\n');
+
+            expect(result.summaryTodo).toBe(3);
+        });
+
+        it('reads the summary under FORCE_COLOR, where bun puts the colour code between the space and the count of the skip and todo lines', () => {
+            // Byte-exact bun 1.4.2 (and 1.3.7) summary with FORCE_COLOR=1.
+            const stderr = '\u001B[0m\u001B[32m 17 pass\u001B[0m\n \u001B[0m\u001B[33m5 skip\u001B[0m\n \u001B[0m\u001B[35m2 todo\u001B[0m\n'
+              + '\u001B[0m\u001B[2m 0 fail\u001B[0m\nRan 24 tests across 3 files. \u001B[0m\u001B[2m[\u001B[1m9.00ms\u001B[0m\u001B[2m]\u001B[0m\n';
+            const result = parseBunTestOutput('', stderr);
+
+            expect(result.summaryPassed).toBe(17);
+            expect(result.summarySkipped).toBe(5);
+            expect(result.summaryTodo).toBe(2);
+            expect(result.summaryFailed).toBe(0);
+        });
+
+        it('reads the --dots summary under FORCE_COLOR, which has no leading space at all', () => {
+            // Byte-exact bun 1.4.2 `--dots` summary with FORCE_COLOR=1.
+            const stderr = '\u001B[0m\u001B[32m17 pass\u001B[0m\n\u001B[0m\u001B[33m5 skip\u001B[0m\n\u001B[0m\u001B[35m2 todo\u001B[0m\n'
+              + '\u001B[0m\u001B[2m0 fail\u001B[0m\nRan 24 tests across 3 files. \u001B[0m\u001B[2m[\u001B[1m9.00ms\u001B[0m\u001B[2m]\u001B[0m\n';
+            const result = parseBunTestOutput('..............\n', stderr);
+
+            expect(result.summaryPassed).toBe(17);
+            expect(result.summarySkipped).toBe(5);
+            expect(result.summaryTodo).toBe(2);
+            expect(result.summaryFailed).toBe(0);
+            expect(result.passed).toBe(17);
         });
     });
 

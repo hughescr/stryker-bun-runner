@@ -16,6 +16,7 @@ import { BunTestRunner } from '../../src/bun-test-runner.js';
 import * as coverageCollector from '../../src/coverage/collector.js';
 import * as coverageMapper from '../../src/coverage/coverage-mapper.js';
 import * as preloadGenerator from '../../src/coverage/preload-generator.js';
+import * as dryRunCompleteness from '../../src/dry-run-completeness.js';
 import * as inspectorModule from '../../src/inspector/inspector-client.js';
 import type { UnexpectedCloseContext, RequestStallInfo } from '../../src/inspector/inspector-client.js';
 import type { TestInfo } from '../../src/inspector/types.js';
@@ -35,6 +36,7 @@ import { mockGetAvailablePort, mockRename, mockWriteFile, resetAllMocks, resetFs
 // coverage-mapper implementation running alongside the real buildTestsFromInspector dedup
 // logic in the same dryRun() call, instead of the mocked pass-through used everywhere else.
 const realMapCoverageToInspectorIds = coverageMapper.mapCoverageToInspectorIds;
+const realFindDryRunDataLoss = dryRunCompleteness.findDryRunDataLoss;
 
 /**
  * Mirrors the run's private temp directory formula (src/utils/private-temp-dir.ts
@@ -122,6 +124,7 @@ describe('BunTestRunner', () => {
     let syncServerSpy: ReturnType<typeof spyOn>;
     let inspectorClientSpy: ReturnType<typeof spyOn>;
     let mapCoverageToInspectorIdsSpy: ReturnType<typeof spyOn>;
+    let findDryRunDataLossSpy: ReturnType<typeof spyOn>;
     let discoverTestFilesSpy: ReturnType<typeof spyOn>;
     let resolveEagerModulesFromGlobsSpy: ReturnType<typeof spyOn>;
     let checkBunVersionSpy: ReturnType<typeof spyOn>;
@@ -209,6 +212,11 @@ describe('BunTestRunner', () => {
         // Mock coverage mapper
         mockMapCoverageToInspectorIds = mock();
         mapCoverageToInspectorIdsSpy = spyOn(coverageMapper, 'mapCoverageToInspectorIds').mockImplementation(mockMapCoverageToInspectorIds);
+        // The dry-run completeness checks compare bun's summary, the inspector events and
+        // the coverage keys exactly; most dry runs below mock only what their own feature
+        // needs. The 'dry-run completeness gate' describe restores the real checks (and
+        // src/dry-run-completeness.ts has its own unit tests).
+        findDryRunDataLossSpy = spyOn(dryRunCompleteness, 'findDryRunDataLoss').mockReturnValue([]);
         // Default: wrap coverage in the new { coverage, inspectorIdToProjectFile, counterKeyToTestName, rawKeyCount, orphanedKeyCount } shape (tests can override if needed)
         // eslint-disable-next-line @typescript-eslint/no-explicit-any -- intentional pass-through mock
         mockMapCoverageToInspectorIds.mockImplementation((coverage: any) => ({ coverage, inspectorIdToProjectFile: new Map(), counterKeyToTestName: new Map(), rawKeyCount: 0, orphanedKeyCount: 0 }));
@@ -296,6 +304,7 @@ describe('BunTestRunner', () => {
         inspectorClientSpy.mockRestore();
 
         mapCoverageToInspectorIdsSpy.mockRestore();
+        findDryRunDataLossSpy.mockRestore();
 
         discoverTestFilesSpy.mockRestore();
 
@@ -10711,6 +10720,10 @@ error: Third failure message
     // Covers the dry-run completeness gate + inspector-socket drain, guarding against a
     // silently truncated inspector event stream, plus duplicate-suffix reconciliation.
     describe('dry-run completeness gate', () => {
+        beforeEach(() => {
+            findDryRunDataLossSpy.mockImplementation(realFindDryRunDataLoss);
+        });
+
         /** Build a healthy N-test hierarchy/executionOrder pair, all status 'pass'. */
         function healthyHierarchy(n: number): TestInfo[] {
             return Array.from({ length: n }, (_, i) => ({
@@ -10759,20 +10772,27 @@ error: Third failure message
             expect(callOrder.indexOf('getExecutionOrder')).toBeGreaterThan(callOrder.indexOf('waitForClose'));
         });
 
-        it('Signal A fires: executionOrder truncated ~35% vs console summary counts on an otherwise-green run', async () => {
-            // Reproduces the incident shape: 100 tests per bun's own summary, but only 65
-            // ids ever reached the inspector's executionOrder (a truncated stream) — all 65
-            // that DID arrive report status 'pass', so the run otherwise looks green.
-            mockRunBunTests.mockImplementation(
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
-                (options: any) => {
-                    if(options.onInspectorReady) {
-                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
-                    }
-                    return Promise.resolve({ exitCode: 0, stdout: ' 100 pass\n 0 fail\n', stderr: '', timedOut: false });
-                }
-            );
-            const hierarchy = healthyHierarchy(65);
+        /** Make the next bun child report `stdout` and exit with `exitCode`. */
+        function mockBunRun(stdout: string, exitCode = 0): void {
+            mockRunBunTests.mockImplementation((options: { onInspectorReady?: (url: string) => void }) => {
+                options.onInspectorReady?.('ws://127.0.0.1:6499/inspector');
+                return Promise.resolve({ exitCode, stdout, stderr: '', timedOut: false });
+            });
+        }
+
+        /** The full gate error for these reasons (see checkCompletenessGate). */
+        function gateError(...reasons: string[]): string {
+            return 'stryker-bun-runner: dry run data-completeness check failed — '
+              + `${reasons.join('; ')}. Completing this dry run would hand Stryker test results or coverage that are silently `
+              + 'missing or credited to the wrong tests, so it is reported as an error instead, and the test registry has NOT '
+              + 'been persisted. If a cause named above is in your test suite, fix it there; otherwise re-run the dry run, and '
+              + 'if this recurs, please report it at https://github.com/hughescr/stryker-bun-runner/issues with this message, '
+              + 'your bun version and a debug log (logLevel: \'debug\').';
+        }
+
+        it('fails a run that lost a single test: bun counted one more passing test than the inspector reported (no slack)', async () => {
+            mockBunRun(' 5 pass\n 0 fail\n');
+            const hierarchy = healthyHierarchy(4);
             mockInspectorClient.getTests.mockReturnValue(hierarchy);
             mockInspectorClient.getExecutionOrder.mockReturnValue(hierarchy.map(t => t.id));
 
@@ -10780,54 +10800,113 @@ error: Third failure message
             await runner.init();
             const result = await runner.dryRun();
 
-            expect(result.status).toBe(DryRunStatus.Error);
-            if(result.status === DryRunStatus.Error) {
-                // All counts named in the message.
-                expect(result.errorMessage).toContain('100'); // consoleTotal
-                expect(result.errorMessage).toContain('65');  // nonSkippedExecutionCount
-                expect(result.errorMessage).toContain('35');  // shortfall
-            }
+            const expected = gateError('bun\'s summary counts 5 passing test(s), but the Bun inspector reported 4: test events were lost or merged on the way from bun to the runner');
+            expect(result).toEqual({ status: DryRunStatus.Error, errorMessage: expected });
+            expect(mockLogger.error).toHaveBeenCalledWith('%s', expected);
         });
 
-        it('gate fires reproducing the FULL incident shape: ~35% executionOrder truncation AND orphaned coverage keys above the floor, on an otherwise-green run', async () => {
-            // Reproduces the original production incident: bun's console summary
-            // reported the full 8,611-test suite, but executionOrder was truncated ~35% at a
-            // file boundary AND thousands of coverage keys for the dropped files were
-            // orphaned — both signals material simultaneously, on a run whose 65 arrived ids
-            // all report 'pass' (no Failed built test, so the gate is reachable at all).
-            mockRunBunTests.mockImplementation(
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
-                (options: any) => {
-                    if(options.onInspectorReady) {
-                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
-                    }
-                    return Promise.resolve({ exitCode: 0, stdout: ' 100 pass\n 0 fail\n', stderr: '', timedOut: false });
-                }
-            );
-            const hierarchy = healthyHierarchy(65);
+        it('fails the reported partial loss: 5 tests reduced to 2, with 2 of 5 coverage keys orphaned and the rest misattributed', async () => {
+            // The shape that used to pass as Complete with only an orphaned-key warn: below
+            // the old floors (shortfall > 10 and > 5%; more than 5 orphaned keys).
+            mockBunRun(' 5 pass\n 0 fail\n');
+            const hierarchy = healthyHierarchy(2);
             mockInspectorClient.getTests.mockReturnValue(hierarchy);
-            mockInspectorClient.getExecutionOrder.mockReturnValue(hierarchy.map(t => t.id));
+            mockInspectorClient.getExecutionOrder.mockReturnValue([1, 2]);
             mockCollectCoverage.mockResolvedValue({ 'static': {}, perTest: { x: { '1': 1 } } });
             mockMapCoverageToInspectorIds.mockReturnValue({
-                coverage: undefined, inspectorIdToProjectFile: new Map(), counterKeyToTestName: new Map(), rawKeyCount: 100, orphanedKeyCount: 35,
+                coverage: { 'static': {}, perTest: {} }, inspectorIdToProjectFile: new Map(), counterKeyToTestName: new Map(), rawKeyCount: 5, orphanedKeyCount: 2,
             });
 
             const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
             await runner.init();
             const result = await runner.dryRun();
 
-            expect(result.status).toBe(DryRunStatus.Error);
-            if(result.status === DryRunStatus.Error) {
-                // Signal A's counts.
-                expect(result.errorMessage).toContain('100'); // consoleTotal
-                expect(result.errorMessage).toContain('65');  // nonSkippedExecutionCount
-                expect(result.errorMessage).toContain('35');  // shortfall (also equals orphanedKeyCount here — both named regardless)
-                // Signal B's counts.
-                expect(result.errorMessage).toContain('orphaned');
-                // Both reasons present, not just whichever was checked first.
-                expect(result.errorMessage).toContain('execution order');
-                expect(result.errorMessage).toContain('coverage key');
+            expect(result).toEqual({
+                status:       DryRunStatus.Error,
+                errorMessage: gateError(
+                    'bun\'s summary counts 5 passing test(s), but the Bun inspector reported 2: test events were lost or merged on the way from bun to the runner',
+                    'the coverage preload recorded 5 per-test coverage key(s), one per test run (retries included), but the Bun inspector reported 2 test start(s): per-test coverage would be credited to the wrong tests',
+                    '2 of 5 per-test coverage key(s) matched no test the inspector reported, so their coverage would be dropped'
+                ),
+            });
+        });
+
+        it('completes a healthy run with a retried, a skipped and a todo test, and credits each attempt\'s coverage to the one retried test', async () => {
+            // Observed with bun 1.3.7, 1.3.14 and 1.4.2: a retried test starts once per attempt
+            // (one coverage key each) and ends once; skipped and pending tests never start.
+            mockMapCoverageToInspectorIds.mockImplementation(
+                (...args: Parameters<typeof realMapCoverageToInspectorIds>) => realMapCoverageToInspectorIds(...args)
+            );
+            mockBunRun(' 2 pass\n 1 skip\n 1 todo\n 0 fail\nRan 4 tests across 1 file.\n');
+            const url = '/project/tests/r.test.ts';
+            mockInspectorClient.getTests.mockReturnValue([
+                { id: 1, name: 'flaky', fullName: 'flaky', type: 'test', status: 'pass', url },
+                { id: 2, name: 'plain', fullName: 'plain', type: 'test', status: 'pass', url },
+                { id: 3, name: 'skipped', fullName: 'skipped', type: 'test', status: 'skip', url },
+                { id: 4, name: 'later', fullName: 'later', type: 'test', status: 'todo', url },
+            ]);
+            mockInspectorClient.getExecutionOrder.mockReturnValue([1, 1, 1, 2]);
+            mockCollectCoverage.mockResolvedValue({
+                'static': {},
+                perTest:  {
+                    'tests/r.test.ts@@test-1': { a1: 1 },
+                    'tests/r.test.ts@@test-2': { a2: 1 },
+                    'tests/r.test.ts@@test-3': { a3: 1 },
+                    'tests/r.test.ts@@test-4': { p: 1 },
+                },
+            });
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            const result = await runner.dryRun({ coverageAnalysis: 'perTest' } as Parameters<BunTestRunner['dryRun']>[0]);
+
+            expect(result.status).toBe(DryRunStatus.Complete);
+            if(result.status === DryRunStatus.Complete) {
+                expect(result.tests.map(t => [t.id, t.status])).toEqual([
+                    ['tests/r.test.ts > flaky', TestStatus.Success],
+                    ['tests/r.test.ts > plain', TestStatus.Success],
+                ]);
+                expect(result.mutantCoverage?.perTest).toEqual({
+                    'tests/r.test.ts > flaky': { a1: 1, a2: 1, a3: 1 },
+                    'tests/r.test.ts > plain': { p: 1 },
+                });
             }
+        });
+
+        it('fails when the coverage credits a test id that is not one of the dry run\'s tests (Stryker would drop that coverage)', async () => {
+            mockBunRun(' 1 pass\n 0 fail\n');
+            mockInspectorClient.getTests.mockReturnValue(healthyHierarchy(1));
+            mockInspectorClient.getExecutionOrder.mockReturnValue([1]);
+            mockCollectCoverage.mockResolvedValue({ 'static': {}, perTest: { x: { '1': 1 } } });
+            mockMapCoverageToInspectorIds.mockReturnValue({
+                coverage: { 'static': {}, perTest: { 'tests/healthy.test.ts > ghost': { '1': 1 } } }, inspectorIdToProjectFile: new Map(), counterKeyToTestName: new Map(), rawKeyCount: 1, orphanedKeyCount: 0,
+            });
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            const result = await runner.dryRun();
+
+            expect(result).toEqual({
+                status:       DryRunStatus.Error,
+                errorMessage: gateError('coverage was recorded under 1 test id(s) that this dry run does not report as tests (tests/healthy.test.ts > ghost), so Stryker would ignore that coverage'),
+            });
+        });
+
+        it('fails when bun reported a test id as found more than once (two tests merged under one id)', async () => {
+            mockBunRun(' 3 pass\n 0 fail\n');
+            const hierarchy = healthyHierarchy(3);
+            mockInspectorClient.getTests.mockReturnValue(hierarchy);
+            mockInspectorClient.getExecutionOrder.mockReturnValue(hierarchy.map(t => t.id));
+            mockInspectorClient.getFoundIdCollisionStats.mockReturnValue({ rawFoundCount: 4, uniqueFoundIdCount: 3, duplicateFoundIdCount: 1 });
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            const result = await runner.dryRun();
+
+            expect(result).toEqual({
+                status:       DryRunStatus.Error,
+                errorMessage: gateError('1 TestReporter.found event(s) reused a test id already seen, merging distinct tests under one id'),
+            });
         });
 
         it('gate does NOT evaluate when the built tests already contain a Failed entry (A1)', async () => {
@@ -10924,19 +11003,12 @@ error: Third failure message
             expect(result.status).toBe(DryRunStatus.Complete);
         });
 
-        it('Signal A does not fire when a custom --reporter bunArg zeros out the console summary on an otherwise-healthy run', async () => {
-            // A non-default reporter (e.g. --reporter=junit) produces no ' N pass'/' N fail'
-            // textual summary at all, so parsed.summaryPassed/summaryFailed are legitimately 0
-            // even on a fully healthy run. consoleTotal===0 must never fire Signal A.
-            mockRunBunTests.mockImplementation(
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
-                (options: any) => {
-                    if(options.onInspectorReady) {
-                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
-                    }
-                    return Promise.resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
-                }
-            );
+        it('fails a green run whose console output carries no summary at all: nothing can vouch for the inspector\'s count', async () => {
+            // bun 1.3.7 and 1.4.2 print their ' N pass' / ' N fail' summary with every
+            // reporter (--reporter=junit needs --reporter-outfile and still prints it),
+            // --dots and --only-failures, even when the count is 0. Its absence means the
+            // console output itself was lost.
+            mockBunRun('');
             const hierarchy = healthyHierarchy(50);
             mockInspectorClient.getTests.mockReturnValue(hierarchy);
             mockInspectorClient.getExecutionOrder.mockReturnValue(hierarchy.map(t => t.id));
@@ -10945,43 +11017,47 @@ error: Third failure message
             await runner.init();
             const result = await runner.dryRun();
 
-            expect(result.status).toBe(DryRunStatus.Complete);
+            expect(result).toEqual({
+                status:       DryRunStatus.Error,
+                errorMessage: gateError('bun\'s summary counts 0 passing test(s), but the Bun inspector reported 50: test events were lost or merged on the way from bun to the runner'),
+            });
         });
 
-        it('Signal A does not fire when console output is degraded to only \'Ran N tests\' on a healthy run with a meaningful skip count', async () => {
-            // Backlog item 5 fix (console-parser.ts): 100 executed + 20 skipped is a healthy
-            // run (>10 shortfall, >5% ratio if summaryPassed/summaryFailed were wrongly
-            // inferred from the 'Ran 120 tests' fallback: 120 vs 100 executed = a 20-test,
-            // ~17% shortfall — comfortably over both EXECUTION_SHORTFALL_ABS_FLOOR and
-            // EXECUTION_SHORTFALL_RATIO_THRESHOLD). Detailed ' N pass'/' N fail' summary lines
-            // are absent (degraded output, e.g. a custom reporter or truncated console
-            // capture) — only the 'Ran N tests' total-only fallback line is present. Because
-            // summaryPassed/summaryFailed must never be populated from that fallback, they
-            // stay 0, consoleTotal is 0, and Signal A's consoleTotal>0 guard keeps the gate
-            // from evaluating at all — the gate must NOT fire.
-            mockRunBunTests.mockImplementation(
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
-                (options: any) => {
-                    if(options.onInspectorReady) {
-                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
-                    }
-                    return Promise.resolve({ exitCode: 0, stdout: 'Ran 120 tests across 3 files. [500.00ms]', stderr: '', timedOut: false });
-                }
-            );
-            const hierarchy = healthyHierarchy(100);
-            for(let i = 0; i < 20; i++) {
-                hierarchy.push({
-                    id: 101 + i, name: `skipped ${i + 1}`, fullName: `skipped ${i + 1}`, type: 'test', status: 'skip', url: '/project/tests/healthy.test.ts',
-                });
-            }
+        it('compares skipped and todo counts too: a lost skipped test fails the run', async () => {
+            mockBunRun(' 2 pass\n 2 skip\n 1 todo\n 0 fail\n');
+            const hierarchy: TestInfo[] = [
+                ...healthyHierarchy(2),
+                { id: 3, name: 'skipped', fullName: 'skipped', type: 'test', status: 'skip', url: '/project/tests/healthy.test.ts' },
+                { id: 4, name: 'later', fullName: 'later', type: 'test', status: 'todo', url: '/project/tests/healthy.test.ts' },
+            ];
             mockInspectorClient.getTests.mockReturnValue(hierarchy);
-            mockInspectorClient.getExecutionOrder.mockReturnValue(hierarchy.map(t => t.id));
+            mockInspectorClient.getExecutionOrder.mockReturnValue([1, 2]);
 
             const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
             await runner.init();
             const result = await runner.dryRun();
 
-            expect(result.status).toBe(DryRunStatus.Complete);
+            expect(result).toEqual({
+                status:       DryRunStatus.Error,
+                errorMessage: gateError('bun\'s summary counts 2 skipped test(s), but the Bun inspector reported 1: test events were lost or merged on the way from bun to the runner'),
+            });
+        });
+
+        it('fails when a test\'s describe block never arrived as a found event (its name would lack the describe path)', async () => {
+            mockBunRun(' 1 pass\n 0 fail\n');
+            mockInspectorClient.getTests.mockReturnValue([
+                { id: 2, name: 'inner', fullName: 'inner', type: 'test', status: 'pass', parentId: 1, url: '/project/tests/healthy.test.ts' },
+            ]);
+            mockInspectorClient.getExecutionOrder.mockReturnValue([2]);
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            const result = await runner.dryRun();
+
+            expect(result).toEqual({
+                status:       DryRunStatus.Error,
+                errorMessage: gateError('1 test(s) or describe block(s) name a parent describe block whose TestReporter.found event never arrived, so their names lack part of the describe path'),
+            });
         });
 
         it('Signal A does not fire when totals match despite an interior cross-file pairing gap (matched totals precondition)', async () => {
@@ -11036,7 +11112,7 @@ error: Third failure message
             expect(result.status).toBe(DryRunStatus.Complete);
         });
 
-        it('Signal B fires via orphaned-key count alone, even when Signal A is not material', async () => {
+        it('fails on orphaned coverage keys alone, even when every count agrees', async () => {
             mockRunBunTests.mockImplementation(
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 (options: any) => {
@@ -11052,21 +11128,19 @@ error: Third failure message
             // A non-empty raw coverage object so collectAndRemapCoverage reaches
             // mapCoverageToInspectorIds instead of short-circuiting on a wholly-absent file.
             mockCollectCoverage.mockResolvedValue({ 'static': {}, perTest: { x: { '1': 1 } } });
-            // consoleTotal (20) matches nonSkippedExecutionCount (20) exactly — Signal A inert.
+            // The summary (20), the starts (20) and the key count (20) all agree.
             mockMapCoverageToInspectorIds.mockReturnValue({
-                coverage: undefined, inspectorIdToProjectFile: new Map(), counterKeyToTestName: new Map(), rawKeyCount: 20, orphanedKeyCount: 6,
+                coverage: undefined, inspectorIdToProjectFile: new Map(), counterKeyToTestName: new Map(), rawKeyCount: 20, orphanedKeyCount: 1,
             });
 
             const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
             await runner.init();
             const result = await runner.dryRun();
 
-            expect(result.status).toBe(DryRunStatus.Error);
-            if(result.status === DryRunStatus.Error) {
-                expect(result.errorMessage).toContain('6');
-                expect(result.errorMessage).toContain('20');
-                expect(result.errorMessage).toContain('orphaned');
-            }
+            expect(result).toEqual({
+                status:       DryRunStatus.Error,
+                errorMessage: gateError('1 of 20 per-test coverage key(s) matched no test the inspector reported, so their coverage would be dropped'),
+            });
         });
 
         it('includes a "closed unexpectedly" context sentence in the Error message iff wasClosedUnexpectedly is true, without changing whether the gate fires', async () => {
@@ -11090,10 +11164,13 @@ error: Third failure message
             const runner1 = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
             await runner1.init();
             const result1 = await runner1.dryRun();
-            expect(result1.status).toBe(DryRunStatus.Error);
-            if(result1.status === DryRunStatus.Error) {
-                expect(result1.errorMessage).toContain('closed unexpectedly');
-            }
+            expect(result1).toEqual({
+                status:       DryRunStatus.Error,
+                errorMessage: gateError(
+                    'bun\'s summary counts 100 passing test(s), but the Bun inspector reported 65: test events were lost or merged on the way from bun to the runner',
+                    'the inspector WebSocket also closed unexpectedly (close code/reason not captured), which is routine on its own and listed only as context'
+                ),
+            });
 
             buildScenario();
             mockInspectorClient.wasClosedUnexpectedly = false;

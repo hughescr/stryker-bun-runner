@@ -19,6 +19,7 @@ import { BunTestRunner } from '../../src/bun-test-runner.js';
 import * as coverageCollector from '../../src/coverage/collector.js';
 import * as coverageMapper from '../../src/coverage/coverage-mapper.js';
 import * as preloadGenerator from '../../src/coverage/preload-generator.js';
+import * as dryRunCompleteness from '../../src/dry-run-completeness.js';
 import * as inspectorModule from '../../src/inspector/inspector-client.js';
 import type { TestInfo } from '../../src/inspector/types.js';
 import * as processRunner from '../../src/process-runner.js';
@@ -97,6 +98,7 @@ describe('BunTestRunner mutation kill tests (first half of the runner)', () => {
     let syncServerSpy: ReturnType<typeof spyOn>;
     let inspectorClientSpy: ReturnType<typeof spyOn>;
     let mapCoverageToInspectorIdsSpy: ReturnType<typeof spyOn>;
+    let findDryRunDataLossSpy: ReturnType<typeof spyOn>;
     let discoverTestFilesSpy: ReturnType<typeof spyOn>;
     let resolveEagerModulesFromGlobsSpy: ReturnType<typeof spyOn>;
     let checkBunVersionSpy: ReturnType<typeof spyOn>;
@@ -187,6 +189,10 @@ describe('BunTestRunner mutation kill tests (first half of the runner)', () => {
         // Default: wrap coverage in the new { coverage, inspectorIdToProjectFile, counterKeyToTestName, rawKeyCount, orphanedKeyCount } shape (tests can override if needed)
         // eslint-disable-next-line @typescript-eslint/no-explicit-any -- intentional pass-through mock
         mockMapCoverageToInspectorIds.mockImplementation((coverage: any) => ({ coverage, inspectorIdToProjectFile: new Map(), counterKeyToTestName: new Map(), rawKeyCount: 0, orphanedKeyCount: 0 }));
+        // These dry runs mock only what their own diagnostics need; the exact completeness
+        // checks have their own tests (dry-run-completeness.test.ts and the 'dry-run
+        // completeness gate' describe in bun-test-runner.test.ts).
+        findDryRunDataLossSpy = spyOn(dryRunCompleteness, 'findDryRunDataLoss').mockReturnValue([]);
 
         // Default mock implementations
         mockCleanupCoverageFile.mockResolvedValue(undefined);
@@ -271,6 +277,7 @@ describe('BunTestRunner mutation kill tests (first half of the runner)', () => {
         inspectorClientSpy.mockRestore();
 
         mapCoverageToInspectorIdsSpy.mockRestore();
+        findDryRunDataLossSpy.mockRestore();
 
         discoverTestFilesSpy.mockRestore();
 
@@ -970,8 +977,9 @@ describe('BunTestRunner mutation kill tests (first half of the runner)', () => {
             mockCollectCoverage.mockResolvedValue({ perTest: {}, 'static': { '1': 1 } });
         });
 
-        // A "(fail)" line with no matching inspector test and no bun summary count: the dry run still
-        // completes (the completeness gate only trusts bun's summary), so the warning is all there is.
+        // A "(fail)" line with no matching inspector test and no bun fail count: the dry run still
+        // completes (the gate's unattributable-failure check only trusts bun's summary, and its
+        // data-loss checks are stubbed in this file), so the warning is all there is.
         const failLineOnly = '(fail) something else entirely [1.00ms]\n';
 
         it('warns with the exit code, the failure count and the last 500 characters of stderr', async () => {

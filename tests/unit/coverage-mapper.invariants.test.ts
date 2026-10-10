@@ -71,7 +71,7 @@ describe('retry merging in buildRemappedPerTest', () => {
             perTest:  {
                 'tests/a.test.ts@@test-1': { '30': 1 },
                 'tests/a.test.ts@@test-2': { '30': 13 },
-                // excess key: a retry of the last test, folded into it
+                // a retry of the last test (its second start), merged into it
                 'tests/a.test.ts@@test-3': { '30': 19 },
             },
         };
@@ -80,7 +80,7 @@ describe('retry merging in buildRemappedPerTest', () => {
             [2, { id: 2, name: 'two', fullName: 'two', type: 'test', url: fileUrl('tests/a.test.ts') }],
         ]);
 
-        const { coverage } = mapCoverageToInspectorIds(rawCoverage, [1, 2], testHierarchy);
+        const { coverage } = mapCoverageToInspectorIds(rawCoverage, [1, 2, 2], testHierarchy);
 
         expect(coverage).toEqual({
             'static': {},

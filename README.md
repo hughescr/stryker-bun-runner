@@ -475,23 +475,56 @@ the coverage it collected before handing it to Stryker:
 ### Dry-run completeness gate (dry run only)
 
 - **`stryker-bun-runner: dry run data-completeness check failed — ...`** — the dry
-  run otherwise looked healthy (no failed tests) but the runner detected that Bun's
-  inspector event stream may have been silently truncated mid-run: either the
-  inspector's execution order fell materially short of what Bun's own console
-  summary reported (`console reported <N> test(s) ... but the inspector's execution
-  order contains only <M> non-skipped test(s)`), or a meaningful number of coverage
-  keys couldn't be paired with any inspector test (`<N> of <M> coverage key(s) ...
-  could not be paired with any inspector test (orphaned)`) — the signature of one or
-  more whole test files being dropped from the stream, most often under CI runner
-  resource contention. When both are present, or the socket also closed
-  unexpectedly before the runner could finish reading it, the message names all of
-  them. This is a genuine `DryRunStatus.Error`, not a warning: proceeding on
-  truncated data would risk silently corrupted coverage attribution (mutants losing
-  their true killers), so the runner reports the error and does **not** persist the
-  test registry, rather than let other Stryker workers load a corrupted one. If you
-  see this, it usually means the CI runner was under heavier contention than usual;
-  retrying the run (with less concurrent load, or fewer parallel Stryker workers) is
-  the first thing to try.
+  run otherwise looked healthy (no failed tests), but the runner could not account
+  for every test bun ran or every per-test coverage key the preload recorded. A dry
+  run produces three records of the same run: bun's console summary, the
+  inspector's `TestReporter` events, and the coverage preload's per-test keys (one
+  each time a test starts). The gate compares them **exactly**, with no absolute or
+  percentage slack, because a single lost event is enough to credit coverage to the
+  wrong test or drop it, and Stryker would then score those mutants wrongly without
+  saying so. This is a genuine `DryRunStatus.Error`, not a warning: the runner
+  reports the error and does **not** persist the test registry, rather than let other
+  Stryker workers load a corrupted one. The message lists every problem found, with
+  its counts, joined by `; `:
+
+  | Problem in the message | What was lost | Likely cause |
+  |---|---|---|
+  | `bun's summary counts <N> passing (or skipped, or todo) test(s), but the Bun inspector reported <M>` | test events: some tests bun ran never reached the runner, or two tests were merged | inspector events lost between bun and the runner (for example under heavy CI load), or bun reused a test id |
+  | `<N> test(s) started but never reported a result` | `TestReporter.end` events | the same |
+  | `<N> test(s) reported a pass or fail result without a TestReporter.start event` | `TestReporter.start` events, so those tests' coverage cannot be paired with them | the same |
+  | `the coverage preload recorded <N> per-test coverage key(s), one per test run (retries included), but the Bun inspector reported <M> test start(s)` | the pairing of coverage with tests: every key after the first missing start would be credited to the wrong test | a lost start event, or a coverage key recorded by something other than the preload |
+  | `<N> of <M> per-test coverage key(s) matched no test the inspector reported` | that coverage, which used to be skipped silently | the same, or a whole test file missing from the inspector stream |
+  | `coverage was recorded under <N> test id(s) that this dry run does not report as tests (...)` | coverage Stryker would ignore (it drops perTest entries whose id is not a test of the dry run) | a naming disagreement inside the runner: please report it |
+  | `<N> TestReporter.found event(s) reused a test id already seen` | a test merged into another under one id | bun's `TestReporter` id collision |
+  | `<N> test(s) or describe block(s) name a parent describe block whose TestReporter.found event never arrived` | the describe path of those tests' names, which mutant runs need to select them | a lost `TestReporter.found` event |
+  | `bun's console summary reported <N> failing test(s), but none of them could be attributed to an individual test` | every failure in the run | a spec file that fails to load (the message includes the end of stderr) |
+
+  When the inspector socket also closed before the runner expected it, the message
+  adds that as context; on its own it is routine (bun closes the socket a few
+  milliseconds after the drain acknowledgment on every healthy run) and never fails
+  a dry run. If the cause is in your test suite, fix it there; otherwise re-run the
+  dry run first, since a loss caused by load on the machine does not recur. If it
+  does recur, please open an issue with the message, your bun version and a debug
+  log (`logLevel: 'debug'`).
+
+  Each comparison accounts exactly for what makes the records differ on healthy
+  runs, as observed with real bun 1.3.7, 1.3.14 and 1.4.2 children: skipped and
+  todo tests (`test.skip`, `skipIf`, `if(false)`, `describe.skip`, `test.todo`)
+  get an end event but are never started and record no coverage key, and bun
+  counts them on their own summary lines, so counts are compared per status; a
+  todo test that `bun test --todo` runs is started and records a key; a retried
+  test (`{ retry: N }`) is started, and records a key, once per attempt but is
+  counted once, so keys are compared with starts and statuses with distinct tests
+  (its attempts' coverage is merged into its one result); tests that `.only`
+  filters out are reported as found but never started or counted. `test.each` and
+  `describe.each` rows, duplicate titles, `test.failing`, `test.concurrent`, tests
+  defined in a shared helper module, `--randomize`, `--isolate`, `--dots`,
+  `--only-failures`, `--reporter=junit` and `FORCE_COLOR` (whose colour codes the
+  runner strips before reading the summary) all complete normally. Coverage
+  recorded while no test is running (module load, `beforeAll`, or between tests)
+  goes to Stryker's static coverage, which runs every test for that mutant, so it
+  is never lost; recording between tests is reported by the coverage-bleed warning
+  below.
 
   Before this check runs, the bun test child process (during `dryRun` only) holds
   itself open past its own natural exit and waits for the runner to prove — via an
@@ -535,17 +568,14 @@ the coverage it collected before handing it to Stryker:
   this gate) exactly as before, so the handshake can only reduce how often this
   gate fires, never mask a real truncation from it.
 
-  The gate's thresholds — `EXECUTION_SHORTFALL_ABS_FLOOR`, `EXECUTION_SHORTFALL_RATIO_THRESHOLD`,
-  `ORPHANED_KEY_ABS_FLOOR`, the drain wait `INSPECTOR_DRAIN_TIMEOUT_MS`, and the drain-handshake
-  bounds (`DRAIN_ACK_SILENCE_TIMEOUT_MS` and `DRAIN_ACK_ABSOLUTE_CEILING_MS`, both in
-  `src/bun-test-runner.ts`) — are fixed module-level constants. The matching preload-side
+  The gate has no thresholds to tune. The drain wait `INSPECTOR_DRAIN_TIMEOUT_MS` and the
+  drain-handshake bounds (`DRAIN_ACK_SILENCE_TIMEOUT_MS` and `DRAIN_ACK_ABSOLUTE_CEILING_MS`,
+  all in `src/bun-test-runner.ts`) are fixed module-level constants. The matching preload-side
   ceiling in `src/templates/coverage-preload.ts` is kept above the runner's absolute ceiling,
   so it remains the true outermost backstop even though it should now rarely if ever be the
   one that actually fires. There is currently no config option to override any of these; if
-  the defaults produce false positives in your environment (e.g. a CI runner with very
-  different contention characteristics than the ones this gate was tuned against), a config
-  knob is a possible follow-up — please open an issue rather than patching the constants
-  locally. Separately, the dry-run child process's own kill timeout is automatically extended
+  the gate fails dry runs in your environment that you believe are complete, please open an
+  issue with the message rather than patching the code locally. Separately, the dry-run child process's own kill timeout is automatically extended
   by the drain ceiling on top of `bun.timeout`, so the drain handshake itself never gets cut
   short by that watchdog. That watchdog covers the child's whole lifetime rather than being
   phase-specific, though, so as a side effect a dry run whose tests themselves hang (rather
@@ -604,8 +634,9 @@ the coverage it collected before handing it to Stryker:
   ids dense while silently merging two distinct tests under one shared id.
   That is exactly what the (DEBUG-level) close/collision diagnostics line's
   raw/unique/duplicate found counts exist to catch: a **nonzero duplicate
-  count is direct in-the-wild evidence of that id-collision bug** (and is
-  what puts the duplicate-event problem into the WARN line above), and the
+  count is direct in-the-wild evidence of that id-collision bug** (it puts
+  the duplicate-event problem into the WARN line above, and on an otherwise
+  green run it also fails the dry run through the completeness gate), and the
   close code/reason/wasClean fields confirm or rule out a separate confirmed
   Bun bug where `idleTimeout: 0` websockets are force-closed on a ~252-second
   ping cycle (`ERR_WEBSOCKET_TIMEOUT`) — a close with that reason landing

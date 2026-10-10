@@ -30,6 +30,7 @@ import { BunTestRunner } from '../../src/bun-test-runner.js';
 import * as coverageCollector from '../../src/coverage/collector.js';
 import * as coverageMapper from '../../src/coverage/coverage-mapper.js';
 import * as preloadGenerator from '../../src/coverage/preload-generator.js';
+import * as dryRunCompleteness from '../../src/dry-run-completeness.js';
 import * as inspectorModule from '../../src/inspector/inspector-client.js';
 import type { TestInfo } from '../../src/inspector/types.js';
 import * as processRunner from '../../src/process-runner.js';
@@ -144,6 +145,10 @@ describe('BunTestRunner cheapest-first file order and fixed test order in mutant
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- intentional pass-through mock
             (coverage: any) => ({ coverage, inspectorIdToProjectFile: new Map(), counterKeyToTestName: new Map(), rawKeyCount: 0, orphanedKeyCount: 0 })
         );
+        // These dry runs mock only the file order and durations they are about; the exact
+        // completeness checks have their own tests (dry-run-completeness.test.ts and the
+        // 'dry-run completeness gate' describe in bun-test-runner.test.ts).
+        spyOn(dryRunCompleteness, 'findDryRunDataLoss').mockReturnValue([]);
 
         // No real fs: the registry write goes to the mocked writeFile and is read back from writePrivateFile's calls.
         mockWriteFile.mockResolvedValue(undefined);

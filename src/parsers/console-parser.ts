@@ -23,30 +23,24 @@ export interface ParsedTestResults {
     skipped:        number
     duration?:      number
     /**
-   * `summaryPassed`/`summaryFailed` are sourced EXCLUSIVELY from bun's genuine
-   * ' N pass' / ' N fail' summary lines (plus the 'Bailed out after N
-   * failures' bail variant) — never from per-line ✓/✗ matches, and, just as
-   * importantly, never from the 'Ran N tests' fallback that {@link
-   * parseSummaryLines} uses to backfill `passed`/`failed`/`skipped` below. The
-   * 'Ran N tests' line counts skipped and not-yet-implemented tests too, while the dry-run
-   * completeness gate's inspector-side count deliberately excludes them —
-   * letting that fallback flow into these fields could false-fire the gate on
-   * a healthy run with a meaningful skip count whenever detailed pass/fail
-   * lines are absent from degraded console output. When only the fallback is
-   * available, summaryPassed/summaryFailed stay 0 (and `summarySkipped` is
-   * unaffected, since it's never touched by that fallback either) —
-   * structurally disarming the gate's Signal A, which is the safe direction.
+   * The summary* counts are sourced EXCLUSIVELY from bun's ' N pass' /
+   * ' N fail' / ' N skip' and pending-count summary lines (plus the 'Bailed
+   * out after N failures' bail variant), read with colour codes stripped — never from per-line ✓/✗ matches, and never
+   * from the 'Ran N tests' fallback that {@link parseSummaryLines} uses to
+   * backfill `passed`/`failed`/`skipped` below ('Ran N tests' counts every
+   * status at once). Each is 0 when its line is absent; bun prints the pass
+   * and fail lines on every run, even when their count is 0.
    * Unlike `passed`/`failed`/`skipped` above (which are `Math.max(perLine,
    * summary)`), these are summary-only so that per-ATTEMPT output from
    * retried tests (bun prints one error block per failed retry attempt, but
    * only ever one summary-counted outcome per test) can never inflate them.
-   * Added for the dry-run completeness gate's Signal A (see
-   * bun-test-runner.ts); existing consumers of passed/failed/skipped are
-   * untouched.
+   * The dry-run completeness gate (bun-test-runner.ts) compares each with
+   * the inspector's count of tests with that status.
    */
     summaryPassed:  number
     summaryFailed:  number
     summarySkipped: number
+    summaryTodo:    number
     /**
    * Bun's ' N error' / ' N errors' summary line: errors raised OUTSIDE any
    * single test — a test file whose import graph throws or fails to parse, a
@@ -272,6 +266,7 @@ interface SummaryCounts {
     passed:        number
     failed:        number
     skipped:       number
+    todo:          number
     /**
    * `passed`/`failed` as populated ONLY by genuine ' N pass' / ' N fail' (and
    * 'Bailed out after N failures') summary lines — never by the 'Ran N tests'
@@ -312,6 +307,8 @@ function parseSummaryLines(output: string): SummaryCounts {
     const failSummary = lastCount(output, /\s(\d+)\s+fail\b/g);
     // Stryker disable next-line Regex: word boundaries are defensive for summary parsing
     const skipSummary = lastCount(output, /\s(\d+)\s+skip\b/g);
+    // bun counts pending tests on a line of their own, apart from skipped ones.
+    const todoSummary = lastCount(output, /\s(\d+) todo\b/g) ?? 0;
     // Stryker disable next-line Regex: character classes are defensive for optional plural
     const bailSummary = lastCount(output, /Bailed out after (\d+) failures?/g);
 
@@ -332,11 +329,8 @@ function parseSummaryLines(output: string): SummaryCounts {
     }
 
     // Snapshot the genuine-only counts NOW, before the 'Ran N tests' fallback below can
-    // inflate `counts.passed`. 'Ran N tests' includes skipped and not-yet-implemented tests, while the
-    // dry-run completeness gate's inspector-side count (nonSkippedExecutionCount)
-    // excludes them — letting the fallback flow into summaryPassed/summaryFailed could
-    // false-fire the gate (DryRunStatus.Error) on a healthy run with a meaningful skip
-    // count whenever the detailed pass/fail summary lines are absent from degraded output.
+    // inflate `counts.passed`. 'Ran N tests' includes skipped and pending tests, while the
+    // dry-run completeness gate compares each status's count with the inspector's own.
     const genuinePassed = counts.passed;
     const genuineFailed = counts.failed;
 
@@ -353,7 +347,7 @@ function parseSummaryLines(output: string): SummaryCounts {
         }
     }
 
-    return { ...counts, genuinePassed, genuineFailed };
+    return { ...counts, todo: todoSummary, genuinePassed, genuineFailed };
 }
 
 /**
@@ -457,7 +451,10 @@ export function parseBunTestOutput(stdout: string, stderr: string, testFiles?: r
     finalizeErrorMessage(currentTest, errorLines);
 
     // Parse summary lines and use them as fallback for counts
-    const summaryCounts = parseSummaryLines(output);
+    // Without colour codes: under FORCE_COLOR bun puts them between the leading
+    // space and the count of its skip and pending lines, and with --dots there is no
+    // leading space at all, only the colour code.
+    const summaryCounts = parseSummaryLines(stripAnsi(output));
     counters.passed = Math.max(counters.passed, summaryCounts.passed);
     counters.failed = Math.max(counters.failed, summaryCounts.failed);
     counters.skipped = Math.max(counters.skipped, summaryCounts.skipped);
@@ -471,6 +468,7 @@ export function parseBunTestOutput(stdout: string, stderr: string, testFiles?: r
         summaryPassed:  summaryCounts.genuinePassed,
         summaryFailed:  summaryCounts.genuineFailed,
         summarySkipped: summaryCounts.skipped,
+        summaryTodo:    summaryCounts.todo,
         summaryErrors:  parseSummaryErrors(output)
     };
 }

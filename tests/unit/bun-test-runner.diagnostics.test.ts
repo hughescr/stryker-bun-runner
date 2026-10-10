@@ -16,6 +16,7 @@ import type { Logger } from '@stryker-mutator/api/logging';
 import { DryRunStatus, TestStatus } from '@stryker-mutator/api/test-runner';
 import { describe, it, expect, beforeEach, afterEach, mock, spyOn, jest } from 'bun:test';
 import { BunTestRunner } from '../../src/bun-test-runner.js';
+import type { DryRunCompletenessFacts } from '../../src/dry-run-completeness.js';
 import type { InspectorCloseInfo } from '../../src/inspector/index.js';
 import type { TestInfo } from '../../src/inspector/types.js';
 import * as bunfigSanitizer from '../../src/utils/bunfig-sanitizer.js';
@@ -35,11 +36,8 @@ interface Internals {
         tests:  readonly { status: TestStatus }[]
     ): void
     checkCompletenessGate(
-        executionOrder:        number[],
-        testHierarchy:         TestInfo[],
-        parsed:                { summaryPassed: number, summaryFailed: number },
-        rawKeyCount:           number,
-        orphanedKeyCount:      number,
+        facts:                 DryRunCompletenessFacts,
+        summaryFailed:         number,
         wasClosedUnexpectedly: boolean,
         tests:                 readonly { status: TestStatus }[],
         closeInfo:             InspectorCloseInfo,
@@ -158,19 +156,23 @@ describe('BunTestRunner diagnostics and killedBy resolution', () => {
             tree?:   TestInfo[]
             passed?: number
             failed?: number
-            raw?:    number
-            orphan?: number
+            keys?:   { keyCount: number, unmatchedKeyCount: number }
             closed?: boolean
             tests?:  readonly { status: TestStatus }[]
             close?:  CloseInfoShape
             stderr?: string
         }): { status: DryRunStatus, errorMessage?: string } | null {
             return internals.checkCompletenessGate(
-                opts.order ?? [],
-                opts.tree ?? [],
-                { summaryPassed: opts.passed ?? 0, summaryFailed: opts.failed ?? 0 },
-                opts.raw ?? 0,
-                opts.orphan ?? 0,
+                {
+                    executionOrder:        opts.order ?? [],
+                    testHierarchy:         opts.tree ?? [],
+                    summary:               { passed: opts.passed ?? 0, skipped: 0, todo: 0 },
+                    coverageKeys:          opts.keys,
+                    coveredTestIds:        [],
+                    resultTestIds:         [],
+                    duplicateFoundIdCount: 0,
+                },
+                opts.failed ?? 0,
                 opts.closed ?? false,
                 opts.tests ?? green,
                 asCloseInfo(opts.close ?? noCloseInfo),
@@ -179,124 +181,37 @@ describe('BunTestRunner diagnostics and killedBy resolution', () => {
         }
 
         const PREFIX = 'stryker-bun-runner: dry run data-completeness check failed — ';
-        const SUFFIX = [
-            '. This indicates the Bun inspector event stream may have been ',
-            'truncated mid-run; proceeding would risk silently ',
-            'corrupted coverage attribution, so this dry run is being reported as an error instead of ',
-            'Complete, and the test registry has NOT been persisted.',
-        ].join('');
+        const SUFFIX = '. Completing this dry run would hand Stryker test results or coverage that are silently '
+          + 'missing or credited to the wrong tests, so it is reported as an error instead, and the test registry has NOT '
+          + 'been persisted. If a cause named above is in your test suite, fix it there; otherwise re-run the dry run, and '
+          + 'if this recurs, please report it at https://github.com/hughescr/stryker-bun-runner/issues with this message, '
+          + 'your bun version and a debug log (logLevel: \'debug\').';
 
-        it('Signal A: reports the exact error message, and logs it through logger.error', () => {
-            const { order, tree } = passing(65);
+        it('reports the exact error message for a single lost test, and logs it through logger.error', () => {
+            const { order, tree } = passing(9);
 
-            const result = gate({ order, tree, passed: 100 });
+            const result = gate({ order, tree, passed: 10 });
 
-            const expected = [
-                PREFIX,
-                "console reported 100 test(s) (pass+fail) but the inspector's execution order ",
-                `contains only 65 non-skipped test(s) (shortfall 35)${SUFFIX}`,
-            ].join('');
+            const expected = `${PREFIX}bun's summary counts 10 passing test(s), but the Bun inspector reported 9: `
+              + `test events were lost or merged on the way from bun to the runner${SUFFIX}`;
             expect(result).toEqual({ status: DryRunStatus.Error, errorMessage: expected });
             expect(mockLogger.error).toHaveBeenCalledTimes(1);
             expect(mockLogger.error).toHaveBeenCalledWith('%s', expected);
         });
 
-        it('Signal A: consoleTotal is passes PLUS failures', () => {
-            const { order, tree } = passing(65);
-
-            // 60 + 40 = 100 → shortfall 35 (a subtraction would give 20 → shortfall -45, no shortfall at all).
-            const result = gate({ order, tree, passed: 60, failed: 40 });
-
-            expect(result?.errorMessage).toContain('console reported 100 test(s) (pass+fail) but');
-            expect(result?.errorMessage).toContain('(shortfall 35)');
-        });
-
-        it('Signal A: skipped and todo tests in the execution order are not counted as executed', () => {
-            // 65 passing + 25 skipped + 10 placeholder-status ids = 100 ids in executionOrder. Console says 100.
-            // Only the 65 passing ones actually ran, so the shortfall is 35, not 0.
-            const tree = hierarchy([
-                ...Array.from({ length: 65 }, () => 'pass' as const),
-                ...Array.from({ length: 25 }, () => 'skip' as const),
-                ...Array.from({ length: 10 }, () => 'todo' as const),
-            ]);
-
-            const result = gate({ order: tree.map(t => t.id), tree, passed: 100 });
-
-            expect(result?.errorMessage).toContain('contains only 65 non-skipped test(s) (shortfall 35)');
-        });
-
-        it('Signal A: skipped tests alone are excluded (todo not involved)', () => {
-            const tree = hierarchy([
-                ...Array.from({ length: 80 }, () => 'pass' as const),
-                ...Array.from({ length: 20 }, () => 'skip' as const),
-            ]);
-
-            // 80 executed vs 100 → shortfall 20 > floor, ratio 0.2 > threshold.
-            const result = gate({ order: tree.map(t => t.id), tree, passed: 100 });
-
-            expect(result?.errorMessage).toContain('contains only 80 non-skipped test(s) (shortfall 20)');
-        });
-
-        it('Signal A: todo tests alone are excluded (skip not involved)', () => {
-            const tree = hierarchy([
-                ...Array.from({ length: 80 }, () => 'pass' as const),
-                ...Array.from({ length: 20 }, () => 'todo' as const),
-            ]);
-
-            const result = gate({ order: tree.map(t => t.id), tree, passed: 100 });
-
-            expect(result?.errorMessage).toContain('contains only 80 non-skipped test(s) (shortfall 20)');
-        });
-
-        it('Signal A: execution ids unknown to the hierarchy still count as executed', () => {
-            // 100 ids, none in the hierarchy (so no status) → all count, no shortfall.
-            const order = Array.from({ length: 100 }, (_, i) => i + 1);
-
-            expect(gate({ order, tree: [], passed: 100 })).toBeNull();
-        });
-
-        it('Signal A: a shortfall exactly at the absolute floor (10) does not fire, one above does', () => {
-            const ninety = passing(90);
-            const eightyNine = passing(89);
-
-            // 100 vs 90: shortfall 10 (ratio 0.1 > 0.05, but the floor is strict).
-            expect(gate({ order: ninety.order, tree: ninety.tree, passed: 100 })).toBeNull();
-            // 100 vs 89: shortfall 11.
-            expect(gate({ order: eightyNine.order, tree: eightyNine.tree, passed: 100 })?.status).toBe(DryRunStatus.Error);
-        });
-
-        it('Signal A: a shortfall ratio exactly at the threshold (5%) does not fire, above it does', () => {
-            const atThreshold = passing(209);
-            const aboveThreshold = passing(208);
-
-            // 220 vs 209: shortfall 11 > floor, ratio 11/220 = 0.05 exactly: strict comparison, no fire.
-            expect(gate({ order: atThreshold.order, tree: atThreshold.tree, passed: 220 })).toBeNull();
-            // 220 vs 208: shortfall 12, ratio 0.0545 > 0.05.
-            expect(gate({ order: aboveThreshold.order, tree: aboveThreshold.tree, passed: 220 })?.status).toBe(DryRunStatus.Error);
-        });
-
-        it('Signal A: a large suite with a shortfall over the floor but a tiny ratio does not fire', () => {
-            // 1000 vs 988: shortfall 12 > floor 10, ratio 1.2% < 5%.
-            const { order, tree } = passing(988);
-
-            expect(gate({ order, tree, passed: 1000 })).toBeNull();
-            expect(mockLogger.error).not.toHaveBeenCalled();
-        });
-
-        it('Signal B: reports orphaned coverage keys, and nothing about the other signals', () => {
+        it('reports a coverage-key count that differs from the test starts by one', () => {
             const { order, tree } = passing(10);
 
-            const result = gate({ order, tree, passed: 10, raw: 100, orphan: 6 });
-
-            expect(result?.errorMessage).toBe(
-                `${PREFIX}6 of 100 coverage key(s) could not be paired with any inspector test (orphaned)${SUFFIX}`
+            expect(gate({ order, tree, passed: 10, keys: { keyCount: 11, unmatchedKeyCount: 0 } })?.errorMessage).toBe(
+                `${PREFIX}the coverage preload recorded 11 per-test coverage key(s), one per test run (retries included), `
+                + `but the Bun inspector reported 10 test start(s): per-test coverage would be credited to the wrong tests${SUFFIX}`
             );
         });
 
         it('Signal C: reports unattributable failures with the LAST 500 chars of stderr', () => {
             const { order, tree } = passing(10);
 
-            const result = gate({ order, tree, failed: 3, passed: 7, stderr: `${'x'.repeat(100)}${'y'.repeat(500)}` });
+            const result = gate({ order, tree, failed: 3, passed: 10, stderr: `${'x'.repeat(100)}${'y'.repeat(500)}` });
 
             expect(result?.errorMessage).toBe(
                 `${PREFIX}bun's console summary reported 3 failing test(s), but none of them could be `
@@ -305,40 +220,47 @@ describe('BunTestRunner diagnostics and killedBy resolution', () => {
             );
         });
 
-        it('joins several material signals with "; " in A, B, C order', () => {
+        it('joins the data-loss problems, then the unattributable failures, then the close context, with "; "', () => {
             const { order, tree } = passing(10);
 
-            const result = gate({ order, tree, passed: 70, failed: 30, raw: 40, orphan: 20, stderr: 'boom' });
+            const result = gate({ order, tree, passed: 70, failed: 30, keys: { keyCount: 10, unmatchedKeyCount: 2 }, closed: true, stderr: 'boom' });
 
-            const message = result?.errorMessage ?? '';
-            const a = message.indexOf("console reported 100 test(s) (pass+fail) but the inspector's execution order contains only 10 non-skipped test(s) (shortfall 90); ");
-            const b = message.indexOf('20 of 40 coverage key(s) could not be paired with any inspector test (orphaned); ');
-            const c = message.indexOf("bun's console summary reported 30 failing test(s)");
-            expect(a).toBeGreaterThan(-1);
-            expect(b).toBeGreaterThan(a);
-            expect(c).toBeGreaterThan(b);
+            expect(result?.errorMessage).toBe(
+                `${PREFIX}bun's summary counts 70 passing test(s), but the Bun inspector reported 10: test events were lost or merged on the way from bun to the runner; `
+                + '2 of 10 per-test coverage key(s) matched no test the inspector reported, so their coverage would be dropped; '
+                + 'bun\'s console summary reported 30 failing test(s), but none of them could be attributed to an individual test — '
+                + 'a whole spec file that fails to load (e.g. an unresolvable import) produces exactly this shape. Last 500 chars of stderr:\nboom; '
+                + `the inspector WebSocket also closed unexpectedly (close code/reason not captured), which is routine on its own and listed only as context${SUFFIX}`
+            );
         });
 
         it('does not evaluate at all when a built test already Failed', () => {
             const { order, tree } = passing(10);
 
-            expect(gate({ order, tree, passed: 100, failed: 5, orphan: 50, tests: [{ status: TestStatus.Failed }] })).toBeNull();
+            expect(gate({ order, tree, passed: 100, failed: 5, keys: { keyCount: 0, unmatchedKeyCount: 50 }, tests: [{ status: TestStatus.Failed }] })).toBeNull();
             expect(mockLogger.error).not.toHaveBeenCalled();
+        });
+
+        it('evaluates when no built test Failed, even if some were skipped', () => {
+            const { order, tree } = passing(10);
+
+            expect(gate({ order, tree, passed: 9, tests: [{ status: TestStatus.Skipped }, { status: TestStatus.Success }] })?.status).toBe(DryRunStatus.Error);
         });
 
         it('returns null for a healthy run and an unexpected close alone is never a trigger', () => {
             const { order, tree } = passing(10);
 
-            expect(gate({ order, tree, passed: 10, closed: true, close: { code: 1006, reason: 'x', wasClean: false, msFromLastFrameToClose: 5 } })).toBeNull();
+            expect(gate({ order, tree, passed: 10, keys: { keyCount: 10, unmatchedKeyCount: 0 }, closed: true, close: { code: 1006, reason: 'x', wasClean: false, msFromLastFrameToClose: 5 } })).toBeNull();
+            expect(mockLogger.error).not.toHaveBeenCalled();
         });
 
         describe('unexpected-close context', () => {
             const fired = (extra: Parameters<typeof gate>[0]): string => {
                 const { order, tree } = passing(10);
-                return gate({ order, tree, orphan: 6, raw: 6, closed: true, ...extra })?.errorMessage ?? '';
+                return gate({ order, tree, passed: 9, closed: true, ...extra })?.errorMessage ?? '';
             };
             const closedDetail = (detail: string): string =>
-                `; the inspector WebSocket closed unexpectedly before this data could be fully drained (${detail})`;
+                `; the inspector WebSocket also closed unexpectedly (${detail}), which is routine on its own and listed only as context`;
 
             it('says the close code/reason were not captured when the close event carried no code', () => {
                 expect(fired({ close: noCloseInfo })).toContain(closedDetail('close code/reason not captured'));
