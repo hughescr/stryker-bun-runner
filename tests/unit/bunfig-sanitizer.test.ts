@@ -404,7 +404,8 @@ describe('generateSanitizedBunfig', () => {
         });
 
         it('does not report forwarded [test] keys', async () => {
-            expect(await dropsFor('[test]\npreload = "./a.ts"\nroot = "./src"\npathIgnorePatterns = ["x"]\ntimeout = 1\nsmol = true\nrandomize = true\nseed = 1\n')).toEqual([]);
+            // randomize/seed are forwarded too, but reported as dropped for mutant runs (bunfig-sanitizer.mutant-runs.test.ts).
+            expect(await dropsFor('[test]\npreload = "./a.ts"\nroot = "./src"\npathIgnorePatterns = ["x"]\ntimeout = 1\nsmol = true\nrandomize = false\n')).toEqual([]);
         });
     });
 

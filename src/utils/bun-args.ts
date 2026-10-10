@@ -21,7 +21,8 @@
  * reason below states an effect, measured with a real Stryker run on a fixture
  * project. Flags measured to leave scores and attribution unchanged
  * (`--only`, `--isolate`, `--randomize`/`--seed`, `--only-failures`, `--dots`,
- * `--reporter*`, `--hot`) are deliberately accepted. `--retry` and
+ * `--reporter*`, `--hot`) are deliberately accepted (`--randomize`/`--seed`
+ * apply to the dry run only: see {@link stripRandomizeArgs}). `--retry` and
  * `--rerun-each` do not corrupt attribution but are rejected anyway: they
  * re-run tests, which only costs time or repeats test names (see
  * {@link RETRY_REASON}, {@link RERUN_EACH_REASON}).
@@ -156,6 +157,36 @@ export function findUnsupportedBunArgs(bunArgs: readonly string[]): UnsupportedB
         }
     }
     return found;
+}
+
+/**
+ * `bunArgs` without bun's test-order randomization flags, for mutant runs.
+ *
+ * `--randomize`, and `--seed` (which turns randomize on by itself), shuffle both
+ * the order of test files and the order of tests within each file (measured on
+ * bun 1.4.2). The dry run keeps them, so a suite with order dependencies still
+ * shows up there. Mutant runs drop them: they run the test files in the
+ * runner's cheapest-first order, so with bail the fastest killing test runs
+ * first, and so a mutant's verdict does not depend on a random order. Removed:
+ * `--randomize`, `--seed=<value>`, and a bare `--seed` together with the token
+ * after it, which bun always reads as the seed. Like the bail flags (see
+ * stripBailArgs in process-runner.ts), they are taken out rather than rejected,
+ * because they are valid for the dry run.
+ *
+ * @param bunArgs - The user's `bun.bunArgs`; not modified
+ * @returns The remaining args, in their original order
+ */
+export function stripRandomizeArgs(bunArgs: readonly string[]): string[] {
+    const args: string[] = [];
+    for(let i = 0; i < bunArgs.length; i++) {
+        const arg = bunArgs[i];
+        if(arg === '--seed') {
+            i += 1;
+        } else if(arg !== '--randomize' && !arg.startsWith('--seed=')) {
+            args.push(arg);
+        }
+    }
+    return args;
 }
 
 /**

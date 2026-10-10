@@ -1,13 +1,15 @@
 export { getAvailablePort } from './port.js';
-export { assertSupportedBunArgs, splitBunConfigArg } from './bun-args.js';
+export { assertSupportedBunArgs, splitBunConfigArg, stripRandomizeArgs } from './bun-args.js';
 export { checkBunVersion, MIN_BUN_VERSION } from './bun-version.js';
 export { SyncServer } from './sync-server.js';
 export type { SyncServerOptions } from './sync-server.js';
-export { generateSanitizedBunfig, cleanupSanitizedBunfig } from './bunfig-sanitizer.js';
+export { generateSanitizedBunfig, cleanupSanitizedBunfig, mutantRunBunfigPath } from './bunfig-sanitizer.js';
 export type { DroppedBunfigKey } from './bunfig-sanitizer.js';
 export { normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName } from './test-name.js';
 export { buildTestNamePattern, TEST_FILE_SUFFIX_RE } from './test-name-pattern.js';
 export { discoverTestFiles, findBuildOutputTestFiles } from './test-file-discovery.js';
+export { buildTestFileArgs, MAX_TEST_FILE_ARGS_BYTES } from './test-file-args.js';
+export type { TestFileArgs } from './test-file-args.js';
 export { getProcessRssBytes, parseVmRss, parsePsRssOutput } from './process-rss.js';
 export { buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery } from './duplicate-suffix.js';
 export { MutantWarnAggregator } from './mutant-warn-aggregator.js';

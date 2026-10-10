@@ -4,6 +4,7 @@
  */
 
 import type { ChildProcess } from 'node:child_process';
+import path from 'node:path';
 import { describe, it, expect, beforeEach, afterEach, mock, jest, spyOn } from 'bun:test';
 import { runBunTests, readSpawnDepth, killAllLiveChildren, ensureSignalCleanup, removeSignalCleanup, stripAnsi, SPAWN_DEPTH_ENV, DEFAULT_MAX_SPAWN_DEPTH } from '../../src/process-runner.js';
 import * as processRss from '../../src/utils/process-rss.js';
@@ -821,9 +822,10 @@ describe('runBunTests', () => {
             const args: readonly string[] = mockSpawn.mock.calls[0][1];
 
             // Flags must come before positional file args
+            // Passed as absolute paths: see process-runner.file-args.test.ts.
             const bailIdx  = args.indexOf('--bail');
-            const alphaIdx = args.indexOf('tests/alpha.test.ts');
-            const betaIdx  = args.indexOf('tests/beta.test.ts');
+            const alphaIdx = args.indexOf(path.resolve('tests/alpha.test.ts'));
+            const betaIdx  = args.indexOf(path.resolve('tests/beta.test.ts'));
 
             expect(bailIdx).toBeGreaterThan(-1);
             expect(alphaIdx).toBeGreaterThan(-1);
@@ -843,9 +845,9 @@ describe('runBunTests', () => {
             await resultPromise;
 
             const args: readonly string[] = mockSpawn.mock.calls[0][1];
-            const aIdx = args.indexOf('tests/a.test.ts');
-            const bIdx = args.indexOf('tests/b.test.ts');
-            const cIdx = args.indexOf('tests/c.test.ts');
+            const aIdx = args.indexOf(path.resolve('tests/a.test.ts'));
+            const bIdx = args.indexOf(path.resolve('tests/b.test.ts'));
+            const cIdx = args.indexOf(path.resolve('tests/c.test.ts'));
 
             expect(aIdx).toBeGreaterThan(-1);
             expect(bIdx).toBe(aIdx + 1);
@@ -865,7 +867,7 @@ describe('runBunTests', () => {
 
             const args: readonly string[] = mockSpawn.mock.calls[0][1];
             const onlyIdx = args.indexOf('--only');
-            const fooIdx  = args.indexOf('tests/foo.test.ts');
+            const fooIdx  = args.indexOf(path.resolve('tests/foo.test.ts'));
 
             expect(onlyIdx).toBeGreaterThan(-1);
             expect(fooIdx).toBeGreaterThan(-1);
