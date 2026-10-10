@@ -3,6 +3,7 @@
  * Parses Bun's console output to extract test results
  */
 
+import path from 'node:path';
 import { stripAnsi } from '../process-runner.js';
 import { TEST_FILE_SUFFIX_PATTERN } from '../utils/test-name-pattern.js';
 
@@ -90,6 +91,47 @@ function parseFilePath(line: string): string | null {
     // Ensure it only matches valid file paths (no line numbers, pipes, or comment markers)
     const fileMatch = fileHeaderRe.exec(line);
     return fileMatch ? fileMatch[1] : null;
+}
+
+/**
+ * Which file-header lines to believe, given the test files the run handed bun.
+ *
+ * Bun prints a failing test's error block BEFORE its `(fail)` line, and a
+ * test's own console output shares the stream, so a header-shaped line can
+ * appear between a file's real header and its `(fail)` line: an expect() diff
+ * of a string holding one (`+ tests/foo.test.ts:`), or the output of a nested
+ * bun run that a test logs. Taken as a header it would prefix the failing test
+ * with the wrong file, and the name would match no dry-run test id.
+ *
+ * Bun prints headers only for the files it runs, relative to the cwd. An entry
+ * of `testFiles` may also be a DIRECTORY (`bun.testFiles` allows one): bun then
+ * runs, and prints a header for, every test file below it. So a header belongs
+ * to the run when it resolves to a listed entry or to a path below one (both
+ * resolved against the cwd, as bun does; a file entry has nothing below it, so
+ * no file-system access is needed to tell the two apart). When the output names
+ * at least one such file in a header, only headers naming files of the run are
+ * believed. When none does (no list, or output this list cannot vouch for, such
+ * as paths printed in a form that does not resolve to the same file), every
+ * header is believed, as without a list.
+ */
+function headerFilter(lines: readonly string[], testFiles: readonly string[] | undefined): (file: string) => boolean {
+    if(testFiles === undefined) {
+        return () => true;
+    }
+    const roots = testFiles.map(file => path.resolve(file));
+    const isRunFile = (file: string): boolean => {
+        const resolved = path.resolve(file);
+        return roots.some((root) => {
+            const relative = path.relative(root, resolved);
+            // '' is the entry itself; anything starting '..' is outside it.
+            return relative !== '..' && !relative.startsWith(`..${path.sep}`);
+        });
+    };
+    const namesRunFile = lines.some((line) => {
+        const file = parseFilePath(line);
+        return file !== null && isRunFile(file);
+    });
+    return namesRunFile ? isRunFile : () => true;
 }
 
 /**
@@ -350,14 +392,18 @@ function parseSummaryErrors(output: string): number {
  *  1 skip
  *  3 expect() calls
  * ```
+ *
+ * @param testFiles - The test files the run handed bun, when it handed it any:
+ *          header lines naming other files are then ignored (see {@link headerFilter})
  */
-export function parseBunTestOutput(stdout: string, stderr: string): ParsedTestResults {
+export function parseBunTestOutput(stdout: string, stderr: string, testFiles?: readonly string[]): ParsedTestResults {
     const tests: TestResult[] = [];
     const counters: TestCounters = { passed: 0, failed: 0, skipped: 0 };
 
     // Combine stdout and stderr for parsing
     const output = `${stdout}\n${stderr}`;
     const lines = output.split('\n');
+    const isHeaderFile = headerFilter(lines, testFiles);
 
     let currentTest: TestResult | null = null;
     // Stryker disable next-line BooleanLiteral: initial false state is defensive; finalizeErrorMessage guards against empty errorLines
@@ -368,7 +414,7 @@ export function parseBunTestOutput(stdout: string, stderr: string): ParsedTestRe
     for(const line of lines) {
         // Check if line is a file path
         const filePath = parseFilePath(line);
-        if(filePath) {
+        if(filePath && isHeaderFile(filePath)) {
             currentFile = filePath;
             continue;
         }
