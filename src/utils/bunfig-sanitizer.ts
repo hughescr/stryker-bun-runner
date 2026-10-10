@@ -64,9 +64,12 @@ export interface DroppedBunfigKey {
     warn:   boolean
 }
 
-/** True for a TOML table (a plain object — not an array, not null). */
+/**
+ * True for a TOML table: a plain object. Arrays, TOML dates (Date subclasses),
+ * null and scalars are not tables.
+ */
 function isTable(value: unknown): value is Record<string, unknown> {
-    return typeof value === 'object' && value !== null && !Array.isArray(value);
+    return Object.prototype.toString.call(value) === '[object Object]';
 }
 
 /**
@@ -205,12 +208,11 @@ export async function generateSanitizedBunfig(
     const rawConfig = await readSourceBunfig(projectCwd, sourceBunfig);
     const dropped: DroppedBunfigKey[] = [];
 
-    // Everything except [test] is carried over untouched; a top-level preload is
-    // anchored at projectCwd (see PATH_VALUED_TEST_KEYS).
+    // Everything is carried over untouched except [test], which is replaced below
+    // (so it needs no filtering here); a top-level preload is anchored at
+    // projectCwd (see PATH_VALUED_TEST_KEYS).
     const sanitized: Record<string, unknown> = Object.fromEntries(
-        Object.entries(rawConfig)
-            .filter(([key]) => key !== 'test')
-            .map(([key, value]) => [key, key === 'preload' ? absolutizePathValue(value, projectCwd) : value])
+        Object.entries(rawConfig).map(([key, value]) => [key, key === 'preload' ? absolutizePathValue(value, projectCwd) : value])
     );
 
     if(rawConfig.test !== undefined && !isTable(rawConfig.test)) {

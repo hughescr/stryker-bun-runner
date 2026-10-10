@@ -202,8 +202,15 @@ function sumHitsByMutant(coverage: MutantCoverage): Map<string, number> {
  * longer appear anywhere are left out; adding them would invent coverage.
  *
  * @returns A copy; neither input is modified.
+ * @throws Error when a mapped mutant is missing from the raw coverage or has more
+ *         mapped hits than raw hits. Mapping only ever removes or merges hits, so
+ *         either means the mapping itself is broken; carrying on would hand Stryker
+ *         counts <= 0 or NaN, which its `count > 0` filter silently drops, losing a
+ *         test's attribution. Failing loudly is preferred to that corruption.
+ *
+ * Exported for unit tests only.
  */
-function restoreHitTotals(rawCoverage: MutantCoverage, mapped: MutantCoverage): MutantCoverage {
+export function restoreHitTotals(rawCoverage: MutantCoverage, mapped: MutantCoverage): MutantCoverage {
     const rawTotals = sumHitsByMutant(rawCoverage);
     const result: MutantCoverage = {
         'static': { ...mapped.static },
@@ -212,8 +219,15 @@ function restoreHitTotals(rawCoverage: MutantCoverage, mapped: MutantCoverage): 
     const buckets = [result.static, ...Object.values(result.perTest)];
     for(const [mutantId, mappedTotal] of sumHitsByMutant(result)) {
         const bucket = buckets.find(counts => mutantId in counts)!;
-        // Mapping only ever removes or merges hits, so the raw total is always present and never smaller.
-        bucket[mutantId] += rawTotals.get(mutantId)! - mappedTotal;
+        const rawTotal = rawTotals.get(mutantId);
+        if(rawTotal === undefined) {
+            throw new Error(`Internal invariant violated: mutant ${mutantId} has ${mappedTotal} mapped hits but no raw hits`);
+        }
+        const shortfall = rawTotal - mappedTotal;
+        if(shortfall < 0) {
+            throw new Error(`Internal invariant violated: mutant ${mutantId} has ${mappedTotal} mapped hits but only ${rawTotal} raw hits`);
+        }
+        bucket[mutantId] += shortfall;
     }
     return result;
 }
@@ -438,10 +452,8 @@ function buildDuplicateNameIndex(
     const indexByKey = new Map<string, number>();
 
     for(const [baseName, ids] of nameInspectorIds) {
-        // Stryker disable next-line EqualityOperator: equivalent — undefined-size branch already excluded by Map value type (Set always has a numeric size); <= 1 vs < 1 both skip singleton groups, only <=1's boundary (size===1) matters and both reach the same "no suffix needed" outcome via the identical no-op (nothing added to indexByKey)
-        if(ids.size <= 1) {
-            continue;
-        }
+        // No special case for single-id groups: they get index 0, which resolveEachTestName never
+        // reads (it returns the bare name when a base name has at most one distinct inspector id).
         // Stryker disable next-line ConditionalExpression: only the always-true variant is
         // equivalent — ids only ever holds defined numbers here. buildNameInspectorIds only calls
         // `ids.add(inspectorId)` after its own `if(!testInfo) continue` guard, and
@@ -733,7 +745,7 @@ function mapLegacyCounterKeys(
     }
 
     // First pass: build unique names and count occurrences (same logic as buildTestsFromInspector)
-    // Stryker disable MethodExpression,ArrayDeclaration,EqualityOperator,BlockStatement,StringLiteral: equivalent mutants — Math.max vs Math.min and i<=maxIndex both cause out-of-bounds access that is silently skipped by the undefined testInfo check; [] vs ["Stryker was here"] only affects nameCounts for a name never used in second pass; the else body pushes to testNames which only affects dedup counts (no effect when names are unique); template literal change only affects an intermediate string not used in output
+    // Stryker disable MethodExpression,ArrayDeclaration,EqualityOperator,BlockStatement,StringLiteral: equivalent mutants — Math.max vs Math.min and i<=maxIndex both cause out-of-bounds access that is silently skipped by the undefined testInfo check; [] vs ["Stryker was here"] only affects nameCounts for a name never used in second pass
     const maxIndex = Math.min(counterIds.length, executionOrder.length);
     const testNames: string[] = [];
 
@@ -743,9 +755,9 @@ function mapLegacyCounterKeys(
         const testInfo = testHierarchy.get(inspectorId);
         if(testInfo) {
             testNames.push(buildUniqueTestName(testInfo.fullName, testInfo.url));
-        } else {
-            testNames.push(`unknown-${inspectorId}`);
         }
+        // A slot without test info contributes no name: the second pass skips it, and a
+        // placeholder name here could collide with a real test titled the same.
     }
     // Stryker restore MethodExpression,ArrayDeclaration,EqualityOperator,BlockStatement,StringLiteral
 
