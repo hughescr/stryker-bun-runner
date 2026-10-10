@@ -468,3 +468,15 @@ describe('eager-import determinism guard', () => {
         expect(templateSource).toContain('await import(modPath);');
     });
 });
+
+describe('coverage write-failure diagnostic', () => {
+    // The runner surfaces only stderr lines that START with '[Stryker Coverage]'
+    // (bun-test-runner.ts extractPreloadCoverageDiagnostics). console.error(prefix, err)
+    // puts bun's code frame on that line and the actual ENOENT/EACCES text several
+    // lines below it, where it would be lost — so the template must format the
+    // file and error message into the prefixed line itself.
+    it('template logs a failed coverage write on one [Stryker Coverage] line naming the file and the error message', async () => {
+        const templateSource = await Bun.file(new URL('../../src/templates/coverage-preload.ts', import.meta.url)).text();
+        expect(templateSource).toMatch(/console\.error\(`\[Stryker Coverage\] Failed to write coverage to \$\{coverageFile\}: \$\{[^`]*error\.message[^`]*\}`\)/);
+    });
+});

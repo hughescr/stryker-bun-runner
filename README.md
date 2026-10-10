@@ -311,6 +311,34 @@ too small for your full suite.
   available) — Stryker core only prints name+failureMessage for initial-run
   failures, so that's the only channel this stack reaches the CI log through.
 
+### Coverage diagnostics (dry run only)
+
+Without coverage data from the dry run, Stryker runs the full test suite for every
+mutant, which can turn minutes into hours, and it does not say why. The runner checks
+the coverage it collected before handing it to Stryker:
+
+- **`stryker-bun-runner: the dry run produced no mutant coverage data — ...`** — the
+  coverage file the preload writes at the end of every dry run was missing,
+  unreadable, or empty. The message names the file and the likely causes: the
+  coverage preload never ran (a `[test].preload` in `bunfig.toml` or a flag in
+  `bun.bunArgs` that replaces or bypasses it), the temporary directory is not
+  writable, or the `bun test` child exited before its final `afterAll` hook (for
+  example a test calls `process.exit`). With `coverageAnalysis: 'perTest'` this
+  **fails the dry run**, because you asked for per-test coverage and would otherwise
+  silently get a much slower run. With `'all'` it is a warning, and with `'off'`
+  nothing is logged. To run without per-test coverage on purpose, set
+  `coverageAnalysis` to `'all'` or `'off'`. A dry run with failing tests skips this
+  check, because Stryker stops on the failing tests anyway.
+- **`The dry run's coverage data shows no mutant covered by any test ...`** —
+  coverage was collected, but no test reached any mutant, so Stryker will report
+  every mutant as NoCoverage. Check that your `mutate` globs match the source files
+  your tests import, and that the tests import those files rather than a built
+  copy such as `dist/`.
+- **`The coverage preload reported problems on the dry-run child's stderr`** — the
+  preload's own `[Stryker Coverage] ...` diagnostics (for example a failed coverage
+  write), which would otherwise be lost on a green dry run. When coverage is
+  missing they are included in the message above instead.
+
 ### Dry-run completeness gate (dry run only)
 
 - **`stryker-bun-runner: dry run data-completeness check failed — ...`** — the dry

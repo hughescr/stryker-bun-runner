@@ -2167,7 +2167,8 @@ tests/example.test.ts:
                     timedOut: false,
                 });
             });
-            mockCollectCoverage.mockResolvedValue(undefined);
+            // A healthy dry run has coverage; a missing one now draws its own warn.
+            mockCollectCoverage.mockResolvedValue({ perTest: {}, 'static': { '1': 1 } });
             mockInspectorClient.getExecutionOrder.mockReturnValue([1]);
             mockInspectorClient.getTests.mockReturnValue([{
                 id:       1,
@@ -3467,6 +3468,159 @@ tests/example.test.ts:
                     expect.stringContaining('exceeded maxChildRss'),
                     600_000_000
                 );
+            });
+        });
+
+        describe('missing or empty coverage diagnostics', () => {
+            const PRELOAD_WRITE_FAILURE = '[Stryker Coverage] Failed to write coverage to /tmp/stryker-bun-runner/coverage-1.json: ENOENT: no such file or directory';
+
+            function childReturns(child: { exitCode?: number, stdout?: string, stderr?: string }): void {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    if(options.onInspectorReady) {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }
+                    return Promise.resolve({ exitCode: child.exitCode ?? 0, stdout: child.stdout ?? ' 1 pass\n', stderr: child.stderr ?? '', timedOut: false });
+                });
+            }
+
+            async function dryRunWith(
+                dryRunOptions: Record<string, unknown> | undefined,
+                strykerOptions: Record<string, unknown> = {}
+            ): Promise<Awaited<ReturnType<BunTestRunner['dryRun']>>> {
+                const runner = new BunTestRunner(mockLogger, strykerOptions as unknown as StrykerOptions);
+                await runner.init();
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- partial DryRunOptions
+                return runner.dryRun(dryRunOptions as any);
+            }
+
+            function warnTexts(): string[] {
+                return (mockLogger.warn as ReturnType<typeof mock>).mock.calls.map(call => call.map(String).join(' '));
+            }
+
+            it('fails the dry run when coverageAnalysis is perTest and the dry run produced no coverage data at all', async () => {
+                childReturns({});
+                mockCollectCoverage.mockResolvedValue(undefined);
+
+                const result = await dryRunWith({ coverageAnalysis: 'perTest', timeout: 300_000, disableBail: false });
+
+                expect(result.status).toBe(DryRunStatus.Error);
+                if(result.status === DryRunStatus.Error) {
+                    // Names the file it looked for, the consequence, and the likely causes.
+                    expect(result.errorMessage).toMatch(/stryker-bun-runner[/\\]coverage-\d+\.json/);
+                    expect(result.errorMessage).toContain('full test suite for every mutant');
+                    expect(result.errorMessage).toContain('preload');
+                    expect(result.errorMessage).toContain('not writable');
+                    expect(result.errorMessage).toContain('coverageAnalysis');
+                }
+                expect(mockLogger.error).toHaveBeenCalledWith('%s', expect.stringContaining('no mutant coverage'));
+            });
+
+            it('includes the preload\'s [Stryker Coverage] stderr lines in that error', async () => {
+                childReturns({ stderr: `some unrelated noise\n${PRELOAD_WRITE_FAILURE}\nmore noise\n` });
+                mockCollectCoverage.mockResolvedValue(undefined);
+
+                const result = await dryRunWith({ coverageAnalysis: 'perTest', timeout: 300_000, disableBail: false });
+
+                expect(result.status).toBe(DryRunStatus.Error);
+                if(result.status === DryRunStatus.Error) {
+                    expect(result.errorMessage).toContain(PRELOAD_WRITE_FAILURE);
+                    expect(result.errorMessage).not.toContain('unrelated noise');
+                }
+            });
+
+            it('reads coverageAnalysis from the Stryker options when dryRun receives no options', async () => {
+                childReturns({});
+                mockCollectCoverage.mockResolvedValue(undefined);
+
+                const result = await dryRunWith(undefined, { coverageAnalysis: 'perTest' });
+
+                expect(result.status).toBe(DryRunStatus.Error);
+            });
+
+            it('only warns, and still completes, when coverageAnalysis is "all" and coverage is missing', async () => {
+                childReturns({ stderr: `${PRELOAD_WRITE_FAILURE}\n` });
+                mockCollectCoverage.mockResolvedValue(undefined);
+
+                const result = await dryRunWith({ coverageAnalysis: 'all', timeout: 300_000, disableBail: false });
+
+                expect(result.status).toBe(DryRunStatus.Complete);
+                const warning = warnTexts().find(text => text.includes('no mutant coverage'));
+                expect(warning).toBeDefined();
+                expect(warning).toContain('full test suite for every mutant');
+                expect(warning).toContain(PRELOAD_WRITE_FAILURE);
+            });
+
+            it('says nothing about missing coverage when coverageAnalysis is "off"', async () => {
+                childReturns({});
+                mockCollectCoverage.mockResolvedValue(undefined);
+
+                const result = await dryRunWith({ coverageAnalysis: 'off', timeout: 300_000, disableBail: false });
+
+                expect(result.status).toBe(DryRunStatus.Complete);
+                expect(warnTexts().filter(text => text.includes('coverage'))).toEqual([]);
+            });
+
+            it('leaves a dry run with failed tests to Stryker\'s own failed-test report instead of a coverage error', async () => {
+                childReturns({ exitCode: 1, stdout: 'tests/alpha.test.ts:\n(fail) breaks [1ms]\n  error: boom\n\n 0 pass\n 1 fail\n' });
+                mockCollectCoverage.mockResolvedValue(undefined);
+
+                const result = await dryRunWith({ coverageAnalysis: 'perTest', timeout: 300_000, disableBail: false });
+
+                expect(result.status).toBe(DryRunStatus.Complete);
+                if(result.status === DryRunStatus.Complete) {
+                    expect(result.tests.some(t => t.status === TestStatus.Failed)).toBe(true);
+                }
+            });
+
+            it('warns that every mutant will be NoCoverage when coverage exists but covers no mutant', async () => {
+                childReturns({});
+                mockCollectCoverage.mockResolvedValue({ perTest: { 'tests/alpha.test.ts > a': {} }, 'static': {} });
+
+                const result = await dryRunWith({ coverageAnalysis: 'perTest', timeout: 300_000, disableBail: false });
+
+                expect(result.status).toBe(DryRunStatus.Complete);
+                const warning = warnTexts().find(text => text.includes('NoCoverage'));
+                expect(warning).toBeDefined();
+                expect(warning).toContain('mutate');
+            });
+
+            it('treats zero hit counts as no coverage, the way Stryker does', async () => {
+                childReturns({});
+                mockCollectCoverage.mockResolvedValue({ perTest: { 'tests/alpha.test.ts > a': { '1': 0 } }, 'static': { '2': 0 } });
+
+                await dryRunWith({ coverageAnalysis: 'perTest', timeout: 300_000, disableBail: false });
+
+                expect(warnTexts().some(text => text.includes('NoCoverage'))).toBe(true);
+            });
+
+            it('does not warn about NoCoverage when some mutant is covered, statically or per test', async () => {
+                childReturns({});
+                mockCollectCoverage.mockResolvedValueOnce({ perTest: {}, 'static': { '1': 1 } });
+                await dryRunWith({ coverageAnalysis: 'perTest', timeout: 300_000, disableBail: false });
+                mockCollectCoverage.mockResolvedValueOnce({ perTest: { 'tests/alpha.test.ts > a': { '3': 1 } }, 'static': {} });
+                await dryRunWith({ coverageAnalysis: 'perTest', timeout: 300_000, disableBail: false });
+
+                expect(warnTexts().some(text => text.includes('NoCoverage'))).toBe(false);
+            });
+
+            it('surfaces [Stryker Coverage] stderr lines at warn on an otherwise green dry run with coverage', async () => {
+                childReturns({ stderr: `${PRELOAD_WRITE_FAILURE}\n` });
+                mockCollectCoverage.mockResolvedValue({ perTest: {}, 'static': { '1': 1 } });
+
+                const result = await dryRunWith({ coverageAnalysis: 'perTest', timeout: 300_000, disableBail: false });
+
+                expect(result.status).toBe(DryRunStatus.Complete);
+                expect(warnTexts().some(text => text.includes(PRELOAD_WRITE_FAILURE))).toBe(true);
+            });
+
+            it('finds [Stryker Coverage] lines through ANSI colouring and leading whitespace', async () => {
+                childReturns({ stderr: `  \u001B[31m${PRELOAD_WRITE_FAILURE}\u001B[0m\n` });
+                mockCollectCoverage.mockResolvedValue({ perTest: {}, 'static': { '1': 1 } });
+
+                await dryRunWith({ coverageAnalysis: 'perTest', timeout: 300_000, disableBail: false });
+
+                expect(warnTexts().some(text => text.includes(PRELOAD_WRITE_FAILURE))).toBe(true);
             });
         });
 

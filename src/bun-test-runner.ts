@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
 import * as fsPromises from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import type { MutantCoverage, StrykerOptions } from '@stryker-mutator/api/core';
+import type { CoverageAnalysis, MutantCoverage, StrykerOptions } from '@stryker-mutator/api/core';
 import type { Logger } from '@stryker-mutator/api/logging';
 import { tokens, commonTokens } from '@stryker-mutator/api/plugin';
 import {
@@ -15,6 +15,7 @@ import {
     MutantRunStatus,
     TestStatus,
     type TestRunner,
+    type DryRunOptions,
     type DryRunResult,
     type MutantRunOptions,
     type MutantRunResult,
@@ -381,6 +382,32 @@ function isUsableTimeout(timeout: unknown): timeout is number {
     return typeof timeout === 'number' && Number.isFinite(timeout) && timeout > 0;
 }
 
+/** Prefix the coverage preload (src/templates/coverage-preload.ts) puts on its own stderr diagnostics. */
+const PRELOAD_COVERAGE_DIAGNOSTIC_PREFIX = '[Stryker Coverage]';
+/** Cap on preload diagnostic lines carried into one log message. */
+const MAX_PRELOAD_DIAGNOSTIC_LINES = 20;
+
+/**
+ * The coverage preload's `[Stryker Coverage] …` lines from a child's stderr,
+ * ANSI-stripped and trimmed, at most {@link MAX_PRELOAD_DIAGNOSTIC_LINES}.
+ */
+function extractPreloadCoverageDiagnostics(stderr: string): string[] {
+    return stripAnsi(stderr)
+        .split('\n')
+        .map(line => line.trim())
+        .filter(line => line.startsWith(PRELOAD_COVERAGE_DIAGNOSTIC_PREFIX))
+        .slice(0, MAX_PRELOAD_DIAGNOSTIC_LINES);
+}
+
+/**
+ * True when any mutant has a positive hit count, per test or statically —
+ * Stryker's own test (TestCoverage.from counts only `count > 0`).
+ */
+function coversAnyMutant(coverage: MutantCoverage): boolean {
+    const buckets = [coverage.static, ...Object.values(coverage.perTest)];
+    return buckets.some(bucket => Object.values(bucket).some(count => count > 0));
+}
+
 /** Per-mutant-run state shared by the first spawn and the zero-match full-suite retry. */
 interface MutantRunContext {
     options:           MutantRunOptions
@@ -412,6 +439,8 @@ export class BunTestRunner implements TestRunner {
     private readonly maxChildRss?:        number;
     private readonly rssCheckIntervalMs?: number;
     private readonly maxSpawnDepth?:      number;
+    /** Stryker's coverageAnalysis from the Stryker options; DryRunOptions.coverageAnalysis wins when given. */
+    private readonly coverageAnalysis?:   CoverageAnalysis;
     private preloadScriptPath?:           string;
     private coverageFilePath?:            string;
     private sanitizedBunfigPath?:         string;
@@ -465,6 +494,8 @@ export class BunTestRunner implements TestRunner {
         // StrykerOptions.mutate is declared non-optional but Stryker may not always
         // populate it (e.g. in unit tests that pass a partial options object).
         this.mutateGlobs = (options as { mutate?: string[] }).mutate ?? [];
+        // Likewise declared non-optional (Stryker defaults it to 'perTest') but absent in partial options.
+        this.coverageAnalysis = (options as { coverageAnalysis?: CoverageAnalysis }).coverageAnalysis;
 
         // Stryker disable next-line StringLiteral: logging message only
         this.logger.debug('BunTestRunner initialized with options: %o', {
@@ -1042,9 +1073,13 @@ export class BunTestRunner implements TestRunner {
     }
 
     /**
-   * Run all tests (dry run)
+   * Run all tests (dry run). Stryker always passes `options`; only its
+   * `coverageAnalysis` is read (to judge missing coverage, see
+   * checkCoverageData), falling back to the Stryker options' value. bun.timeout,
+   * not `options.timeout` (dryRunTimeoutMinutes), bounds the child.
    */
-    public async dryRun(): Promise<DryRunResult> {
+    public async dryRun(options?: DryRunOptions): Promise<DryRunResult> {
+        const coverageAnalysis = this.resolveCoverageAnalysis(options);
         // Stryker disable next-line StringLiteral: logging message only
         this.logger.debug('Running dry run with inspector-based coverage collection...');
 
@@ -1409,7 +1444,7 @@ export class BunTestRunner implements TestRunner {
             // 13–16. Collect/remap coverage, build tests, run the completeness gate, and
             // (if it passes) persist the registry — extracted to keep dryRun()'s own
             // complexity under the lint threshold; see buildGatedDryRunResult's doc comment.
-            return await this.buildGatedDryRunResult(result, parsed, testHierarchy, executionOrder, totalElapsedMs, wasClosedUnexpectedly, closeInfo);
+            return await this.buildGatedDryRunResult(result, parsed, testHierarchy, executionOrder, totalElapsedMs, wasClosedUnexpectedly, closeInfo, coverageAnalysis);
         } finally {
             // Abort the child process if it is still running.  This is idempotent —
             // if the process already exited normally, the signal fires to a dead process
@@ -1422,6 +1457,15 @@ export class BunTestRunner implements TestRunner {
             // 10 (always). Close sync server — idempotent, safe even after early-return paths
             await syncServer.close();
         }
+    }
+
+    /**
+   * The dry run's coverageAnalysis: Stryker's DryRunOptions value, else the
+   * Stryker options' value. Extracted to keep dryRun()'s complexity under the
+   * lint threshold.
+   */
+    private resolveCoverageAnalysis(options: DryRunOptions | undefined): CoverageAnalysis | undefined {
+        return options?.coverageAnalysis ?? this.coverageAnalysis;
     }
 
     /**
@@ -1457,7 +1501,8 @@ export class BunTestRunner implements TestRunner {
         executionOrder:        number[],
         totalElapsedMs:        number,
         wasClosedUnexpectedly: boolean,
-        closeInfo:              InspectorCloseInfo
+        closeInfo:              InspectorCloseInfo,
+        coverageAnalysis:       CoverageAnalysis | undefined
     ): Promise<DryRunResult> {
         // 13. Collect and remap coverage data
         const { coverage: mutantCoverage, inspectorIdToProjectFile, rawKeyCount, orphanedKeyCount } = await this.collectAndRemapCoverage(testHierarchy, executionOrder);
@@ -1479,6 +1524,13 @@ export class BunTestRunner implements TestRunner {
             return gateResult;
         }
 
+        // Like the gate, before the registry is persisted: a dry run failed for missing
+        // coverage must not leave a registry behind for other workers.
+        const coverageResult = this.checkCoverageData(mutantCoverage, tests, coverageAnalysis, result.stderr);
+        if(coverageResult) {
+            return coverageResult;
+        }
+
         // Cache test names and persist registry for killedBy resolution in mutantRun
         await this.buildAndPersistTestRegistry(tests, testNameIndex);
 
@@ -1490,6 +1542,83 @@ export class BunTestRunner implements TestRunner {
             tests,
             mutantCoverage,
         };
+    }
+
+    /**
+   * Judge the dry run's mutant coverage before it is handed to Stryker.
+   *
+   * Stryker treats `mutantCoverage: undefined` as "no coverage analysis": every
+   * mutant then runs the FULL suite (mutant-test-planner's no-coverage branch),
+   * with no message saying why. The coverage preload writes the coverage file in
+   * its final afterAll on every dry run — even one that covered nothing writes a
+   * line with empty perTest/static — so a dry run that completed without one
+   * means the preload never ran, could not write (it logs a `[Stryker Coverage]`
+   * line on the child's stderr), or the child exited before that afterAll.
+   *
+   * - coverageAnalysis 'perTest': the user asked for per-test coverage, and
+   *   silently running the full suite per mutant can turn a run of minutes into
+   *   hours — fail the dry run (Error), naming the file and likely causes.
+   *   'all'/'off' remain available to run without it.
+   * - 'all' (or unknown): warn with the same explanation; the run is correct, only slower.
+   * - 'off': Stryker wants no coverage; say nothing.
+   * A dry run with failed tests is left alone: Stryker stops on those anyway,
+   * and its failed-test report is the more useful message.
+   *
+   * When coverage exists but covers no mutant at all, every mutant will be
+   * NoCoverage (Stryker's executeNoCoverage) — warn, since that is a legitimate
+   * outcome only when the tests really never touch the mutated files.
+   *
+   * `[Stryker Coverage]` diagnostics from the preload are otherwise dropped on a
+   * green run (the child's stderr is only shown on failure), so they are
+   * surfaced at warn here, or folded into the missing-coverage message.
+   */
+    private checkCoverageData(
+        coverage:         MutantCoverage | undefined,
+        tests:            readonly RunnerTestResult[],
+        coverageAnalysis: CoverageAnalysis | undefined,
+        stderr:           string
+    ): DryRunResult | null {
+        const preloadLines = extractPreloadCoverageDiagnostics(stderr);
+        const coverageMissing = coverage === undefined && coverageAnalysis !== 'off';
+        if(!coverageMissing || tests.some(t => t.status === TestStatus.Failed)) {
+            if(preloadLines.length > 0) {
+                // Stryker disable next-line StringLiteral: logging message only
+                this.logger.warn('The coverage preload reported problems on the dry-run child\'s stderr:\n%s', preloadLines.join('\n'));
+            }
+            if(coverage !== undefined && coverageAnalysis !== 'off' && !coversAnyMutant(coverage)) {
+                // Stryker disable next-line StringLiteral: logging message only
+                this.logger.warn(
+                    'The dry run\'s coverage data shows no mutant covered by any test, per test or statically, so Stryker will report every mutant as NoCoverage. '
+                    + 'Check that the mutate globs (%s) match the source files your tests import, and that the tests import those files rather than a built copy (e.g. dist/).',
+                    this.mutateGlobs.join(', ') || '(none)'
+                );
+            }
+            return null;
+        }
+
+        const coverageDir = this.coverageFilePath === undefined ? tmpdir() : path.dirname(this.coverageFilePath);
+        const parts = [
+            `stryker-bun-runner: the dry run produced no mutant coverage data — the coverage file ${this.coverageFilePath ?? '(none configured)'} was missing, unreadable or empty. `
+            + 'Without it Stryker runs the full test suite for every mutant, which is far slower than running each mutant\'s covering tests. '
+            + 'Likely causes: the coverage preload never ran (check for a [test].preload in bunfig.toml or bun.bunArgs that replaces or bypasses it), '
+            + `${coverageDir} is not writable, or the bun test child exited before its final afterAll hook wrote the file (e.g. a test calls process.exit).`,
+        ];
+        if(coverageAnalysis === 'perTest') {
+            parts.push('Failing the dry run because coverageAnalysis is \'perTest\'; set coverageAnalysis to \'all\' or \'off\' to run without per-test coverage instead.');
+        }
+        if(preloadLines.length > 0) {
+            parts.push(`Coverage preload diagnostics from the child's stderr:\n${preloadLines.join('\n')}`);
+        }
+        const message = parts.join(' ');
+
+        if(coverageAnalysis === 'perTest') {
+            // Stryker disable next-line StringLiteral: logging message only
+            this.logger.error('%s', message);
+            return { status: DryRunStatus.Error, errorMessage: message };
+        }
+        // Stryker disable next-line StringLiteral: logging message only
+        this.logger.warn('%s', message);
+        return null;
     }
 
     /**

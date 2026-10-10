@@ -272,7 +272,10 @@ const writeCoverageData = () => {
         // eslint-disable-next-line @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
         writeCoverageToFile(coverageFile, data);
     } catch (error) {
-        console.error('[Stryker Coverage] Failed to write coverage:', error);
+        // One self-contained line: the runner surfaces stderr lines starting with
+        // '[Stryker Coverage]', and console.error(prefix, error) would put bun's code
+        // frame on this line and the actual ENOENT/EACCES text several lines below it.
+        console.error(`[Stryker Coverage] Failed to write coverage to ${coverageFile}: ${error instanceof Error ? error.message : String(error)}`);
     }
 };
 
