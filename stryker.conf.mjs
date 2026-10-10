@@ -36,7 +36,6 @@ const config = {
     thresholds:       { high: 100, low: 100, 'break': 100 },
     coverageAnalysis: 'perTest',
     concurrency:      isCI ? 4 : 12,
-    disableBail:      true,
     reporters:        isCI ? ['clear-text', 'progress', 'dashboard'] : ['progress', 'json', 'html'],
     tempDirName:      '.stryker-tmp',
 };
