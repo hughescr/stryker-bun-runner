@@ -5,7 +5,9 @@
  * must be carried over: every top-level key and section is preserved as-is
  * (`[loader]`, `define`, `jsx*`, `[macros]`, `[install]`, `[run]`, ...) except
  * `[test]`, which is rebuilt from an allowlist with coverage and onlyFailures
- * forced off — settings that would break mutation testing.
+ * forced off — settings that would break mutation testing. A project that
+ * randomizes the test order also gets a copy for mutant runs with randomize
+ * turned off (see mutantRunBunfigPath).
  */
 
 import { readFile, unlink } from 'node:fs/promises';
@@ -57,11 +59,43 @@ const PATH_VALUED_TEST_KEYS = new Set(['preload', 'root']);
 /** A bunfig setting the sanitizer did not forward as written. */
 export interface DroppedBunfigKey {
     /** Dotted key path, e.g. `test.retry`. */
-    key:    string
+    key:             string
     /** Why it was dropped or overridden. */
-    reason: string
+    reason:          string
     /** True when the user asked for something mutation runs cannot honour (worth a warning); false for routine, expected drops. */
-    warn:   boolean
+    warn:            boolean
+    /**
+     * True when the key is kept in the sanitized bunfig (which the dry run uses) and dropped
+     * only from its mutant-run copy at {@link mutantRunBunfigPath}; mutant runs must then use that copy.
+     */
+    mutantRunsOnly?: boolean
+}
+
+/**
+ * [test] keys that randomize the test order: `randomize`, and `seed`, which bun
+ * accepts only together with `randomize = true`. Measured on bun 1.4.2, randomize
+ * shuffles both the order of the test files and the order of the tests within
+ * each file. The dry run keeps them; mutant runs must not (see
+ * {@link mutantRunBunfigPath}).
+ */
+const RANDOM_ORDER_TEST_KEYS = ['randomize', 'seed'] as const;
+
+const RANDOM_ORDER_REASON = 'kept for the dry run, but mutant runs use a copy of the sanitized bunfig with randomize = false and no seed, '
+  + 'so they run test files in the runner\'s cheapest-first order and tests in source order';
+
+/**
+ * Where {@link generateSanitizedBunfig} writes the copy of the sanitized bunfig
+ * that mutant runs use when the project's bunfig randomizes the test order: the
+ * same file name with `.mutant-runs` before the `.toml` extension. The copy
+ * differs only in `[test]`: `randomize = false` and no `seed`. bun has no flag
+ * that turns randomize off, so a second file is the only way; an explicit
+ * `randomize = false` there also wins over a `--randomize` or `--seed` flag
+ * (measured on bun 1.4.2).
+ *
+ * @param sanitizedPath - A path generateSanitizedBunfig returned
+ */
+export function mutantRunBunfigPath(sanitizedPath: string): string {
+    return `${sanitizedPath.replace(/\.toml$/, '')}.mutant-runs.toml`;
 }
 
 /**
@@ -182,6 +216,11 @@ function sanitizeTestSection(sourceTest: Record<string, unknown>, projectCwd: st
  * forwarded, `retry` and `rerunEach` are dropped, and `coverage = false` and
  * `onlyFailures = false` are forced regardless of the project's settings.
  *
+ * When `[test]` randomizes the test order (`randomize = true`, or a `seed`), a
+ * second file is written for mutant runs at {@link mutantRunBunfigPath}, the
+ * same except `randomize = false` and no `seed`, and both keys are reported
+ * with `mutantRunsOnly: true`.
+ *
  * The runner's own coverage preload is passed on the command line (`--preload`),
  * which bun runs AFTER `[test].preload` — user preloads therefore still run
  * first. Bun 1.4.2 does not run a top-level `preload` for `bun test` at all.
@@ -218,22 +257,31 @@ export async function generateSanitizedBunfig(
     if(rawConfig.test !== undefined && !isTable(rawConfig.test)) {
         dropped.push({ key: 'test', reason: 'dropped: [test] is not a table', warn: false });
     }
-    sanitized.test = sanitizeTestSection(isTable(rawConfig.test) ? rawConfig.test : {}, projectCwd, dropped);
+    const sanitizedTest = sanitizeTestSection(isTable(rawConfig.test) ? rawConfig.test : {}, projectCwd, dropped);
+    sanitized.test = sanitizedTest;
+
+    // A randomized order is dropped for mutant runs only: `randomize = false` needs no copy.
+    const randomOrderKeys = RANDOM_ORDER_TEST_KEYS.filter(key => sanitizedTest[key] !== undefined && sanitizedTest[key] !== false);
+    for(const key of randomOrderKeys) {
+        dropped.push({ key: `test.${key}`, reason: RANDOM_ORDER_REASON, warn: false, mutantRunsOnly: true });
+    }
 
     onDropped?.(dropped);
 
-    const serialized = stringify(sanitized);
-
     const outPath = path.join(tmpDir, `stryker-bun-runner-bunfig-${process.pid}-${Date.now()}.toml`);
-    await writePrivateFile(outPath, serialized);
+    await writePrivateFile(outPath, stringify(sanitized));
+
+    if(randomOrderKeys.length > 0) {
+        const mutantRunTest = Object.fromEntries(Object.entries(sanitizedTest).filter(([key]) => key !== 'seed'));
+        mutantRunTest.randomize = false;
+        await writePrivateFile(mutantRunBunfigPath(outPath), stringify({ ...sanitized, test: mutantRunTest }));
+    }
 
     return outPath;
 }
 
-/**
- * Remove the sanitized bunfig file, ignoring ENOENT.
- */
-export async function cleanupSanitizedBunfig(filePath: string): Promise<void> {
+/** Unlink `filePath`, ignoring ENOENT. */
+async function unlinkIfPresent(filePath: string): Promise<void> {
     try {
         await unlink(filePath);
     } catch (err: unknown) {
@@ -241,4 +289,13 @@ export async function cleanupSanitizedBunfig(filePath: string): Promise<void> {
             throw err;
         }
     }
+}
+
+/**
+ * Remove the sanitized bunfig file and its mutant-run copy (see
+ * {@link mutantRunBunfigPath}), ignoring either one being absent.
+ */
+export async function cleanupSanitizedBunfig(filePath: string): Promise<void> {
+    await unlinkIfPresent(filePath);
+    await unlinkIfPresent(mutantRunBunfigPath(filePath));
 }

@@ -4,6 +4,7 @@
  */
 
 import { type ChildProcess, type SpawnOptions, spawn } from 'node:child_process';
+import path from 'node:path';
 import { killProcessGroup } from './utils/process-group.js';
 import { getProcessRssBytes } from './utils/process-rss.js';
 
@@ -165,8 +166,9 @@ export interface BunTestRunOptions {
    * Explicit list of test file paths to pass as positional arguments to bun test.
    * When provided, Bun runs only these files in the given order, eliminating
    * readdir-based non-determinism.  Both absolute and relative paths are
-   * accepted; relative paths resolve against the bun subprocess's cwd.
-   * When omitted, Bun performs its normal file discovery.
+   * accepted; relative paths resolve against the bun subprocess's cwd (the
+   * current one), and every entry reaches bun as an absolute path — see
+   * where runBunTests appends them for why. When omitted, Bun performs its normal file discovery.
    */
     testFiles?: string[]
 
@@ -552,12 +554,18 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
     }
 
     // Append explicit test file paths as positional arguments.
-    // Positional args to `bun test` tell it exactly which files to load and in
-    // which order, removing reliance on readdir ordering (non-deterministic on
-    // macOS APFS) so mutantCoverage.perTest is stable across runs.
+    // A path argument to `bun test` tells it exactly which file to load, and path
+    // arguments run in the order given — the order the runner relies on for its
+    // cheapest-first mutant runs. Only an argument that IS a path counts: bun takes
+    // one without a leading `/`, `./` or `../` (`tests/a.test.ts`) as a substring
+    // filter, runs every discovered file that contains it (a `dist/tests/a.test.ts`
+    // copy too), and runs the matches in its own directory-scan order whatever the
+    // argument order (all measured on bun 1.4.2). So every entry is passed absolute,
+    // resolved against the cwd the child is spawned in. Bun still prints file
+    // headers relative to that cwd.
     // Stryker disable next-line EqualityOperator,ConditionalExpression,BlockStatement: length >= 0 equivalent to > 0 for empty arrays; spread of [] is a no-op; BlockStatement: removing body means bun runs all tests instead of targeted subset → coverage non-determinism → Timeout
     if(options.testFiles && options.testFiles.length > 0) {
-        args.push(...options.testFiles);
+        args.push(...options.testFiles.map(file => path.resolve(file)));
     }
 
     const env = buildChildEnv(options, spawnDepth);

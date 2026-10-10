@@ -42,7 +42,7 @@ import type { TestInfo } from './inspector/types.js';
 import type { StrykerBunOptions } from './options.js';
 import { parseBunTestOutput, type ParsedTestResults } from './parsers/console-parser.js';
 import { runBunTests, stripAnsi, type BunProcessResult } from './process-runner.js';
-import { type DroppedBunfigKey, assertSupportedBunArgs, splitBunConfigArg, checkBunVersion, getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, TEST_FILE_SUFFIX_RE, discoverTestFiles, findBuildOutputTestFiles, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery, resolveRunTempDir, writePrivateFile, MutantWarnAggregator } from './utils/index.js';
+import { type DroppedBunfigKey, assertSupportedBunArgs, splitBunConfigArg, stripRandomizeArgs, checkBunVersion, getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, mutantRunBunfigPath, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, TEST_FILE_SUFFIX_RE, discoverTestFiles, findBuildOutputTestFiles, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery, resolveRunTempDir, writePrivateFile, MutantWarnAggregator } from './utils/index.js';
 
 /**
  * Poll (every 50ms) until `getUrl()` reports the inspector URL, `timeoutMs`
@@ -270,18 +270,26 @@ function collectAbnormalDrainProblems(data: {
  * version, and the reader safely degrades to the lossy pattern path.
  */
 interface RegistryFileV2 {
-    version:         number
-    writtenAt:       number
-    cachedTestNames: string[]
-    baseNameIndex:   [string, string[]][]
-    testNameIndex:   [string, string][]
+    version:            number
+    writtenAt:          number
+    cachedTestNames:    string[]
+    baseNameIndex:      [string, string[]][]
+    testNameIndex:      [string, string][]
     /**
      * The exact (absolute) test files Stryker's `testFiles` option selected for the
      * dry run, so workers that never ran dryRun keep to the same selection in their
      * full-suite runs. Optional and additive: absent when Stryker selected none, and
      * ignored when not a non-empty array of strings.
      */
-    testFiles?:      string[]
+    testFiles?:         string[]
+    /**
+     * How long each test file's tests took in the dry run, in ms (project-relative file,
+     * the id prefix, → the sum of its tests' durations), so every worker can hand bun a
+     * mutant run's files cheapest first. Optional and additive, like testFiles: a registry
+     * without it (or with a malformed one) still loads, and its mutant runs keep the
+     * alphabetical file order.
+     */
+    testFileDurations?: [string, number][]
 }
 
 /** Union of the per-test result shapes the runner produces for Stryker. */
@@ -368,6 +376,45 @@ const ORPHANED_KEY_ABS_FLOOR = 5;
  * one. Kept here so resolveCoveringTestFiles splits on exactly what was joined.
  */
 const TEST_ID_FILE_SEPARATOR = ' > ';
+
+/**
+ * Per test file, the sum of its tests' durations (ms). The file is the id's prefix
+ * (see buildProjectFileTestName), so the keys are exactly the files
+ * resolveCoveringTestFiles derives from ids; tests whose id carries no file prefix
+ * (console-fallback ids) are left out. Skipped tests count too, with their (near
+ * zero) time. A test's duration is bun's own, so time spent loading the file or in
+ * its beforeAll hooks is not counted.
+ */
+function sumDurationsByFile(tests: readonly RunnerTestResult[]): Map<string, number> {
+    const durations = new Map<string, number>();
+    for(const test of tests) {
+        const sepIdx = test.id.indexOf(TEST_ID_FILE_SEPARATOR);
+        if(sepIdx !== -1) {
+            const file = test.id.slice(0, sepIdx);
+            durations.set(file, (durations.get(file) ?? 0) + test.timeSpentMs);
+        }
+    }
+    return durations;
+}
+
+/** `bun.bunArgs` (as spawned) for mutant runs: without `--randomize`/`--seed` (see stripRandomizeArgs). */
+function mutantRunBunArgs(bunArgs: string[] | undefined): string[] | undefined {
+    return bunArgs === undefined ? undefined : stripRandomizeArgs(bunArgs);
+}
+
+/** True for a `[file, ms]` registry entry. */
+function isFileDurationEntry(entry: unknown): entry is [string, number] {
+    return Array.isArray(entry) && entry.length === 2 && typeof entry[0] === 'string' && typeof entry[1] === 'number';
+}
+
+/**
+ * The registry's testFileDurations as a map, or undefined when it is absent or
+ * malformed. It is only advisory (it orders files, it never selects them), so a bad
+ * value is ignored rather than invalidating the registry.
+ */
+function parseTestFileDurations(value: unknown): Map<string, number> | undefined {
+    return Array.isArray(value) && value.every(entry => isFileDurationEntry(entry)) ? new Map(value) : undefined;
+}
 
 /**
  * How long the completeness gate waits, after {@link InspectorClient.expectClose}
@@ -535,6 +582,18 @@ export class BunTestRunner implements TestRunner {
     private readonly configuredBunArgs?:  string[];
     /** `bun.bunArgs` as spawned: the user's `--config`/`-c` is removed (the runner passes its own sanitized one). */
     private readonly bunArgs?:            string[];
+    /** {@link bunArgs} for mutant runs: without `--randomize`/`--seed`, which only the dry run keeps (see stripRandomizeArgs). */
+    private readonly mutantBunArgs?:      string[];
+    /** True when the current sanitized bunfig randomizes the test order, so mutant runs use its mutant-run copy (see mutantRunBunfigPath). */
+    private sanitizedBunfigRandomizes = false;
+    /** True once the "randomized order is off for mutant runs" debug line has been logged; it is shown once per runner. */
+    private loggedRandomizeOff = false;
+    /**
+     * Each test file's dry-run duration in ms (project-relative file → sum of its tests' durations),
+     * from this worker's dry run or the shared registry. Mutant runs hand bun their files in
+     * ascending order of it; undefined when neither had any, and the order is then left alone.
+     */
+    private testFileDurations?:           Map<string, number>;
     /** The user's bunfig named by `--config`/`-c` in `bun.bunArgs`, as written: the source the runner sanitizes and reads `[test].root` from. */
     private readonly sourceBunfig?:       string;
     private readonly testFilesOverride?:  string[];
@@ -614,6 +673,7 @@ export class BunTestRunner implements TestRunner {
         this.configuredBunArgs = bunOptions.bunArgs;
         const split = bunOptions.bunArgs === undefined ? undefined : splitBunConfigArg(bunOptions.bunArgs);
         this.bunArgs = split?.args;
+        this.mutantBunArgs = mutantRunBunArgs(this.bunArgs);
         this.sourceBunfig = split?.configPath;
         this.smol = bunOptions.smol ?? false;
         this.maxChildRss = bunOptions.maxChildRss;
@@ -781,8 +841,48 @@ export class BunTestRunner implements TestRunner {
             }
             files.add(listed);
         }
-        // Stryker disable next-line MethodExpression: sort is for deterministic argv only; unsorted would still run the same files
+        // Alphabetical: the order orderCheapestFirst keeps between files with the same (or no) dry-run time.
         return [...files].toSorted((a, b) => a.localeCompare(b));
+    }
+
+    /**
+   * `files` in ascending order of their dry-run duration, for a mutant run.
+   *
+   * Mutant runs bail on the first failing test, and bun runs the files it is given
+   * in argument order (measured on bun 1.4.2, for path arguments — see
+   * runBunTests). Running the cheapest covering file first means a fast unit test
+   * usually kills the mutant before a slow integration file is even loaded.
+   *
+   * The sort is stable: files that took the same time keep their order (the
+   * alphabetical order of the discovered list and of resolveCoveringTestFiles), and
+   * files with no recorded duration — every file, when there are no durations at
+   * all — go last in their old order. `files` itself is not modified.
+   */
+    private orderCheapestFirst(files: readonly string[] | undefined): string[] | undefined {
+        const cost = (file: string): number => this.testFileDurations?.get(normalizeTestFilePath(file) ?? file) ?? Number.POSITIVE_INFINITY;
+        // Infinity - Infinity is NaN, which a sort comparator treats as "equal".
+        return files?.toSorted((a, b) => cost(a) - cost(b));
+    }
+
+    /**
+   * Say once, at debug, that mutant runs do not randomize the test order although
+   * the project asked for it (in the bunfig, in bun.bunArgs, or both). They run
+   * test files cheapest first and tests in source order, so a mutant's verdict
+   * never depends on a random order; the dry run keeps the setting.
+   */
+    private logRandomizeOffOnce(): void {
+        const sources: string[] = [];
+        if(this.sanitizedBunfigRandomizes) {
+            sources.push('the bunfig\'s [test].randomize/seed');
+        }
+        if(this.mutantBunArgs?.length !== this.bunArgs?.length) {
+            sources.push('--randomize/--seed in bun.bunArgs');
+        }
+        if(this.loggedRandomizeOff || sources.length === 0) {
+            return;
+        }
+        this.loggedRandomizeOff = true;
+        this.logger.debug('Randomized test order applies to the dry run only; mutant runs turn it off (%s) and run test files cheapest-first', sources.join(' and '));
     }
 
     /**
@@ -1106,9 +1206,13 @@ export class BunTestRunner implements TestRunner {
             await cleanupSanitizedBunfig(this.sanitizedBunfigPath);
         }
         const tempDir = this.tempDir ?? await this.ensureRunTempDir();
+        let randomizes = false;
         this.sanitizedBunfigPath = await generateSanitizedBunfig(cwd, tempDir, this.sourceBunfig, (drops) => {
+            // A key dropped for mutant runs only means the sanitizer wrote a mutant-run copy.
+            randomizes = drops.some(drop => drop.mutantRunsOnly);
             this.reportDroppedBunfigKeys(drops);
         });
+        this.sanitizedBunfigRandomizes = randomizes;
         this.sanitizedBunfigCwd  = cwd;
         // Stryker disable next-line StringLiteral: logging message only
         this.logger.debug('Sanitized bunfig (re)generated at: %s for cwd: %s', this.sanitizedBunfigPath, cwd);
@@ -1175,6 +1279,7 @@ export class BunTestRunner implements TestRunner {
             if(Array.isArray(selectedFiles) && selectedFiles.length > 0 && selectedFiles.every((file: unknown) => typeof file === 'string')) {
                 this.strykerTestFiles = { cwd: process.cwd(), files: selectedFiles };
             }
+            this.testFileDurations = parseTestFileDurations(parsed.testFileDurations);
             // Stryker disable next-line StringLiteral: diagnostic logging message
             this.logger.debug('Loaded dryRun registry from %s (%d entries)', registryPath, this.cachedTestNames.size);
         } catch (err) {
@@ -2032,6 +2137,8 @@ export class BunTestRunner implements TestRunner {
         // (mirrors cachedTestNames) so this worker's own mutantRuns can use it
         // even when the registry file write below fails.
         this.testNameIndex = testNameIndex;
+        this.testFileDurations = sumDurationsByFile(tests);
+        this.logger.debug('Recorded dry-run durations for %d test file(s) to order mutant runs cheapest-first', this.testFileDurations.size);
 
         try {
             // registryPath lives in the run's private temp directory, resolved (created/verified)
@@ -2040,14 +2147,15 @@ export class BunTestRunner implements TestRunner {
             const registryPath = await this.resolveRegistryPath();
             const tmpPath = `${registryPath}.tmp`;
             const registryData = JSON.stringify({
-                version:         2,
-                writtenAt:       Date.now(),
+                version:           2,
+                writtenAt:         Date.now(),
                 // Stryker disable next-line ArrayDeclaration: equivalent mutant — prepending "Stryker was here" leaves all real test names in place; killedBy resolution is unaffected
-                cachedTestNames: [...this.cachedTestNames],
-                baseNameIndex:   [...this.baseNameIndex.entries()],
-                testNameIndex:   [...testNameIndex.entries()],
+                cachedTestNames:   [...this.cachedTestNames],
+                baseNameIndex:     [...this.baseNameIndex.entries()],
+                testNameIndex:     [...testNameIndex.entries()],
                 // Omitted (JSON drops undefined) when Stryker selected no files.
-                testFiles:       this.selectedTestFilesFor(process.cwd()),
+                testFiles:         this.selectedTestFilesFor(process.cwd()),
+                testFileDurations: [...this.testFileDurations.entries()],
             } satisfies RegistryFileV2);
             // The tmp file is created owner-only and exclusively, replacing anything at its path.
             await writePrivateFile(tmpPath, registryData);
@@ -2182,9 +2290,12 @@ export class BunTestRunner implements TestRunner {
         // Use cached bunfig path synchronously when available (pre-warmed by init()).
         const mutantCwd = process.cwd();
         // Stryker disable next-line ConditionalExpression,LogicalOperator,EqualityOperator: inline cache hit — same pattern as ensureSanitizedBunfig, covered by 'reuses cached bunfig in mutantRun when cwd unchanged'
-        const bunfigPath = (this.sanitizedBunfigPath && this.sanitizedBunfigCwd === mutantCwd)
+        const sanitizedBunfig = (this.sanitizedBunfigPath && this.sanitizedBunfigCwd === mutantCwd)
             ? this.sanitizedBunfigPath
             : await this.ensureSanitizedBunfig();
+        // Mutant runs never randomize the test order: a bunfig that does gets its mutant-run copy.
+        const bunfigPath = this.sanitizedBunfigRandomizes ? mutantRunBunfigPath(sanitizedBunfig) : sanitizedBunfig;
+        this.logRandomizeOffOnce();
 
         // Reuse the sorted test-file list cached during dryRun.
         // If this worker never ran dryRun (cachedTestFiles is undefined), discover
@@ -2283,6 +2394,11 @@ export class BunTestRunner implements TestRunner {
         this.currentAbortController = abortController;
         // Per spawn, so neither a retry nor a later run can accept another child's report.
         const hitLimitToken = newHitLimitToken();
+        // Narrowed to the covering tests' own files when the run is targeted; the full
+        // list whenever it is not, or whenever the narrowing cannot be proven safe (see
+        // resolveCoveringTestFiles). A file-scoped run (Stryker's testFiles option) runs
+        // exactly its files, whatever was discovered. Either way cheapest first.
+        const testFiles = this.orderCheapestFirst(ctx.testFileScope ?? (testNamePattern === undefined ? this.effectiveTestFiles : (coveringTestFiles ?? this.effectiveTestFiles)));
         let result;
         try {
             result = await runBunTests({
@@ -2290,7 +2406,7 @@ export class BunTestRunner implements TestRunner {
                 // The 1 ms floor only matters once the deadline has passed (a retry after a slow first spawn).
                 timeout:               Math.max(1, ctx.deadline - Date.now()),
                 env:                   this.env,
-                bunArgs:               this.bunArgs,
+                bunArgs:               this.mutantBunArgs, // No --randomize/--seed: see stripRandomizeArgs
                 bunfigPath,
                 activeMutant:          options.activeMutant.id,
                 hitLimit:              options.hitLimit, // Arms the instrumenter's infinite-loop protection in the preload
@@ -2299,11 +2415,7 @@ export class BunTestRunner implements TestRunner {
                 sequentialMode:        true,            // Match dryRun's serialized execution for deterministic results
                 preloadScript:         this.preloadScriptPath, // Needed to set globalThis.__stryker__.activeMutant
                 testNamePattern, // undefined → no filter → full suite (current behaviour)
-                // Narrowed to the covering tests' own files when the run is
-                // targeted; the full list whenever it is not, or whenever the
-                // narrowing cannot be proven safe (see resolveCoveringTestFiles).
-                // A file-scoped run (Stryker's testFiles option) runs exactly its files, whatever was discovered.
-                testFiles:             ctx.testFileScope ?? (testNamePattern === undefined ? this.effectiveTestFiles : (coveringTestFiles ?? this.effectiveTestFiles)),
+                testFiles,
                 signal:                abortController.signal,
                 smol:                  this.smol,
                 maxChildRss:           this.maxChildRss,
@@ -2340,7 +2452,8 @@ export class BunTestRunner implements TestRunner {
             return { status: MutantRunStatus.Error, errorMessage };
         }
 
-        const parsed = parseBunTestOutput(result.stdout, result.stderr);
+        // With the run's files, so a header-shaped line in a failure message cannot rename the failing test.
+        const parsed = parseBunTestOutput(result.stdout, result.stderr, testFiles);
 
         // Stryker disable next-line StringLiteral: logging message only
         this.logger.debug('Mutant run completed: %o', {
