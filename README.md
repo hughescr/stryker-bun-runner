@@ -201,11 +201,13 @@ Each time Stryker loads the config, it reads your tsconfig with your project's T
 
 - test files, found the way this runner finds them: Bun's naming rules under bunfig's `[test].root`, plus `bun.testFiles` and Stryker's `testFiles` patterns;
 - your bunfig's `[test].preload` scripts;
-- files that only those import, such as test helpers, unless a `mutate` pattern covers them.
+- files that only those import, such as test helpers, unless a `mutate` pattern covers them or they shape the types of other files: a global script (no imports or exports), or a module with a `declare global` or `declare module "x"` augmentation. Those stay in, even when only a test imports them.
 
-Anything the remaining code imports still comes in through the import, so the checker sees a program that compiles exactly as before. The returned config has `tsconfigFile` pointing at the new file and, if you set `ignorePatterns`, a negation for it appended so Stryker copies it into the sandbox. Add `*.stryker-checker.json` to your `.gitignore`.
+Anything the remaining code imports still comes in through the import, so the checker sees a program that compiles exactly as before. As a safety net, the helper type-checks the new program once, when Stryker loads the config, and compares its errors in non-test files with the original program's. If leaving the tests out introduces an error (a global declared only through a test's `/// <reference types>`, say), it warns with the first few and falls back. The returned config has `tsconfigFile` pointing at the new file and, if you set `ignorePatterns`, a negation for it appended so Stryker copies it into the sandbox. Add `*.stryker-checker.json` to your `.gitignore`.
 
-The config comes back unchanged when TypeScript cannot be loaded from the project, the tsconfig is missing, has errors or uses project references, or there is nothing to exclude.
+Each call logs one line: an `info` naming the new file and how many test/helper files it excluded and how many it kept, or a `warn` giving the reason for a fallback. The file is only rewritten when its content changed (through a temp file and a rename), and a file of that name that does not start with the generated header is never overwritten.
+
+The config comes back unchanged, with a warning, when TypeScript cannot be loaded from the project, the tsconfig is missing, has errors or uses project references, it includes no test files or nothing would be left, leaving the tests out adds errors, or the new file cannot be written. It comes back unchanged with an info line when `checkers` does not include `'typescript'`, so list the checker in the config you wrap.
 
 The tradeoff: a mutant that only breaks the types your tests use, and that no test then fails at run time, now survives instead of counting as a compile error. On this repository, with the checker alone, it cut the checkers' CPU time by about a quarter (4,445 s to 3,398 s) and found exactly the same 1,012 compile errors.
 
