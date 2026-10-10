@@ -157,13 +157,9 @@ export class SyncServer {
                 this.httpServer.listen(this.port, '127.0.0.1', () => {
                     resolve();
                 });
-            // eslint-disable-next-line @stylistic/brace-style -- required for Stryker disable to work
-            }
-            // Stryker disable all: defensive error handling, rejects promise
-            catch (error) {
+            } catch (error) {
                 reject(error instanceof Error ? error : new Error(String(error)));
             }
-            // Stryker restore all
         });
     }
 

@@ -48,6 +48,8 @@ interface Internals {
     emitCoverageBleedWarnings(lateHits: { testId: string, mutantIds: string[] }[], counterKeyToTestName: Map<string, string>): void
     buildLocalTestFilterIndex(testFilter: string[]): { localRegistry: Set<string>, localBaseIndex: Map<string, string[]> }
     resolveKilledBy(raw: string[], localRegistry: Set<string>, localBaseIndex: Map<string, string[]>, mutantId: string): string[]
+    warnLossyPatternAlternatives(filterIds: readonly string[], mutantId: string): void
+    testNameIndex?:       Map<string, string>
     cachedTestNames?:     Set<string>
     baseNameIndex?:       Map<string, string[]>
     sanitizedBunfigPath?: string
@@ -460,6 +462,48 @@ describe('BunTestRunner diagnostics and killedBy resolution', () => {
 
             expect(mockLogger.warn).toHaveBeenCalledTimes(1);
             expect(rendered(mockLogger.warn)[0]).toContain('ghost');
+        });
+
+        const unresolvedWarning = (count: number, sample: string): string => `Mutant m1: ${count} failed test name(s) could not be resolved to dry-run test ids `
+          + `and will not be recorded in killedBy — this mutant's Killed verdict will not be reusable from the incremental cache: ${sample}`;
+
+        it('names every unresolved test, comma-separated and without an ellipsis, when there are at most five', () => {
+            expect(resolve(['g1', 'g2', 'g3', 'g4', 'g5'], ['other'])).toEqual([]);
+
+            expect(rendered(mockLogger.warn)).toEqual([unresolvedWarning(5, 'g1, g2, g3, g4, g5')]);
+        });
+
+        it('names only the first five unresolved tests, then an ellipsis, when there are more', () => {
+            expect(resolve(['g1', 'g2', 'g3', 'g4', 'g5', 'g6'], ['other'])).toEqual([]);
+
+            expect(rendered(mockLogger.warn)).toEqual([unresolvedWarning(6, 'g1, g2, g3, g4, g5, …')]);
+        });
+    });
+
+    describe('warnLossyPatternAlternatives', () => {
+        const registryMissWarning = (missing: number, total: number, sample: string): string => `Mutant m2: ${missing} of ${total} testFilter ids missing from exact-name registry `
+          + `(lossy fallback; " > " titles among them may be silently dropped): ${sample}`;
+
+        beforeEach(() => {
+            internals.testNameIndex = new Map([['present', 'present']]);
+        });
+
+        it('names one missing id exactly, without an ellipsis', () => {
+            internals.warnLossyPatternAlternatives(['present', 'a'], 'm2');
+
+            expect(rendered(mockLogger.warn)).toEqual([registryMissWarning(1, 2, 'a')]);
+        });
+
+        it('names all missing ids, comma-separated and without an ellipsis, when there are exactly five', () => {
+            internals.warnLossyPatternAlternatives(['a', 'b', 'present', 'c', 'd', 'e'], 'm2');
+
+            expect(rendered(mockLogger.warn)).toEqual([registryMissWarning(5, 6, 'a, b, c, d, e')]);
+        });
+
+        it('names only the first five missing ids, then an ellipsis, when there are more', () => {
+            internals.warnLossyPatternAlternatives(['a', 'b', 'c', 'present', 'd', 'e', 'f'], 'm2');
+
+            expect(rendered(mockLogger.warn)).toEqual([registryMissWarning(6, 7, 'a, b, c, d, e, …')]);
         });
     });
 

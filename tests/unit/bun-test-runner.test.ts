@@ -5411,6 +5411,7 @@ tests/example.test.ts:
             it.each([
                 ['an ordinary test id', (): string[] => ['tests/alpha.test.ts > handles alpha']],
                 ['a test-file-shaped path that does not exist', (): string[] => ['/nonexistent/sandbox/tests/gone.test.ts']],
+                ['a real test file alongside a test-file-shaped path that does not exist', (): string[] => [alphaFile, '/nonexistent/sandbox/tests/gone.test.ts']],
                 ['a directory whose name looks like a test file', (): string[] => [path.join(sandboxDir, 'dir.test.ts')]],
                 ['a file that is not a test file', (): string[] => [path.join(sandboxDir, 'readme.md')]],
                 ['a mix of a real test file and a test id', (): string[] => [alphaFile, 'tests/alpha.test.ts > handles alpha']],
@@ -5870,6 +5871,33 @@ tests/example.test.ts:
                     // before the retry), not a fresh index derived from the full-suite run.
                     expect(result.killedBy).toEqual(['tests/example.test.ts > handles alpha']);
                 }
+            });
+
+            it('does not warn "no killing test identifiable" when the killing test was identified', async () => {
+                mockRunBunTests.mockResolvedValueOnce({
+                    exitCode: 1,
+                    stdout:   'tests/example.test.ts:\n✗ handles alpha [1ms]\n  error: mutant escaped\n\n 0 pass\n 1 fail\n',
+                    stderr:   '',
+                    timedOut: false,
+                });
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+
+                const result = await runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '902' } as any,
+                    testFilter:      ['tests/example.test.ts > handles alpha'],
+                    sandboxFileName: 'sandbox',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+
+                expect(result).toMatchObject({ status: MutantRunStatus.Killed, killedBy: ['tests/example.test.ts > handles alpha'] });
+                const noKillerLogs = [
+                    ...(mockLogger.warn as ReturnType<typeof mock>).mock.calls,
+                    ...(mockLogger.debug as ReturnType<typeof mock>).mock.calls,
+                ].filter(args => String(args[0]).includes('no killing test identifiable'));
+                expect(noKillerLogs).toEqual([]);
             });
 
             it('reports Error (never Killed) when the retry also matches 0 tests — runBunTests called EXACTLY twice', async () => {

@@ -134,13 +134,11 @@ async function handleSymlink(
         ctx.logger?.debug('discoverTestFiles: broken symlink at %s; skipping', fullPath);
         return;
     }
-    // Stryker disable ConditionalExpression: equivalent mutant — stat.isFile() → true still applies handleSymlinkFile only for non-directory symlinks; block devices/sockets never have .test.ts extension so output is identical
     if(stat.isDirectory()) {
         await handleSymlinkDir(fullPath, entryName, ctx);
     } else if(stat.isFile()) {
         await handleSymlinkFile(fullPath, entryName, ctx);
     }
-    // Stryker restore ConditionalExpression
 }
 
 /**
@@ -160,11 +158,9 @@ async function processEntry(
         }
     } else if(entry.isSymbolicLink()) {
         await handleSymlink(fullPath, entry.name, ctx);
-        // Stryker disable ConditionalExpression: equivalent mutant — entry.isFile() → true in the else-if means only the extension check matters; non-file entries (devices, FIFOs) are already excluded by earlier branches and never have .test.ts extensions
     } else if(entry.isFile() && TEST_FILE_SUFFIX_RE.test(entry.name)) {
         ctx.results.push(path.relative(ctx.cwd, fullPath));
     }
-    // Stryker restore ConditionalExpression
 }
 
 /**

@@ -279,6 +279,35 @@ describe('SyncServer', () => {
             expect(startError).toBeInstanceOf(Error);
             expect((startError as Error).message).toContain('EADDRINUSE');
         });
+
+        it('rejects with the very error a synchronous setup step throws', async () => {
+            const thrown = new RangeError('port out of range');
+            mockHttpServer.listen = mock(() => {
+                throw thrown;
+            });
+
+            const startError = await createServer().start().catch((e: unknown) => e);
+
+            expect(startError).toBe(thrown);
+        });
+
+        it('rejects with an Error carrying the text when a synchronous setup step throws a non-Error', async () => {
+            const throwingFactory = mock(() => {
+                // The case under test: a non-Error throw.
+                throw 'no server for you';
+            });
+            const server = new SyncServer({
+                port:                 8080,
+                createHttpServer:     throwingFactory,
+                WebSocketServerClass: mockWssClass as never,
+                webSocketOpenState:   1,
+            });
+
+            const startError = await server.start().catch((e: unknown) => e);
+
+            expect(startError).toBeInstanceOf(Error);
+            expect((startError as Error).message).toBe('no server for you');
+        });
     });
 
     describe('client connections', () => {

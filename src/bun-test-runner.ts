@@ -1186,7 +1186,6 @@ export class BunTestRunner implements TestRunner {
                     'dryRun registry file not found at %s; this worker has no static-coverage registry (expected on non-dryRun workers)',
                     registryPath
                 );
-            // Stryker disable next-line BlockStatement: else branch covered by test 'logs warning when registry file load fails with non-ENOENT error'
             } else {
                 // Stryker disable next-line StringLiteral: diagnostic logging message
                 this.mutantWarnings.warn(
@@ -2107,7 +2106,6 @@ export class BunTestRunner implements TestRunner {
         }
         const missed = filterIds.filter(id => !exactNameIndex.has(id));
         if(missed.length > 0) {
-            // Stryker disable StringLiteral,MethodExpression,ConditionalExpression,EqualityOperator: diagnostic warn — the slice(0, 5) sample cap and the ', …' ellipsis ternary only shape log output; the guarding conditionals around this warn are behaviorally tested
             this.mutantWarnings.warn(
                 MUTANT_WARN_KIND.registryMiss,
                 mutantId,
@@ -2118,7 +2116,6 @@ export class BunTestRunner implements TestRunner {
                 missed.slice(0, 5).join(', '),
                 missed.length > 5 ? ', …' : ''
             );
-            // Stryker restore StringLiteral,MethodExpression,ConditionalExpression,EqualityOperator
         }
     }
 
@@ -3137,7 +3134,6 @@ export class BunTestRunner implements TestRunner {
             return;
         }
         const sample = [...unresolved];
-        // Stryker disable StringLiteral,MethodExpression,ConditionalExpression,EqualityOperator: diagnostic warn — the slice(0, 5) sample cap and the ', …' ellipsis ternary only shape log output; the drop itself is behaviorally tested
         this.mutantWarnings.warn(
             MUTANT_WARN_KIND.unresolvedKilledBy,
             mutantId,
@@ -3147,7 +3143,6 @@ export class BunTestRunner implements TestRunner {
             sample.slice(0, 5).join(', '),
             sample.length > 5 ? ', …' : ''
         );
-        // Stryker restore StringLiteral,MethodExpression,ConditionalExpression,EqualityOperator
     }
 
     /**

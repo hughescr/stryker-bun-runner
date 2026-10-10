@@ -645,6 +645,59 @@ describe('InspectorClient', () => {
             expect(onError).toHaveBeenCalledTimes(1);
             expect(onError.mock.calls[0][0].message).toBe('Test start event for unknown test ID: 777');
         });
+
+        it('reports an unparseable frame to onError as the original SyntaxError, and keeps handling frames', async () => {
+            const onError = mock((_error: unknown) => {});
+            const onTestFound = mock((_test: TestInfo) => {});
+
+            const client = new InspectorClient({
+                url:      'ws://localhost:6499',
+                handlers: { onError, onTestFound },
+
+                WebSocketClass: MockWebSocketConstructor,
+            });
+
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            mockWs.simulateMessage('{ this is not valid JSON');
+
+            expect(onError).toHaveBeenCalledTimes(1);
+            expect(onError.mock.calls[0][0]).toBeInstanceOf(SyntaxError);
+
+            mockWs.simulateMessage(JSON.stringify({ method: 'TestReporter.found', params: { id: 1, name: 't', type: 'test' } }));
+
+            expect(onTestFound).toHaveBeenCalledTimes(1);
+        });
+
+        it('wraps a non-Error thrown while handling a frame in an Error carrying its text', async () => {
+            const onError = mock((_error: unknown) => {});
+
+            const client = new InspectorClient({
+                url:      'ws://localhost:6499',
+                handlers: {
+                    onError,
+                    onTestFound: () => {
+                        // The case under test: a handler throwing a non-Error.
+                        throw 'handler blew up';
+                    },
+                },
+
+                WebSocketClass: MockWebSocketConstructor,
+            });
+
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            mockWs.simulateMessage(JSON.stringify({ method: 'TestReporter.found', params: { id: 1, name: 't', type: 'test' } }));
+
+            expect(onError).toHaveBeenCalledTimes(1);
+            const reported = onError.mock.calls[0][0];
+            expect(reported).toBeInstanceOf(Error);
+            expect((reported as Error).message).toBe('handler blew up');
+        });
     });
 
     describe('test hierarchy', () => {
@@ -2693,6 +2746,27 @@ describe('InspectorClient', () => {
 
             expect(onError).toHaveBeenCalledTimes(1);
             expect(onError.mock.calls[0][0].message).toContain('Circular reference detected in test hierarchy:');
+        });
+
+        it('names every id walked before the cycle closed, in walk order, in the circular-reference error', async () => {
+            const onError = mock((_e: Error) => {});
+            const client = new InspectorClient({
+                url:      'ws://localhost:6499',
+                handlers: { onError },
+
+                WebSocketClass: MockWebSocketConstructor,
+            });
+
+            const connectPromise = client.connect();
+            mockWs.simulateOpen();
+            await connectPromise;
+
+            // 1's parent (3) is not known yet, so 1 is recorded without a walk; 3 -> 1 -> 3 then closes a cycle.
+            mockWs.simulateMessage(JSON.stringify({ method: 'TestReporter.found', params: { id: 1, name: 'one', type: 'describe', parentId: 3 } }));
+            mockWs.simulateMessage(JSON.stringify({ method: 'TestReporter.found', params: { id: 3, name: 'three', type: 'test', parentId: 1 } }));
+
+            expect(onError).toHaveBeenCalledTimes(1);
+            expect(onError.mock.calls[0][0].message).toBe('Circular reference detected in test hierarchy: 3 -> 1 -> 3');
         });
 
         it('invokes a real onError handler for a WebSocket error event', async () => {

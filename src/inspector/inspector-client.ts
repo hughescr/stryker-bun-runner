@@ -609,13 +609,11 @@ export class InspectorClient {
                     this.pendingRequests.delete(message.id);
                     this.clearPendingTimers(pending);
 
-                    // Stryker disable BlockStatement: removing either branch means pending request never resolves or rejects → all inspector calls hang → Timeout
                     if(message.error) {
                         pending.reject(new Error(`Inspector error: ${message.error.message}`));
                     } else {
                         pending.resolve(message.result);
                     }
-                    // Stryker restore BlockStatement
                 }
                 return;
             }
@@ -628,13 +626,9 @@ export class InspectorClient {
             } else if(isTestReporterEndEvent(message)) {
                 this.handleTestEnd(message.params);
             }
-        // eslint-disable-next-line @stylistic/brace-style -- required for Stryker disable to work
-        }
-        // Stryker disable all: defensive error handling, logs and continues
-        catch (error) {
+        } catch (error) {
             this.handleError(error instanceof Error ? error : new Error(String(error)));
         }
-        // Stryker restore all
     }
 
     /**

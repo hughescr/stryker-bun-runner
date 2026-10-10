@@ -2,8 +2,10 @@
  * Unit tests for discoverTestFiles
  */
 
+import { execFile } from 'node:child_process';
 import { mkdtemp, rm, mkdir, writeFile, symlink } from 'node:fs/promises';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
 import { discoverTestFiles, findBuildOutputTestFiles } from '../../src/utils/test-file-discovery.js';
 
@@ -282,6 +284,30 @@ describe('discoverTestFiles (symlink handling)', () => {
     });
 
     // ── processEntry: regular file without test extension (mutant 1551/1554/1556) ─
+    it('discovers regular test files when the walk root itself lies under .stryker-tmp (a Stryker sandbox)', async () => {
+        // The excluded-target check applies to symlink targets only: a sandbox's own files
+        // all resolve under .stryker-tmp and must still be found.
+        const sandbox = path.join(tmpDir, '.stryker-tmp', 'sandbox-1');
+        await mkdir(path.join(sandbox, 'tests'), { recursive: true });
+        await writeFile(path.join(sandbox, 'tests', 'a.test.ts'), '');
+
+        expect(await discoverTestFiles(sandbox)).toEqual(['tests/a.test.ts']);
+    });
+
+    it('does not include a test-named symlink whose target is neither a file nor a directory (a device)', async () => {
+        await writeFile(path.join(tmpDir, 'real.test.ts'), '');
+        await symlink('/dev/null', path.join(tmpDir, 'device.test.ts'));
+
+        expect(await discoverTestFiles(tmpDir)).toEqual(['real.test.ts']);
+    });
+
+    it('does not include a test-named entry that is not a regular file (a FIFO)', async () => {
+        await writeFile(path.join(tmpDir, 'real.test.ts'), '');
+        await promisify(execFile)('/usr/bin/mkfifo', [path.join(tmpDir, 'pipe.test.ts')]);
+
+        expect(await discoverTestFiles(tmpDir)).toEqual(['real.test.ts']);
+    });
+
     it('ignores regular files without a test extension', async () => {
         // Kills ConditionalExpression mutants at line 134: entry.isFile() && testFileRe.test(entry.name)
         // If entry.isFile() is always true, non-test files would be erroneously included.
