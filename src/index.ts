@@ -99,4 +99,6 @@ export const strykerValidationSchema = {
  * Re-export public API
  */
 export { BunTestRunner } from './bun-test-runner.js';
+export { withTestFilesExcludedFromTypeCheck } from './checker-tsconfig.js';
+export type { TestFilesExcludedFromTypeCheckOptions } from './checker-tsconfig.js';
 export type { BunTestRunnerOptions, StrykerBunOptions } from './options.js';

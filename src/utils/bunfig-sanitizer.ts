@@ -147,6 +147,26 @@ export async function readBunfigTestRoot(projectCwd: string, sourceBunfig?: stri
 }
 
 /**
+ * Return the project's `[test].preload` scripts from the source bunfig (see
+ * {@link readSourceBunfig}), resolved to absolute paths in their given order.
+ *
+ * Accepts a single string or an array; entries that are not strings are
+ * skipped. A top-level `preload` is not read: bun test does not run it
+ * (bun 1.4.2). Relative entries resolve against `projectCwd`, as bun does.
+ *
+ * @param projectCwd - Directory holding bunfig.toml (and the bun subprocess cwd)
+ * @param sourceBunfig - Path of the user's bunfig from `bun.bunArgs` (relative
+ *          to projectCwd); `<projectCwd>/bunfig.toml` when omitted
+ */
+export async function readBunfigTestPreloads(projectCwd: string, sourceBunfig?: string): Promise<string[]> {
+    const rawConfig = await readSourceBunfig(projectCwd, sourceBunfig);
+    const preload = (rawConfig.test as Record<string, unknown> | undefined)?.preload;
+    return [preload].flat()
+        .filter((entry): entry is string => typeof entry === 'string')
+        .map(entry => path.resolve(projectCwd, entry));
+}
+
+/**
  * Build the sanitized `[test]` table from the project's, and report what was
  * not forwarded as written.
  */

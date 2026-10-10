@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, it, expect, beforeEach, afterEach, mock, spyOn } from 'bun:test';
 import { parse } from 'smol-toml';
-import { generateSanitizedBunfig, cleanupSanitizedBunfig, readBunfigTestRoot, type DroppedBunfigKey } from '../../src/utils/bunfig-sanitizer.js';
+import { generateSanitizedBunfig, cleanupSanitizedBunfig, readBunfigTestPreloads, readBunfigTestRoot, type DroppedBunfigKey } from '../../src/utils/bunfig-sanitizer.js';
 import * as privateTempDir from '../../src/utils/private-temp-dir.js';
 import { mockMkdir, mockReadFile, mockWriteFile, mockUnlink, resetFsMocks } from '../test-preload.js';
 
@@ -657,6 +657,47 @@ describe('readBunfigTestRoot', () => {
         mockReadFile.mockRejectedValue(Object.assign(new Error('Permission denied'), { code: 'EACCES' }));
         const err = await readBunfigTestRoot('/project').catch((e: unknown) => e);
         expect((err as Error).message).toMatch(/Failed to read bunfig\.toml/);
+    });
+});
+
+describe('readBunfigTestPreloads', () => {
+    afterEach(() => {
+        resetFsMocks();
+    });
+
+    it('resolves a single [test].preload string against the project cwd', async () => {
+        mockReadFile.mockResolvedValue('[test]\npreload = "./tests/setup.ts"\n');
+        expect(await readBunfigTestPreloads('/project')).toEqual(['/project/tests/setup.ts']);
+    });
+
+    it('resolves every entry of a [test].preload array, keeping absolute ones and their order', async () => {
+        mockReadFile.mockResolvedValue('[test]\npreload = ["./b.ts", "/abs/a.ts"]\n');
+        expect(await readBunfigTestPreloads('/project')).toEqual(['/project/b.ts', '/abs/a.ts']);
+    });
+
+    it('skips entries that are not strings', async () => {
+        mockReadFile.mockResolvedValue('[test]\npreload = ["./ok.ts", 5, ["./nested.ts"]]\n');
+        expect(await readBunfigTestPreloads('/project')).toEqual(['/project/ok.ts']);
+    });
+
+    it('ignores a top-level preload, which bun test does not run', async () => {
+        mockReadFile.mockResolvedValue('preload = "./top.ts"\n');
+        expect(await readBunfigTestPreloads('/project')).toEqual([]);
+    });
+
+    it('returns an empty list without a bunfig, a [test] table, or a preload', async () => {
+        mockReadFile.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+        expect(await readBunfigTestPreloads('/project')).toEqual([]);
+        mockReadFile.mockResolvedValue('[install]\nexact = true\n');
+        expect(await readBunfigTestPreloads('/project')).toEqual([]);
+        mockReadFile.mockResolvedValue('[test]\ntimeout = 5\n');
+        expect(await readBunfigTestPreloads('/project')).toEqual([]);
+    });
+
+    it('reads an explicit source bunfig, still resolving against the project cwd', async () => {
+        mockReadFile.mockResolvedValue('[test]\npreload = "./setup.ts"\n');
+        expect(await readBunfigTestPreloads('/project', 'config/ci.toml')).toEqual(['/project/setup.ts']);
+        expect(mockReadFile.mock.calls.at(-1)?.[0]).toBe('/project/config/ci.toml');
     });
 });
 
