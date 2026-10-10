@@ -118,12 +118,12 @@ describe('dry-run completeness gate (real bun children)', () => {
     }
 
     /** Make the inspector client swallow the first `method` event that `matches`. */
-    function dropFirstEvent(method: keyof InspectorEventHandlers, matches: (params: TestEventParams) => boolean): void {
+    function dropFirstEvent(method: keyof InspectorEventHandlers, matches: (params: TestEventParams, name: string | undefined) => boolean): void {
         const prototype = InspectorClient.prototype as unknown as InspectorEventHandlers;
         const original = prototype[method];
         let dropped = false;
         spies.push(spyOn(prototype, method).mockImplementation(function(this: InspectorEventHandlers, params: TestEventParams) {
-            if(!dropped && matches(params)) {
+            if(!dropped && matches(params, (this as unknown as InspectorClient).getTest(params.id)?.name)) {
                 dropped = true;
                 return;
             }
@@ -196,7 +196,8 @@ describe('dry-run completeness gate (real bun children)', () => {
     }, 60_000);
 
     test('fails the dry run when a single TestReporter.start event is lost', async () => {
-        dropFirstEvent('handleTestStart', () => true);
+        // A test that runs once: bun's --randomize (from this repo's bunfig) may start any test first.
+        dropFirstEvent('handleTestStart', (_params, name) => name === 'plain');
 
         const result = await dryRun([suiteFile]);
 
