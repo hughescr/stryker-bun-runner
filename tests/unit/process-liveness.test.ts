@@ -8,6 +8,8 @@
  */
 
 import type { ChildProcess } from 'node:child_process';
+import { createInterface } from 'node:readline';
+import type { Writable } from 'node:stream';
 import { describe, it, expect, afterEach } from 'bun:test';
 import { isProcessRunning, parseProcStatState, parsePsState } from '../helpers/process-liveness.js';
 import { realSpawn as spawn } from '../test-preload.js';
@@ -101,16 +103,33 @@ describe('isProcessRunning', () => {
     });
 
     it('treats an unreaped zombie as dead even though kill(pid, 0) still succeeds', async () => {
-        // The shell forks a background `true` (pid echoed), then exec()s into sleep, which never
-        // wait()s. `true` exits at once and stays a zombie until the sleep is killed.
-        const parent = spawn('/bin/sh', ['-c', 'true & echo $!; exec sleep 5'], { stdio: ['ignore', 'pipe', 'ignore'] });
+        // The shell forks a background child (pid echoed), then exec()s into cat, which never
+        // wait()s, so once the child exits it stays a zombie until cat is killed.
+        //
+        // The child must not exit while the shell is still a shell: shells reap finished
+        // background jobs (dash calls wait4(-1, WNOHANG) when SIGCHLD arrives during a builtin
+        // such as the echo; bash reaps from its SIGCHLD handler), and a reaped child is gone
+        // from the process table instead of a zombie. So the child blocks reading fd 3 until
+        // the test writes to it, and the test writes only after cat has echoed a line back:
+        // only the exec()ed cat reads stdin, so that echo proves the shell is gone.
+        const parent = spawn('/bin/sh', ['-c', '{ read -r _ <&3; } & echo $!; exec cat'], { stdio: ['pipe', 'pipe', 'ignore', 'pipe'] });
         spawned.push(parent);
-        const zombiePid = await new Promise<number>((resolve, reject) => {
-            parent.stdout.once('data', (data: Buffer) => {
-                resolve(Number(data.toString().trim()));
-            });
-            parent.once('error', reject);
-        });
+        // The stdio option above guarantees these pipes; spawn's typings cannot see that.
+        const stdin = parent.stdio[0]!;
+        const stdout = parent.stdio[1]!;
+        const release = parent.stdio[3] as Writable;
+        const lines = createInterface({ input: stdout })[Symbol.asyncIterator]();
+        const nextLine = async (): Promise<string> => {
+            const line = await lines.next();
+            if(line.done) {
+                throw new Error('the shell closed stdout early');
+            }
+            return line.value;
+        };
+        const zombiePid = Number(await nextLine());
+        stdin.write('exec-check\n');
+        expect(await nextLine()).toBe('exec-check');
+        release.write('exit\n');
 
         // Still in the process table (the zombie) ...
         expect(await waitUntil(() => !isProcessRunning(zombiePid))).toBe(true);
