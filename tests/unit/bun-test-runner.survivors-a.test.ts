@@ -947,6 +947,20 @@ describe('BunTestRunner mutation kill tests (first half of the runner)', () => {
             });
         });
 
+        it('runs every discovered file when the covering-test pattern is too long for argv, not just the covering tests\' files', async () => {
+            // The run falls back to the full suite, so it must get the full suite's files.
+            mockChild({ stdout: ' 1 pass\n' });
+            const runner = await initRunner();
+            mockRunBunTests.mockClear();
+            const huge = ['a', 'b'].map(name => `tests/alpha.test.ts > ${name}${'x'.repeat(60_000)}`);
+
+            await mutantRunOnce(runner, huge);
+
+            const spawn = mockRunBunTests.mock.calls[0][0];
+            expect(spawn.testNamePattern).toBeUndefined();
+            expect(spawn.testFiles).toEqual(['tests/alpha.test.ts', 'tests/beta.test.ts']);
+        });
+
         describe('testFilter holding test file paths', () => {
             let sandboxDir: string;
 
@@ -970,6 +984,20 @@ describe('BunTestRunner mutation kill tests (first half of the runner)', () => {
                     'Mutant %s: testFilter holds %d test file path(s) (Stryker\'s testFiles option); running those files without a --test-name-pattern',
                     '7', 2
                 );
+            });
+
+            it('treats the filter as test ids when one existing entry lacks a test-file suffix', async () => {
+                // Both entries are real files, but helper.ts is not a test file, so this is not
+                // Stryker's file list: the entries go into a --test-name-pattern instead.
+                await Bun.write(path.join(sandboxDir, 'helper.ts'), '');
+                mockChild({ stdout: ' 1 pass\n' });
+                const runner = await initRunner();
+                mockRunBunTests.mockClear();
+
+                await mutantRunOnce(runner, [path.join(sandboxDir, 'one.test.ts'), path.join(sandboxDir, 'helper.ts')]);
+
+                expect(mockRunBunTests.mock.calls[0][0].testNamePattern).toBeDefined();
+                expect(callsMatching(mockLogger.debug, 'testFilter holds')).toEqual([]);
             });
         });
     });
