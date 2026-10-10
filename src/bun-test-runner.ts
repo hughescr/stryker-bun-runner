@@ -39,7 +39,7 @@ import type { TestInfo } from './inspector/types.js';
 import type { StrykerBunOptions } from './options.js';
 import { parseBunTestOutput, type ParsedTestResults } from './parsers/console-parser.js';
 import { runBunTests, stripAnsi } from './process-runner.js';
-import { assertSupportedBunArgs, splitBunConfigArg, checkBunVersion, getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, TEST_FILE_SUFFIX_RE, discoverTestFiles, findBuildOutputTestFiles, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery } from './utils/index.js';
+import { type DroppedBunfigKey, assertSupportedBunArgs, splitBunConfigArg, checkBunVersion, getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, TEST_FILE_SUFFIX_RE, discoverTestFiles, findBuildOutputTestFiles, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery } from './utils/index.js';
 
 /**
  * Sleep for the given number of milliseconds.
@@ -494,6 +494,8 @@ export class BunTestRunner implements TestRunner {
     private warnedTestFilesConflict = false;
     /** True once the dist/build-discovery warning has been logged; it is shown once per runner. */
     private warnedBuildOutputTests = false;
+    /** True once the "bunfig retry/rerunEach ignored" warning has been logged; it is shown once per runner. */
+    private warnedIgnoredBunfigKeys = false;
     private cachedEagerModules?:          string[];
     private cachedEagerModulesCwd?:       string;
     private lastRegistryTmpPath?:         string;
@@ -939,10 +941,33 @@ export class BunTestRunner implements TestRunner {
     }
 
     /**
+   * Log the bunfig settings the sanitizer dropped or overrode: each at debug with
+   * its reason, and the ones mutation runs cannot honour (retry, rerunEach) in
+   * one warning, shown once per runner however often the bunfig is regenerated.
+   */
+    private reportDroppedBunfigKeys(drops: readonly DroppedBunfigKey[]): void {
+        for(const drop of drops) {
+            this.logger.debug('Sanitized bunfig dropped %s: %s', drop.key, drop.reason);
+        }
+        const ignored = drops.filter(d => d.warn);
+        if(this.warnedIgnoredBunfigKeys || ignored.length === 0) {
+            return;
+        }
+        this.warnedIgnoredBunfigKeys = true;
+        const lines = ignored.map(() => '  - %s: it %s').join('\n');
+        this.logger.warn(
+            `These bunfig settings were ignored for mutation runs (remove them from the bunfig to silence this warning; a per-test { retry } option in test code still applies):\n${lines}`,
+            ...ignored.flatMap(d => [d.key.replace(/^test\./, '[test].'), d.reason])
+        );
+    }
+
+    /**
    * Regenerate the sanitized bunfig if the worker's cwd has changed (or if this
-   * is the first spawn). Bun resolves relative paths in a bunfig against the
-   * bunfig file's location, so keying on cwd ensures preload/root paths land in
-   * the right sandbox.
+   * is the first spawn). The sanitizer anchors the relative `preload`/`root`
+   * paths it forwards at this cwd (bun itself resolves relative bunfig paths
+   * against the process cwd, not against the bunfig's directory), so keying on
+   * cwd ensures those paths land in the right sandbox. Every setting it did not
+   * forward is logged at debug; ignored retry/rerun settings warn once per runner.
    */
     private async ensureSanitizedBunfig(): Promise<string> {
         const cwd = process.cwd();
@@ -956,7 +981,9 @@ export class BunTestRunner implements TestRunner {
         }
         // Stryker disable next-line StringLiteral: equivalent mutant — mutating 'stryker-bun-runner' to '' still produces a valid writable directory under tmpdir(); sanitized bunfig generation succeeds either way
         const tempDir = this.tempDir ?? path.join(tmpdir(), 'stryker-bun-runner');
-        this.sanitizedBunfigPath = await generateSanitizedBunfig(cwd, tempDir, this.sourceBunfig);
+        this.sanitizedBunfigPath = await generateSanitizedBunfig(cwd, tempDir, this.sourceBunfig, (drops) => {
+            this.reportDroppedBunfigKeys(drops);
+        });
         this.sanitizedBunfigCwd  = cwd;
         // Stryker disable next-line StringLiteral: logging message only
         this.logger.debug('Sanitized bunfig (re)generated at: %s for cwd: %s', this.sanitizedBunfigPath, cwd);

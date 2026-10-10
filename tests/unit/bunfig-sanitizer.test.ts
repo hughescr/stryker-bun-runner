@@ -5,9 +5,9 @@
 
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
 import { parse } from 'smol-toml';
-import { generateSanitizedBunfig, cleanupSanitizedBunfig, readBunfigTestRoot } from '../../src/utils/bunfig-sanitizer.js';
+import { generateSanitizedBunfig, cleanupSanitizedBunfig, readBunfigTestRoot, type DroppedBunfigKey } from '../../src/utils/bunfig-sanitizer.js';
 import { mockMkdir, mockReadFile, mockWriteFile, mockUnlink, resetFsMocks } from '../test-preload.js';
 
 describe('generateSanitizedBunfig', () => {
@@ -27,6 +27,14 @@ describe('generateSanitizedBunfig', () => {
     afterEach(() => {
         resetFsMocks();
     });
+
+    /** Sanitize `toml` (as the project bunfig) and return the parsed sanitized file. */
+    async function sanitize(toml: string): Promise<Record<string, unknown>> {
+        mockReadFile.mockResolvedValue(toml);
+        await generateSanitizedBunfig(projectCwd, tmpDir);
+        const [, written] = mockWriteFile.mock.calls[0] as [string, string, string];
+        return parse(written);
+    }
 
     describe('directory creation', () => {
         it('creates tmpDir with recursive option', async () => {
@@ -73,10 +81,12 @@ describe('generateSanitizedBunfig', () => {
     });
 
     describe('preload preservation', () => {
-        // Bun resolves relative paths in a bunfig against the file's own directory.
-        // Because the sanitized bunfig lives in tmpdir, not projectCwd, relative
-        // preload paths must be rewritten to absolute paths anchored at projectCwd
-        // or bun will hunt for them in /tmp and silently fail to preload.
+        // Bun resolves relative `preload`/`root` paths against the process cwd, not
+        // the bunfig's own directory (measured on bun 1.4.2 with `--config` pointing
+        // at a file in another directory). The runner spawns bun with cwd =
+        // projectCwd, so those paths would already resolve; they are still rewritten
+        // to absolute paths anchored at projectCwd so the sanitized file (in tmpdir)
+        // does not depend on the spawn cwd matching.
         it('rewrites scalar preload string to an absolute path anchored at projectCwd', async () => {
             mockReadFile.mockResolvedValue('[test]\npreload = \'./setup.ts\'\n');
 
@@ -190,6 +200,204 @@ describe('generateSanitizedBunfig', () => {
         });
     });
 
+    describe('top-level keys and sections are preserved (bun --config REPLACES the project bunfig)', () => {
+        it('keeps the [loader] table (custom extension loaders change what imports resolve to)', async () => {
+            const parsed = await sanitize('[loader]\n".foo" = "text"\n".bar" = "json"\n');
+            expect(parsed.loader).toEqual({ '.foo': 'text', '.bar': 'json' });
+        });
+
+        it('keeps top-level define (compile-time constants the tests rely on)', async () => {
+            const parsed = await sanitize('define = { MY_DEF = "\\"defd\\"", "process.env.X" = "\\"1\\"" }\n');
+            expect(parsed.define).toEqual({ MY_DEF: '"defd"', 'process.env.X': '"1"' });
+        });
+
+        it('keeps jsx* settings', async () => {
+            const parsed = await sanitize('jsx = "react"\njsxFactory = "h"\njsxFragment = "Fragment"\njsxImportSource = "preact"\n');
+            expect(parsed.jsx).toBe('react');
+            expect(parsed.jsxFactory).toBe('h');
+            expect(parsed.jsxFragment).toBe('Fragment');
+            expect(parsed.jsxImportSource).toBe('preact');
+        });
+
+        it('keeps the [macros] table, nested tables included', async () => {
+            const parsed = await sanitize('[macros]\n"react-relay" = { graphql = "bun-macro-relay/bun-macro-relay.tsx" }\n');
+            expect(parsed.macros).toEqual({ 'react-relay': { graphql: 'bun-macro-relay/bun-macro-relay.tsx' } });
+        });
+
+        it('keeps [run], smol, logLevel and telemetry', async () => {
+            const parsed = await sanitize('smol = true\nlogLevel = "debug"\ntelemetry = false\n\n[run]\nsilent = true\nbun = true\n');
+            expect(parsed.smol).toBe(true);
+            expect(parsed.logLevel).toBe('debug');
+            expect(parsed.telemetry).toBe(false);
+            expect(parsed.run).toEqual({ silent: true, bun: true });
+        });
+
+        it('keeps keys it has never heard of, so newer bun settings are not silently lost', async () => {
+            const parsed = await sanitize('futureKey = [1, 2]\n\n[futureSection]\nx = "y"\n');
+            expect(parsed.futureKey).toEqual([1, 2]);
+            expect(parsed.futureSection).toEqual({ x: 'y' });
+        });
+
+        it('keeps top-level keys alongside a sanitized [test] (round trip of a mixed file)', async () => {
+            const parsed = await sanitize('jsx = "react"\n\n[loader]\n".foo" = "text"\n\n[test]\ntimeout = 5\ncoverage = true\n');
+            expect(parsed.jsx).toBe('react');
+            expect(parsed.loader).toEqual({ '.foo': 'text' });
+            expect(parsed.test).toEqual({ timeout: 5, coverage: false, onlyFailures: false });
+        });
+
+        it('keeps [install] verbatim including nested tables', async () => {
+            const parsed = await sanitize('[install]\nexact = true\n\n[install.scopes]\n"@acme" = "https://r.example"\n');
+            expect(parsed.install).toEqual({ exact: true, scopes: { '@acme': 'https://r.example' } });
+        });
+
+        it('does not let a user-supplied top-level key replace the sanitized [test]', async () => {
+            // A TOML inline `test = {...}` is the same key as [test]: it is sanitized, not copied.
+            const parsed = await sanitize('test = { coverage = true, coverageThreshold = 0.9, timeout = 7 }\n');
+            expect(parsed.test).toEqual({ timeout: 7, coverage: false, onlyFailures: false });
+        });
+
+        it('keeps a __proto__ key as plain data without touching the prototype', async () => {
+            mockReadFile.mockResolvedValue('[__proto__]\npolluted = true\n');
+            await generateSanitizedBunfig(projectCwd, tmpDir);
+            const [, written] = mockWriteFile.mock.calls[0] as [string, string, string];
+            expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+            expect(written).toContain('polluted');
+        });
+    });
+
+    describe('top-level preload', () => {
+        // Bun 1.4.2 does not run a top-level `preload` for `bun test` (only [test].preload,
+        // then the CLI --preload), but it is preserved and anchored exactly like
+        // [test].preload so it still resolves if a bun version starts honouring it.
+
+        it('anchors a scalar relative path at projectCwd', async () => {
+            const parsed = await sanitize('preload = "./plugin.ts"\n');
+            expect(parsed.preload).toBe(path.resolve(projectCwd, './plugin.ts'));
+        });
+
+        it('anchors every entry of an array, keeping order, and leaves absolute paths alone', async () => {
+            const parsed = await sanitize('preload = ["./a.ts", "/abs/b.ts", "c.ts"]\n');
+            expect(parsed.preload).toEqual([path.resolve(projectCwd, './a.ts'), '/abs/b.ts', path.resolve(projectCwd, 'c.ts')]);
+        });
+
+        it('keeps top-level and [test] preloads separate', async () => {
+            const parsed = await sanitize('preload = ["./top.ts"]\n\n[test]\npreload = ["./test.ts"]\n');
+            expect(parsed.preload).toEqual([path.resolve(projectCwd, './top.ts')]);
+            expect((parsed.test as Record<string, unknown>).preload).toEqual([path.resolve(projectCwd, './test.ts')]);
+        });
+
+        it('does not add a top-level preload when the project has none', async () => {
+            const parsed = await sanitize('[test]\ntimeout = 5\n');
+            expect('preload' in parsed).toBe(false);
+        });
+    });
+
+    describe('dropped-key reporting', () => {
+        async function dropsFor(toml: string): Promise<DroppedBunfigKey[]> {
+            mockReadFile.mockResolvedValue(toml);
+            const onDropped = mock<(drops: DroppedBunfigKey[]) => void>();
+            await generateSanitizedBunfig(projectCwd, tmpDir, undefined, onDropped);
+            expect(onDropped).toHaveBeenCalledTimes(1);
+            return onDropped.mock.calls[0][0];
+        }
+
+        it('reports nothing dropped for a bunfig that is entirely forwarded', async () => {
+            expect(await dropsFor('jsx = "react"\n\n[test]\ntimeout = 5\n')).toEqual([]);
+        });
+
+        it('works without a callback', async () => {
+            mockReadFile.mockResolvedValue('[test]\nretry = 2\n');
+            const result = await generateSanitizedBunfig(projectCwd, tmpDir);
+            expect(result).toBeTruthy();
+        });
+
+        it('drops [test].retry, reporting it as a warn-worthy ignored setting with the reason', async () => {
+            const drops = await dropsFor('[test]\nretry = 2\n');
+            expect(drops).toHaveLength(1);
+            expect(drops[0].key).toBe('test.retry');
+            expect(drops[0].warn).toBe(true);
+            expect(drops[0].reason).toContain('re-runs failing tests');
+            expect(drops[0].reason).toContain('killedBy');
+        });
+
+        it('drops [test].rerunEach, reporting it as a warn-worthy ignored setting with the reason', async () => {
+            const drops = await dropsFor('[test]\nrerunEach = 3\n');
+            expect(drops).toHaveLength(1);
+            expect(drops[0].key).toBe('test.rerunEach');
+            expect(drops[0].warn).toBe(true);
+            expect(drops[0].reason).toContain('multiplies');
+        });
+
+        it('removes retry and rerunEach from the written file (no retry, no rerun)', async () => {
+            mockReadFile.mockResolvedValue('[test]\nretry = 2\nrerunEach = 3\ntimeout = 9\n');
+            await generateSanitizedBunfig(projectCwd, tmpDir);
+            const [, written] = mockWriteFile.mock.calls[0] as [string, string, string];
+            const test = (parse(written) as Record<string, unknown>).test as Record<string, unknown>;
+            expect('retry' in test).toBe(false);
+            expect('rerunEach' in test).toBe(false);
+            expect(test.timeout).toBe(9);
+        });
+
+        it('reports retry and rerunEach together, in a stable order, alongside other drops', async () => {
+            const drops = await dropsFor('[test]\nrerunEach = 3\nretry = 2\ncoverageDir = "./c"\n');
+            expect(drops.map(d => d.key).toSorted((a, b) => a.localeCompare(b))).toEqual(['test.coverageDir', 'test.rerunEach', 'test.retry']);
+            expect(drops.filter(d => d.warn).map(d => d.key).toSorted((a, b) => a.localeCompare(b))).toEqual(['test.rerunEach', 'test.retry']);
+        });
+
+        it.each([
+            ['coverageReporter', '[\'text\']', 'coverage'],
+            ['coverageDir', '\'./c\'', 'coverage'],
+            ['coverageSkipTestFiles', 'true', 'coverage'],
+            ['coverageThreshold', '0.9', 'coverage'],
+            ['coveragePathIgnorePatterns', '[\'x\']', 'coverage'],
+        ])('reports [test].%s as dropped (debug-level, no warn) because coverage is off for mutation runs', async (key, value, word) => {
+            const drops = await dropsFor(`[test]\n${key} = ${value}\n`);
+            expect(drops).toHaveLength(1);
+            expect(drops[0].key).toBe(`test.${key}`);
+            expect(drops[0].warn).toBe(false);
+            expect(drops[0].reason).toContain(word);
+        });
+
+        it('reports an unknown [test] key as dropped with the generic allowlist reason', async () => {
+            const drops = await dropsFor('[test]\nconcurrent = true\n');
+            expect(drops).toEqual([{ key: 'test.concurrent', reason: expect.stringContaining('allowlist') as string, warn: false }]);
+        });
+
+        it('reports forced coverage = true and onlyFailures = true as overridden', async () => {
+            const drops = await dropsFor('[test]\ncoverage = true\nonlyFailures = true\n');
+            expect(drops.map(d => d.key).toSorted((a, b) => a.localeCompare(b))).toEqual(['test.coverage', 'test.onlyFailures']);
+            for(const d of drops) {
+                expect(d.warn).toBe(false);
+                expect(d.reason).toContain('forced to false');
+            }
+        });
+
+        it('does not report coverage = false / onlyFailures = false (already what the runner wants)', async () => {
+            expect(await dropsFor('[test]\ncoverage = false\nonlyFailures = false\n')).toEqual([]);
+        });
+
+        it('reports a [test] that is not a table', async () => {
+            const drops = await dropsFor('test = 3\n');
+            expect(drops).toEqual([{ key: 'test', reason: expect.stringContaining('not a table') as string, warn: false }]);
+        });
+
+        it('treats [test] as an array of tables the same way: not a table, nothing forwarded', async () => {
+            const drops = await dropsFor('[[test]]\ntimeout = 1\n');
+            expect(drops.map(d => d.key)).toEqual(['test']);
+            const [, written] = mockWriteFile.mock.calls[0] as [string, string, string];
+            expect((parse(written) as Record<string, unknown>).test).toEqual({ coverage: false, onlyFailures: false });
+        });
+
+        it('does not mistake Object.prototype names for allowlisted or ignored keys', async () => {
+            const drops = await dropsFor('[test]\ntoString = 1\nconstructor = 2\n');
+            expect(drops.map(d => [d.key, d.warn])).toEqual([['test.toString', false], ['test.constructor', false]]);
+        });
+
+        it('does not report forwarded [test] keys', async () => {
+            expect(await dropsFor('[test]\npreload = "./a.ts"\nroot = "./src"\npathIgnorePatterns = ["x"]\ntimeout = 1\nsmol = true\nrandomize = true\nseed = 1\n')).toEqual([]);
+        });
+    });
+
     describe('non-allowlisted [test] sub-keys are dropped', () => {
         it('drops coverageReporter', async () => {
             mockReadFile.mockResolvedValue('[test]\ncoverageReporter = [\'text\', \'lcov\']\n');
@@ -269,30 +477,6 @@ describe('generateSanitizedBunfig', () => {
             const parsed = parse(written) as Record<string, unknown>;
             const test = parsed.test as Record<string, unknown>;
             expect(test.smol).toBe(true);
-        });
-
-        it('forwards rerunEach', async () => {
-            // Kills StringLiteral mutant 1354: 'rerunEach' → "" in SAFE_TEST_KEYS
-            mockReadFile.mockResolvedValue('[test]\nrerunEach = 3\n');
-
-            await generateSanitizedBunfig(projectCwd, tmpDir);
-
-            const [, written] = mockWriteFile.mock.calls[0] as [string, string, string];
-            const parsed = parse(written) as Record<string, unknown>;
-            const test = parsed.test as Record<string, unknown>;
-            expect(test.rerunEach).toBe(3);
-        });
-
-        it('forwards retry', async () => {
-            // Kills StringLiteral mutant 1355: 'retry' → "" in SAFE_TEST_KEYS
-            mockReadFile.mockResolvedValue('[test]\nretry = 2\n');
-
-            await generateSanitizedBunfig(projectCwd, tmpDir);
-
-            const [, written] = mockWriteFile.mock.calls[0] as [string, string, string];
-            const parsed = parse(written) as Record<string, unknown>;
-            const test = parsed.test as Record<string, unknown>;
-            expect(test.retry).toBe(2);
         });
 
         it('forwards pathIgnorePatterns', async () => {

@@ -20,9 +20,11 @@
  * Every entry was checked against bun 1.4.2 (`bun test --help`) and, where the
  * reason below states an effect, measured with a real Stryker run on a fixture
  * project. Flags measured to leave scores and attribution unchanged
- * (`--only`, `--isolate`, `--randomize`/`--seed`, `--rerun-each`, `--retry`,
- * `--only-failures`, `--dots`, `--reporter*`, `--hot`) are deliberately
- * accepted.
+ * (`--only`, `--isolate`, `--randomize`/`--seed`, `--only-failures`, `--dots`,
+ * `--reporter*`, `--hot`) are deliberately accepted. `--retry` and
+ * `--rerun-each` do not corrupt attribution but are rejected anyway: they
+ * re-run tests, which only costs time or repeats test names (see
+ * {@link RETRY_REASON}, {@link RERUN_EACH_REASON}).
  */
 
 /** A group of spellings of one rejected flag, with the reason it is rejected. */
@@ -34,6 +36,16 @@ export interface RejectedFlag {
 }
 
 const BREAKS_ATTRIBUTION = 'breaks per-test coverage attribution';
+
+/**
+ * Why `retry` (`--retry`, `[test].retry`) is unusable. Starts with a verb so it
+ * completes both `bun.bunArgs contains "<flag>", which <reason>` and
+ * `<setting> was ignored: it <reason>`.
+ */
+export const RETRY_REASON = 're-runs failing tests, which repeats test names (so a killedBy test cannot be resolved to one test, and incremental mode re-runs them) and cannot improve mutation scores';
+
+/** Why `rerunEach` (`--rerun-each`, `[test].rerunEach`) is unusable; same sentence shape as {@link RETRY_REASON}. */
+export const RERUN_EACH_REASON = 'runs every test N times, which multiplies the cost of every mutant run and repeats test names, and cannot improve mutation scores';
 
 export const REJECTED_BUN_FLAGS: readonly RejectedFlag[] = [
     { flags: ['--concurrent'], reason: BREAKS_ATTRIBUTION },
@@ -48,6 +60,8 @@ export const REJECTED_BUN_FLAGS: readonly RejectedFlag[] = [
     { flags: ['--coverage', '--coverage-reporter', '--coverage-dir'], reason: "re-enables bun's own coverage, which the runner turns off; it slows every run and skews timeouts" },
     // Only spellings splitBunConfigArg could not use are left to reach this table.
     { flags: ['--config', '-c'], reason: 'has no usable path: write --config=<path>, --config <path> or -c <path> (the runner sanitizes that file and passes its own --config to bun)' },
+    { flags: ['--retry'], reason: RETRY_REASON },
+    { flags: ['--rerun-each'], reason: RERUN_EACH_REASON },
     { flags: ['--cwd'], reason: 'moves bun out of the Stryker sandbox, so tests run against the unmutated project and every mutant goes uncovered' },
     { flags: ['--inspect', '--inspect-wait', '--inspect-brk'], reason: 'conflicts with the inspector endpoint the runner uses to track tests' },
 ];
