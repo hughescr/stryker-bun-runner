@@ -1347,6 +1347,122 @@ tests/example.test.ts:
             }
         });
 
+        it('reports a spawn error immediately instead of waiting out bun.inspectorTimeout', async () => {
+            // Real timers on purpose: the point is wall-clock. A child that never started cannot
+            // print an inspector URL, so waiting the full (here: 30s) inspectorTimeout is pure delay.
+            mockRunBunTests.mockImplementation(() => {
+                return Promise.resolve({
+                    exitCode:   null,
+                    signal:     null,
+                    stdout:     '',
+                    stderr:     '\nProcess error: spawn bun ENOENT',
+                    timedOut:   false,
+                    spawnError: 'spawn bun ENOENT',
+                });
+            });
+
+            const runner = new BunTestRunner(mockLogger, {
+                bun: { inspectorTimeout: 30_000 },
+            } as unknown as StrykerOptions);
+            await runner.init();
+
+            const started = Date.now();
+            const result = await runner.dryRun();
+            const elapsed = Date.now() - started;
+
+            expect(result.status).toBe(DryRunStatus.Error);
+            if(result.status === DryRunStatus.Error) {
+                expect(result.errorMessage).toBe('could not start bun test: spawn bun ENOENT');
+            }
+            expect(elapsed).toBeLessThan(5000);
+        });
+
+        it('reports an early child exit without an inspector URL immediately instead of waiting out bun.inspectorTimeout', async () => {
+            mockRunBunTests.mockImplementation(() => {
+                return Promise.resolve({
+                    exitCode: 1,
+                    stdout:   '',
+                    stderr:   'preload crashed before inspector came up',
+                    timedOut: false,
+                });
+            });
+
+            const runner = new BunTestRunner(mockLogger, {
+                bun: { inspectorTimeout: 30_000 },
+            } as unknown as StrykerOptions);
+            await runner.init();
+
+            const started = Date.now();
+            const result = await runner.dryRun();
+            const elapsed = Date.now() - started;
+
+            expect(result.status).toBe(DryRunStatus.Error);
+            if(result.status === DryRunStatus.Error) {
+                expect(result.errorMessage).toStartWith('Timeout waiting for inspector URL after 30000ms');
+                expect(result.errorMessage).toContain('exit code 1');
+                expect(result.errorMessage).toContain('preload crashed before inspector came up');
+            }
+            expect(elapsed).toBeLessThan(5000);
+        });
+
+        it('stops waiting as soon as the inspector URL arrives, even while the child is still running', async () => {
+            // The wait loop must end on the URL, not on the child finishing: a healthy bun keeps
+            // running through the whole test run, and the inspector has to connect while it does.
+            let childResolved = false;
+            let connectedWhileChildAlive: boolean | undefined;
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+            mockRunBunTests.mockImplementation((options: any) => {
+                options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                return new Promise((resolve) => {
+                    setTimeout(() => {
+                        childResolved = true;
+                        resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
+                    }, 600);
+                });
+            });
+            mockInspectorClient.connect.mockImplementation(() => {
+                connectedWhileChildAlive ??= !childResolved;
+                return Promise.resolve();
+            });
+
+            const runner = new BunTestRunner(mockLogger, {
+                bun: { inspectorTimeout: 30_000 },
+            } as unknown as StrykerOptions);
+            await runner.init();
+            await runner.dryRun();
+
+            expect(connectedWhileChildAlive).toBe(true);
+        });
+
+        it('gives up at bun.inspectorTimeout even though the child is still running, and ignores a URL that shows up later', async () => {
+            // Child alive past the timeout and printing its URL only after it expired: the
+            // timeout still decides. (Child settling is an extra way to stop waiting, not a
+            // replacement for the timeout.)
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+            mockRunBunTests.mockImplementation((options: any) => {
+                return new Promise((resolve) => {
+                    setTimeout(() => {
+                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    }, 300);
+                    setTimeout(() => {
+                        resolve({ exitCode: 0, stdout: '', stderr: 'late', timedOut: false });
+                    }, 700);
+                });
+            });
+
+            const runner = new BunTestRunner(mockLogger, {
+                bun: { inspectorTimeout: 100 },
+            } as unknown as StrykerOptions);
+            await runner.init();
+            const result = await runner.dryRun();
+
+            expect(result.status).toBe(DryRunStatus.Error);
+            if(result.status === DryRunStatus.Error) {
+                expect(result.errorMessage).toStartWith('Timeout waiting for inspector URL after 100ms');
+            }
+            expect(mockInspectorClient.connect).not.toHaveBeenCalled();
+        });
+
         it('includes only the LAST 1000 chars of stderr in the inspector-timeout error message', async () => {
             jest.useFakeTimers();
             try {
@@ -1423,17 +1539,20 @@ tests/example.test.ts:
                 // Mock runBunTests to call onInspectorReady after 160ms (will be triggered by fake timers)
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
-                    // Schedule callback after 160ms (3+ polling cycles)
-                    setTimeout(() => {
-                        if(options.onInspectorReady) {
-                            options.onInspectorReady('ws://127.0.0.1:6499/inspector');
-                        }
-                    }, 160);
-                    return Promise.resolve({
-                        exitCode: 0,
-                        stdout:   '✓ test [0.12ms]\n 1 pass',
-                        stderr:   '',
-                        timedOut: false,
+                    // Schedule callback after 160ms (3+ polling cycles). As in a real run, the
+                    // child only finishes (the returned promise resolves) AFTER it printed the URL.
+                    return new Promise((resolve) => {
+                        setTimeout(() => {
+                            if(options.onInspectorReady) {
+                                options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                            }
+                            resolve({
+                                exitCode: 0,
+                                stdout:   '✓ test [0.12ms]\n 1 pass',
+                                stderr:   '',
+                                timedOut: false,
+                            });
+                        }, 160);
                     });
                 });
                 mockCollectCoverage.mockResolvedValue(undefined);
@@ -1490,16 +1609,20 @@ tests/example.test.ts:
                 // Mock runBunTests to call onInspectorReady after 60ms (just over one polling cycle)
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
-                    setTimeout(() => {
-                        if(options.onInspectorReady) {
-                            options.onInspectorReady('ws://127.0.0.1:6499/inspector');
-                        }
-                    }, 60);
-                    return Promise.resolve({
-                        exitCode: 0,
-                        stdout:   '✓ test [0.12ms]\n 1 pass',
-                        stderr:   '',
-                        timedOut: false,
+                    // As in a real run, the child only finishes (the returned promise resolves)
+                    // AFTER it printed the URL.
+                    return new Promise((resolve) => {
+                        setTimeout(() => {
+                            if(options.onInspectorReady) {
+                                options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                            }
+                            resolve({
+                                exitCode: 0,
+                                stdout:   '✓ test [0.12ms]\n 1 pass',
+                                stderr:   '',
+                                timedOut: false,
+                            });
+                        }, 60);
                     });
                 });
                 mockCollectCoverage.mockResolvedValue(undefined);
