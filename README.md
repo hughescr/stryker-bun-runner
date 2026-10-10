@@ -19,6 +19,8 @@ This plugin requires **Bun 1.3.7 or later** for full functionality. Bun 1.3.7 in
 
 **Important:** Bun versions prior to 1.3.7 will NOT work with this plugin due to missing TestReporter events.
 
+At startup the runner executes `bun --version` and fails with a clear message if Bun can't be run or is older than 1.3.7, telling you to install Bun or set `bun.bunPath`.
+
 **To install Bun 1.3.7 or later:**
 
 ```bash
@@ -49,6 +51,7 @@ Create a `stryker.conf.mjs` file:
 
 ```javascript
 export default {
+  appendPlugins: ['@hughescr/stryker-bun-runner'],
   testRunner: 'bun',
   coverageAnalysis: 'perTest',
   mutate: ['src/**/*.ts'],
@@ -59,15 +62,19 @@ export default {
 };
 ```
 
+`appendPlugins` is required because Stryker only auto-loads plugins named `@stryker-mutator/*`, and this package is published as `@hughescr/stryker-bun-runner`; without it, `testRunner: 'bun'` is never registered. (`appendPlugins` adds to Stryker's default `plugins` list rather than replacing it.)
+
 ## How It Works
 
 The plugin uses Bun's Inspector Protocol (WebSocket) to:
 
 1. **Discover tests** - Connects to Bun's test process via WebSocket
 2. **Track execution** - Listens for TestReporter events to correlate test runs with coverage
-3. **Sequential execution** - Uses `--concurrency=1` to ensure reliable coverage correlation
+3. **Sequential execution** - Uses `--max-concurrency=1` to ensure reliable coverage correlation (the coverage preload also forces `test.concurrent` tests to run sequentially)
 4. **Build hierarchy** - Reconstructs test names from describe blocks for accurate reporting
 5. **Targeted mutant runs** - Runs only the tests that covered each mutant (via `--test-name-pattern`); bails after the first failure unless Stryker's `disableBail` option is set (dry runs never bail, since the full suite must run for coverage). Any bail flag in `bun.bunArgs` is ignored — bail is decided solely by the runner.
+
+**How crashes are scored.** A mutant run's `bun test` child can die from a signal (for example SIGSEGV, or SIGKILL from the operating system's out-of-memory killer) or fail to start at all (for example the `bun` executable is missing). Either outcome is scored **Killed** only when a failing test was reported and could be attributed to a known test. Otherwise the mutant is scored as an **Error** (Stryker shows it as a RuntimeError, which is excluded from the mutation score), and the message names the signal or the spawn error. The runner's own `bun.timeout` and `bun.maxChildRss` kills are unaffected and are still scored as Timeout. Earlier versions counted such crashes as Killed, so upgrading can lower your mutation score; the crashes were never real evidence that a test caught the mutant. Each Error is logged at warn (see [Diagnostic warnings worth grepping for in CI](#diagnostic-warnings-worth-grepping-for-in-ci)).
 
 Oversized covering-test patterns (over 100,000 UTF-8 bytes) fall back to running the full suite, to stay within OS argument-length limits. This approach provides reliable test-to-mutant correlation, even with multiple test files.
 
@@ -78,7 +85,7 @@ A second full-suite fallback happens at run time: a `--test-name-pattern` that m
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `bun.bunPath` | `string` | `'bun'` | Path to the Bun executable |
-| `bun.timeout` | `number` | `10000` | Timeout per test in milliseconds |
+| `bun.timeout` | `number` | `10000` | Wall-clock limit in milliseconds for one whole `bun test` child process (an entire dry run, or one mutant run); the child is killed when it expires. This is **not** Bun's per-test `[test].timeout` from `bunfig.toml`, which is independent. Set it comfortably above your full test suite's run time: mutants that need the whole suite (static mutants) are bounded by this limit. The dry run gets an extra 30 s on top of this limit for the coverage drain handshake. |
 | `bun.inspectorTimeout` | `number` | `5000` | Timeout for Inspector WebSocket connection in milliseconds |
 | `bun.env` | `object` | `undefined` | Additional environment variables to pass to bun test |
 | `bun.bunArgs` | `string[]` | `undefined` | Additional bun test flags (e.g., `['--only']`). Bail flags (`--bail`, `--bail=<N>`, or a space-separated `--bail <N>`) are ignored here — bail is fully managed by the runner via Stryker's `disableBail` option (see [How It Works](#how-it-works)). |
@@ -91,17 +98,37 @@ A second full-suite fallback happens at run time: a `--test-name-pattern` that m
 ### Example with all options
 
 ```javascript
-bun: {
-  bunPath: '/path/to/bun',   // Custom bun executable (defaults to 'bun')
-  timeout: 30000,            // 30 second test timeout
-  inspectorTimeout: 10000,   // 10 second connection timeout
-  env: { DEBUG: 'true' },    // Extra environment variables
-  bunArgs: ['--only'],       // Extra bun test flags (bail flags here are ignored — see Options table)
-  smol: true,                // Smaller JSC heap, some speed cost — see Memory model
-  maxChildRss: 1_500_000_000, // Kill+report-timeout a child using more than ~1.5GB RSS
-  rssCheckIntervalMs: 1000,  // How often to poll RSS when maxChildRss is set
-}
+export default {
+  appendPlugins: ['@hughescr/stryker-bun-runner'],
+  testRunner: 'bun',
+  bun: {
+    bunPath: '/path/to/bun',   // Custom bun executable (defaults to 'bun')
+    timeout: 30000,            // 30 second limit for one whole bun test run (not a per-test timeout)
+    inspectorTimeout: 10000,   // 10 second connection timeout
+    env: { DEBUG: 'true' },    // Extra environment variables
+    bunArgs: ['--only'],       // Extra bun test flags (bail flags here are ignored — see Options table)
+    smol: true,                // Smaller JSC heap, some speed cost — see Memory model
+    maxChildRss: 1_500_000_000, // Kill+report-timeout a child using more than ~1.5GB RSS
+    rssCheckIntervalMs: 1000,  // How often to poll RSS when maxChildRss is set
+  },
+};
 ```
+
+### Speeding up runs: `ignoreStatic`
+
+Static mutants are mutants in code that only runs while a file is being loaded (module-level code), so no single test covers them. Testing one means reloading the whole environment and running the entire test suite, for every such mutant. In one measured run, static mutants were 11% of all mutants but about 41% of the mutation time.
+
+Stryker's core `ignoreStatic: true` option skips them:
+
+```javascript
+export default {
+  appendPlugins: ['@hughescr/stryker-bun-runner'],
+  testRunner: 'bun',
+  ignoreStatic: true,
+};
+```
+
+The tradeoff is that those mutants are never tested, so they are left out of your mutation score. Leave it off if module-load behavior matters to you; turn it on if run time matters more.
 
 ## Running Stryker
 
@@ -184,6 +211,7 @@ This plugin is designed to tolerate that recycling cleanly:
 ```javascript
 // stryker.conf.mjs
 export default {
+  appendPlugins: ['@hughescr/stryker-bun-runner'],
   testRunner: 'bun',
   coverageAnalysis: 'perTest',
   mutate: ['src/**/*.ts'],
@@ -198,10 +226,11 @@ export default {
 
 ## Diagnostic warnings worth grepping for in CI
 
-The runner logs three warnings that flag when a mutant run's `--test-name-pattern`
-couldn't be built or applied with full fidelity. None of them indicate a wrong
-mutation-testing verdict by themselves, but they're worth grepping your CI logs for
-because they mark where the runner fell back to less-precise behavior:
+The runner logs five warnings worth grepping for. The first three flag when a
+mutant run's `--test-name-pattern` couldn't be built or applied with full fidelity.
+None of them indicate a wrong mutation-testing verdict by themselves, but they mark
+where the runner fell back to less-precise behavior. The last two (listed after
+them) flag a mutant scored as an Error instead of Killed:
 
 - **`--test-name-pattern matched 0 tests`** — the pattern for a mutant's covering
   tests matched nothing across the whole run (usually because a mutant changed a
@@ -221,11 +250,26 @@ because they mark where the runner fell back to less-precise behavior:
   `testFilter` ids for this mutant weren't in it (falls back to the same lossy
   reconstruction for just those ids, listing up to 5 of the missing ids).
 
-The last two matter because Bun only errors when a pattern matches **zero** tests
+The two registry warns matter because Bun only errors when a pattern matches **zero** tests
 across the whole run; a *partial* miss — some alternatives hit, others silently
 don't — exits 0 with no error text at all. These two warns are the only signal
 that a partial silent drop was possible for a given mutant run, so seeing either
 of them in a clean run's logs is worth investigating before trusting the score.
+
+The remaining two warns mark mutants scored as an `Error` instead of `Killed` (see
+[How It Works](#how-it-works)); they share the form
+`Mutant <id>: <reason> — scoring as Error rather than Killed`:
+
+- **`Mutant <id>: bun test terminated by <SIGNAL> ... — scoring as Error rather than Killed`**
+  — the `bun test` child died from a signal (SIGSEGV, an OOM-killer SIGKILL, ...)
+  and either no test had reported a failure, or the failing tests reported could not
+  be attributed to a known test. The warn also prints the first 600 characters of
+  the child's stdout and stderr.
+- **`Mutant <id>: could not start bun test: <error> — scoring as Error rather than Killed`**
+  — the child failed to spawn (for example `spawn bun ENOENT`), so no tests ran.
+
+A handful of these can be a genuine crash worth fixing in your suite; a flood of
+the second kind means the `bun` executable or its environment is broken.
 
 ### Dry-run failure diagnostics (dry run only)
 
@@ -317,14 +361,16 @@ of them in a clean run's logs is worth investigating before trusting the score.
   backlog-under-contention risk is negligible and the completeness gate does not
   apply to them.
 
-  At the default (WARN) log level, dry runs also emit a few lines tracing this
-  handshake: `Drain-request received`, `Drain handler settled via ...`,
-  `Post-drain inspector snapshot`, and `Post-drain inspector close/collision
-  diagnostics`, reporting the round-trip's outcome (`ack`, `silence`,
-  `ceiling`, or `send-rejected`), the found/start/end event-count deltas
-  observed during the wait, any found-id gaps, the WebSocket close
-  code/reason/wasClean (plus how many ms after the last received frame the
-  close arrived), and raw-vs-unique found-event counts. A separate DEBUG-level
+  A healthy dry run is quiet about this handshake at the default (WARN) log
+  level. The detailed trace is logged at DEBUG: `Drain-request received`,
+  `Drain handler settled via ...`, `Post-drain inspector snapshot`, and
+  `Post-drain inspector close/collision diagnostics`, reporting the
+  round-trip's outcome (`ack`, `silence`, `ceiling`, or `send-rejected`), the
+  found/start/end event-count deltas observed during the wait, any found-id
+  gaps, the WebSocket close code/reason/wasClean (plus how many ms after the
+  last received frame the close arrived), and raw-vs-unique found-event
+  counts. To see those lines, run Stryker with `logLevel: 'debug'` in your
+  config (or `--logLevel debug` on the command line). A separate DEBUG-level
   line notes if the inspector socket closed while the run was still thought to
   be in progress (including the same close code/reason/wasClean detail) — this
   is logged at DEBUG rather than WARN because the child closing its own socket
@@ -333,8 +379,20 @@ of them in a clean run's logs is worth investigating before trusting the score.
   evidence of anything wrong (it is folded into the completeness gate's error
   message as corroborating context — now including the captured close
   code/reason — only if that gate has already fired for another reason).
-  Together the WARN-level lines are useful for telling apart two different
-  failure shapes: residual loss caused by a runner-side bound being hit (a
+
+  At WARN, the dry run emits a single line beginning
+  `Inspector data looks abnormal after the dry run:`, and only when the
+  inspector data may be incomplete or merged: the drain handshake did not
+  settle via `ack` (it settled via `silence`, `ceiling`, or `send-rejected`, or
+  the drain request never arrived), the inspector WebSocket closed uncleanly
+  (`wasClean` false, e.g. close code 1006) even though the drain was
+  acknowledged, found-id gaps remain after the wait, or
+  duplicate found-id events were seen (the id-collision bug described below).
+  The line lists the specific problems found (an unclean close is reported with
+  its close code and reason) and points you at debug logging
+  for the full diagnostics above. Together, the WARN line and the DEBUG detail
+  are useful for telling apart two different failure shapes: residual loss
+  caused by a runner-side bound being hit (a
   give-up outcome — `silence` or `ceiling`) versus loss happening inside Bun's
   own inspector agent (found-id gaps persisting even though the round-trip
   `ack` succeeded). One caveat: gap detection assumes Bun assigns
@@ -343,9 +401,10 @@ of them in a clean run's logs is worth investigating before trusting the score.
   losslessness: a confirmed Bun TestReporter id-collision bug (two interleaved
   `1..N` id sequences when `TestReporter.enable` lands mid-collection) keeps
   ids dense while silently merging two distinct tests under one shared id.
-  That is exactly what the close/collision diagnostics line's
+  That is exactly what the (DEBUG-level) close/collision diagnostics line's
   raw/unique/duplicate found counts exist to catch: a **nonzero duplicate
-  count is direct in-the-wild evidence of that id-collision bug**, and the
+  count is direct in-the-wild evidence of that id-collision bug** (and is
+  what puts the duplicate-event problem into the WARN line above), and the
   close code/reason/wasClean fields confirm or rule out a separate confirmed
   Bun bug where `idleTimeout: 0` websockets are force-closed on a ~252-second
   ping cycle (`ERR_WEBSOCKET_TIMEOUT`) — an abnormal close landing right on
@@ -381,7 +440,7 @@ of them in a clean run's logs is worth investigating before trusting the score.
 
 ## Known Limitations
 
-- **Sequential execution required** - Tests run with `--concurrency=1` to ensure accurate coverage tracking. This is slower than parallel execution but necessary for correct test-to-mutant correlation.
+- **Sequential execution required** - Tests run with `--max-concurrency=1` to ensure accurate coverage tracking, and the coverage preload also forces `test.concurrent` tests to run sequentially. This is slower than parallel execution but necessary for correct test-to-mutant correlation.
 
 - **Inspector-stream drain handshake covers `dryRun` only** — the hold-open-until-drained
   handshake described under "Dry-run completeness gate" above only runs for the dry run
