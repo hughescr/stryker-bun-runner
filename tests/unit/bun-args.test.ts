@@ -73,6 +73,8 @@ describe('findUnsupportedBunArgs', () => {
             '--inspect',
             '--inspect-wait',
             '--inspect-brk',
+            '--retry',
+            '--rerun-each',
         ];
 
         it.each(longFlags)('rejects bare %s', (flag) => {
@@ -135,14 +137,31 @@ describe('findUnsupportedBunArgs', () => {
         });
     });
 
+    describe('--retry / --rerun-each (re-run tests, which mutation testing cannot use)', () => {
+        it('explains that --retry repeats test names and re-runs failing tests', () => {
+            const [found] = findUnsupportedBunArgs(['--retry=2']);
+            expect(found.arg).toBe('--retry=2');
+            expect(found.reason).toContain('re-runs failing tests');
+            expect(found.reason).toContain('killedBy');
+        });
+
+        it('explains that --rerun-each multiplies every mutant run', () => {
+            const [found] = findUnsupportedBunArgs(['--rerun-each', '3']);
+            expect(found.arg).toBe('--rerun-each');
+            expect(found.reason).toContain('multiplies');
+        });
+
+        it('rejects them through assertSupportedBunArgs with the reason', () => {
+            expect(assertFn(['--retry=2'])).toThrow('bun.bunArgs contains "--retry=2", which re-runs failing tests');
+        });
+    });
+
     describe('accepted flags', () => {
         it.each([
             '--only',
             '--verbose',
             '--smol',
             '--timeout=20000',
-            '--retry=2',
-            '--rerun-each=2',
             '--randomize',
             '--seed=7',
             '--isolate',

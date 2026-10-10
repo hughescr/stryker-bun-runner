@@ -690,6 +690,8 @@ describe('BunTestRunner', () => {
                 ['--update-snapshots'],
                 ['--pass-with-no-tests'],
                 ['--cwd=/elsewhere'],
+                ['--retry=2'],
+                ['--rerun-each=2'],
             ])('rejects init() for bunArgs containing %s', async (flag) => {
                 const runner = new BunTestRunner(mockLogger, {
                     bun: { bunArgs: [flag] },
@@ -700,7 +702,7 @@ describe('BunTestRunner', () => {
 
             it('accepts flags that do not affect attribution or selection', async () => {
                 const runner = new BunTestRunner(mockLogger, {
-                    bun: { bunArgs: ['--only', '--randomize', '--seed=1', '--isolate', '--rerun-each=2', '--timeout=20000'] },
+                    bun: { bunArgs: ['--only', '--randomize', '--seed=1', '--isolate', '--timeout=20000'] },
                 } as unknown as StrykerOptions);
 
                 await runner.init();
@@ -734,7 +736,7 @@ describe('BunTestRunner', () => {
                     await runner.init();
                     await runner.dryRun();
 
-                    expect(mockGenerateSanitizedBunfig).toHaveBeenCalledWith(process.cwd(), expect.any(String), 'ci.toml');
+                    expect(mockGenerateSanitizedBunfig).toHaveBeenCalledWith(process.cwd(), expect.any(String), 'ci.toml', expect.any(Function));
                     expect(discoverTestFilesSpy).toHaveBeenCalledWith(process.cwd(), mockLogger, 'ci.toml');
                     // Only the runner's own sanitized --config reaches bun (built in process-runner from bunfigPath).
                     expect(mockRunBunTests).toHaveBeenCalledWith(expect.objectContaining({ bunArgs: ['--only'] }));
@@ -745,8 +747,76 @@ describe('BunTestRunner', () => {
 
                     await runner.init();
 
-                    expect(mockGenerateSanitizedBunfig).toHaveBeenCalledWith(process.cwd(), expect.any(String), undefined);
+                    expect(mockGenerateSanitizedBunfig).toHaveBeenCalledWith(process.cwd(), expect.any(String), undefined, expect.any(Function));
                     expect(discoverTestFilesSpy).toHaveBeenCalledWith(process.cwd(), mockLogger, undefined);
+                });
+
+                describe('keys the sanitizer dropped', () => {
+                    type OnDropped = (drops: { key: string, reason: string, warn: boolean }[]) => void;
+                    const retryDrop    = { key: 'test.retry', reason: 'RETRY-REASON', warn: true };
+                    const rerunDrop    = { key: 'test.rerunEach', reason: 'RERUN-REASON', warn: true };
+                    const coverageDrop = { key: 'test.coverageDir', reason: 'COV-REASON', warn: false };
+
+                    /** Make the mocked sanitizer report `drops` to the runner's callback on every call. */
+                    function reportDrops(drops: { key: string, reason: string, warn: boolean }[]): void {
+                        mockGenerateSanitizedBunfig.mockImplementation((_cwd: string, _tmp: string, _src: string | undefined, onDropped?: OnDropped) => {
+                            onDropped?.(drops);
+                            return Promise.resolve('/tmp/sanitized.toml');
+                        });
+                    }
+
+                    it('logs every dropped key at debug with its reason', async () => {
+                        reportDrops([retryDrop, coverageDrop]);
+                        const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+
+                        await runner.init();
+
+                        const debugCalls = (mockLogger.debug as ReturnType<typeof mock>).mock.calls;
+                        const dropLines = debugCalls.filter(c => String(c[0]).includes('Sanitized bunfig dropped'));
+                        expect(dropLines.map(c => [c[1], c[2]])).toEqual([
+                            ['test.retry', 'RETRY-REASON'],
+                            ['test.coverageDir', 'COV-REASON'],
+                        ]);
+                    });
+
+                    it('warns once, naming each ignored setting and its reason', async () => {
+                        reportDrops([retryDrop, rerunDrop, coverageDrop]);
+                        const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+
+                        await runner.init();
+
+                        const warns = (mockLogger.warn as ReturnType<typeof mock>).mock.calls;
+                        expect(warns).toHaveLength(1);
+                        const message = String(warns[0][0]);
+                        expect(message).toContain('ignored for mutation runs');
+                        expect(warns[0].slice(1)).toEqual(['[test].retry', 'RETRY-REASON', '[test].rerunEach', 'RERUN-REASON']);
+                    });
+
+                    it('does not warn for drops that are not warn-worthy', async () => {
+                        reportDrops([coverageDrop]);
+                        const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+
+                        await runner.init();
+
+                        expect(mockLogger.warn).not.toHaveBeenCalled();
+                    });
+
+                    it('does not warn again when the sanitized bunfig is regenerated for another cwd', async () => {
+                        reportDrops([retryDrop]);
+                        let useNewCwd = false;
+                        const cwdSpy = spyOn(process, 'cwd').mockImplementation(() => (useNewCwd ? '/new/sandbox/cwd' : '/old/cwd'));
+                        try {
+                            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                            await runner.init();
+                            useNewCwd = true;
+                            await runner.init();
+
+                            expect(mockGenerateSanitizedBunfig).toHaveBeenCalledTimes(2);
+                            expect(mockLogger.warn).toHaveBeenCalledTimes(1);
+                        } finally {
+                            cwdSpy.mockRestore();
+                        }
+                    });
                 });
 
                 it('strips the flag from the args of mutant runs too', async () => {
