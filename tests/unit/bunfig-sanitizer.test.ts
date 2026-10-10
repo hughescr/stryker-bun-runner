@@ -3,17 +3,21 @@
  * Covers sanitization logic for bunfig.toml files used during mutation testing
  */
 
-import { lstat, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, it, expect, beforeEach, afterEach, mock, spyOn } from 'bun:test';
 import { parse } from 'smol-toml';
 import { generateSanitizedBunfig, cleanupSanitizedBunfig, readBunfigTestRoot, type DroppedBunfigKey } from '../../src/utils/bunfig-sanitizer.js';
+import * as privateTempDir from '../../src/utils/private-temp-dir.js';
 import { mockMkdir, mockReadFile, mockWriteFile, mockUnlink, resetFsMocks } from '../test-preload.js';
 
 describe('generateSanitizedBunfig', () => {
     const projectCwd = '/project';
     const tmpDir     = path.join(tmpdir(), 'stryker-test-bunfig');
+    // The directory checks are real-fs syscalls; here the directory is taken as verified
+    // (the real checks run in the 'file safety (real filesystem)' tests below).
+    let ensurePrivateDirSpy: ReturnType<typeof spyOn>;
 
     beforeEach(() => {
         mockMkdir.mockClear();
@@ -23,9 +27,11 @@ describe('generateSanitizedBunfig', () => {
 
         mockMkdir.mockResolvedValue(undefined);
         mockWriteFile.mockResolvedValue(undefined);
+        ensurePrivateDirSpy = spyOn(privateTempDir, 'ensurePrivateDir').mockImplementation((dir: string) => Promise.resolve(dir));
     });
 
     afterEach(() => {
+        ensurePrivateDirSpy.mockRestore();
         resetFsMocks();
     });
 
@@ -38,12 +44,15 @@ describe('generateSanitizedBunfig', () => {
     }
 
     describe('directory creation', () => {
-        it('creates tmpDir with recursive option', async () => {
+        it('creates/verifies tmpDir as a private directory before writing, like the preload generator', async () => {
             mockReadFile.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
 
             await generateSanitizedBunfig(projectCwd, tmpDir);
 
-            expect(mockMkdir).toHaveBeenCalledWith(tmpDir, { recursive: true });
+            expect(ensurePrivateDirSpy).toHaveBeenCalledWith(tmpDir);
+            expect(ensurePrivateDirSpy.mock.invocationCallOrder[0]).toBeLessThan(mockWriteFile.mock.invocationCallOrder[0]);
+            // Never a plain (recursive, unchecked) mkdir
+            expect(mockMkdir).not.toHaveBeenCalled();
         });
     });
 
@@ -691,7 +700,8 @@ describe('generateSanitizedBunfig file safety (real filesystem)', () => {
     beforeEach(async () => {
         // Pass-through fs mocks: these tests exercise the kernel's modes and symlinks.
         resetFsMocks();
-        root = await mkdtemp(path.join(tmpdir(), 'sbr-bunfig-safety-'));
+        // Resolved: the directory checks refuse a symlink above the directory (macOS's /var -> /private/var).
+        root = await realpath(await mkdtemp(path.join(tmpdir(), 'sbr-bunfig-safety-')));
         projectCwd = path.join(root, 'project');
         privateDir = path.join(root, 'private');
         await mkdir(projectCwd, { recursive: true });
@@ -730,5 +740,24 @@ describe('generateSanitizedBunfig file safety (real filesystem)', () => {
         } finally {
             nowSpy.mockRestore();
         }
+    });
+
+    it('creates an absent tmpDir with mode 0700', async () => {
+        const fresh = path.join(root, 'fresh');
+
+        const outPath = await generateSanitizedBunfig(projectCwd, fresh);
+
+        expect(path.dirname(outPath)).toBe(fresh);
+        const { mode } = await lstat(fresh);
+        expect(mode & 0o777).toBe(0o700); // eslint-disable-line no-bitwise -- extracting permission bits
+    });
+
+    it('refuses a tmpDir other users can access, writing nothing into it', async () => {
+        await chmod(privateDir, 0o755);
+
+        const err = await generateSanitizedBunfig(projectCwd, privateDir).catch((e: unknown) => e);
+
+        expect(err).toBeInstanceOf(privateTempDir.UnsafeTempDirError);
+        expect(await readdir(privateDir)).toEqual([]);
     });
 });

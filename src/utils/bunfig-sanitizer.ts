@@ -8,11 +8,11 @@
  * forced off — settings that would break mutation testing.
  */
 
-import { readFile, unlink, mkdir } from 'node:fs/promises';
+import { readFile, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { parse, stringify } from 'smol-toml';
 import { RETRY_REASON, RERUN_EACH_REASON } from './bun-args.js';
-import { writePrivateFile } from './private-temp-dir.js';
+import { ensurePrivateDir, writePrivateFile } from './private-temp-dir.js';
 
 // [test] keys that are safe to forward to child bun test processes.
 // Coverage, reporter, and output-filtering keys are deliberately excluded.
@@ -184,7 +184,9 @@ function sanitizeTestSection(sourceTest: Record<string, unknown>, projectCwd: st
  * first. Bun 1.4.2 does not run a top-level `preload` for `bun test` at all.
  *
  * @param projectCwd - Absolute path of the project root (where bunfig.toml lives)
- * @param tmpDir     - Directory where the sanitized file is written
+ * @param tmpDir     - Directory where the sanitized file is written: a resolved
+ *          path; it is created (0700) if absent and must be private to the
+ *          current user (see ensurePrivateDir), or UnsafeTempDirError is thrown
  * @param sourceBunfig - Path of the user's bunfig from `bun.bunArgs` `--config`
  *          (relative to projectCwd); `<projectCwd>/bunfig.toml` when omitted
  * @param onDropped  - Called once with every setting that was dropped or
@@ -197,8 +199,8 @@ export async function generateSanitizedBunfig(
     sourceBunfig?: string,
     onDropped?: (dropped: DroppedBunfigKey[]) => void
 ): Promise<string> {
-    // Ensure temp directory exists
-    await mkdir(tmpDir, { recursive: true });
+    // bun reads its config from here: like the preload, only ever written into a verified private directory
+    await ensurePrivateDir(tmpDir);
 
     const rawConfig = await readSourceBunfig(projectCwd, sourceBunfig);
     const dropped: DroppedBunfigKey[] = [];
