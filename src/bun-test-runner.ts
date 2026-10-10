@@ -2768,8 +2768,8 @@ export class BunTestRunner implements TestRunner {
     }
 
     /**
-   * Diagnostic-only check for the Complete dry-run path: bun reported a failure
-   * (non-zero exit, or a failed count in its console recap) but nothing in the
+   * Diagnostic-only check for the Complete dry-run path: bun's console recap
+   * reported a failed count (a non-zero exit always comes with one by this point) but nothing in the
    * built test results identifies which test failed. This is the observed
    * incident fingerprint — bun prints e.g. "1 tests failed:" with an empty
    * recap, the inspector shows no TestStatus.Failed entry, and nothing points
@@ -2785,7 +2785,10 @@ export class BunTestRunner implements TestRunner {
         parsed: { failed: number },
         tests:  readonly RunnerTestResult[]
     ): void {
-        if((result.exitCode !== 0 || parsed.failed > 0) && !tests.some(t => t.status === TestStatus.Failed)) {
+        // Only `parsed.failed` is tested, not the exit code: this runs only after
+        // checkDryRunProcessResult, which already returned an Error for any non-zero exit with
+        // zero parsed failures, so a non-zero exit reaching here implies parsed.failed > 0.
+        if(parsed.failed > 0 && !tests.some(t => t.status === TestStatus.Failed)) {
             // Stryker disable next-line StringLiteral: diagnostic logging message only
             this.logger.warn(
                 'Bun exited with code %s and its console output reported %d failed test(s), '
@@ -2986,9 +2989,8 @@ export class BunTestRunner implements TestRunner {
         // an empty map so the runner falls back to testInfo.url-based naming.
         const { coverage, inspectorIdToProjectFile, counterKeyToTestName, rawKeyCount, orphanedKeyCount } = mapCoverageToInspectorIds(rawCoverage, executionOrder, testMap, this.logger);
 
-        if(lateHits.length > 0) {
-            this.emitCoverageBleedWarnings(lateHits, counterKeyToTestName);
-        }
+        // No length guard: with no lateHits, emitCoverageBleedWarnings logs nothing.
+        this.emitCoverageBleedWarnings(lateHits, counterKeyToTestName);
 
         return { coverage, inspectorIdToProjectFile, rawKeyCount, orphanedKeyCount };
     }
