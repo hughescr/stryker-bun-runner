@@ -103,18 +103,29 @@ function parseFilePath(line: string): string | null {
  * bun run that a test logs. Taken as a header it would prefix the failing test
  * with the wrong file, and the name would match no dry-run test id.
  *
- * Bun prints headers only for the files it runs, relative to the cwd. So when
- * the output names at least one of `testFiles` in a header, only headers naming
- * one of them are believed. When none does (no list, or output this list cannot
- * vouch for, such as paths printed in a form that does not resolve to the same
- * file), every header is believed, as without a list.
+ * Bun prints headers only for the files it runs, relative to the cwd. An entry
+ * of `testFiles` may also be a DIRECTORY (`bun.testFiles` allows one): bun then
+ * runs, and prints a header for, every test file below it. So a header belongs
+ * to the run when it resolves to a listed entry or to a path below one (both
+ * resolved against the cwd, as bun does; a file entry has nothing below it, so
+ * no file-system access is needed to tell the two apart). When the output names
+ * at least one such file in a header, only headers naming files of the run are
+ * believed. When none does (no list, or output this list cannot vouch for, such
+ * as paths printed in a form that does not resolve to the same file), every
+ * header is believed, as without a list.
  */
 function headerFilter(lines: readonly string[], testFiles: readonly string[] | undefined): (file: string) => boolean {
     if(testFiles === undefined) {
         return () => true;
     }
-    const runFiles = new Set(testFiles.map(file => path.resolve(file)));
-    const isRunFile = (file: string): boolean => runFiles.has(path.resolve(file));
+    const roots = testFiles.map(file => path.resolve(file));
+    const isRunFile = (file: string): boolean => {
+        const resolved = path.resolve(file);
+        return roots.some((root) => {
+            const relative = path.relative(root, resolved);
+            return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+        });
+    };
     const namesRunFile = lines.some((line) => {
         const file = parseFilePath(line);
         return file !== null && isRunFile(file);

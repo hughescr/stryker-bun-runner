@@ -136,4 +136,19 @@ describe('failure output in a real bun test child', () => {
             without:   ['+ tests/foo.test.ts > reports a nested run'],
         });
     });
+
+    it('credits a failing test under a listed directory to its own file, not to the listed file whose header also printed', async () => {
+        const files = ['tests/00-integration/slow.test.ts', 'tests/unit'];
+        const run = await inFixture([
+            RUN(files, ', bail: true'),
+            `extra = parseBunTestOutput(result.stdout, result.stderr, ${JSON.stringify(files)}).tests.filter(t => t.status === 'failed').map(t => t.name);`,
+        ].join('\n'));
+
+        expect(run.exitCode).toBe(1);
+        expect(run.ran.slice(0, 3)).toEqual(['S1', 'S2', 'S3']);
+        const failed = run.extra as string[];
+        expect(failed).toHaveLength(1);
+        // Whichever unit file bun reaches first fails first; it is never slow.test.ts.
+        expect(failed[0]).toMatch(/^tests\/unit\/(?:b|c|diff)\.test\.ts > /);
+    });
 });

@@ -100,6 +100,60 @@ describe('parseBunTestOutput with the run\'s test files', () => {
         expect(failedNames(DIFF_WITH_HEADER_LINE, [])).toEqual(['+ tests/foo.test.ts > Runner > returns Error']);
     });
 
+    describe('when the run\'s list holds a directory (bun runs everything under it)', () => {
+        const stderr = [
+            'tests/other/x.test.ts:',
+            '(pass) x [1ms]',
+            '',
+            'tests/unit/deep/y.test.ts:',
+            '(fail) y [1ms]',
+            '',
+            'tests/unit/z.test.ts:',
+            '(fail) z [1ms]',
+        ].join('\n');
+        const FAILED = ['tests/unit/deep/y.test.ts > y', 'tests/unit/z.test.ts > z'];
+
+        it('believes the headers of files under the directory, however deep (the failure is not credited to the listed file)', () => {
+            expect(failedNames(stderr, ['tests/other/x.test.ts', 'tests/unit'])).toEqual(FAILED);
+        });
+
+        it('accepts a directory spelled with a trailing slash, ./ or an absolute path', () => {
+            for(const dir of ['tests/unit/', './tests/unit', path.resolve('tests/unit')]) {
+                expect(failedNames(stderr, ['tests/other/x.test.ts', dir])).toEqual(FAILED);
+            }
+        });
+
+        it('works when the directory is the only entry', () => {
+            expect(failedNames(stderr, ['tests/unit'])).toEqual(FAILED);
+        });
+
+        it('still ignores a header outside both the files and the directories', () => {
+            const stray = `${stderr}\n+ tests/stray.test.ts:\n(fail) w [1ms]`;
+
+            expect(failedNames(stray, ['tests/other/x.test.ts', 'tests/unit'])).toEqual([...FAILED, 'tests/unit/z.test.ts > w']);
+        });
+
+        it('does not take a sibling whose name merely starts with the directory\'s', () => {
+            const sibling = 'tests/unit/z.test.ts:\n(fail) z [1ms]\n\ntests/unit-extra/q.test.ts:\n(fail) q [1ms]\n';
+
+            expect(failedNames(sibling, ['tests/unit'])).toEqual(['tests/unit/z.test.ts > z', 'tests/unit/z.test.ts > q']);
+        });
+
+        it('does not take a parent directory\'s file for a nested directory entry', () => {
+            const parent = 'tests/unit/z.test.ts:\n(fail) z [1ms]\n\ntests/a.test.ts:\n(fail) a [1ms]\n';
+
+            expect(failedNames(parent, ['tests/unit'])).toEqual(['tests/unit/z.test.ts > z', 'tests/unit/z.test.ts > a']);
+        });
+
+        it('treats a directory above the working directory as covering the files under it', () => {
+            const outside = path.resolve('..', 'sibling', 'q.test.ts');
+            const relative = path.relative(process.cwd(), outside);
+            const out = `${relative}:\n(fail) q [1ms]\n/elsewhere/s.test.ts:\n(fail) r [1ms]\n`;
+
+            expect(failedNames(out, [path.resolve('..')])).toEqual([`${relative} > q`, `${relative} > r`]);
+        });
+    });
+
     it('finds a run file\'s header in stdout too', () => {
         const result = parseBunTestOutput('tests/a.test.ts:\n(fail) one [1ms]\n', 'tests/x.test.ts:\n', ['tests/a.test.ts']);
 
