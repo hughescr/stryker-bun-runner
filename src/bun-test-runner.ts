@@ -474,8 +474,15 @@ export class BunTestRunner implements TestRunner {
     private cachedTestNames?:             Set<string>;
     private baseNameIndex?:               Map<string, string[]>;
     private testNameIndex?:               Map<string, string>;
+    /** The auto-discovered test files, valid for `cachedTestFilesCwd` only. Written by discovery alone, never by a selection. */
     private cachedTestFiles?:             string[];
     private cachedTestFilesCwd?:          string;
+    /**
+     * The list mutantRun uses for its "run all tests" runs and for validating covering-test
+     * narrowing: the effective selection (Stryker's testFiles, bun.testFiles or discovery).
+     * Kept apart from {@link cachedTestFiles} so a selection can never be read back as the discovered set.
+     */
+    private effectiveTestFiles?:          string[];
     /**
      * The test files Stryker's own `testFiles` option selected (DryRunOptions.testFiles), as
      * exact absolute paths, valid for `cwd`. Set by dryRun (or loaded from the shared registry
@@ -652,7 +659,7 @@ export class BunTestRunner implements TestRunner {
         if(filterIds.length === 0) {
             return undefined;
         }
-        const discovered = this.cachedTestFiles;
+        const discovered = this.effectiveTestFiles;
         // Stryker disable next-line ConditionalExpression,BlockStatement: without a discovered list there is nothing to validate against; covered by 'keeps the full file list when discovery produced nothing'
         if(!discovered || discovered.length === 0) {
             return undefined;
@@ -717,7 +724,6 @@ export class BunTestRunner implements TestRunner {
     private applyDryRunTestFiles(options: DryRunOptions | undefined): void {
         const requested = options?.testFiles;
         const cwd = process.cwd();
-        const previous = this.strykerTestFiles;
         if(requested === undefined || requested.length === 0) {
             this.strykerTestFiles = undefined;
             if(requested !== undefined) {
@@ -728,11 +734,6 @@ export class BunTestRunner implements TestRunner {
             const files = [...new Set(requested.map(file => path.resolve(cwd, file)))].toSorted((a, b) => a.localeCompare(b));
             this.strykerTestFiles = { cwd, files };
             this.warnIfTestFilesOverridden(files, cwd);
-        }
-        // cachedTestFiles may hold the previous selection (mutantRun stores the effective
-        // list there); drop it so a changed or cleared selection is never read back as the discovered set.
-        if(previous !== undefined) {
-            this.cachedTestFiles = undefined;
         }
     }
 
@@ -934,7 +935,7 @@ export class BunTestRunner implements TestRunner {
         // hot path.  If cwd changes between init and dryRun (Stryker sandbox rotation),
         // getOrDiscoverTestFiles() will detect the stale cachedTestFilesCwd key and
         // re-glob from the new cwd before returning.
-        this.cachedTestFiles = await this.getOrDiscoverTestFiles();
+        await this.getOrDiscoverTestFiles();
     }
 
     /**
@@ -1913,9 +1914,27 @@ export class BunTestRunner implements TestRunner {
         } catch (error) {
             // Non-fatal: the worker that did dryRun still has its in-memory copy.
             // Other workers will fall back to raw names and log a warning.
-            // Stryker disable next-line StringLiteral: diagnostic logging message
-            this.logger.warn('Failed to write dryRun registry file: %s', error instanceof Error ? error.message : String(error));
+            this.warnRegistryWriteFailed(error instanceof Error ? error.message : String(error));
         }
+    }
+
+    /**
+     * Warn that the dry-run registry could not be written. The registry also carries
+     * Stryker's testFiles selection, so when one is active the warning adds that other
+     * workers will not see it and fall back to bun.testFiles or auto-discovery.
+     */
+    private warnRegistryWriteFailed(message: string): void {
+        if(this.selectedTestFilesFor(process.cwd()) === undefined) {
+            // Stryker disable next-line StringLiteral: diagnostic logging message
+            this.logger.warn('Failed to write dryRun registry file: %s', message);
+            return;
+        }
+        // Stryker disable next-line StringLiteral: diagnostic logging message
+        this.logger.warn(
+            'Failed to write dryRun registry file: %s. Stryker\'s testFiles option is active, so other workers will not see the selection '
+            + 'and will fall back to bun.testFiles or auto-discovery for full-suite runs.',
+            message
+        );
     }
 
     /**
@@ -2027,7 +2046,7 @@ export class BunTestRunner implements TestRunner {
         // The files Stryker's testFiles option selected (kept from this worker's dryRun, or
         // loaded from the shared registry above) and then bun.testFiles are used directly
         // without globbing; either way this is the list every "run all tests" fallback uses.
-        this.cachedTestFiles = await this.getOrDiscoverTestFiles();
+        this.effectiveTestFiles = await this.getOrDiscoverTestFiles();
 
         // Kill limit: Stryker's per-mutant timeout less a margin, so the runner reports
         // the Timeout itself before Stryker's TimeoutDecorator fires and restarts the
@@ -2131,7 +2150,7 @@ export class BunTestRunner implements TestRunner {
                 // targeted; the full list whenever it is not, or whenever the
                 // narrowing cannot be proven safe (see resolveCoveringTestFiles).
                 // A file-scoped run (Stryker's testFiles option) runs exactly its files, whatever was discovered.
-                testFiles:             ctx.testFileScope ?? (testNamePattern === undefined ? this.cachedTestFiles : (coveringTestFiles ?? this.cachedTestFiles)),
+                testFiles:             ctx.testFileScope ?? (testNamePattern === undefined ? this.effectiveTestFiles : (coveringTestFiles ?? this.effectiveTestFiles)),
                 signal:                abortController.signal,
                 smol:                  this.smol,
                 maxChildRss:           this.maxChildRss,

@@ -10591,6 +10591,17 @@ error: Third failure message
 
                 expect(dryRunSpawn().testFiles).toEqual(['tests/alpha.test.ts', 'tests/beta.test.ts']);
             });
+
+            it('a later dryRun without testFiles goes back to the discovered files even with a mutantRun in between', async () => {
+                const runner = await initAndDryRun([alpha]);
+                // The mutant run keeps its effective file list; it must not leak into the discovery cache.
+                await mutantRunWithFilter(runner, []);
+                expect(mockRunBunTests.mock.calls[0][0].testFiles).toEqual([alpha]);
+                mockRunBunTests.mockClear();
+                await runner.dryRun(dryRunOptions(undefined));
+
+                expect(dryRunSpawn().testFiles).toEqual(['tests/alpha.test.ts', 'tests/beta.test.ts']);
+            });
         });
 
         describe('mutant runs after a dryRun with Stryker\'s testFiles', () => {
@@ -10737,6 +10748,30 @@ error: Third failure message
 
                 expect(storedRegistry).toBeDefined();
                 expect(JSON.parse(storedRegistry ?? '{}')).not.toHaveProperty('testFiles');
+            });
+
+            it('warns that other workers will fall back when the registry write fails while a selection is active', async () => {
+                writeFileSpy.mockRejectedValue(Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' }));
+
+                const runner = await initAndDryRun([alpha]);
+
+                const warnings = warnMessages().filter(m => m.includes('Failed to write dryRun registry file'));
+                expect(warnings).toHaveLength(1);
+                expect(warnings[0]).toContain('will fall back to bun.testFiles or auto-discovery for full-suite runs');
+                expect((mockLogger.warn as ReturnType<typeof mock>).mock.calls.find(call => String(call[0]).includes('Failed to write'))?.[1]).toContain('ENOSPC');
+                // The dry-running worker still keeps its own selection.
+                await mutantRunWithFilter(runner, []);
+                expect(mockRunBunTests.mock.calls[0][0].testFiles).toEqual([alpha]);
+            });
+
+            it('keeps the plain registry-write warning when no selection is active', async () => {
+                writeFileSpy.mockRejectedValue(Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' }));
+
+                await initAndDryRun(undefined);
+
+                const warnings = warnMessages().filter(m => m.includes('Failed to write dryRun registry file'));
+                expect(warnings).toHaveLength(1);
+                expect(warnings[0]).not.toContain('fall back');
             });
 
             it('runs the selected files in its full-suite runs and narrows within them', async () => {
