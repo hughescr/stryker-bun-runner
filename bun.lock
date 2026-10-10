@@ -6,9 +6,9 @@
       "name": "@hughescr/stryker-bun-runner",
       "dependencies": {
         "@stryker-mutator/api": "^9.0.0 || ^10.0.0",
-        "smol-toml": "1.7.0",
-        "tinyglobby": "0.2.17",
-        "ws": "8.21.0",
+        "smol-toml": "^1.7.0",
+        "tinyglobby": "^0.2.17",
+        "ws": "^8.21.0",
       },
       "devDependencies": {
         "@hughescr/eslint-config-default": "6.0.1",
