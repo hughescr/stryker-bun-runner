@@ -83,6 +83,13 @@ export class SyncServer {
    */
     private drainInFlight: Promise<void> | null = null;
 
+    /**
+   * Clients whose 'drain-request' arrived before {@link setDrainHandler} was
+   * called. They are served as soon as a handler is registered: dropping such a
+   * request would leave the child waiting for a 'drained' that never comes.
+   */
+    private pendingDrainClients: WebSocket[] = [];
+
     constructor(options: SyncServerOptions) {
         this.port = options.port;
         this.createHttpServer = options.createHttpServer ?? createServer;
@@ -193,19 +200,29 @@ export class SyncServer {
    * inside the handler itself), nothing is sent back — the preload's own
    * bounded wait is the fallback, so a broken/slow handler degrades to
    * today's behavior rather than hanging.
+   *
+   * A 'drain-request' that arrived before this call was queued, not dropped,
+   * and is served here.
    */
     setDrainHandler(handler: () => Promise<void>): void {
         this.drainHandler = handler;
+        const pending = this.pendingDrainClients;
+        this.pendingDrainClients = [];
+        for(const ws of pending) {
+            this.handleDrainRequest(ws);
+        }
     }
 
     /**
    * Handle an inbound 'drain-request' message from a client. Re-entrant: a
    * second 'drain-request' (e.g. a retry) while one is already in flight
    * shares the same in-flight promise rather than invoking the handler
-   * again.
+   * again. Before a handler is registered the request is queued for
+   * {@link setDrainHandler} to serve.
    */
     private handleDrainRequest(ws: WebSocket): void {
         if(!this.drainHandler) {
+            this.pendingDrainClients.push(ws);
             return;
         }
 
@@ -239,6 +256,7 @@ export class SyncServer {
         this.readyLatched = false;
         this.drainHandler = null;
         this.drainInFlight = null;
+        this.pendingDrainClients = [];
 
         // Close all client connections
         for(const client of this.clients) {

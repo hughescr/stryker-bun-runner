@@ -521,7 +521,7 @@ describe('SyncServer', () => {
             expect(client.on).toHaveBeenCalledWith('message', expect.any(Function));
         });
 
-        it('ignores drain-request when no handler is registered', async () => {
+        it('holds a drain-request that arrives before any handler is registered, without replying', async () => {
             const server = createServer();
             await server.start();
 
@@ -530,9 +530,127 @@ describe('SyncServer', () => {
             mockWss.triggerConnection(client);
 
             expect(() => messageHandler(Buffer.from('drain-request'))).not.toThrow();
-            // Flush microtasks: nothing should have been scheduled, but this proves
-            // no crash and no stray reply either.
             await Promise.resolve();
+            await Promise.resolve();
+            expect(client.send).not.toHaveBeenCalled();
+        });
+
+        it('serves a drain-request that arrived before the handler as soon as the handler is registered', async () => {
+            // The child can send drain-request before the runner has registered its
+            // handler (a slow TestReporter.enable round trip). Dropping it left the
+            // child waiting for a 'drained' that never came.
+            const server = createServer();
+            await server.start();
+
+            const client = createMockClient(1);
+            const messageHandler = captureHandler(client, 'message');
+            mockWss.triggerConnection(client);
+            messageHandler(Buffer.from('drain-request'));
+
+            const drainHandler = mock(() => Promise.resolve());
+            server.setDrainHandler(drainHandler);
+            expect(drainHandler).toHaveBeenCalledTimes(1);
+            await Promise.resolve();
+            await Promise.resolve();
+            await Promise.resolve();
+
+            expect(client.send).toHaveBeenCalledWith('drained');
+        });
+
+        it('serves every client queued before registration with a single handler invocation', async () => {
+            const server = createServer();
+            await server.start();
+
+            const first = createMockClient(1);
+            const firstMessage = captureHandler(first, 'message');
+            mockWss.triggerConnection(first);
+            const second = createMockClient(1);
+            const secondMessage = captureHandler(second, 'message');
+            mockWss.triggerConnection(second);
+            firstMessage(Buffer.from('drain-request'));
+            secondMessage(Buffer.from('drain-request'));
+
+            const drainHandler = mock(() => Promise.resolve());
+            server.setDrainHandler(drainHandler);
+            await Promise.resolve();
+            await Promise.resolve();
+            await Promise.resolve();
+
+            expect(drainHandler).toHaveBeenCalledTimes(1);
+            expect(first.send).toHaveBeenCalledWith('drained');
+            expect(second.send).toHaveBeenCalledWith('drained');
+        });
+
+        it('serves a queued request only once, even when the handler is registered again', async () => {
+            const server = createServer();
+            await server.start();
+
+            const client = createMockClient(1);
+            const messageHandler = captureHandler(client, 'message');
+            mockWss.triggerConnection(client);
+            messageHandler(Buffer.from('drain-request'));
+
+            server.setDrainHandler(mock(() => Promise.resolve()));
+            const laterHandler = mock(() => Promise.resolve());
+            server.setDrainHandler(laterHandler);
+            await Promise.resolve();
+            await Promise.resolve();
+            await Promise.resolve();
+
+            expect(laterHandler).not.toHaveBeenCalled();
+            expect(client.send).toHaveBeenCalledTimes(1);
+        });
+
+        it('does not invoke a handler on registration when no request is queued, including on re-registration', async () => {
+            const server = createServer();
+            await server.start();
+
+            const firstHandler = mock(() => Promise.resolve());
+            const secondHandler = mock(() => Promise.resolve());
+            server.setDrainHandler(firstHandler);
+            server.setDrainHandler(secondHandler);
+            await Promise.resolve();
+
+            expect(firstHandler).not.toHaveBeenCalled();
+            expect(secondHandler).not.toHaveBeenCalled();
+        });
+
+        it('does not reply drained to a queued client that closed before the handler was registered', async () => {
+            const server = createServer();
+            await server.start();
+
+            const client = createMockClient(1);
+            const messageHandler = captureHandler(client, 'message');
+            mockWss.triggerConnection(client);
+            messageHandler(Buffer.from('drain-request'));
+            client.readyState = 3; // CLOSED
+
+            server.setDrainHandler(mock(() => Promise.resolve()));
+            await Promise.resolve();
+            await Promise.resolve();
+            await Promise.resolve();
+
+            expect(client.send).not.toHaveBeenCalled();
+        });
+
+        it('forgets queued drain-requests on close, so a reused server never serves a client of the previous run', async () => {
+            const server = createServer();
+            await server.start();
+
+            const client = createMockClient(1);
+            const messageHandler = captureHandler(client, 'message');
+            mockWss.triggerConnection(client);
+            messageHandler(Buffer.from('drain-request'));
+
+            await server.close();
+            await server.start();
+            const drainHandler = mock(() => Promise.resolve());
+            server.setDrainHandler(drainHandler);
+            await Promise.resolve();
+            await Promise.resolve();
+            await Promise.resolve();
+
+            expect(drainHandler).not.toHaveBeenCalled();
             expect(client.send).not.toHaveBeenCalledWith('drained');
         });
 
@@ -772,6 +890,7 @@ describe('SyncServer', () => {
             expect(() => freshMessageHandler(Buffer.from('drain-request'))).not.toThrow();
             await Promise.resolve();
             expect(freshClient.send).not.toHaveBeenCalledWith('drained');
+            expect(drainHandler).toHaveBeenCalledTimes(1);
         });
     });
 
@@ -887,6 +1006,6 @@ describe('preload sync dial address', () => {
     it('dials the literal loopback address the server binds (127.0.0.1), not "localhost"', async () => {
         const template = await Bun.file(new URL('../../src/templates/coverage-preload.ts', import.meta.url)).text();
         expect(template).not.toContain('ws://localhost:');
-        expect(template.match(/ws:\/\/127\.0\.0\.1:\$\{syncPort\}\/sync/g)).toHaveLength(2);
+        expect(template.match(/ws:\/\/127\.0\.0\.1:\$\{syncPort\}\/sync/g)).toHaveLength(1);
     });
 });
