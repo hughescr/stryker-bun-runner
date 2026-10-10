@@ -615,8 +615,9 @@ describe('BunTestRunner mutation kill tests (first half of the runner)', () => {
          * clock `elapsedMs` ahead (Date.now is faked in lockstep), let one poll tick fire,
          * and report how many timers the handler left pending afterwards.
          */
-        async function giveUp(elapsedMs: number, msSinceLastFrame: number): Promise<{ leftoverTimers: number }> {
+        async function giveUp(elapsedMs: number, msSinceLastFrame: number, foundIdGaps: number[] = []): Promise<{ leftoverTimers: number }> {
             const drainHandler = await registeredDrainHandler();
+            mockInspectorClient.getFoundIdGaps.mockReturnValue(foundIdGaps);
             mockLogger.debug = mock();
             jest.useFakeTimers();
             let fakeNow = Date.now();
@@ -645,7 +646,18 @@ describe('BunTestRunner mutation kill tests (first half of the runner)', () => {
             const settled = settledLog();
             expect(settled[1]).toBe('silence');
             expect(settled[2]).toBe(4250);
+            // Not an ack, and no gaps: no "ack may under-prove drain" suffix.
+            expect(settled.at(-1)).toBe('');
             expect(leftoverTimers).toBe(0);
+        });
+
+        it('on silence with found-id gaps remaining: still no "ack may under-prove drain" suffix, since no ack resolved', async () => {
+            await giveUp(4250, 4321, [3]);
+
+            const settled = settledLog();
+            expect(settled[1]).toBe('silence');
+            expect(settled.at(-2)).toBe(1);
+            expect(settled.at(-1)).toBe('');
         });
 
         it('on the absolute ceiling: logs the ceiling, the elapsed time, and leaves no timer behind', async () => {
@@ -728,6 +740,9 @@ describe('BunTestRunner mutation kill tests (first half of the runner)', () => {
 
     describe('coverage diagnostics', () => {
         const preloadLine = (n: number): string => `[Stryker Coverage] problem ${n}`;
+        /** The missing-coverage warns, which log the whole message through a bare '%s' format. */
+        const missingCoverageWarnings = (): unknown[][] =>
+            callsOf(mockLogger.warn).filter(args => args[0] === '%s' && String(args[1]).includes('the dry run produced no mutant coverage data'));
 
         it('carries at most the first 20 preload diagnostics into the warn on a run with coverage', async () => {
             mockChild({ stderr: Array.from({ length: 25 }, (_, i) => `  ${preloadLine(i)}  `).join('\n') });
@@ -785,6 +800,33 @@ describe('BunTestRunner mutation kill tests (first half of the runner)', () => {
 
             expect(result.status).toBe(DryRunStatus.Complete);
             expect(mockLogger.warn).toHaveBeenCalledWith('%s', expect.stringContaining('the dry run produced no mutant coverage data'));
+            const [[, message]] = missingCoverageWarnings();
+            // Not perTest, so the run is not failed; no preload lines, so no diagnostics section.
+            expect(message).not.toContain('Failing the dry run');
+            expect(message).not.toContain('Coverage preload diagnostics');
+        });
+
+        it('says nothing about missing coverage when coverageAnalysis is off', async () => {
+            mockChild();
+            mockCollectCoverage.mockResolvedValue(undefined);
+            mockInspectorClient.getExecutionOrder.mockReturnValue([1]);
+            mockInspectorClient.getTests.mockReturnValue([{ id: 1, name: 'test', fullName: 'test', status: 'pass', url: '/project/tests/test.ts' }]);
+
+            const result = await dryRunOnce({}, { coverageAnalysis: 'off' });
+
+            expect(result.status).toBe(DryRunStatus.Complete);
+            expect(missingCoverageWarnings()).toEqual([]);
+        });
+
+        it('does not warn that no mutant is covered when coverageAnalysis is off', async () => {
+            mockChild();
+            mockHealthyInspectorRun();
+            mockCollectCoverage.mockResolvedValue({ perTest: {}, 'static': {} });
+
+            const result = await dryRunOnce({}, { coverageAnalysis: 'off' });
+
+            expect(result.status).toBe(DryRunStatus.Complete);
+            expect(callsMatching(mockLogger.warn, 'shows no mutant covered by any test')).toEqual([]);
         });
 
         describe('bun.timeout headroom boundary', () => {
