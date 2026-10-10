@@ -9,58 +9,33 @@ import type { Logger } from '@stryker-mutator/api/logging';
 import type { CoverageFileData, LateHitEntry } from './types.js';
 
 /**
- * Convert an array of mutant IDs to CoverageData format
- *
- * CoverageData is Record<mutantId, hitCount>
- * We don't track hit counts, so we just set each to 1
+ * Add every hit count in `from` into `into`, summing the counts of a mutant
+ * both already hold.
  */
-function arrayToCoverageData(mutantIds: string[]): Record<string, number> {
-    const coverage: Record<string, number> = {};
-    for(const mutantId of mutantIds) {
-        coverage[mutantId] = 1;
+function addHitCounts(into: Record<string, number>, from: Record<string, number>): void {
+    for(const [mutantId, count] of Object.entries(from)) {
+        into[mutantId] = (into[mutantId] ?? 0) + count;
     }
-    return coverage;
 }
 
 /**
- * Merge coverage data from multiple test files
+ * Merge the coverage lines of one run into Stryker's MutantCoverage.
  *
- * Takes multiple coverage objects and merges them into one.
- * For perTest data, combines all test IDs.
- * For static data, unions all covered mutants.
+ * The real hit counts are kept: Stryker sums them per mutant (static plus every
+ * perTest entry) and gives each mutant run a hitLimit of 100 × that sum. Where
+ * two lines report the same test id (shouldn't happen, but be safe) or the same
+ * static mutant, their counts are summed — each line is a separate record of
+ * hits, and dropping one would understate the limit.
  */
-function mergeCoverageData(dataList: CoverageFileData[]): CoverageFileData {
-    const merged: CoverageFileData = {
-        perTest:  {},
-        // Stryker disable next-line ArrayDeclaration: Initial value overwritten at line 60, mutation is equivalent
-        'static': [],
-    };
-
-    const staticSet = new Set<string>();
-
+function mergeCoverageData(dataList: CoverageFileData[]): MutantCoverage {
+    const merged: MutantCoverage = { perTest: {}, 'static': {} };
     for(const data of dataList) {
-    // Merge perTest data
-        for(const [testId, mutantIds] of Object.entries(data.perTest)) {
-            // Stryker disable next-line ConditionalExpression: equivalent mutant — mutating to true makes the first occurrence union an empty set then add all mutantIds, yielding the same result as direct assignment
-            if(testId in merged.perTest) {
-                // Union mutant IDs if duplicate test ID (shouldn't happen, but be safe)
-                const existingSet = new Set(merged.perTest[testId]);
-                for(const mutantId of mutantIds) {
-                    existingSet.add(mutantId);
-                }
-                merged.perTest[testId] = [...existingSet];
-            } else {
-                merged.perTest[testId] = mutantIds;
-            }
+        for(const [testId, counts] of Object.entries(data.perTest)) {
+            merged.perTest[testId] ??= {};
+            addHitCounts(merged.perTest[testId], counts);
         }
-
-        // Merge static data
-        for(const mutantId of data.static) {
-            staticSet.add(mutantId);
-        }
+        addHitCounts(merged.static, data.static);
     }
-
-    merged.static = [...staticSet];
     return merged;
 }
 
@@ -133,21 +108,7 @@ export async function collectCoverage(
         }
 
         // Merge all coverage data from different test files
-        const mergedData = mergeCoverageData(dataList);
-
-        // Convert to Stryker's MutantCoverage format
-        // Stryker expects Record<mutantId, hitCount> not string[]
-        const perTest: Record<string, Record<string, number>> = {};
-        for(const [testId, mutantIds] of Object.entries(mergedData.perTest)) {
-            perTest[testId] = arrayToCoverageData(mutantIds);
-        }
-
-        const staticCoverage = arrayToCoverageData(mergedData.static);
-
-        return {
-            perTest,
-            'static': staticCoverage,
-        };
+        return mergeCoverageData(dataList);
     } catch{
     // No coverage file - coverage wasn't enabled or no mutants were covered
     // This is not an error condition, just return undefined

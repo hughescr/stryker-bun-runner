@@ -6,7 +6,7 @@
  * uses these functions.
  */
 
-import { appendFileSync, closeSync, constants, openSync } from 'node:fs';
+import { appendFileSync, closeSync, constants, openSync, writeSync } from 'node:fs';
 import type { MutantCoverage } from '@stryker-mutator/api/core';
 import type { CoverageFileData, LateHitEntry } from './types.js';
 
@@ -16,10 +16,18 @@ import type { CoverageFileData, LateHitEntry } from './types.js';
 // correctly once the template is copied to its temp-dir location.
 export type { LateHitEntry } from './types.js';
 
+/**
+ * The `__stryker__` global shared with Stryker-instrumented code. Field names
+ * are the instrumenter's (INSTRUMENTER_CONSTANTS in @stryker-mutator/api/core).
+ */
 export interface StrykerNamespace {
     mutantCoverage?: MutantCoverage
     currentTestId?:  string
     activeMutant?:   string
+    /** Hits of the active mutant so far; the instrumenter only counts (and limits) while this is defined. */
+    hitCount?:       number
+    /** The instrumenter throws once {@link hitCount} exceeds this. */
+    hitLimit?:       number
 }
 
 // ============================================================================
@@ -30,6 +38,8 @@ export interface PreloadConfig {
     syncPort?:     string
     coverageFile?: string
     activeMutant?: string
+    /** Stryker's hit limit for the active mutant (mutant runs only), see {@link installHitLimit}. */
+    hitLimit?:     number
 }
 
 export function getPreloadConfig(): PreloadConfig {
@@ -37,7 +47,19 @@ export function getPreloadConfig(): PreloadConfig {
         syncPort:     process.env.__STRYKER_SYNC_PORT__,
         coverageFile: process.env.__STRYKER_COVERAGE_FILE__,
         activeMutant: process.env.__STRYKER_ACTIVE_MUTANT__,
+        hitLimit:     parseHitLimit(process.env.__STRYKER_HIT_LIMIT__),
     };
+}
+
+/**
+ * Parse the `__STRYKER_HIT_LIMIT__` value. Stryker computes the limit as 100 ×
+ * the mutant's dry-run hit count, so anything other than a positive integer
+ * means no usable limit — and no limit is the safe reading: it can only cost
+ * time, never misreport a mutant.
+ */
+export function parseHitLimit(raw: string | undefined): number | undefined {
+    const limit = Number(raw);
+    return Number.isInteger(limit) && limit > 0 ? limit : undefined;
 }
 
 export function shouldCollectCoverage(config: PreloadConfig): boolean {
@@ -60,6 +82,72 @@ export function initializeStrykerNamespace(globalObj: Record<string, unknown>): 
 
 export function setActiveMutant(strykerNamespace: StrykerNamespace, activeMutant: string): void {
     strykerNamespace.activeMutant = activeMutant;
+}
+
+// ============================================================================
+// Hit limit (Stryker's infinite-loop protection)
+// ============================================================================
+
+/**
+ * Marker the preload writes on the child's stderr when the active mutant
+ * exceeds its hit limit; the runner (bun-test-runner.ts) reads it back and
+ * scores the mutant as a Timeout.
+ */
+export const HIT_LIMIT_SENTINEL = '__STRYKER_HIT_LIMIT_REACHED__';
+
+/**
+ * The stderr line reporting `hitCount`. It starts with a newline because bun
+ * may have just written a partial line, and the runner only accepts the
+ * sentinel at the start of a line.
+ */
+export function formatHitLimitSentinel(hitCount: number): string {
+    return `\n${HIT_LIMIT_SENTINEL} ${hitCount}\n`;
+}
+
+/**
+ * Arm the instrumenter's hit limit for this (single-mutant) process.
+ *
+ * Instrumented code calls `stryMutAct_9fa48(id)` at every mutant switch; for
+ * the active mutant it does `if (ns.hitCount !== void 0 && ++ns.hitCount >
+ * ns.hitLimit) throw new Error('Stryker: Hit count limit reached (…)')`. So
+ * setting `hitCount = 0` and `hitLimit` here is all it takes for a mutant that
+ * loops forever to throw out of its loop within ~100 × its dry-run hits instead
+ * of spinning until the runner's timeout.
+ *
+ * The thrown error alone is not enough for the runner: the test may catch it,
+ * and a failing test would otherwise be scored Killed. So the runner also needs
+ * the count, and it needs it even though, under `--bail`, bun exits on the
+ * first failure without running afterAll hooks or process 'exit' handlers
+ * (verified with bun 1.4.2). `hitCount` is therefore an accessor whose setter
+ * reports the first hit past the limit synchronously, from inside the
+ * instrumenter's own `++ns.hitCount`, before the error is even thrown.
+ *
+ * @param report - Receives {@link formatHitLimitSentinel}'s line once; defaults
+ *   to a synchronous write to fd 2, which nothing in bun buffers or drops.
+ */
+export function installHitLimit(
+    strykerNamespace: StrykerNamespace,
+    hitLimit: number,
+    report: (line: string) => void = (line) => {
+        // eslint-disable-next-line n/no-sync -- must reach stderr before bun's bail exit, which runs no async work
+        writeSync(2, line);
+    }
+): void {
+    let hitCount = 0;
+    let reported = false;
+    strykerNamespace.hitLimit = hitLimit;
+    Object.defineProperty(strykerNamespace, 'hitCount', {
+        configurable: true,
+        enumerable:   true,
+        get:          () => hitCount,
+        set:          (value: number) => {
+            hitCount = value;
+            if(!reported && hitCount > hitLimit) {
+                reported = true;
+                report(formatHitLimitSentinel(hitCount));
+            }
+        },
+    });
 }
 
 // ============================================================================
@@ -117,16 +205,19 @@ export function formatCoverageData(
     lateHits: LateHitEntry[] = []
 ): CoverageFileData {
     if(!mutantCoverage) {
-        return { perTest: {}, 'static': [] };
+        return { perTest: {}, 'static': {} };
     }
 
-    const perTest: Record<string, string[]> = {};
+    // Hit counts are kept, not just the covered ids: Stryker sums them per mutant
+    // to size each mutant run's hitLimit (100 × dry-run hits). Copied so later
+    // hits cannot change what is written.
+    const perTest: Record<string, Record<string, number>> = {};
     for(const [testId, coverage] of Object.entries(mutantCoverage.perTest ?? {})) {
         const actualName = counterToName.get(testId) ?? testId;
-        perTest[actualName] = Object.keys(coverage);
+        perTest[actualName] = { ...coverage };
     }
 
-    const staticCoverage = Object.keys(mutantCoverage.static ?? {});
+    const staticCoverage = { ...mutantCoverage.static };
 
     return {
         perTest,

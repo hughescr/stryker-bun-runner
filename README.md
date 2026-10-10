@@ -10,6 +10,7 @@ Stryker test runner plugin for Bun with perTest coverage support.
 - **Inspector Protocol integration** - Uses Bun's WebSocket Inspector API for reliable test discovery and tracking
 - **Multi-file support** - Works correctly with multiple test files
 - **Incremental mode compatible** - Runs only the tests affected by each mutant
+- **Infinite-loop protection** - Supports Stryker's hit limit, so a mutant that loops forever is stopped early and scored Timeout without waiting for the timeout (see [Infinite loops: the hit limit](#infinite-loops-the-hit-limit))
 
 ## Requirements
 
@@ -91,6 +92,18 @@ The runner therefore kills a mutant run's `bun test` child slightly earlier, at 
 One case cannot be scored reliably. When the runner falls back to the full suite for a mutant that has covering tests (the pattern is too long, or matched zero tests), Stryker's timeout was sized for those covering tests, not the full suite. A full suite that is merely slower than that budget looks the same as a mutant that hangs, and the runner cannot extend Stryker's timer. Such a run is scored **Error**, not Timeout, so it does not inflate the score. It is logged at warn as `inconclusive timeout`. If you see it often, raise Stryker's `timeoutMS` or `timeoutFactor`.
 
 Stryker's own `testFiles` option (Stryker 9.6+) is handled separately. With it set, Stryker gives static and no-coverage mutants a list of test **file paths** (inside the sandbox) instead of test ids, and sizes their timeout for those files. The runner recognises that shape (every entry is not a known test id and is an existing test file), runs exactly those files without a `--test-name-pattern`, and scores a run killed at the deadline as a normal **Timeout**, since the budget was sized for it. Note this is Stryker's `testFiles`, not the runner's `bun.testFiles`.
+
+### Infinite loops: the hit limit
+
+Most mutants that hang loop forever (`i++` becomes `i--`, a loop body becomes `{}`). The runner supports Stryker's infinite-loop protection, so such a mutant is usually stopped within milliseconds instead of running until the timeout above.
+
+- **Real hit counts.** The dry run records how many times each mutant was executed, per test and outside tests, and reports those counts to Stryker. Stryker sums them per mutant and gives each mutant run a hit limit of 100 × that sum. When the runner moves a mutant out of the per-test coverage (for example a mutant that also runs at module load is reported as static), its hits move with it, so the sum Stryker sees does not change.
+- **Enforcement.** For a mutant run, the coverage preload sets `__stryker__.hitCount = 0` and `__stryker__.hitLimit` in the `bun test` child. Stryker's instrumented code counts every execution of the active mutant and throws `Stryker: Hit count limit reached (N)` once the count exceeds the limit, which breaks the loop.
+- **Scoring.** The preload writes a `__STRYKER_HIT_LIMIT_REACHED__ <count>` line to the child's stderr the moment the limit is exceeded. It cannot wait for the end of the run, because `--bail` exits without running `afterAll` hooks. The runner scores that run **Timeout** with the reason `Hit limit reached (count/limit)`, as Stryker's jest, vitest, mocha and tap runners do. This holds whether the error failed a test, a test caught it and passed, or the run was killed anyway.
+
+A loop that is merely hot is not affected. A mutant has to run 100 times more often than it did in the whole dry run before it is stopped. A mutant that loops forever without passing through its own mutant switch on each iteration still runs until the timeout, as before. So does a run where Stryker supplies no hit limit (for example with `coverageAnalysis: 'off'`).
+
+For example, in a small project with 7 such mutants, a full Stryker run took 4 s instead of 18 s, with identical results. A single `i++` → `i--` mutant took about 0.7 s instead of about 4.7 s with Stryker's default `timeoutMS`.
 
 ## Options
 

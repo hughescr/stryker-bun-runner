@@ -13,6 +13,8 @@ import {
     DryRunStatus,
     MutantRunStatus,
     TestStatus,
+    determineHitLimitReached,
+    toMutantRunResult,
     type TestRunner,
     type DryRunOptions,
     type DryRunResult,
@@ -33,11 +35,12 @@ import {
     mapCoverageToInspectorIds,
     type LateHitEntry
 } from './coverage/index.js';
+import { HIT_LIMIT_SENTINEL } from './coverage/preload-logic.js';
 import { InspectorClient, type InspectorCloseInfo } from './inspector/index.js';
 import type { TestInfo } from './inspector/types.js';
 import type { StrykerBunOptions } from './options.js';
 import { parseBunTestOutput, type ParsedTestResults } from './parsers/console-parser.js';
-import { runBunTests, stripAnsi } from './process-runner.js';
+import { runBunTests, stripAnsi, type BunProcessResult } from './process-runner.js';
 import { type DroppedBunfigKey, assertSupportedBunArgs, splitBunConfigArg, checkBunVersion, getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, TEST_FILE_SUFFIX_RE, discoverTestFiles, findBuildOutputTestFiles, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery, resolveRunTempDir, writePrivateFile, MutantWarnAggregator } from './utils/index.js';
 
 /**
@@ -481,6 +484,18 @@ function emptyMutantRunCounts(): Record<MutantRunStatus, number> {
         [MutantRunStatus.Timeout]:  0,
         [MutantRunStatus.Error]:    0,
     };
+}
+
+/** The coverage preload's own stderr line reporting the active mutant past its hit limit (see installHitLimit in preload-logic.ts). */
+const HIT_LIMIT_SENTINEL_RE = new RegExp(String.raw`^${HIT_LIMIT_SENTINEL} (\d+)$`, 'm');
+
+/**
+ * The active mutant's hit count, if the coverage preload reported it past its
+ * hit limit on the child's stderr; undefined otherwise.
+ */
+function readReportedHitCount(stderr: string): number | undefined {
+    const match = HIT_LIMIT_SENTINEL_RE.exec(stderr);
+    return match ? Number(match[1]) : undefined;
 }
 
 /** Per-mutant-run state shared by the first spawn and the zero-match full-suite retry. */
@@ -2292,6 +2307,7 @@ export class BunTestRunner implements TestRunner {
                 bunArgs:               this.bunArgs,
                 bunfigPath,
                 activeMutant:          options.activeMutant.id,
+                hitLimit:              options.hitLimit, // Arms the instrumenter's infinite-loop protection in the preload
                 bail:                  !options.disableBail, // Bail on first failure unless Stryker's disableBail is set
                 sequentialMode:        true,            // Match dryRun's serialized execution for deterministic results
                 preloadScript:         this.preloadScriptPath, // Needed to set globalThis.__stryker__.activeMutant
@@ -2323,25 +2339,9 @@ export class BunTestRunner implements TestRunner {
             }
         }
 
-        if(result.timedOut) {
-            // A full-suite FALLBACK run (the covering tests' pattern was too long, or
-            // matched nothing and this is the retry) killed at a Stryker-derived limit
-            // proves nothing: Stryker sized that budget for the covering tests only, so
-            // a merely slow full suite and a hanging mutant look identical. Scoring it
-            // Timeout would count it as detected. The runner cannot buy the full suite
-            // more time — Stryker's TimeoutDecorator fires at options.timeout no matter
-            // what the runner does — so it reports Error (excluded from the score). A
-            // maxChildRss kill is evidence of a runaway either way and stays Timeout, as
-            // does a kill at bun.timeout, which is documented as a full-suite limit.
-            const isFullSuiteFallback = testNamePattern === undefined && ctx.coveringTestCount > 0;
-            if(isFullSuiteFallback && ctx.strykerTimeoutMs !== undefined && result.memoryLimitExceeded !== true) {
-                return this.buildInconclusiveFallbackTimeout(options.activeMutant.id, ctx.coveringTestCount, ctx.strykerTimeoutMs);
-            }
-            // Stryker disable next-line all: Logging statement
-            this.logger.debug('Mutant run timed out');
-            return {
-                status: MutantRunStatus.Timeout,
-            };
+        const runawayResult = this.classifyRunawayMutantRun(result, ctx, testNamePattern);
+        if(runawayResult) {
+            return runawayResult;
         }
 
         // The child failed to spawn (ENOENT, EACCES, …): bun test never ran, so exitCode is
@@ -2404,8 +2404,51 @@ export class BunTestRunner implements TestRunner {
     }
 
     /**
+   * The verdict for a mutant run that ran away — it exceeded Stryker's hit limit,
+   * or the runner had to kill it — or undefined for a run that ended on its own.
+   */
+    private classifyRunawayMutantRun(
+        result:          BunProcessResult,
+        ctx:             MutantRunContext,
+        testNamePattern: string | undefined
+    ): MutantRunResult | undefined {
+        // Stryker's infinite-loop protection: past its hitLimit the instrumenter throws
+        // out of the mutant's loop, and the preload reports the count on stderr. That
+        // is conclusive whatever happened next — the error failed a test (which would
+        // read as Killed), a test swallowed it (Survived), or the run was killed anyway
+        // — so, as in Stryker's own runners, it is scored Timeout with Stryker's reason.
+        const hitLimitTimeout = determineHitLimitReached(readReportedHitCount(result.stderr), ctx.options.hitLimit);
+        if(hitLimitTimeout) {
+            return toMutantRunResult(hitLimitTimeout);
+        }
+
+        if(!result.timedOut) {
+            return undefined;
+        }
+
+        // A full-suite FALLBACK run (the covering tests' pattern was too long, or
+        // matched nothing and this is the retry) killed at a Stryker-derived limit
+        // proves nothing: Stryker sized that budget for the covering tests only, so
+        // a merely slow full suite and a hanging mutant look identical. Scoring it
+        // Timeout would count it as detected. The runner cannot buy the full suite
+        // more time — Stryker's TimeoutDecorator fires at options.timeout no matter
+        // what the runner does — so it reports Error (excluded from the score). A
+        // maxChildRss kill is evidence of a runaway either way and stays Timeout, as
+        // does a kill at bun.timeout, which is documented as a full-suite limit.
+        const isFullSuiteFallback = testNamePattern === undefined && ctx.coveringTestCount > 0;
+        if(isFullSuiteFallback && ctx.strykerTimeoutMs !== undefined && result.memoryLimitExceeded !== true) {
+            return this.buildInconclusiveFallbackTimeout(ctx.options.activeMutant.id, ctx.coveringTestCount, ctx.strykerTimeoutMs);
+        }
+        // Stryker disable next-line all: Logging statement
+        this.logger.debug('Mutant run timed out');
+        return {
+            status: MutantRunStatus.Timeout,
+        };
+    }
+
+    /**
    * Error result for a full-suite fallback run killed at the limit derived from
-   * Stryker's per-mutant timeout — see the timedOut branch of executeMutantRun.
+   * Stryker's per-mutant timeout — see classifyRunawayMutantRun.
    */
     private buildInconclusiveFallbackTimeout(mutantId: string, coveringTestCount: number, strykerTimeoutMs: number): MutantRunResult {
         // Stryker disable next-line StringLiteral: diagnostic error message text — behaviorally tested via .toContain

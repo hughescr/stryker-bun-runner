@@ -480,6 +480,37 @@ describe('runBunTests', () => {
             expect(spawnOptions.env!.__STRYKER_ACTIVE_MUTANT__).toBe('42');
         });
 
+        it('should set __STRYKER_HIT_LIMIT__ when hitLimit is provided, overriding any value in env', async () => {
+            const resultPromise = runBunTests({
+                bunPath:      'bun',
+                timeout:      5000,
+                activeMutant: '42',
+                hitLimit:     1100,
+                env:          { __STRYKER_HIT_LIMIT__: '7' },
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            expect(mockSpawn.mock.calls[0][2].env!.__STRYKER_HIT_LIMIT__).toBe('1100');
+        });
+
+        it('should never pass on an inherited __STRYKER_HIT_LIMIT__ when hitLimit is not provided', async () => {
+            // A nested run (this runner driven from inside a mutant run) inherits the outer
+            // run's limit through process.env, which is spread into the child env exactly
+            // like `env` here; the child must only ever see the limit this run was given.
+            const resultPromise = runBunTests({
+                bunPath: 'bun',
+                timeout: 5000,
+                env:     { __STRYKER_HIT_LIMIT__: '600' },
+            });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            expect(Object.hasOwn(mockSpawn.mock.calls[0][2].env!, '__STRYKER_HIT_LIMIT__')).toBe(false);
+        });
+
         it('should set __STRYKER_COVERAGE_FILE__ when coverageFile is provided', async () => {
             const resultPromise = runBunTests({
                 bunPath:      'bun',

@@ -173,6 +173,52 @@ function stabilizeCoverage(coverage: MutantCoverage): MutantCoverage {
 }
 
 /**
+ * Per-mutant hit totals exactly as Stryker core computes them
+ * (mutants/test-coverage.js): the `static` count plus the count in every
+ * perTest entry.
+ */
+function sumHitsByMutant(coverage: MutantCoverage): Map<string, number> {
+    const totals = new Map<string, number>();
+    for(const counts of [coverage.static, ...Object.values(coverage.perTest)]) {
+        for(const [mutantId, count] of Object.entries(counts)) {
+            totals.set(mutantId, (totals.get(mutantId) ?? 0) + count);
+        }
+    }
+    return totals;
+}
+
+/**
+ * Give every mutant in the mapped coverage back the hit total it had in the raw
+ * coverage, without changing which buckets it appears in.
+ *
+ * Stryker gives each mutant run a hitLimit of 100 × the mutant's total hits.
+ * Mapping changes attribution — "static wins" strips static mutants out of
+ * perTest, and keys that cannot be paired with an inspector test are dropped —
+ * and both would otherwise drop hits along with it. A static mutant hit once at
+ * module load and 1000 times by tests would get a limit of 100, and its
+ * full-suite mutant run would be stopped as a false Timeout. So each mapped
+ * mutant's shortfall is added to one bucket that already holds it: `static`
+ * when it is static, else the first perTest entry holding it. Mutants that no
+ * longer appear anywhere are left out; adding them would invent coverage.
+ *
+ * @returns A copy; neither input is modified.
+ */
+function restoreHitTotals(rawCoverage: MutantCoverage, mapped: MutantCoverage): MutantCoverage {
+    const rawTotals = sumHitsByMutant(rawCoverage);
+    const result: MutantCoverage = {
+        'static': { ...mapped.static },
+        perTest:  Object.fromEntries(Object.entries(mapped.perTest).map(([testId, counts]) => [testId, { ...counts }])),
+    };
+    const buckets = [result.static, ...Object.values(result.perTest)];
+    for(const [mutantId, mappedTotal] of sumHitsByMutant(result)) {
+        const bucket = buckets.find(counts => mutantId in counts)!;
+        // Mapping only ever removes or merges hits, so the raw total is always present and never smaller.
+        bucket[mutantId] += rawTotals.get(mutantId)! - mappedTotal;
+    }
+    return result;
+}
+
+/**
  * Map file-prefixed counter keys ("relativeFile@@test-N") to full test names.
  *
  * For each key we:
@@ -639,10 +685,10 @@ function mapFilePrefixedCounterKeys(
     // Signal B (bun-test-runner.ts).
     const orphanedKeyCount = reportOrphanedKeys(resolved, counterIds, logger);
 
-    const coverage = stabilizeCoverage({
+    const coverage = restoreHitTotals(rawCoverage, stabilizeCoverage({
         'static': rawCoverage.static,
         perTest:  remappedPerTest,
-    });
+    }));
 
     return {
         coverage,
@@ -745,9 +791,10 @@ function mapLegacyCounterKeys(
     }
 
     // Return new coverage with remapped perTest and original static, with
-    // static-covered mutants stripped from perTest (static wins).
-    return stabilizeCoverage({
+    // static-covered mutants stripped from perTest (static wins), and every
+    // mutant's raw hit total kept for Stryker's hitLimit.
+    return restoreHitTotals(rawCoverage, stabilizeCoverage({
         'static': rawCoverage.static,
         perTest:  remappedPerTest,
-    });
+    }));
 }

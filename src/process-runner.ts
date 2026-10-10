@@ -90,6 +90,14 @@ export interface BunTestRunOptions {
     activeMutant?: string
 
     /**
+   * Stryker's hit limit for the active mutant (MutantRunOptions.hitLimit), set
+   * as the __STRYKER_HIT_LIMIT__ env var for the coverage preload, which arms
+   * the instrumenter's infinite-loop protection with it. When undefined the
+   * variable is removed, so a child never inherits another run's limit.
+   */
+    hitLimit?: number
+
+    /**
    * Whether to bail on first failure
    */
     bail?: boolean
@@ -424,6 +432,48 @@ export async function runBunTests(options: BunTestRunOptions): Promise<BunProces
 }
 
 /**
+ * The child's environment: this process's, the configured extra variables,
+ * and the `__STRYKER_*` variables the coverage preload reads.
+ */
+function buildChildEnv(options: BunTestRunOptions, spawnDepth: number): Record<string, string | undefined> {
+    // Stryker disable next-line ObjectLiteral: removing env spreads means bun runs with empty env → no PATH/HOME → bun cannot initialize → Timeout
+    const env: Record<string, string | undefined> = {
+        ...process.env,
+        ...options.env,
+    };
+
+    // Set active mutant if specified
+    if(options.activeMutant) {
+        env.__STRYKER_ACTIVE_MUTANT__ = options.activeMutant;
+    }
+
+    // Always set or cleared, never inherited: a run nested inside a mutant run
+    // must not pick up the outer run's limit.
+    if(options.hitLimit === undefined) {
+        delete env.__STRYKER_HIT_LIMIT__;
+    } else {
+        env.__STRYKER_HIT_LIMIT__ = String(options.hitLimit);
+    }
+
+    // Set coverage file path if specified
+    // Stryker disable next-line ConditionalExpression: mutating to always true would set env var to undefined
+    if(options.coverageFile) {
+        env.__STRYKER_COVERAGE_FILE__ = options.coverageFile;
+    }
+
+    // Set sync port if specified
+    if(options.syncPort) {
+        env.__STRYKER_SYNC_PORT__ = String(options.syncPort);
+    }
+
+    // Stamp the child's nesting depth so that, if the suite it runs turns
+    // around and drives this runner again, that nested call can see how deep it
+    // already is — see maxSpawnDepth.
+    env[SPAWN_DEPTH_ENV] = String(spawnDepth + 1);
+    return env;
+}
+
+/**
  * Build the argv/env and run the child. Split from {@link runBunTests} so the
  * recursion ceiling is decided before any of this work happens.
  */
@@ -505,33 +555,7 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
         args.push(...options.testFiles);
     }
 
-    // Prepare environment variables
-    // Stryker disable next-line ObjectLiteral: removing env spreads means bun runs with empty env → no PATH/HOME → bun cannot initialize → Timeout
-    const env: Record<string, string | undefined> = {
-        ...process.env,
-        ...options.env,
-    };
-
-    // Set active mutant if specified
-    if(options.activeMutant) {
-        env.__STRYKER_ACTIVE_MUTANT__ = options.activeMutant;
-    }
-
-    // Set coverage file path if specified
-    // Stryker disable next-line ConditionalExpression: mutating to always true would set env var to undefined
-    if(options.coverageFile) {
-        env.__STRYKER_COVERAGE_FILE__ = options.coverageFile;
-    }
-
-    // Set sync port if specified
-    if(options.syncPort) {
-        env.__STRYKER_SYNC_PORT__ = String(options.syncPort);
-    }
-
-    // Stamp the child's nesting depth so that, if the suite it runs turns
-    // around and drives this runner again, that nested call can see how deep it
-    // already is — see maxSpawnDepth.
-    env[SPAWN_DEPTH_ENV] = String(spawnDepth + 1);
+    const env = buildChildEnv(options, spawnDepth);
 
     // Stryker disable next-line BlockStatement: removing entire Promise body means resolve() never called → Timeout
     return new Promise((resolve) => {
