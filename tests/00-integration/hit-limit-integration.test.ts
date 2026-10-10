@@ -13,7 +13,13 @@ import { DryRunStatus, MutantRunStatus, type MutantRunOptions } from '@stryker-m
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { BunTestRunner } from '../../src/bun-test-runner.js';
 import { resolveRunTempDir } from '../../src/utils/private-temp-dir.js';
+import { allowRealTimersFromSource } from '../real-clock-guard.js';
 import { resetAllMocks } from '../test-preload.js';
+
+// Real bun children: the runner's own timers (inspector-URL poll, drain-silence
+// poll) have to run on real time here. The tests themselves wait on nothing but
+// the runner's results.
+allowRealTimersFromSource();
 
 /**
  * Real output of @stryker-mutator/instrumenter 10.0.0 for

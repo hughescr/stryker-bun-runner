@@ -3,8 +3,9 @@
  */
 
 import type { ChildProcess } from 'node:child_process';
-import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, mock, jest } from 'bun:test';
 import { MIN_BUN_VERSION, checkBunVersion, compareVersions, parseBunVersion } from '../../src/utils/bun-version.js';
+import { runUntilSettled } from '../helpers/fake-clock.js';
 import { mockSpawn, resetAllMocks } from '../test-preload.js';
 
 describe('parseBunVersion', () => {
@@ -202,18 +203,29 @@ describe('checkBunVersion', () => {
         expect((error as Error).message).toContain('could not run "bun" (unrecognized --version output "hello")');
     });
 
-    it('kills the child and rejects with "could not run" when --version does not finish in time', async () => {
-        const error = await checkBunVersion('bun', undefined, 10).catch((e: unknown) => e);
+    describe('when --version never finishes (fake clock)', () => {
+        beforeEach(() => {
+            jest.useFakeTimers();
+        });
 
-        expect(child.kill).toHaveBeenCalledWith('SIGKILL');
-        expect((error as Error).message).toContain('could not run "bun" (timed out after 10ms)');
-    });
+        afterEach(() => {
+            jest.useRealTimers();
+        });
 
-    it('ignores a late close after the timeout already settled the check', async () => {
-        const error = await checkBunVersion('bun', undefined, 10).catch((e: unknown) => e);
-        child.stdoutHandler?.(Buffer.from('1.4.2\n'));
-        child.closeHandler?.(0, null);
+        it('kills the child and rejects with "could not run" when --version does not finish in time', async () => {
+            const { value: error, fakeMs } = await runUntilSettled(checkBunVersion('bun', undefined, 10).catch((e: unknown) => e));
 
-        expect((error as Error).message).toContain('timed out');
+            expect(fakeMs).toBe(10);
+            expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+            expect((error as Error).message).toContain('could not run "bun" (timed out after 10ms)');
+        });
+
+        it('ignores a late close after the timeout already settled the check', async () => {
+            const { value: error } = await runUntilSettled(checkBunVersion('bun', undefined, 10).catch((e: unknown) => e));
+            child.stdoutHandler?.(Buffer.from('1.4.2\n'));
+            child.closeHandler?.(0, null);
+
+            expect((error as Error).message).toContain('timed out');
+        });
     });
 });

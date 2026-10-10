@@ -65,6 +65,37 @@ export default defineConfig([
             // This project's bunfig-registered preload/setup file is tests/test-preload.ts,
             // not the rule's default tests/setup.ts
             '@hughescr/test-hygiene/no-mock-module-in-test-body': ['error', { setupFiles: ['tests/test-preload.ts'] }],
+
+            // Tests never wait on the real clock. tests/real-clock-guard.ts fails any test
+            // whose real timers run out, but it can only see the global timer functions:
+            // these are the ways around it, so they are banned outright.
+            'no-restricted-imports': ['error', {
+                paths: [
+                    { name: 'lodash', message: 'Use lodash-es instead for proper ESM tree-shaking.' },
+                    ...['node:timers', 'node:timers/promises', 'timers', 'timers/promises'].map(name => ({
+                        name,
+                        message: 'Its timers bypass tests/real-clock-guard.ts. Use the global timers under jest.useFakeTimers(), or wait on an event.',
+                    })),
+                ],
+            }],
+            'no-restricted-properties': ['error',
+                { object: 'Atomics', property: 'wait', message: 'Blocks on the real clock. Use jest.useFakeTimers(), or wait on an event.' },
+                { object: 'Bun', property: 'sleepSync', message: 'Blocks on the real clock. Use jest.useFakeTimers(), or wait on an event.' },
+            ],
+        }
+    },
+    {
+        // Integration tests drive real processes, so a fake clock cannot help them and
+        // they have no business with timers at all: they wait on events (exit, close,
+        // output). tests/real-clock-guard.ts enforces the same at run time.
+        files: ['tests/00-integration/**/*.ts'],
+        rules: {
+            'no-restricted-globals': ['error',
+                ...['setTimeout', 'setInterval'].map(name => ({
+                    name,
+                    message: 'Integration tests wait on events (exit, close, output), never on a timer.',
+                })),
+            ],
         }
     },
 ]);

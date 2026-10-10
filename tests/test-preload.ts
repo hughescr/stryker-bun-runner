@@ -3,6 +3,8 @@
  * Sets up module mocks using Bun's mock.module() API
  */
 
+// Fails any test that waits on the real clock; see the file for the policy.
+import './real-clock-guard.js';
 import * as actualChildProcess from 'node:child_process';
 import * as actualFs from 'node:fs/promises';
 import * as actualNet from 'node:net';

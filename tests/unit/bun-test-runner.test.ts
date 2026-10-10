@@ -25,6 +25,7 @@ import * as bunfigSanitizer from '../../src/utils/bunfig-sanitizer.js';
 import * as privateTempDir from '../../src/utils/private-temp-dir.js';
 import * as syncServerModule from '../../src/utils/sync-server.js';
 import * as testFileDiscovery from '../../src/utils/test-file-discovery.js';
+import { runUntilSettled } from '../helpers/fake-clock.js';
 import { mockGetAvailablePort, mockRename, mockWriteFile, resetAllMocks, resetFsMocks } from '../test-preload.js';
 
 // Captured at module load time, BEFORE any `spyOn(coverageMapper, 'mapCoverageToInspectorIds')`
@@ -1516,119 +1517,139 @@ tests/example.test.ts:
         });
 
         it('reports a spawn error immediately instead of waiting out bun.inspectorTimeout', async () => {
-            // Real timers on purpose: the point is wall-clock. A child that never started cannot
-            // print an inspector URL, so waiting the full (here: 30s) inspectorTimeout is pure delay.
-            mockRunBunTests.mockImplementation(() => {
-                return Promise.resolve({
-                    exitCode:   null,
-                    signal:     null,
-                    stdout:     '',
-                    stderr:     '\nProcess error: spawn bun ENOENT',
-                    timedOut:   false,
-                    spawnError: 'spawn bun ENOENT',
+            // A child that never started cannot print an inspector URL, so waiting the full
+            // (here: 30s) inspectorTimeout is pure delay: the wait ends at the first 50ms poll
+            // after the child settled. Measured on the fake clock.
+            jest.useFakeTimers();
+            try {
+                mockRunBunTests.mockImplementation(() => {
+                    return Promise.resolve({
+                        exitCode:   null,
+                        signal:     null,
+                        stdout:     '',
+                        stderr:     '\nProcess error: spawn bun ENOENT',
+                        timedOut:   false,
+                        spawnError: 'spawn bun ENOENT',
+                    });
                 });
-            });
 
-            const runner = new BunTestRunner(mockLogger, {
-                bun: { inspectorTimeout: 30_000 },
-            } as unknown as StrykerOptions);
-            await runner.init();
+                const runner = new BunTestRunner(mockLogger, {
+                    bun: { inspectorTimeout: 30_000 },
+                } as unknown as StrykerOptions);
+                await runner.init();
 
-            const started = Date.now();
-            const result = await runner.dryRun();
-            const elapsed = Date.now() - started;
+                const { value: result, fakeMs } = await runUntilSettled(runner.dryRun());
 
-            expect(result.status).toBe(DryRunStatus.Error);
-            if(result.status === DryRunStatus.Error) {
-                expect(result.errorMessage).toBe('could not start bun test: spawn bun ENOENT');
+                expect(result.status).toBe(DryRunStatus.Error);
+                if(result.status === DryRunStatus.Error) {
+                    expect(result.errorMessage).toBe('could not start bun test: spawn bun ENOENT');
+                }
+                expect(fakeMs).toBeLessThanOrEqual(50);
+            } finally {
+                jest.useRealTimers();
             }
-            expect(elapsed).toBeLessThan(5000);
         });
 
         it('reports an early child exit without an inspector URL immediately instead of waiting out bun.inspectorTimeout', async () => {
-            mockRunBunTests.mockImplementation(() => {
-                return Promise.resolve({
-                    exitCode: 1,
-                    stdout:   '',
-                    stderr:   'preload crashed before inspector came up',
-                    timedOut: false,
+            jest.useFakeTimers();
+            try {
+                mockRunBunTests.mockImplementation(() => {
+                    return Promise.resolve({
+                        exitCode: 1,
+                        stdout:   '',
+                        stderr:   'preload crashed before inspector came up',
+                        timedOut: false,
+                    });
                 });
-            });
 
-            const runner = new BunTestRunner(mockLogger, {
-                bun: { inspectorTimeout: 30_000 },
-            } as unknown as StrykerOptions);
-            await runner.init();
+                const runner = new BunTestRunner(mockLogger, {
+                    bun: { inspectorTimeout: 30_000 },
+                } as unknown as StrykerOptions);
+                await runner.init();
 
-            const started = Date.now();
-            const result = await runner.dryRun();
-            const elapsed = Date.now() - started;
+                const { value: result, fakeMs } = await runUntilSettled(runner.dryRun());
 
-            expect(result.status).toBe(DryRunStatus.Error);
-            if(result.status === DryRunStatus.Error) {
-                expect(result.errorMessage).toStartWith('Timeout waiting for inspector URL after 30000ms');
-                expect(result.errorMessage).toContain('exit code 1');
-                expect(result.errorMessage).toContain('preload crashed before inspector came up');
+                expect(result.status).toBe(DryRunStatus.Error);
+                if(result.status === DryRunStatus.Error) {
+                    expect(result.errorMessage).toStartWith('Timeout waiting for inspector URL after 30000ms');
+                    expect(result.errorMessage).toContain('exit code 1');
+                    expect(result.errorMessage).toContain('preload crashed before inspector came up');
+                }
+                expect(fakeMs).toBeLessThanOrEqual(50);
+            } finally {
+                jest.useRealTimers();
             }
-            expect(elapsed).toBeLessThan(5000);
         });
 
         it('stops waiting as soon as the inspector URL arrives, even while the child is still running', async () => {
             // The wait loop must end on the URL, not on the child finishing: a healthy bun keeps
             // running through the whole test run, and the inspector has to connect while it does.
-            let childResolved = false;
-            let connectedWhileChildAlive: boolean | undefined;
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
-            mockRunBunTests.mockImplementation((options: any) => {
-                options.onInspectorReady('ws://127.0.0.1:6499/inspector');
-                return new Promise((resolve) => {
-                    setTimeout(() => {
-                        childResolved = true;
-                        resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
-                    }, 600);
+            jest.useFakeTimers();
+            try {
+                let childResolved = false;
+                let connectedWhileChildAlive: boolean | undefined;
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                    return new Promise((resolve) => {
+                        setTimeout(() => {
+                            childResolved = true;
+                            resolve({ exitCode: 0, stdout: '', stderr: '', timedOut: false });
+                        }, 600);
+                    });
                 });
-            });
-            mockInspectorClient.connect.mockImplementation(() => {
-                connectedWhileChildAlive ??= !childResolved;
-                return Promise.resolve();
-            });
+                mockInspectorClient.connect.mockImplementation(() => {
+                    connectedWhileChildAlive ??= !childResolved;
+                    return Promise.resolve();
+                });
 
-            const runner = new BunTestRunner(mockLogger, {
-                bun: { inspectorTimeout: 30_000 },
-            } as unknown as StrykerOptions);
-            await runner.init();
-            await runner.dryRun();
+                const runner = new BunTestRunner(mockLogger, {
+                    bun: { inspectorTimeout: 30_000 },
+                } as unknown as StrykerOptions);
+                await runner.init();
+                await runUntilSettled(runner.dryRun());
 
-            expect(connectedWhileChildAlive).toBe(true);
+                expect(connectedWhileChildAlive).toBe(true);
+                expect(childResolved).toBe(true);
+            } finally {
+                jest.useRealTimers();
+            }
         });
 
         it('gives up at bun.inspectorTimeout even though the child is still running, and ignores a URL that shows up later', async () => {
             // Child alive past the timeout and printing its URL only after it expired: the
             // timeout still decides. (Child settling is an extra way to stop waiting, not a
             // replacement for the timeout.)
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
-            mockRunBunTests.mockImplementation((options: any) => {
-                return new Promise((resolve) => {
-                    setTimeout(() => {
-                        options.onInspectorReady('ws://127.0.0.1:6499/inspector');
-                    }, 300);
-                    setTimeout(() => {
-                        resolve({ exitCode: 0, stdout: '', stderr: 'late', timedOut: false });
-                    }, 700);
+            jest.useFakeTimers();
+            try {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    return new Promise((resolve) => {
+                        setTimeout(() => {
+                            options.onInspectorReady('ws://127.0.0.1:6499/inspector');
+                        }, 300);
+                        setTimeout(() => {
+                            resolve({ exitCode: 0, stdout: '', stderr: 'late', timedOut: false });
+                        }, 700);
+                    });
                 });
-            });
 
-            const runner = new BunTestRunner(mockLogger, {
-                bun: { inspectorTimeout: 100 },
-            } as unknown as StrykerOptions);
-            await runner.init();
-            const result = await runner.dryRun();
+                const runner = new BunTestRunner(mockLogger, {
+                    bun: { inspectorTimeout: 100 },
+                } as unknown as StrykerOptions);
+                await runner.init();
+                const { value: result, fakeMs } = await runUntilSettled(runner.dryRun());
 
-            expect(result.status).toBe(DryRunStatus.Error);
-            if(result.status === DryRunStatus.Error) {
-                expect(result.errorMessage).toStartWith('Timeout waiting for inspector URL after 100ms');
+                expect(result.status).toBe(DryRunStatus.Error);
+                if(result.status === DryRunStatus.Error) {
+                    expect(result.errorMessage).toStartWith('Timeout waiting for inspector URL after 100ms');
+                }
+                expect(mockInspectorClient.connect).not.toHaveBeenCalled();
+                // The diagnostic awaits the child, which the mock keeps alive until t=700.
+                expect(fakeMs).toBe(700);
+            } finally {
+                jest.useRealTimers();
             }
-            expect(mockInspectorClient.connect).not.toHaveBeenCalled();
         });
 
         it('stops waiting once elapsed time equals the timeout, ignoring a URL that arrives on the next poll (fake clock)', async () => {
@@ -4168,6 +4189,8 @@ tests/example.test.ts:
         });
 
         describe('bun.timeout headroom warning', () => {
+            // The mocked child "runs" for delayMs of fake time; the runner measures it with
+            // Date.now(), which the fake clock drives as well.
             function respondAfter(delayMs: number): void {
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation(async (options: any) => {
@@ -4181,12 +4204,20 @@ tests/example.test.ts:
                 });
             }
 
+            beforeEach(() => {
+                jest.useFakeTimers();
+            });
+
+            afterEach(() => {
+                jest.useRealTimers();
+            });
+
             it('warns once when the dry run took more than 80% of bun.timeout, naming the option', async () => {
                 respondAfter(120);
                 const runner = new BunTestRunner(mockLogger, { bun: { timeout: 100 } } as unknown as StrykerOptions);
                 await runner.init();
 
-                const result = await runner.dryRun();
+                const { value: result } = await runUntilSettled(runner.dryRun());
 
                 expect(result.status).toBe(DryRunStatus.Complete);
                 const headroomWarns = (mockLogger.warn as ReturnType<typeof mock>).mock.calls.filter(call => String(call[0]).includes('bun.timeout'));
@@ -4200,7 +4231,7 @@ tests/example.test.ts:
                 const runner = new BunTestRunner(mockLogger, { bun: { timeout: 60_000 } } as unknown as StrykerOptions);
                 await runner.init();
 
-                await runner.dryRun();
+                await runUntilSettled(runner.dryRun());
 
                 expect(mockLogger.warn).not.toHaveBeenCalledWith(expect.stringContaining('bun.timeout'), expect.anything(), expect.anything());
             });
@@ -8726,11 +8757,16 @@ tests/example.test.ts:
 
             it('aborts the in-flight child when dispose() runs while mutantRun has not yet resolved', async () => {
                 let capturedSignal: AbortSignal | undefined;
+                let markRunStarted: () => void = () => {};
+                const runStarted = new Promise<void>((resolve) => {
+                    markRunStarted = resolve;
+                });
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 let releaseRunBunTests: (value: any) => void = () => {};
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
                     capturedSignal = options.signal;
+                    markRunStarted();
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                     return new Promise((resolve: (value: any) => void) => {
                         releaseRunBunTests = resolve;
@@ -8749,16 +8785,8 @@ tests/example.test.ts:
                 } as any);
 
                 // mutantRun() does real (non-mocked-away) fs.readFile/discovery work
-                // before reaching runBunTests, which needs at least one real
-                // macrotask tick to settle — plain Promise.resolve() microtask
-                // chains aren't enough here (unlike the dryRun equivalent test).
-                // eslint-disable-next-line no-unmodified-loop-condition -- capturedSignal is set by the mockRunBunTests closure above, a different function; ESLint cannot track that cross-closure mutation
-                for(let i = 0; i < 5 && !capturedSignal; i++) {
-                    // eslint-disable-next-line no-await-in-loop -- sequential polling to let pending I/O settle before asserting
-                    await new Promise<void>((resolve) => {
-                        setTimeout(resolve, 0);
-                    });
-                }
+                // before reaching runBunTests: wait for the child to be "spawned".
+                await runStarted;
 
                 expect(capturedSignal?.aborted).toBe(false);
 
