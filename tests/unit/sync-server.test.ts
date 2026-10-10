@@ -601,6 +601,73 @@ describe('SyncServer', () => {
             expect(client.send).toHaveBeenCalledTimes(1);
         });
 
+        it('queues a client once however often it repeats drain-request before the handler exists', async () => {
+            const server = createServer();
+            await server.start();
+
+            const client = createMockClient(1);
+            const messageHandler = captureHandler(client, 'message');
+            mockWss.triggerConnection(client);
+            messageHandler(Buffer.from('drain-request'));
+            messageHandler(Buffer.from('drain-request'));
+            messageHandler(Buffer.from('drain-request'));
+
+            server.setDrainHandler(mock(() => Promise.resolve()));
+            await Promise.resolve();
+            await Promise.resolve();
+            await Promise.resolve();
+
+            expect(client.send.mock.calls).toEqual([['drained']]);
+        });
+
+        it('drops a queued client when it closes, so the handler is not even invoked for it', async () => {
+            const server = createServer();
+            await server.start();
+
+            const client = createMockClient(1);
+            const handlers = new Map<string, (...args: unknown[]) => void>();
+            client.on = mock((event: string, handler: (...args: unknown[]) => void) => {
+                handlers.set(event, handler);
+            });
+            mockWss.triggerConnection(client);
+            handlers.get('message')?.(Buffer.from('drain-request'));
+            handlers.get('close')?.();
+
+            const drainHandler = mock(() => Promise.resolve());
+            server.setDrainHandler(drainHandler);
+            await Promise.resolve();
+            await Promise.resolve();
+
+            expect(drainHandler).not.toHaveBeenCalled();
+            expect(client.send).not.toHaveBeenCalled();
+        });
+
+        it('keeps other queued clients when one of them closes', async () => {
+            const server = createServer();
+            await server.start();
+
+            const leaving = createMockClient(1);
+            const leavingHandlers = new Map<string, (...args: unknown[]) => void>();
+            leaving.on = mock((event: string, handler: (...args: unknown[]) => void) => {
+                leavingHandlers.set(event, handler);
+            });
+            mockWss.triggerConnection(leaving);
+            const staying = createMockClient(1);
+            const stayingMessage = captureHandler(staying, 'message');
+            mockWss.triggerConnection(staying);
+            leavingHandlers.get('message')?.(Buffer.from('drain-request'));
+            stayingMessage(Buffer.from('drain-request'));
+            leavingHandlers.get('close')?.();
+
+            server.setDrainHandler(mock(() => Promise.resolve()));
+            await Promise.resolve();
+            await Promise.resolve();
+            await Promise.resolve();
+
+            expect(staying.send).toHaveBeenCalledWith('drained');
+            expect(leaving.send).not.toHaveBeenCalled();
+        });
+
         it('does not invoke a handler on registration when no request is queued, including on re-registration', async () => {
             const server = createServer();
             await server.start();
