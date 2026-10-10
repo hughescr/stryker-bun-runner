@@ -145,6 +145,12 @@ describe('parseBunTestOutput with the run\'s test files', () => {
             expect(failedNames(parent, ['tests/unit'])).toEqual(['tests/unit/z.test.ts > z', 'tests/unit/z.test.ts > a']);
         });
 
+        it('does not take the parent of a listed directory for one of its files', () => {
+            const parentNamedLikeATest = 'tests/a.test.ts:\n(fail) a [1ms]\n\ntests/dir.test.ts:\n(fail) b [1ms]\n';
+
+            expect(failedNames(parentNamedLikeATest, ['tests/a.test.ts', 'tests/dir.test.ts/inner'])).toEqual(['tests/a.test.ts > a', 'tests/a.test.ts > b']);
+        });
+
         it('treats a directory above the working directory as covering the files under it', () => {
             const outside = path.resolve('..', 'sibling', 'q.test.ts');
             const relative = path.relative(process.cwd(), outside);

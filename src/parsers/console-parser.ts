@@ -123,7 +123,8 @@ function headerFilter(lines: readonly string[], testFiles: readonly string[] | u
         const resolved = path.resolve(file);
         return roots.some((root) => {
             const relative = path.relative(root, resolved);
-            return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+            // '' is the entry itself; anything starting '..' is outside it.
+            return relative !== '..' && !relative.startsWith(`..${path.sep}`);
         });
     };
     const namesRunFile = lines.some((line) => {
