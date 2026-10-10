@@ -25,7 +25,7 @@ import * as bunfigSanitizer from '../../src/utils/bunfig-sanitizer.js';
 import * as privateTempDir from '../../src/utils/private-temp-dir.js';
 import * as syncServerModule from '../../src/utils/sync-server.js';
 import * as testFileDiscovery from '../../src/utils/test-file-discovery.js';
-import { runUntilSettled } from '../helpers/fake-clock.js';
+import { runUntilSettled, trackTimers } from '../helpers/fake-clock.js';
 import { mockGetAvailablePort, mockRename, mockWriteFile, resetAllMocks, resetFsMocks } from '../test-preload.js';
 
 // Captured at module load time, BEFORE any `spyOn(coverageMapper, 'mapCoverageToInspectorIds')`
@@ -1521,6 +1521,7 @@ tests/example.test.ts:
             // (here: 30s) inspectorTimeout is pure delay: the wait ends the moment the child
             // settles, with no fake time passing at all. Measured on the fake clock.
             jest.useFakeTimers();
+            const timers = trackTimers();
             try {
                 mockRunBunTests.mockImplementation(() => {
                     return Promise.resolve({
@@ -1546,8 +1547,10 @@ tests/example.test.ts:
                 }
                 expect(fakeMs).toBe(0);
                 // The inspector-timeout timer armed for the wait is cancelled, not left to fire later.
-                expect(jest.getTimerCount()).toBe(0);
+                expect(timers.delays).toContain(30_000);
+                expect(timers.pending()).toBe(0);
             } finally {
+                timers.restore();
                 jest.useRealTimers();
             }
         });
@@ -1754,6 +1757,7 @@ tests/example.test.ts:
 
         it('waits with a single bun.inspectorTimeout timer and no recurring poll timers, cancelling it once the URL arrives', async () => {
             jest.useFakeTimers();
+            const timers = trackTimers();
             try {
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
                 mockRunBunTests.mockImplementation((options: any) => {
@@ -1768,22 +1772,20 @@ tests/example.test.ts:
                     });
                 });
                 mockCollectCoverage.mockResolvedValue(undefined);
-                const setTimeoutSpy = jest.spyOn(globalThis, 'setTimeout');
 
                 const runner = new BunTestRunner(mockLogger, {
                     bun: { inspectorTimeout: 5000 },
                 } as unknown as StrykerOptions);
                 await runner.init();
                 const { value: result } = await runUntilSettled(runner.dryRun());
-                const delays = setTimeoutSpy.mock.calls.map(call => call[1]);
-                setTimeoutSpy.mockRestore();
 
                 expect(result.status).toBe(DryRunStatus.Complete);
-                expect(delays.filter(delay => delay === 5000)).toHaveLength(1);
-                expect(delays).not.toContain(50);
+                expect(timers.delays.filter(delay => delay === 5000)).toHaveLength(1);
+                expect(timers.delays).not.toContain(50);
                 // Nothing left armed: the inspector-timeout timer was cleared when the URL arrived.
-                expect(jest.getTimerCount()).toBe(0);
+                expect(timers.pending()).toBe(0);
             } finally {
+                timers.restore();
                 jest.useRealTimers();
             }
         });
@@ -1857,6 +1859,7 @@ tests/example.test.ts:
 
         it('stops waiting the moment a rejected child promise settles, without waiting out bun.inspectorTimeout', async () => {
             jest.useFakeTimers();
+            const timers = trackTimers();
             try {
                 mockRunBunTests.mockImplementation(() => Promise.reject(new Error('child blew up')));
 
@@ -1869,8 +1872,11 @@ tests/example.test.ts:
                 // The diagnostic that follows the wait awaits the same child and so rethrows.
                 await expect(runUntilSettled(runner.dryRun())).rejects.toThrow('child blew up');
                 expect(Date.now() - startedAt).toBe(0);
-                expect(jest.getTimerCount()).toBe(0);
+                // The 30s inspector-timeout timer was armed, and cleared when the child settled.
+                expect(timers.delays).toContain(30_000);
+                expect(timers.pending()).toBe(0);
             } finally {
+                timers.restore();
                 jest.useRealTimers();
             }
         });

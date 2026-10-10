@@ -51,3 +51,71 @@ export async function runUntilSettled<T>(promise: Promise<T>): Promise<{ value: 
     const fakeMs = Date.now() - startedAt;
     return { value: await promise, fakeMs };
 }
+
+/** What {@link trackTimers} has seen since it started. */
+export interface TrackedTimers {
+    /** The delay of every setTimeout/setInterval armed while tracking, in order. */
+    delays:  number[]
+    /** How many of those timers are still armed: not cleared, and (for a timeout) not yet fired. */
+    pending: () => number
+    /** Stop tracking and put the global timer functions back. */
+    restore: () => void
+}
+
+type TimerCallback = (...args: unknown[]) => void;
+
+/**
+ * Track the timers armed through the global timer functions from now until
+ * `restore()`, so a test can check that the code under test cleared every
+ * timer it armed.
+ *
+ * Use this instead of `jest.getTimerCount()`, which counts every timer in the
+ * fake queue, including ones this test never armed. bun moves a REAL interval
+ * into the fake queue when it ticks while fake timers are installed (seen on
+ * bun 1.4.2), and under Stryker the runner's coverage preload runs a real 1s
+ * orphan-watchdog interval in every `bun test` child. Whenever a fake-timer
+ * test hands control back to the event loop (runUntilSettled's macrotask
+ * turns, or `expect(pendingPromise).rejects`, which runs the loop until the
+ * promise settles) at the moment that watchdog is due, the count is one higher
+ * than the code under test can explain. Plain `bun test` has no such interval,
+ * so a getTimerCount() assertion passes there and fails at random in a
+ * Stryker dry run.
+ */
+export function trackTimers(): TrackedTimers {
+    const delays: number[] = [];
+    const armed = new Set<unknown>();
+    const { setTimeout: realSetTimeout, setInterval: realSetInterval, clearTimeout: realClearTimeout, clearInterval: realClearInterval } = globalThis;
+
+    globalThis.setTimeout = ((callback: TimerCallback, delay?: number, ...args: unknown[]) => {
+        delays.push(delay ?? 0);
+        const handle = realSetTimeout((...callArgs: unknown[]) => {
+            armed.delete(handle);
+            callback(...callArgs);
+        }, delay, ...args);
+        armed.add(handle);
+        return handle;
+    }) as typeof setTimeout;
+    globalThis.setInterval = ((callback: TimerCallback, delay?: number, ...args: unknown[]) => {
+        delays.push(delay ?? 0);
+        const handle = realSetInterval(callback, delay, ...args);
+        armed.add(handle);
+        return handle;
+    }) as typeof setInterval;
+    // Either clear function cancels either kind of timer.
+    globalThis.clearTimeout = ((handle?: Parameters<typeof clearTimeout>[0]) => {
+        armed.delete(handle);
+        realClearTimeout(handle);
+    }) as typeof clearTimeout;
+    globalThis.clearInterval = ((handle?: Parameters<typeof clearInterval>[0]) => {
+        armed.delete(handle);
+        realClearInterval(handle);
+    }) as typeof clearInterval;
+
+    return {
+        delays,
+        pending: () => armed.size,
+        restore: () => {
+            Object.assign(globalThis, { setTimeout: realSetTimeout, setInterval: realSetInterval, clearTimeout: realClearTimeout, clearInterval: realClearInterval });
+        },
+    };
+}
