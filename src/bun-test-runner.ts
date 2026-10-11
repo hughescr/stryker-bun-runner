@@ -1034,10 +1034,11 @@ export class BunTestRunner implements TestRunner {
     }
 
     /**
-     * Log the one-line start summary (at info, once per runner): the bun version and path, how
+     * Log the one-line start summary (at debug, once per runner): the bun version and path, how
      * many test files the runner hands bun and where they came from, the sanitized bunfig, and
      * whether mutant runs bail. Called at the end of init(), so a re-init in another cwd
-     * (Stryker's sandbox rotation) does not repeat it.
+     * (Stryker's sandbox rotation) does not repeat it. It is debug, not info, because every
+     * Stryker worker process logs its own copy, which at high concurrency reads like many dry runs.
      *
      * @param testFiles the files {@link getOrDiscoverTestFiles} chose; undefined when discovery
      *                  found none and bun is left to discover the tests itself
@@ -1058,7 +1059,7 @@ export class BunTestRunner implements TestRunner {
         if(this.disableBail !== undefined) {
             parts.push(this.disableBail ? 'bail off' : 'bail on');
         }
-        this.logger.info('%s', parts.join('; '));
+        this.logger.debug('%s', parts.join('; '));
     }
 
     /**
