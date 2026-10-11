@@ -224,14 +224,33 @@ function formatInspectorTimeoutMessage(
     if(child.spawnError !== undefined) {
         return formatSpawnErrorMessage(child.spawnError);
     }
-    const stderrTail = child.stderr.trim().slice(-1000);
     // A timedOut child was SIGTERMed by the runner's own run timeout (it hung without printing the URL), not killed externally.
     let ended = child.signal ? `terminated by signal ${child.signal}` : `exit code ${child.exitCode ?? 'none'}`;
     if(child.timedOut === true) {
         ended = 'killed by the runner after the run timeout (bun.timeout)';
     }
     const prefix = `Timeout waiting for inspector URL after ${inspectorTimeoutMs}ms (raise bun.inspectorTimeout if bun is slow to start)`;
-    return `${prefix}; bun test ${ended}; last stderr: ${stderrTail || '(empty)'}`;
+    return `${prefix}; bun test ${ended}; last stderr: ${formatStderrTail(child.stderr)}`;
+}
+
+/**
+ * The last 1000 characters of a child's stderr, trimmed, for a dry-run error:
+ * the tail is where a child's own reason for exiting lands, the head is usually
+ * just startup banner.
+ */
+function formatStderrTail(stderr: string): string {
+    return stderr.trim().slice(-1000) || '(empty)';
+}
+
+/**
+ * User-facing dry-run error for an inspector connection (or TestReporter.enable)
+ * that failed after bun printed its URL. The usual cause is the child itself
+ * exiting, e.g. the coverage preload giving up when its sync channel to the
+ * runner is lost, and whether the enable is refused or left unanswered is down
+ * to timing; either way the child's stderr says why, so its tail goes with it.
+ */
+function formatInspectorConnectMessage(error: string, child: { stderr: string }): string {
+    return `Failed to connect to Bun inspector: ${error}; last stderr: ${formatStderrTail(child.stderr)}`;
 }
 
 /**
@@ -1779,9 +1798,13 @@ export class BunTestRunner implements TestRunner {
                 // process would keep running until its own timeout fires.
                 abortController.abort();
                 await inspector.close();
+                // The child may well be the one that went away (see
+                // formatInspectorConnectMessage): wait for it, already exiting or
+                // just aborted, so its stderr can say why.
+                const child = await testProcess;
                 return {
                     status:       DryRunStatus.Error,
-                    errorMessage: `Failed to connect to Bun inspector: ${errorMsg}`,
+                    errorMessage: formatInspectorConnectMessage(errorMsg, child),
                 };
             }
 

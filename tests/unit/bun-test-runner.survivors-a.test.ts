@@ -582,7 +582,7 @@ describe('BunTestRunner mutation kill tests (first half of the runner)', () => {
 
                 const result = await dryRunOnce();
 
-                expect(result).toEqual({ status: DryRunStatus.Error, errorMessage: 'Failed to connect to Bun inspector: refused' });
+                expect(result).toEqual({ status: DryRunStatus.Error, errorMessage: 'Failed to connect to Bun inspector: refused; last stderr: (empty)' });
                 expect(mockLogger.error).toHaveBeenCalledWith('Failed to connect inspector: %s', 'refused');
                 expect(abortedWhenClosing).toBe(true);
             });

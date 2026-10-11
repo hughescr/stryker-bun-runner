@@ -1952,8 +1952,40 @@ tests/example.test.ts:
 
             expect(result.status).toBe(DryRunStatus.Error);
             if(result.status === DryRunStatus.Error) {
-                expect(result.errorMessage).toBe('Failed to connect to Bun inspector: Connection refused');
+                expect(result.errorMessage).toBe('Failed to connect to Bun inspector: Connection refused; last stderr: (empty)');
             }
+        });
+
+        it('waits for the child once the inspector connection fails, and names what its stderr ends with', async () => {
+            // The child exits on its own (here: the preload losing its sync channel)
+            // while TestReporter.enable is outstanding; it settles only once the
+            // runner has aborted it, so its stderr exists only if the runner waits.
+            const preloadReason = '[Stryker] stryker-bun-runner: the dry run\'s sync connection to the runner closed before the runner signalled that it is ready';
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+            mockRunBunTests.mockImplementation((options: any) => {
+                options.onInspectorReady?.('ws://127.0.0.1:6499/inspector');
+                const signal = options.signal as AbortSignal;
+                return new Promise((resolve) => {
+                    signal.addEventListener('abort', () => resolve({
+                        exitCode: null,
+                        stdout:   '',
+                        stderr:   `bun test v1.4.2\n${'banner '.repeat(200)}\n${preloadReason}\n\n`,
+                        timedOut: true,
+                    }));
+                });
+            });
+            mockInspectorClient.send.mockRejectedValue(new Error('Connection closed unexpectedly'));
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+
+            const result = await runner.dryRun();
+
+            expect(result.status).toBe(DryRunStatus.Error);
+            const errorMessage = result.status === DryRunStatus.Error ? result.errorMessage : '';
+            expect(errorMessage).toStartWith('Failed to connect to Bun inspector: Connection closed unexpectedly; last stderr: ');
+            expect(errorMessage).toEndWith(`banner \n${preloadReason}`);
+            expect(errorMessage).not.toContain('bun test v1.4.2');
         });
 
         it('closes sync server via finally even when inspector.close() throws', async () => {

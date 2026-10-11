@@ -226,4 +226,37 @@ describe('dry-run ready handshake (real bun children)', () => {
             await runner.dispose();
         }
     }, 60_000);
+
+    test('names the preload\'s reason when the child is already gone by the time the runner enables TestReporter', async () => {
+        // The ordering the test above leaves to chance: the child sees its sync channel
+        // close and exits before the runner's TestReporter.enable reaches it, so the
+        // enable fails for want of a connection. The dry run's error must still carry
+        // the child's own account of why it exited, not just the connection failure.
+        const syncServers: SyncServer[] = [];
+        observeSyncServers((server) => {
+            syncServers.push(server);
+        });
+        let inspector: InspectorClient | undefined;
+        interceptFirstEnable(async () => {
+            await Promise.all(syncServers.map(server => server.close()));
+            // The child's exit closes the inspector socket; 30 s is only a backstop.
+            await inspector?.waitForClose(30_000);
+        }, (client) => {
+            inspector = client;
+        });
+        const runner = createRunner();
+        try {
+            await runner.init();
+            const dryRun = await runner.dryRun({ coverageAnalysis: 'perTest' } as Parameters<BunTestRunner['dryRun']>[0]);
+
+            expect(dryRun.status).toBe(DryRunStatus.Error);
+            const errorMessage = dryRun.status === DryRunStatus.Error ? dryRun.errorMessage : '';
+            expect(errorMessage).toStartWith('Failed to connect to Bun inspector: WebSocket not connected');
+            expect(errorMessage).toContain(
+                'before the runner signalled that it is ready to observe the tests. Exiting without running any test'
+            );
+        } finally {
+            await runner.dispose();
+        }
+    }, 60_000);
 });
