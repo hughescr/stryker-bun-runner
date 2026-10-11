@@ -9,11 +9,13 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 /** @type {import('@stryker-mutator/api/core').PartialStrykerOptions} */
 const config = {
-    testRunner:  'bun',
-    bun:         { timeout: 60_000 },
-    checkers:    ['typescript'],
-    incremental: !isCI,
-    plugins:     [
+    testRunner:        'bun',
+    bun:               { timeout: 60_000 },
+    checkers:          ['typescript'],
+    // TypeScript 7's native compiler (the @typescript/native devDependency); experimental upstream.
+    typescriptChecker: { experimentalNativePreview: true },
+    incremental:       !isCI,
+    plugins:           [
         path.resolve(__dirname, 'dist/index.js'),
         '@stryker-mutator/typescript-checker',
     ],

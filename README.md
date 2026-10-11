@@ -211,6 +211,30 @@ The config comes back unchanged, with a warning, when TypeScript cannot be loade
 
 The tradeoff: a mutant that only breaks the types your tests use, and that no test then fails at run time, now survives instead of counting as a compile error. On this repository, with the checker alone, it cut the checkers' CPU time by about a quarter (4,445 s to 3,398 s) and found exactly the same 1,012 compile errors.
 
+### Speeding up runs: TypeScript 7's native checker (experimental)
+
+`@stryker-mutator/typescript-checker` 10 can type-check mutants with TypeScript 7's native compiler instead of the JavaScript one. Upstream marks this as experimental: it uses TypeScript 7's unstable API, does not support project references, and checks mutants one at a time. To opt in, install TypeScript 7 under the name the checker loads it by, next to your existing `typescript`, and set the option:
+
+```sh
+bun add -D --exact @typescript/native@npm:typescript@7.0.2
+```
+
+```javascript
+export default await withTestFilesExcludedFromTypeCheck({
+  appendPlugins: ['@hughescr/stryker-bun-runner', '@stryker-mutator/typescript-checker'],
+  testRunner: 'bun',
+  checkers: ['typescript'],
+  typescriptChecker: { experimentalNativePreview: true },
+});
+```
+
+- The checker imports `@typescript/native/unstable/sync`. Its error message suggests a `typescript7` alias, but it never looks for one, so use the `@typescript/native` name above.
+- Pin TypeScript 7.0.x. TypeScript 7.1 renames the `unstable/sync` entry point to `sync`, and checker 10.0.0 cannot load it.
+- Your own `typescript` (6 or earlier) stays in place for everything else, including `withTestFilesExcludedFromTypeCheck`, which works the same with either checker. The alias does install a second `tsc` that takes over `node_modules/.bin/tsc`, so call TypeScript 6 by its path (`node node_modules/typescript/bin/tsc`) where that matters.
+- Checker 10.0.0 has a bug in this mode: the checker writes a copy of your tsconfig with `noUnusedLocals` and `noUnusedParameters` turned off, but when `tsconfigFile` is a relative path (the default, and what `withTestFilesExcludedFromTypeCheck` sets), the native compiler never receives that copy. Mutants whose only effect is an unused variable or parameter then count as compile errors and never get tested. On this repository that was 540 extra compile errors. This repository fixes it with a one-line `bun patch` ([`patches/@stryker-mutator%2Ftypescript-checker@10.0.0.patch`](patches/%40stryker-mutator%252Ftypescript-checker%4010.0.0.patch)), which you can copy into your own project. If your tsconfig turns neither option on, the bug does not affect you.
+
+On this repository, with the patch, a checker-only run (a no-op test runner) took 3 min 36 s and 829 s of CPU, against 14 min 10 s and 3,291 s with the JavaScript checker, and found exactly the same 1,162 compile errors. A full `bun run mutate --force` went from 21 min 17 s to 10 min 4 s, and from 4,908 s to 2,283 s of CPU, still at 100%. The native compiler runs as one extra process per checker (about 210 MB each here), yet the checkers used less memory in all: in the checker-only runs, the six checkers and their compiler processes peaked at about 2.2 GB together, against 5.1 GB for the six JavaScript checkers.
+
 ## Running Stryker
 
 ```bash
