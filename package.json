@@ -1,11 +1,13 @@
 {
   "name": "@hughescr/stryker-bun-runner",
   "version": "1.4.0",
-  "description": "Stryker test runner plugin for Bun with perTest coverage support",
+  "description": "Stryker mutation testing test runner plugin for Bun (bun test), with per-test coverage",
   "keywords": [
     "stryker",
     "stryker-plugin",
+    "stryker-test-runner",
     "bun",
+    "bun-test",
     "test-runner",
     "mutation-testing"
   ],

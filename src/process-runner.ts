@@ -218,8 +218,8 @@ export interface BunTestRunOptions {
     /**
    * Maximum `bun test` spawn nesting depth. A call made from a process already
    * at or beyond this depth refuses to spawn and resolves with a non-zero exit
-   * code instead, which is what keeps runaway self-spawning finite — see the
-   * README's "Recursion containment" section for the mechanism.
+   * code instead, which is what keeps runaway self-spawning finite — see
+   * "Recursion containment" in docs/internals.md for the mechanism.
    *
    * @default 1
    */
@@ -549,7 +549,7 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
 
     // Reduce Bun's JavaScriptCore heap growth at the cost of some speed.
     // Useful on memory-constrained machines, especially at higher Stryker
-    // `concurrency` — see README "Memory containment" section.
+    // `concurrency` — see "Memory containment" in docs/internals.md.
     if(options.smol) {
         args.push('--smol');
     }

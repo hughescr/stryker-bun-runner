@@ -31,8 +31,8 @@ import {
 // the lifeline is watched unconditionally, regardless of coverage collection.
 // If the Stryker worker that spawned this process dies (including via
 // SIGKILL, which gives it no chance to kill its children), this process would
-// otherwise run forever, or until its own --timeout is reached — see README
-// "Orphan prevention". The watch is left in place for the life of the process:
+// otherwise run forever, or until its own --timeout is reached — see
+// "Orphan prevention" in docs/internals.md. The watch is left in place for the life of the process:
 // it arms no timer and does not keep bun test from exiting. Only if the
 // lifeline is unavailable does it fall back to polling process.ppid on an
 // unref'd interval, saying so on stderr when STRYKER_BUN_RUNNER_DEBUG is set.
@@ -349,7 +349,7 @@ if(shouldCollectCoverage) {
         // Fully catching trailing leaks would need a deliberate strict-drain
         // mode (draining the microtask/timer queue before treating the run as
         // over) — deliberately out of scope here (event-loop starvation risk);
-        // see README's "Coverage-bleed warning" section.
+        // see "Coverage bleed" in docs/internals.md.
         if(lastEndedTestId !== undefined) {
             // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-argument -- Placeholder import replaced at runtime
             const bledMutantIds = detectGapWindowBleed(staticSnapshotAtLastBoundary, mutantCoverage.static);

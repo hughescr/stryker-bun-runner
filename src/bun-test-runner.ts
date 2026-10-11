@@ -651,8 +651,8 @@ export class BunTestRunner implements TestRunner {
     /**
    * AbortController for whichever `dryRun`/`mutantRun` child process is
    * currently in flight, if any. Lets {@link dispose} kill an orphaned child
-   * if Stryker disposes this runner while a run hasn't finished — see README
-   * "Orphan prevention".
+   * if Stryker disposes this runner while a run hasn't finished — see
+   * "Orphan prevention" in docs/internals.md.
    */
     private currentAbortController?: AbortController;
 
@@ -749,7 +749,7 @@ export class BunTestRunner implements TestRunner {
      * (resolveRunTempDir's numbered slots converge too: each call takes the
      * lowest slot that is already ours). A
      * worker recycled mid-run is still a child of the same main process, so
-     * it re-derives the same path too (README documents recycled instances
+     * it re-derives the same path too (docs/internals.md documents recycled instances
      * lazily loading the registry). This is the entire sharing contract:
      * writer (buildAndPersistTestRegistry) and reader (loadRegistryFile) both
      * go through this one method rather than reimplementing the formula, so

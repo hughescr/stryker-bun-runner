@@ -50,10 +50,14 @@ export interface BunTestRunnerOptions {
    *
    * Flags that would break per-test coverage attribution or the runner's own
    * test selection (`--concurrent`, `--max-concurrency`, `--parallel`,
-   * `--shard`, `--changed`, `-t`/`--test-name-pattern`,
+   * `--test-worker`, `--shard`, `--changed`, `-t`/`--test-name-pattern`,
    * `-u`/`--update-snapshots`, `--pass-with-no-tests`, `--watch`,
-   * `--coverage*`, `--cwd`, `--inspect*`) make `init()` throw instead of being
+   * `--coverage`, `--coverage-reporter`, `--coverage-dir`, `--cwd`,
+   * `--inspect`, `--inspect-wait`, `--inspect-brk`), and the flags that re-run
+   * tests (`--retry`, `--rerun-each`), make `init()` throw instead of being
    * passed through — see src/utils/bun-args.ts.
+   *
+   * `--randomize` and `--seed` apply to the dry run only: mutant runs drop them.
    *
    * `--config=<path>` (or `--config <path>` / `-c <path>`) names the bunfig the
    * runner sanitizes and reads `[test].root` from, resolved against the project
@@ -90,7 +94,7 @@ export interface BunTestRunnerOptions {
    * memory-constrained machines, especially at higher Stryker `concurrency`,
    * since peak memory during a campaign is roughly
    * `concurrency × per-run suite footprint` (each run is an isolated process
-   * that exits when it completes — see README "Memory model").
+   * that exits when it completes — see "Memory model" in docs/internals.md).
    * @default false
    */
     smol?: boolean
@@ -98,10 +102,10 @@ export interface BunTestRunnerOptions {
     /**
    * Soft memory ceiling, in bytes, for each `bun test` child's resident set
    * size (RSS). When set, the child's RSS is polled periodically; a run that
-   * exceeds this ceiling is killed and reported as a clean timeout/error for
-   * that one mutant, rather than being left to grow toward system-wide swap
+   * exceeds this ceiling is killed and reported as a Timeout for that one
+   * mutant, rather than being left to grow toward system-wide swap
    * exhaustion. This is a polled userspace check, not a kernel-enforced
-   * limit — see README "Memory containment" for why a true hard ceiling
+   * limit — see "Memory containment" in docs/internals.md for why a true hard ceiling
    * (rlimit/cgroup) isn't used. Omit to disable.
    */
     maxChildRss?: number
@@ -120,7 +124,7 @@ export interface BunTestRunnerOptions {
    * project root, it picks up the project's entire suite — including the test
    * that spawned it — and the nesting never terminates. This ceiling makes that
    * finite: a run at or beyond the limit fails with a non-zero exit code
-   * instead of spawning. See the README's "Recursion containment" section.
+   * instead of spawning. See "Recursion containment" in docs/internals.md.
    *
    * The default of 1 allows the runner's own `bun test` children and nothing
    * deeper, which is right for every project whose tests do not themselves

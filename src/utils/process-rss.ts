@@ -9,7 +9,7 @@
  * exhaust system memory/swap.
  *
  * This is deliberately NOT a kernel-enforced hard ceiling (no rlimit/cgroup
- * usage) — see README "Memory containment" section for why: RLIMIT_AS caps
+ * usage) — see "Memory containment" in docs/internals.md for why: RLIMIT_AS caps
  * virtual address space, not RSS, and modern JS engines (Bun's JavaScriptCore,
  * V8) reserve large virtual ranges up front regardless of actual resident
  * usage, so an RLIMIT_AS ceiling tight enough to matter for RSS would abort
