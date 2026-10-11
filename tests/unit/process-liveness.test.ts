@@ -124,7 +124,13 @@ describe('isProcessRunning', () => {
         // before they signal its parent, so that line is the event this test waits on. A pipe
         // only the child holds would not do: it reaches EOF while the child is still
         // partway through exiting, before it is a zombie.
-        const parent = spawn('/bin/sh', ['-c', String.raw`{ read -r _ <&3; } & echo $!; exec perl -e '$| = 1; $SIG{CHLD} = sub { print "zombie\n" }; print "ready\n"; sleep while 1'`], { stdio: ['ignore', 'pipe', 'ignore', 'pipe'] });
+        //
+        // perl keeps SIGCHLD blocked except inside sigsuspend, which unblocks it and waits in
+        // one step. perl runs a handler only between its own ops, so with a plain `sleep`
+        // (pause) a SIGCHLD that lands after perl's last check but before pause() is held for
+        // a handler that never runs, and the line never comes; a blocked SIGCHLD instead
+        // stays pending until sigsuspend takes it.
+        const parent = spawn('/bin/sh', ['-c', String.raw`{ read -r _ <&3; } & echo $!; exec perl -MPOSIX -e '$| = 1; sigprocmask(SIG_BLOCK, POSIX::SigSet->new(SIGCHLD)); $SIG{CHLD} = sub { print "zombie\n" }; print "ready\n"; sigsuspend(POSIX::SigSet->new) while 1'`], { stdio: ['ignore', 'pipe', 'ignore', 'pipe'] });
         spawned.push(parent);
         // The stdio option above guarantees these pipes; spawn's typings cannot see that.
         const stdout = parent.stdio[1]!;
