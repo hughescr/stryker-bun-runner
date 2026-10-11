@@ -1,0 +1,15 @@
+diff --git a/dist/src/ts-native/native-typescript-compiler.js b/dist/src/ts-native/native-typescript-compiler.js
+index 3caca8ec758fe8d42a262691397e8ba3d18b40a4..28874aacfb8af43f66337ed13bc4ad3f7415749a 100644
+--- a/dist/src/ts-native/native-typescript-compiler.js
++++ b/dist/src/ts-native/native-typescript-compiler.js
+@@ -43,7 +43,9 @@ export class NativeTypescriptCompiler {
+         this.log.debug('Started the native TypeScript compiler on project "%s"', this.tsconfigFile);
+         return this.checkSnapshot();
+     }
+-    async #adjustTSConfigFile(fileName = this.options.tsconfigFile) {
++    // Patched (@hughescr/stryker-bun-runner): the absolute path, which is what the native compiler asks readFile for.
++    // With the relative options.tsconfigFile the adjusted tsconfig (noUnusedLocals: false, ...) was never served.
++    async #adjustTSConfigFile(fileName = this.tsconfigFile) {
+         const parsedConfig = ts.parseConfigFileTextToJson(toPosixFileName(fileName), await fs.promises.readFile(fileName, 'utf-8'));
+         if (parsedConfig.error) {
+             return; // let the ts compiler deal with this error
