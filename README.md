@@ -21,6 +21,7 @@ coverage so that each mutant runs only the tests that reach it.
   - [Before you start](#before-you-start) · [Install](#1-install) · [Configure](#2-configure) ·
     [Run](#3-run) · [Reading the output](#reading-the-output) ·
     [Optional: skip mutants that do not compile](#optional-skip-mutants-that-do-not-compile)
+- [Upgrading from 1.4](#upgrading-from-14)
 - [Terms](#terms)
 - [Requirements and compatibility](#requirements-and-compatibility)
 - [Configuration](#configuration)
@@ -160,6 +161,40 @@ export default await withTestFilesExcludedFromTypeCheck({
   checkers: ['typescript'],
 });
 ```
+
+## Upgrading from 1.4
+
+Most projects need no config change, but these differ from 1.4:
+
+- **`bun.timeout` now bounds only the dry run** (plus the 30 s drain-handshake allowance). Mutant
+  runs use Stryker's per-mutant timeout: `timeoutFactor` × the dry-run time of the tests that
+  mutant runs (the whole suite for a static mutant) + `timeoutMS` + the dry run's overhead, less a
+  small margin ([Timeouts](#timeouts)). If you raised `bun.timeout` so slow mutant runs would not
+  time out, raise `timeoutMS` or `timeoutFactor` instead. `bun.timeout` can now be generous: the
+  runner warns above 80% use, and only a hung dry run takes that long to fail.
+- **Mutant runs never randomize.** Covering files run cheapest first (by dry-run time), tests in
+  source order. The dry run still follows your bunfig `randomize` and `seed`.
+- **Some verdicts change, toward correctness** ([How results are scored](#how-results-are-scored)).
+  A hang that a fast test catches is Killed. An infinite loop stops at Stryker's hit limit and is
+  Timeout, reason `Hit limit reached`. A bun crash or failed start with no failing test is Error
+  (left out of the score), not Killed. A mutant that stops a test file loading is Killed (1.4
+  usually scored it Error). Incremental mode keeps the old verdict of mutants it reuses; run once
+  with `--force` to re-score.
+- **The dry run is stricter.** Bun's summary, the inspector's events and the coverage records must
+  agree exactly (1.4 tolerated small shortfalls), and missing per-test coverage with
+  `coverageAnalysis: 'perTest'` is an Error. See [the dry run fails](#the-dry-run-fails).
+- **Configuration.** Some `bun.bunArgs` flags are now rejected, `--retry` and `--rerun-each`
+  among them ([bun.bunArgs](#bunbunargs)). `retry` and `rerunEach` in your bunfig are dropped with
+  a warning. `bun.testFiles` entries are exact paths, not substring filters, so a bare name no
+  longer matches copies under `dist/` ([Choosing the test files](#choosing-the-test-files)).
+  `--config`/`-c` in `bun.bunArgs` names the bunfig the runner reads, and everything outside
+  `[test]` in it is kept (1.4 kept only `[install]`): [Your bunfig.toml](#your-bunfigtoml).
+- **Install.** A peer dependency on `typescript` below 7 (see the callout under
+  [Install](#1-install)); dependencies are no longer bundled and install normally. Startup now
+  requires Bun 1.3.7 or later and stops at once otherwise.
+- **Test ids are unchanged**, so a 1.4 incremental report stays reusable. The one exception is a
+  test retried in the dry run (a per-test `{ retry }` option, or `retry` in your bunfig): it had one
+  id per attempt (`name [0]`, `name [1]`, ...) and now has the single id `name`.
 
 ## Terms
 
@@ -568,7 +603,7 @@ also fails; see [Inspector diagnostics](docs/internals.md#inspector-diagnostics)
 | `bun test child exceeded maxChildRss` | A run went over `bun.maxChildRss`; scored Timeout. | Expected for runaway mutants; raise the limit if many hit it. |
 | Many mutants Timeout | Stryker's timeout is tight for your suite, or many mutants loop forever. Infinite loops stopped by the hit limit carry the reason `Hit limit reached (count/limit)`: open the mutant in the HTML report, or read `statusReason` in Stryker's JSON report. | For the others, raise `timeoutMS` or `timeoutFactor`. |
 | Every mutant runs the whole suite | No per-test coverage: `coverageAnalysis` is not `'perTest'`, or coverage was missing. | Use `'perTest'` and check the dry-run warnings. |
-| The score changed after upgrading this plugin | Scoring has changed over time (for example, a crash without a matching failing test is now Error, and a test file that a mutant stops from loading is Killed). | Expected. See [How results are scored](#how-results-are-scored), and the [commit history](https://github.com/hughescr/stryker-bun-runner/commits/main) for what changed. |
+| The score changed after upgrading this plugin | Scoring has changed over time (for example, a crash without a matching failing test is now Error, and a test file that a mutant stops from loading is Killed). | Expected. See [Upgrading from 1.4](#upgrading-from-14), [How results are scored](#how-results-are-scored), and the [commit history](https://github.com/hughescr/stryker-bun-runner/commits/main) for what changed. |
 
 ## Limitations
 
