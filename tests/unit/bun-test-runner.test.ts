@@ -27,7 +27,7 @@ import * as privateTempDir from '../../src/utils/private-temp-dir.js';
 import * as syncServerModule from '../../src/utils/sync-server.js';
 import * as testFileDiscovery from '../../src/utils/test-file-discovery.js';
 import { runUntilSettled, trackTimers } from '../helpers/fake-clock.js';
-import { mockGetAvailablePort, mockRename, mockWriteFile, resetAllMocks, resetFsMocks } from '../test-preload.js';
+import { mockRename, mockWriteFile, resetAllMocks, resetFsMocks } from '../test-preload.js';
 
 // Captured at module load time, BEFORE any `spyOn(coverageMapper, 'mapCoverageToInspectorIds')`
 // runs in a beforeEach below — a plain function-value snapshot, immune to the later spy's
@@ -94,6 +94,7 @@ describe('BunTestRunner', () => {
         setDrainHandler: ReturnType<typeof mock>
         close:           ReturnType<typeof mock>
         clientCount:     number
+        port:            number
     };
     let mockInspectorClient: {
         connect:                  ReturnType<typeof mock>
@@ -176,9 +177,6 @@ describe('BunTestRunner', () => {
         generateSanitizedBunfigSpy = spyOn(bunfigSanitizer, 'generateSanitizedBunfig').mockImplementation(mockGenerateSanitizedBunfig);
         cleanupSanitizedBunfigSpy = spyOn(bunfigSanitizer, 'cleanupSanitizedBunfig').mockImplementation(mockCleanupSanitizedBunfig);
 
-        // Port utility mock comes from preload - just clear its state
-        mockGetAvailablePort.mockClear();
-
         // Mock sync server
         mockSyncServer = {
             start:           mock(),
@@ -186,6 +184,7 @@ describe('BunTestRunner', () => {
             setDrainHandler: mock(),
             close:           mock(),
             clientCount:     0,
+            port:            6500,
         };
         // @ts-expect-error - Mocking constructor, type system doesn't understand this pattern
         syncServerSpy = spyOn(syncServerModule, 'SyncServer').mockImplementation(() => mockSyncServer);
@@ -226,8 +225,6 @@ describe('BunTestRunner', () => {
         mockCleanupPreloadScript.mockResolvedValue(undefined);
         mockGenerateSanitizedBunfig.mockResolvedValue('/tmp/stryker-bun-runner-bunfig-0-0.toml');
         mockCleanupSanitizedBunfig.mockResolvedValue(undefined);
-        let portCounter = 6499;
-        mockGetAvailablePort.mockImplementation(() => Promise.resolve(portCounter++));
         mockSyncServer.start.mockResolvedValue(undefined);
         mockSyncServer.signalReady.mockReturnValue(undefined);
         mockSyncServer.close.mockResolvedValue(undefined);
@@ -12596,6 +12593,7 @@ describe('mutantRun testFilter integration', () => {
         setDrainHandler: ReturnType<typeof mock>
         close:           ReturnType<typeof mock>
         clientCount:     number
+        port:            number
     };
     let mockInspectorClient: {
         connect:               ReturnType<typeof mock>
@@ -12652,14 +12650,13 @@ describe('mutantRun testFilter integration', () => {
         collectCoverageSpy       = spyOn(coverageCollector, 'collectCoverage').mockImplementation(mockCollectCoverage);
         cleanupCoverageFileSpy   = spyOn(coverageCollector, 'cleanupCoverageFile').mockImplementation(mockCleanupCoverageFile);
 
-        mockGetAvailablePort.mockImplementation(() => Promise.resolve(7000));
-
         mockSyncServer = {
             start:           mock().mockResolvedValue(undefined),
             signalReady:     mock().mockReturnValue(undefined),
             setDrainHandler: mock(),
             close:           mock().mockResolvedValue(undefined),
             clientCount:     0,
+            port:            7000,
         };
         // @ts-expect-error - Mocking constructor
         syncServerSpy = spyOn(syncServerModule, 'SyncServer').mockImplementation(() => mockSyncServer);

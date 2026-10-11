@@ -937,11 +937,11 @@ describe('runBunTests', () => {
     });
 
     describe('inspector debugging', () => {
-        it('should add --inspect flag when inspectWaitPort is specified', async () => {
+        it('adds --inspect on a loopback port bun picks itself when inspect is set', async () => {
             const resultPromise = runBunTests({
-                bunPath:         'bun',
-                timeout:         5000,
-                inspectWaitPort: 9229,
+                bunPath: 'bun',
+                timeout: 5000,
+                inspect: true,
             });
 
             mockChildProcess.closeHandler?.(0);
@@ -951,22 +951,36 @@ describe('runBunTests', () => {
 
             const args = spawnCall[1];
             // Host is pinned to 127.0.0.1 (not left bare) so bun's bind address
-            // matches InspectorClient's dial address exactly. A bare --inspect=9229
+            // matches InspectorClient's dial address exactly. A bare --inspect=<port>
             // makes bun bind ::1 only, while a dial to "localhost" resolves via
             // Node's fast path to 127.0.0.1 — deterministic ECONNREFUSED on any
             // host with that v4/v6 split (e.g. Docker Desktop for Mac). This
             // assertion is the regression test for that mismatch: it fails if the
             // host prefix is ever dropped or changed.
-            expect(args).toContain('--inspect=127.0.0.1:9229');
+            // Port 0: bun binds whatever port the OS gives it and prints that port in
+            // its banner. A port chosen in advance (probed free, then released) can be
+            // taken by another process before bun binds it, and bun then exits with
+            // EADDRINUSE instead of starting.
+            expect(args).toContain('--inspect=127.0.0.1:0');
+        });
+
+        it('adds no --inspect flag when inspect is not set', async () => {
+            const resultPromise = runBunTests({ bunPath: 'bun', timeout: 5000, inspect: false });
+
+            mockChildProcess.closeHandler?.(0);
+            await resultPromise;
+
+            const args: readonly string[] = mockSpawn.mock.calls[0][1];
+            expect(args.some(arg => arg.startsWith('--inspect'))).toBe(false);
         });
 
         it('should call onInspectorReady when inspector URL is found in stderr', async () => {
             const onInspectorReady = mock(() => {});
 
             const resultPromise = runBunTests({
-                bunPath:         'bun',
-                timeout:         5000,
-                inspectWaitPort: 9229,
+                bunPath: 'bun',
+                timeout: 5000,
+                inspect: true,
                 onInspectorReady,
             });
 
@@ -987,9 +1001,9 @@ describe('runBunTests', () => {
             const onInspectorReady = mock(() => {});
 
             const resultPromise = runBunTests({
-                bunPath:         'bun',
-                timeout:         5000,
-                inspectWaitPort: 9229,
+                bunPath: 'bun',
+                timeout: 5000,
+                inspect: true,
                 onInspectorReady,
             });
 
@@ -1153,9 +1167,9 @@ describe('runBunTests', () => {
             // Kills mutation on line 179: if(options.onInspectorReady) → if(true)
             // If mutated to always true, would crash trying to call undefined callback
             const resultPromise = runBunTests({
-                bunPath:         'bun',
-                timeout:         5000,
-                inspectWaitPort: 9229,
+                bunPath: 'bun',
+                timeout: 5000,
+                inspect: true,
                 // onInspectorReady intentionally not provided
             });
 
@@ -1173,9 +1187,9 @@ describe('runBunTests', () => {
             const onInspectorReady = mock(() => {});
 
             const resultPromise = runBunTests({
-                bunPath:         'bun',
-                timeout:         5000,
-                inspectWaitPort: 9229,
+                bunPath: 'bun',
+                timeout: 5000,
+                inspect: true,
                 onInspectorReady,
             });
 
@@ -2507,7 +2521,7 @@ describe('runBunTests', () => {
         it('extracts the URL from a dimmed banner', async () => {
             const onInspectorReady = mock((_url: string) => undefined);
             const resultPromise = runBunTests({
-                bunPath: 'bun', timeout: 5000, inspectWaitPort: 9229, onInspectorReady,
+                bunPath: 'bun', timeout: 5000, inspect: true, onInspectorReady,
             });
             await Promise.resolve();
             mockChildProcess.stderrHandler?.(Buffer.from(COLOURED_BANNER));
@@ -2520,7 +2534,7 @@ describe('runBunTests', () => {
         it('still extracts the URL from an uncoloured banner', async () => {
             const onInspectorReady = mock((_url: string) => undefined);
             const resultPromise = runBunTests({
-                bunPath: 'bun', timeout: 5000, inspectWaitPort: 9229, onInspectorReady,
+                bunPath: 'bun', timeout: 5000, inspect: true, onInspectorReady,
             });
             await Promise.resolve();
             mockChildProcess.stderrHandler?.(Buffer.from('Listening:\n  ws://127.0.0.1:6499/plain\n'));

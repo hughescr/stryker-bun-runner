@@ -40,7 +40,7 @@ import * as privateTempDir from '../../src/utils/private-temp-dir.js';
 import * as syncServerModule from '../../src/utils/sync-server.js';
 import { buildTestFileArgs, MAX_TEST_FILE_ARGS_BYTES } from '../../src/utils/test-file-args.js';
 import * as testFileDiscovery from '../../src/utils/test-file-discovery.js';
-import { mockGetAvailablePort, mockReadFile, mockRename, mockWriteFile, resetAllMocks } from '../test-preload.js';
+import { mockReadFile, mockRename, mockWriteFile, resetAllMocks } from '../test-preload.js';
 
 /** The run's private temp directory, derived independently (see survivors-a's copy of this helper). */
 function expectedRunTempDir(cwd: string = process.cwd(), ppid: number = process.ppid): string {
@@ -109,16 +109,13 @@ describe('BunTestRunner cheapest-first file order and fixed test order in mutant
         spyOn(bunfigSanitizer, 'generateSanitizedBunfig').mockImplementation(mockGenerateSanitizedBunfig);
         spyOn(bunfigSanitizer, 'cleanupSanitizedBunfig').mockResolvedValue(undefined);
 
-        mockGetAvailablePort.mockClear();
-        let portCounter = 6499;
-        mockGetAvailablePort.mockImplementation(() => Promise.resolve(portCounter++));
-
         const mockSyncServer = {
             start:           mock().mockResolvedValue(undefined),
             signalReady:     mock(),
             setDrainHandler: mock(),
             close:           mock().mockResolvedValue(undefined),
             clientCount:     0,
+            port:            6500,
         };
         // @ts-expect-error - Mocking constructor, type system doesn't understand this pattern
         spyOn(syncServerModule, 'SyncServer').mockImplementation(() => mockSyncServer);

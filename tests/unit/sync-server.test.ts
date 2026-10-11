@@ -3,7 +3,9 @@
  * Tests WebSocket synchronization server using mock injection
  */
 
+import { once } from 'node:events';
 import { describe, it, expect, beforeEach, mock } from 'bun:test';
+import { WebSocket } from 'ws';
 import { SyncServer } from '../../src/utils/sync-server';
 
 // Mock WebSocket client
@@ -72,6 +74,7 @@ const createMockWss = (): MockWss => {
 interface MockHttpServer {
     on:                ReturnType<typeof mock>
     listen:            ReturnType<typeof mock>
+    address:           ReturnType<typeof mock>
     close:             ReturnType<typeof mock>
     triggerError:      (err: Error) => void
     getRequestHandler: () => ((req: { url?: string }, res: { writeHead: (code: number) => void, end: (msg: string) => void }) => void) | null
@@ -88,7 +91,9 @@ const createMockHttpServer = (): MockHttpServer => {
         listen: mock((_port: number, _host: string, callback: () => void) => {
             setImmediate(callback);
         }),
-        close: mock((callback?: () => void) => {
+        // The port the OS assigned for listen(0, ...).
+        address: mock(() => ({ address: '127.0.0.1', family: 'IPv4', port: 41_234 })),
+        close:   mock((callback?: () => void) => {
             if(!callback) {
                 return;
             }
@@ -135,19 +140,24 @@ describe('SyncServer', () => {
         mockWssClass = mock(() => mockWss);
     });
 
-    const createServer = (port = 8080) => {
+    const createServer = () => {
         return new SyncServer({
-            port,
             createHttpServer:     mockHttpServerFactory as never,
             WebSocketServerClass: mockWssClass as never,
             webSocketOpenState:   1,
         });
     };
 
-    describe('constructor', () => {
-        it('stores the port', () => {
-            const server = createServer(9000);
-            expect(server).toBeDefined();
+    describe('port', () => {
+        it('is the port the server is listening on, once started', async () => {
+            const server = createServer();
+            await server.start();
+
+            expect(server.port).toBe(41_234);
+        });
+
+        it('throws before the server has started, rather than handing out a port nobody listens on', () => {
+            expect(() => createServer().port).toThrow('the sync server is not listening yet');
         });
     });
 
@@ -241,16 +251,18 @@ describe('SyncServer', () => {
             expect(mockHttpServer.on).toHaveBeenCalledWith('error', expect.any(Function));
         });
 
-        it('starts listening on specified port', async () => {
-            const server = createServer(3000);
+        it('listens on port 0, so the OS picks a port that is free when it binds', async () => {
+            // A port probed free in advance and released again can be taken by another
+            // process before the server binds it.
+            const server = createServer();
             await server.start();
-            expect(mockHttpServer.listen).toHaveBeenCalledWith(3000, expect.any(String), expect.any(Function));
+            expect(mockHttpServer.listen).toHaveBeenCalledWith(0, expect.any(String), expect.any(Function));
         });
 
         it('binds loopback only (127.0.0.1), never all interfaces', async () => {
-            const server = createServer(3000);
+            const server = createServer();
             await server.start();
-            expect(mockHttpServer.listen).toHaveBeenCalledWith(3000, '127.0.0.1', expect.any(Function));
+            expect(mockHttpServer.listen).toHaveBeenCalledWith(0, '127.0.0.1', expect.any(Function));
         });
 
         it('resolves when listen completes', async () => {
@@ -266,7 +278,6 @@ describe('SyncServer', () => {
             const errorFactory = mock(() => errorServer);
 
             const server = new SyncServer({
-                port:                 8080,
                 createHttpServer:     errorFactory as never,
                 WebSocketServerClass: mockWssClass as never,
                 webSocketOpenState:   1,
@@ -297,7 +308,6 @@ describe('SyncServer', () => {
                 throw 'no server for you';
             });
             const server = new SyncServer({
-                port:                 8080,
                 createHttpServer:     throwingFactory,
                 WebSocketServerClass: mockWssClass as never,
                 webSocketOpenState:   1,
@@ -1077,5 +1087,28 @@ describe('preload sync dial address', () => {
         expect(template).not.toContain('ws://');
         expect(preloadLogic).not.toContain('ws://localhost:');
         expect(preloadLogic.match(/ws:\/\/127\.0\.0\.1:\$\{syncPort\}\/sync/g)).toHaveLength(1);
+    });
+});
+
+describe('SyncServer on a real socket', () => {
+    it('reports the port the OS gave it, and a client dialing that port reaches it', async () => {
+        const server = new SyncServer();
+        await server.start();
+        try {
+            expect(server.port).toBeGreaterThan(0);
+
+            const client = new WebSocket(`ws://127.0.0.1:${server.port}/sync`);
+            const received = new Promise<string>((resolve, reject) => {
+                client.on('message', (data: Buffer) => resolve(data.toString('utf8')));
+                client.on('error', reject);
+            });
+            await once(client, 'open');
+            server.signalReady();
+
+            expect(await received).toBe('ready');
+            client.close();
+        } finally {
+            await server.close();
+        }
     });
 });

@@ -135,13 +135,14 @@ export interface BunTestRunOptions {
     bunfigPath?: string
 
     /**
-   * Port for --inspect flag
-   * When provided, adds --inspect=127.0.0.1:<port> flag to enable debugging.
-   * The host is pinned to 127.0.0.1 (not left bare) so bun's bind address and
-   * InspectorClient's dial address are always the same literal string — see
-   * the comment at the call site in runBunTests for why this matters.
+   * Enable bun's inspector: adds --inspect=127.0.0.1:0, so bun binds a
+   * loopback port the OS picks and prints it in the URL that
+   * {@link onInspectorReady} receives. The host is pinned to 127.0.0.1 (not
+   * left bare) so bun's bind address and InspectorClient's dial address are
+   * always the same literal string — see the comment at the call site in
+   * runBunTests for why this matters.
    */
-    inspectWaitPort?: number
+    inspect?: boolean
 
     /**
    * Whether to force sequential test execution
@@ -151,7 +152,7 @@ export interface BunTestRunOptions {
 
     /**
    * Callback invoked when inspector WebSocket URL is detected in stderr
-   * Only called when inspectWaitPort is set
+   * Only called when inspect is set
    */
     onInspectorReady?: (url: string) => void
 
@@ -512,9 +513,13 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
     // eliminates the mismatch. This is behavioral, not diagnostic, so unlike
     // the disables below it is intentionally left un-disabled and is covered by
     // the exact-arg assertion in process-runner.test.ts (inspector debugging).
+    // Port 0 lets bun bind whatever free port the OS hands it; the stderr handler
+    // below reads the real port from bun's banner. A port probed free in advance
+    // and then released can be bound by another process before bun gets to it,
+    // and bun then exits with EADDRINUSE.
     // Stryker disable next-line ConditionalExpression,BlockStatement: all mutations here remove required args, causing dryRun to never emit inspector URL → Timeout
-    if(options.inspectWaitPort) {
-        args.push(`--inspect=127.0.0.1:${options.inspectWaitPort}`);
+    if(options.inspect) {
+        args.push('--inspect=127.0.0.1:0');
     }
 
     // Override the project bunfig with a sanitized copy to prevent coverage
@@ -725,7 +730,7 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
                 stderrChunks.push(data);
 
                 // If inspector is enabled, parse stderr for WebSocket URL
-                if(options.inspectWaitPort && !inspectorUrlExtracted && options.onInspectorReady) {
+                if(options.inspect && !inspectorUrlExtracted && options.onInspectorReady) {
                     const text = Buffer.concat(stderrChunks).toString();
                     // Look for pattern: "Listening:\n  ws://127.0.0.1:PORT/SESSION_ID"
                     // Bun echoes back whatever host we passed to --inspect (verified: bare

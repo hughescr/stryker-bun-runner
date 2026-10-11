@@ -43,7 +43,7 @@ import type { TestInfo } from './inspector/types.js';
 import type { StrykerBunOptions } from './options.js';
 import { parseBunTestOutput, type ParsedTestResults } from './parsers/console-parser.js';
 import { runBunTests, stripAnsi, type BunProcessResult } from './process-runner.js';
-import { type DroppedBunfigKey, assertSupportedBunArgs, splitBunConfigArg, stripRandomizeArgs, checkBunVersion, getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, mutantRunBunfigPath, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, TEST_FILE_SUFFIX_RE, discoverTestFiles, findBuildOutputTestFiles, buildTestFileArgs, MAX_TEST_FILE_ARGS_BYTES, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery, resolveRunTempDir, writePrivateFile, MutantWarnAggregator } from './utils/index.js';
+import { type DroppedBunfigKey, assertSupportedBunArgs, splitBunConfigArg, stripRandomizeArgs, checkBunVersion, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, mutantRunBunfigPath, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, TEST_FILE_SUFFIX_RE, discoverTestFiles, findBuildOutputTestFiles, buildTestFileArgs, MAX_TEST_FILE_ARGS_BYTES, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery, resolveRunTempDir, writePrivateFile, MutantWarnAggregator } from './utils/index.js';
 
 /**
  * Event-driven wait for the inspector URL bun prints on startup.
@@ -1607,16 +1607,15 @@ export class BunTestRunner implements TestRunner {
         const abortController = new AbortController();
         this.currentAbortController = abortController;
 
-        // 1. Get available ports for inspector and sync server
-        const inspectPort = await getAvailablePort();
-        const syncPort = await getAvailablePort();
-        // Stryker disable next-line StringLiteral: logging message only
-        this.logger.debug('Using inspector port: %d, sync port: %d', inspectPort, syncPort);
-
-        // 2. Start sync server
-        const syncServer = new SyncServer({ port: syncPort, timeout: this.inspectorTimeout });
+        // 1-2. Start the sync server. Neither it nor bun's inspector (see inspect
+        // below) is given a port chosen in advance: each binds port 0 and reports
+        // the port the OS gave it. A port probed free and released again can be
+        // bound by another process before the server or bun gets to it.
+        const syncServer = new SyncServer();
+        let syncPort: number;
         try {
             await syncServer.start();
+            syncPort = syncServer.port;
             // Stryker disable next-line StringLiteral: logging message only
             this.logger.debug('Sync server started on port %d', syncPort);
         } catch (error) {
@@ -1678,7 +1677,7 @@ export class BunTestRunner implements TestRunner {
                 bunfigPath,
                 preloadScript:         this.preloadScriptPath,
                 coverageFile:          this.coverageFilePath,
-                inspectWaitPort:       inspectPort,
+                inspect:               true,
                 sequentialMode:        true,  // Critical for correlation
                 syncPort, // Pass sync port to preload script via env var
                 testFiles,

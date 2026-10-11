@@ -1,4 +1,3 @@
-export { getAvailablePort } from './port.js';
 export { assertSupportedBunArgs, splitBunConfigArg, stripRandomizeArgs } from './bun-args.js';
 export { checkBunVersion, MIN_BUN_VERSION } from './bun-version.js';
 export { SyncServer } from './sync-server.js';
