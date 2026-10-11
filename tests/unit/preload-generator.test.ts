@@ -6,7 +6,8 @@
 import { chmod, lstat, mkdir, mkdtemp, readFile as fsReadFile, realpath, symlink, writeFile as fsWriteFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, spyOn, type Mock } from 'bun:test';
+import * as tinyglobby from 'tinyglobby';
 import { generatePreloadScript, cleanupPreloadScript, resolveEagerModulesFromGlobs } from '../../src/coverage/preload-generator.js';
 import { UnsafeTempDirError } from '../../src/utils/private-temp-dir.js';
 import { mockMkdir, mockReadFile, mockWriteFile, mockUnlink, resetFsMocks } from '../test-preload.js';
@@ -345,6 +346,8 @@ describe('cleanupPreloadScript', () => {
 // ============================================================================
 describe('resolveEagerModulesFromGlobs', () => {
     let fixtureDir: string;
+    // Spy on the glob the module under test calls; set only by tests that control its output order
+    let globSpy: Mock<typeof tinyglobby.glob> | undefined;
 
     // Helper: create a file (and its parent dirs) inside fixtureDir
     const mkfile = async (rel: string): Promise<string> => {
@@ -362,6 +365,8 @@ describe('resolveEagerModulesFromGlobs', () => {
 
     afterEach(async () => {
         // Clean up fixture dir, and the calls these real-fs tests recorded on the shared fs mocks
+        globSpy?.mockRestore();
+        globSpy = undefined;
         await rm(fixtureDir, { recursive: true, force: true });
         resetFsMocks();
     });
@@ -387,16 +392,19 @@ describe('resolveEagerModulesFromGlobs', () => {
         expect(result).toEqual([path.resolve(absA), path.resolve(absB)]);
     });
 
-    it('should sort results ascending by absolute path', async () => {
-        // Create files that would be returned in reverse order by some fs implementations
-        await mkfile('src/z.ts');
-        await mkfile('src/a.ts');
-        await mkfile('src/m.ts');
+    it('should sort results ascending by absolute path whatever order the glob returns them in', async () => {
+        // The order tinyglobby returns depends on the filesystem's readdir order, so a test on
+        // real files cannot tell a missing sort from a lucky directory order. Feed the glob a
+        // fixed, deliberately unsorted list instead.
+        const z = path.join(fixtureDir, 'src/z.ts');
+        const a = path.join(fixtureDir, 'src/a.ts');
+        const m = path.join(fixtureDir, 'src/m.ts');
+        globSpy = spyOn(tinyglobby, 'glob').mockResolvedValue([z, a, m]);
 
         const result = await resolveEagerModulesFromGlobs(['src/**/*.ts'], fixtureDir);
 
-        const sorted = result.toSorted((a, b) => a.localeCompare(b));
-        expect(result).toEqual(sorted);
+        expect(globSpy).toHaveBeenCalledTimes(1);
+        expect(result).toEqual([a, m, z]);
     });
 
     it('should handle negation patterns to exclude specific files', async () => {
