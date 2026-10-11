@@ -927,7 +927,7 @@ describe('BunTestRunner', () => {
             });
 
             it('rejects init() with the checker error (bun missing) before generating any files', async () => {
-                const message = 'stryker-bun-runner: could not run "bun" (ENOENT). Install bun >= 1.3.7 or set bun.bunPath in your Stryker config.';
+                const message = 'stryker-bun-runner: could not run "bun" (ENOENT). Install bun >= 1.4.0 or set bun.bunPath in your Stryker config.';
                 checkBunVersionSpy.mockRejectedValue(new Error(message));
 
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
@@ -937,7 +937,7 @@ describe('BunTestRunner', () => {
             });
 
             it('rejects init() with the checker error (bun too old)', async () => {
-                const message = 'stryker-bun-runner: bun 1.3.6 at "bun" is too old; version 1.3.7 or newer is required.';
+                const message = 'stryker-bun-runner: bun 1.3.14 at "bun" is too old; version 1.4.0 or newer is required.';
                 checkBunVersionSpy.mockRejectedValue(new Error(message));
 
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);

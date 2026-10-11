@@ -38,6 +38,10 @@ describe('compareVersions', () => {
 });
 
 describe('MIN_BUN_VERSION', () => {
+    it('is 1.4.0, the oldest bun the suite is run against', () => {
+        expect(MIN_BUN_VERSION).toBe('1.4.0');
+    });
+
     it('matches the package.json engines floor', async () => {
         const pkg = await Bun.file(new URL('../../package.json', import.meta.url)).json() as { engines: { bun: string } };
         expect(pkg.engines.bun).toBe(`>=${MIN_BUN_VERSION}`);
@@ -123,7 +127,7 @@ describe('checkBunVersion', () => {
     });
 
     it('accepts exactly the minimum version and anything newer (numeric compare)', async () => {
-        for(const output of [MIN_BUN_VERSION, '1.3.10', '1.10.0', '2.0.0']) {
+        for(const output of ['1.4.0', '1.4.10', '1.10.0', '2.0.0']) {
             mockSpawn.mockClear();
             const result = checkBunVersion('bun');
             // eslint-disable-next-line no-await-in-loop -- sequential: each iteration re-uses the shared mock child
@@ -138,14 +142,29 @@ describe('checkBunVersion', () => {
     it('rejects with the "too old" message when below the minimum version', async () => {
         const result = checkBunVersion('/usr/local/bin/bun');
         await settleSpawn();
-        child.stdoutHandler?.(Buffer.from('1.3.6\n'));
+        // The last 1.3 release, just below the 1.4.0 floor.
+        child.stdoutHandler?.(Buffer.from('1.3.14\n'));
         child.closeHandler?.(0, null);
 
         const error = await result.catch((e: unknown) => e);
         expect(error).toBeInstanceOf(Error);
         expect((error as Error).message).toBe(
-            'stryker-bun-runner: bun 1.3.6 at "/usr/local/bin/bun" is too old; version 1.3.7 or newer is required.'
+            'stryker-bun-runner: bun 1.3.14 at "/usr/local/bin/bun" is too old; version 1.4.0 or newer is required.'
         );
+    });
+
+    it('rejects every version below 1.4.0, whichever component is lower', async () => {
+        for(const output of ['1.3.7', '1.3.99', '0.99.99']) {
+            mockSpawn.mockClear();
+            const result = checkBunVersion('bun');
+            // eslint-disable-next-line no-await-in-loop -- sequential: each iteration re-uses the shared mock child
+            await settleSpawn();
+            child.stdoutHandler?.(Buffer.from(`${output}\n`));
+            child.closeHandler?.(0, null);
+            // eslint-disable-next-line no-await-in-loop -- sequential, see above
+            const error = await result.catch((e: unknown) => e);
+            expect((error as Error).message).toBe(`stryker-bun-runner: bun ${output} at "bun" is too old; version 1.4.0 or newer is required.`);
+        }
     });
 
     it('rejects with the "could not run" message including the error code when spawn emits an error (ENOENT)', async () => {
@@ -156,7 +175,7 @@ describe('checkBunVersion', () => {
         const error = await result.catch((e: unknown) => e);
         expect(error).toBeInstanceOf(Error);
         expect((error as Error).message).toBe(
-            'stryker-bun-runner: could not run "bun" (ENOENT). Install bun >= 1.3.7 or set bun.bunPath in your Stryker config.'
+            'stryker-bun-runner: could not run "bun" (ENOENT). Install bun >= 1.4.0 or set bun.bunPath in your Stryker config.'
         );
     });
 
@@ -167,7 +186,7 @@ describe('checkBunVersion', () => {
 
         const error = await checkBunVersion('/nope/bun').catch((e: unknown) => e);
         expect((error as Error).message).toBe(
-            'stryker-bun-runner: could not run "/nope/bun" (EACCES). Install bun >= 1.3.7 or set bun.bunPath in your Stryker config.'
+            'stryker-bun-runner: could not run "/nope/bun" (EACCES). Install bun >= 1.4.0 or set bun.bunPath in your Stryker config.'
         );
     });
 

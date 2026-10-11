@@ -28,8 +28,9 @@ a `bun test` child is never reused across runs. The plugin talks to the child in
 - **Bun's inspector protocol** (a WebSocket on `127.0.0.1`, enabled with
   `--inspect=127.0.0.1:0`: bun binds a port the OS picks and prints its URL, which the runner
   reads from bun's stderr). Its `TestReporter` events tell the runner which tests exist,
-  when each starts and ends, and how it ended. This needs Bun 1.3.7 or later, which added those
-  events ([oven-sh/bun#25986](https://github.com/oven-sh/bun/pull/25986)).
+  when each starts and ends, and how it ended. Bun added those events in 1.3.7
+  ([oven-sh/bun#25986](https://github.com/oven-sh/bun/pull/25986)); the runner itself requires
+  Bun 1.4.0 or later, the oldest release its test suite is run against.
 - **A coverage preload** (`--preload`), a script the runner generates. It activates the mutant
   under test, records which mutants each test executed (dry run only), arms Stryker's hit
   limit, and guards against the child outliving its parent.

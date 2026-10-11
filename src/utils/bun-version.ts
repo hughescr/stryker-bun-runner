@@ -10,10 +10,11 @@
 import { spawn } from 'node:child_process';
 
 /**
- * Oldest bun this package supports — mirrors `engines.bun` in package.json
- * (`>=1.3.7`). Keep the two in lockstep.
+ * Oldest bun this package supports — the oldest release its test suite is run
+ * against — and mirrors `engines.bun` in package.json (`>=1.4.0`). Keep the two
+ * in lockstep, along with the versions the README states.
  */
-export const MIN_BUN_VERSION = '1.3.7';
+export const MIN_BUN_VERSION = '1.4.0';
 
 /** How long `bun --version` may take before it is treated as not runnable. */
 const VERSION_CHECK_TIMEOUT_MS = 10_000;
@@ -21,7 +22,7 @@ const VERSION_CHECK_TIMEOUT_MS = 10_000;
 /**
  * Extract `major.minor.patch` from `bun --version` output (e.g. `1.4.2`, or a
  * canary such as `1.4.3-canary.20260101.1`). Prerelease/build suffixes are
- * ignored, so a canary of 1.3.7 counts as 1.3.7.
+ * ignored, so a canary of 1.4.0 counts as 1.4.0.
  *
  * @returns the three numeric components, or `undefined` when no version is found.
  */

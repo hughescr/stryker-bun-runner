@@ -5,7 +5,7 @@ measures how good your tests are by making small changes (mutants) to your code 
 some test fails for each one. This plugin lets Stryker run your `bun test` suite, using per-test
 coverage so that each mutant runs only the tests that reach it.
 
-[![npm version](https://img.shields.io/npm/v/@hughescr/stryker-bun-runner)](https://www.npmjs.com/package/@hughescr/stryker-bun-runner) [![LICENSE](https://img.shields.io/badge/LICENSE-Apache--2.0-blue)](LICENSE.md) [![Bun](https://img.shields.io/badge/Bun-%3E%3D1.3.7-f9f1e1?logo=bun)](https://bun.sh) [![Stryker](https://img.shields.io/badge/Stryker-9%20%7C%2010-e74c3c?logo=stryker)](https://stryker-mutator.io) [![Mutation testing badge](https://img.shields.io/endpoint?url=https%3A%2F%2Fbadge-api.stryker-mutator.io%2Fgithub.com%2Fhughescr%2Fstryker-bun-runner%2Fmain)](https://dashboard.stryker-mutator.io/reports/github.com/hughescr/stryker-bun-runner/main)
+[![npm version](https://img.shields.io/npm/v/@hughescr/stryker-bun-runner)](https://www.npmjs.com/package/@hughescr/stryker-bun-runner) [![LICENSE](https://img.shields.io/badge/LICENSE-Apache--2.0-blue)](LICENSE.md) [![Bun](https://img.shields.io/badge/Bun-%3E%3D1.4.0-f9f1e1?logo=bun)](https://bun.sh) [![Stryker](https://img.shields.io/badge/Stryker-9%20%7C%2010-e74c3c?logo=stryker)](https://stryker-mutator.io) [![Mutation testing badge](https://img.shields.io/endpoint?url=https%3A%2F%2Fbadge-api.stryker-mutator.io%2Fgithub.com%2Fhughescr%2Fstryker-bun-runner%2Fmain)](https://dashboard.stryker-mutator.io/reports/github.com/hughescr/stryker-bun-runner/main)
 
 - **Per-test coverage**, so each mutant runs only its covering tests, in only their files,
   cheapest file first.
@@ -46,7 +46,7 @@ coverage so that each mutant runs only the tests that reach it.
 
 ### Before you start
 
-- **Bun 1.3.7 or later** (`bun --version`).
+- **Bun 1.4.0 or later** (`bun --version`).
 - **Node.js 22 or later** (`node --version`). Stryker itself runs on Node; only your tests run on
   Bun. Stryker 10, which the install below gets you, needs Node 22; Stryker 9 needs Node 20.
 - **A project whose `bun test` passes**, with its source code under `src/` or `lib/` (Stryker's
@@ -191,7 +191,7 @@ Most projects need no config change, but these differ from 1.4:
   `[test]` in it is kept (1.4 kept only `[install]`): [Your bunfig.toml](#your-bunfigtoml).
 - **Install.** A peer dependency on `typescript` below 7 (see the callout under
   [Install](#1-install)); dependencies are no longer bundled and install normally. Startup now
-  requires Bun 1.3.7 or later and stops at once otherwise.
+  requires Bun 1.4.0 or later and stops at once otherwise.
 - **Test ids are unchanged**, so a 1.4 incremental report stays reusable. The one exception is a
   test retried in the dry run (a per-test `{ retry }` option, or `retry` in your bunfig): it had one
   id per attempt (`name [0]`, `name [1]`, ...) and now has the single id `name`.
@@ -230,7 +230,7 @@ Most projects need no config change, but these differ from 1.4:
 
 | Component | Supported | Notes |
 |---|---|---|
-| Bun | 1.3.7 or later | Tested with 1.3.7, 1.3.14 and 1.4.2. Older versions lack the inspector test events the runner needs ([oven-sh/bun#25986](https://github.com/oven-sh/bun/pull/25986)). |
+| Bun | 1.4.0 or later | Tested with 1.4.0, 1.4.2 and 1.4.3. 1.4.0 is the oldest release the runner's test suite is run against, so older versions are not supported. |
 | `@stryker-mutator/core` | 9.x or 10.x | Peer dependency. Stryker's `testFiles` option needs 9.6 or later. |
 | Node.js | 20 or later with Stryker 9; 22 or later with Stryker 10 | Stryker runs on Node; only the test processes run on Bun. |
 | `typescript` | 6 or earlier, when your project has a `tsconfig.json` | Peer dependency (`<7`): bun warns and npm refuses to install next to TypeScript 7, and a project without TypeScript gets TypeScript 6. Stryker reads `tsconfig.json` with it, with or without a checker, and TypeScript 7's package cannot (see [Install](#1-install)). TypeScript 7 can only be added next to it, for the [native checker](#typescript-7s-native-checker-experimental). |
@@ -238,7 +238,7 @@ Most projects need no config change, but these differ from 1.4:
 | Operating system | Linux, macOS | |
 
 At startup the runner runs `<bunPath> --version` and stops with a clear error if Bun cannot be run
-or is older than 1.3.7. To upgrade Bun, run `bun upgrade`.
+or is older than 1.4.0. To upgrade Bun, run `bun upgrade`.
 
 ## Configuration
 
@@ -547,8 +547,8 @@ Every log message: [Log output](docs/internals.md#log-output).
 | `TypeError: ts.parseConfigFileTextToJson is not a function` (from Stryker) | TypeScript 7 is installed as `typescript`. | `bun remove typescript && bun add -D typescript@^6` (see [Install](#1-install)). |
 | `Cannot find TestRunner plugin "bun"` (from Stryker) | The plugin was not loaded. | Add `appendPlugins: ['@hughescr/stryker-bun-runner']`. |
 | `Config option "bun" must NOT have additional properties` (from Stryker) | A misspelt or unknown option under `bun`. Stryker does not say which. | Compare each key under `bun` with the [options table](#configuration). |
-| `stryker-bun-runner: could not run "<bunPath>" (<reason>). Install bun >= 1.3.7 or set bun.bunPath in your Stryker config.` | Bun is not installed, not on `PATH`, or `bun.bunPath` is wrong. | Install Bun or set `bun.bunPath`. `bun.env` can set `PATH`. |
-| `stryker-bun-runner: bun <version> at "<bunPath>" is too old; version 1.3.7 or newer is required.` | Bun before 1.3.7 lacks the inspector events the runner needs. | `bun upgrade`. |
+| `stryker-bun-runner: could not run "<bunPath>" (<reason>). Install bun >= 1.4.0 or set bun.bunPath in your Stryker config.` | Bun is not installed, not on `PATH`, or `bun.bunPath` is wrong. | Install Bun or set `bun.bunPath`. `bun.env` can set `PATH`. |
+| `stryker-bun-runner: bun <version> at "<bunPath>" is too old; version 1.4.0 or newer is required.` | Bun before 1.4.0, which the runner does not support. | `bun upgrade`. |
 | `stryker-bun-runner: bun.bunArgs contains "<flag>", which <reason>. Remove it.` (or `contains unsupported flags`) | A flag that would corrupt the scores. | Remove it; see [bun.bunArgs](#bunbunargs). |
 | `has no usable path: write --config=<path>, --config <path> or -c <path>` | A `--config`/`-c` with no file name. | Give the path. |
 | `Failed to read bunfig.toml at <path>` or `Failed to read bunfig (named by --config in bun.bunArgs) at <path>` | The bunfig does not parse, or the file named by `--config` is not in the sandbox. | Fix the file, or the path and `ignorePatterns`. |
