@@ -260,8 +260,7 @@ layering on top of it, so:
   `[test].preload`; use `[test].preload` to register a Bun plugin for your tests.)
 - **`[test]` is rebuilt from an allowlist**: `preload`, `root`, `pathIgnorePatterns`, `timeout`,
   `smol`, `randomize` and `seed` are forwarded; any other `[test]` key is dropped and logged at
-  debug with the reason. If you need another `[test]` key forwarded, it has to be added to
-  `SAFE_TEST_KEYS` in `src/utils/bunfig-sanitizer.ts`; please open an issue.
+  debug with the reason. If you need another `[test]` key forwarded, please open an issue.
 - **Forced off**: `coverage = false` and `onlyFailures = false`. A `coverageThreshold` miss makes
   bun exit 1 even when no test fails, which would be mistaken for a mutant kill, and hiding passing
   tests would hide results the runner needs.
@@ -309,8 +308,8 @@ receiving frames of any kind, and gives up only after 4 s of complete silence, o
 ceiling of 30 s. Either way it then sends `drained` at once, so the child is released rather than
 left to time out. The child's own fallback (40 s, above the runner's ceiling) only matters when
 the sync channel itself is dead. After the child exits, the runner gives the inspector socket up to
-1 s to finish closing before it reads the collected data. These bounds are fixed constants in
-`src/bun-test-runner.ts` and `src/templates/coverage-preload.ts`; there are no options for them.
+1 s to finish closing before it reads the collected data. These bounds are fixed; there are no
+options for them.
 
 Mutant runs are not held open this way: they run small, filtered subsets, and the completeness
 gate does not apply to them.
@@ -543,7 +542,7 @@ live child's group, and re-raises the signal so the default behaviour is preserv
   its stderr giving the reason.
 
 To check the lifeline on a given machine, run `bun scripts/verify-orphan-lifeline.ts` from a clone
-of this repository (see the README's [Contributing](../README.md#contributing) section).
+of this repository (see [CONTRIBUTING.md](../CONTRIBUTING.md#checking-orphan-prevention-on-a-machine)).
 
 ### Recursion containment
 
@@ -561,10 +560,11 @@ stderr instead of spawning. The failure this prevents is real and not survivable
 Under mutation testing this is reachable through ordinary mutants: anything that defeats a
 `bun.testFiles` override puts a nested run back on auto-discovery. The depth ceiling turns that into
 one loud failure. The default allows the runner's own children and nothing deeper, which is right
-for every project whose tests do not themselves drive this runner. If yours do, raise it to `2` on
-the runner instance making the nested call, since that is where the ceiling is enforced; setting it
-in `stryker.conf.mjs` only configures the outer run. This plugin's own integration tests pass
-`maxSpawnDepth: 2` in their `bun: { … }` options for that reason.
+for every project whose tests do not themselves drive this runner. If yours do (a test runs
+`stryker run` on a fixture project, or creates a `BunTestRunner`), raise it to `2` on the runner
+making the nested call, since that is where the ceiling is enforced: in the Stryker config that test
+runs (`bun: { maxSpawnDepth: 2 }`), or in the options the test passes. Setting it in your own
+`stryker.conf.mjs` only configures the outer run, which never reaches the ceiling.
 
 ## Memory
 
