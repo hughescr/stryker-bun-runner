@@ -41,7 +41,6 @@ describe('generateSanitizedBunfig: the mutant-run copy', () => {
 
     beforeEach(() => {
         mockMkdir.mockResolvedValue(undefined);
-        mockWriteFile.mockClear();
         mockWriteFile.mockResolvedValue(undefined);
         ensurePrivateDirSpy = spyOn(privateTempDir, 'ensurePrivateDir').mockImplementation((dir: string) => Promise.resolve(dir));
     });
@@ -135,7 +134,6 @@ describe('cleanupSanitizedBunfig and the mutant-run copy', () => {
     });
 
     it('unlinks the copy too', async () => {
-        mockUnlink.mockClear();
         mockUnlink.mockResolvedValue(undefined);
 
         await cleanupSanitizedBunfig('/tmp/s.toml');
@@ -152,7 +150,6 @@ describe('cleanupSanitizedBunfig and the mutant-run copy', () => {
     });
 
     it('still removes the copy when the sanitized bunfig itself is already gone', async () => {
-        mockUnlink.mockClear();
         mockUnlink.mockImplementation((file: unknown) => (String(file).endsWith('.mutant-runs.toml')
             ? Promise.resolve()
             : Promise.reject(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }))));
@@ -177,7 +174,6 @@ describe('the mutant-run copy on a real filesystem', () => {
     let root: string;
 
     beforeEach(async () => {
-        resetFsMocks();
         root = await realpath(await mkdtemp(path.join(tmpdir(), 'sbr-bunfig-mutant-runs-')));
         await mkdir(path.join(root, 'project'));
         await mkdir(path.join(root, 'private'), { mode: 0o700 });

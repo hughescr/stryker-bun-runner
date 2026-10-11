@@ -11,7 +11,7 @@
 
 import type { ChildProcess } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach, mock, jest, spyOn } from 'bun:test';
-import { runBunTests, removeSignalCleanup, SPAWN_DEPTH_ENV } from '../../src/process-runner.js';
+import { runBunTests, killAllLiveChildren, removeSignalCleanup, SPAWN_DEPTH_ENV } from '../../src/process-runner.js';
 import * as processRss from '../../src/utils/process-rss.js';
 import { mockSpawn, resetChildProcessMocks, mockKillProcessGroup, resetProcessGroupMocks } from '../test-preload.js';
 
@@ -72,9 +72,7 @@ describe('process-runner child lifecycle', () => {
         ambientSpawnDepth = process.env[SPAWN_DEPTH_ENV];
         delete process.env[SPAWN_DEPTH_ENV];
         fake = makeFakeChild();
-        mockSpawn.mockClear();
         mockSpawn.mockImplementation(() => fake.child);
-        mockKillProcessGroup.mockClear();
     });
 
     afterEach(() => {
@@ -83,6 +81,10 @@ describe('process-runner child lifecycle', () => {
         } else {
             process.env[SPAWN_DEPTH_ENV] = ambientSpawnDepth;
         }
+        // A mock child the test never closed is still tracked: forget it (the group
+        // signal goes to the inert mock), and drop the signal listeners the spawn attached.
+        killAllLiveChildren();
+        removeSignalCleanup();
         resetChildProcessMocks();
         resetProcessGroupMocks();
         jest.useRealTimers();
@@ -270,12 +272,7 @@ describe('process-runner child lifecycle', () => {
     });
 
     describe('signal cleanup registration', () => {
-        afterEach(() => {
-            removeSignalCleanup();
-        });
-
         it('attaches the cleanup listeners to SIGINT, SIGTERM and SIGHUP when a child is spawned', async () => {
-            removeSignalCleanup();
             const before = SIGNALS.map(s => process.listenerCount(s));
 
             const resultPromise = runBunTests({ bunPath: 'bun', timeout: 5000 });
@@ -292,7 +289,7 @@ describe('process-runner child lifecycle', () => {
             const killSpy = spyOn(process, 'kill').mockImplementation(() => true);
             try {
                 for(const signal of SIGNALS) {
-                    removeSignalCleanup();
+                    // The previous iteration's handler detached itself from every signal.
                     const before = process.listeners(signal);
 
                     const current = makeFakeChild();

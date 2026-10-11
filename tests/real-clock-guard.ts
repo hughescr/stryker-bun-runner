@@ -11,8 +11,8 @@
  * Installed by tests/test-preload.ts, so it is active in every `bun test` run,
  * mutant runs included. It wraps the global timer APIs and records every REAL
  * timer with a delay above zero that actually fires (or a real `Bun.sleep` that
- * resolves, or any `Bun.sleepSync`), then fails the test from a global
- * `afterEach`.
+ * resolves, or any `Bun.sleepSync`), then fails the test from the global
+ * `afterEach` in tests/test-preload.ts (see {@link failOnRealWaits}).
  *
  * - "Real" means scheduled while fake timers were NOT installed. bun's fake
  *   timers work natively underneath these same globals, so a timer scheduled
@@ -41,7 +41,7 @@
  */
 
 import path from 'node:path';
-import { afterAll, afterEach, beforeAll, beforeEach, jest } from 'bun:test';
+import { afterAll, beforeAll, beforeEach, jest } from 'bun:test';
 
 interface RealWait {
     api:     string
@@ -153,7 +153,13 @@ Bun.sleepSync = (ms: number): void => {
     nativeSleepSync(ms);
 };
 
-function failOnRealWaits(): void {
+/**
+ * Throws the real-wait report, if any. Called from the global afterEach in
+ * tests/test-preload.ts, which runs it together with the leak guard's check:
+ * bun stops running afterEach hooks at the first one that throws, so two
+ * separately registered guards would let one guard's failure skip the other.
+ */
+export function failOnRealWaits(): void {
     if(realWaits.length === 0) {
         return;
     }
@@ -167,7 +173,6 @@ function failOnRealWaits(): void {
     ].join('\n'));
 }
 
-afterEach(failOnRealWaits);
 afterAll(failOnRealWaits);
 
 /**

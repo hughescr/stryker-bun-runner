@@ -442,7 +442,6 @@ describe('BunTestRunner mutation kill tests (first half of the runner)', () => {
         it('hands bun.testFiles to the dry run verbatim, without discovering', async () => {
             mockChild();
             mockHealthyInspectorRun();
-            discoverTestFilesSpy.mockClear();
 
             await dryRunOnce({ bun: { testFiles: ['only/this.test.ts'] } });
 

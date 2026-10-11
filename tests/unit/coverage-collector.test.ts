@@ -22,12 +22,10 @@ describe('collectCoverage', () => {
 
     beforeEach(() => {
         tempCoverageFile = path.join(tmpdir(), `test-coverage-${Date.now()}.json`);
-        // Clear the mock state before each test
-        mockReadFile.mockClear();
     });
 
     afterEach(() => {
-        // Reset fs mocks to prevent leakage to other tests
+        // Undo this test's fs mock setup and calls
         resetFsMocks();
     });
 
@@ -382,7 +380,6 @@ describe('collectLateHits', () => {
 
     beforeEach(() => {
         tempCoverageFile = path.join(tmpdir(), `test-coverage-${Date.now()}.json`);
-        mockReadFile.mockClear();
     });
 
     afterEach(() => {
@@ -457,13 +454,8 @@ describe('collectLateHits', () => {
 });
 
 describe('cleanupCoverageFile', () => {
-    beforeEach(() => {
-        // Clear the mock state before each test
-        mockUnlink.mockClear();
-    });
-
     afterEach(() => {
-        // Reset fs mocks to prevent leakage to other tests
+        // Undo this test's fs mock setup and calls
         resetFsMocks();
     });
 

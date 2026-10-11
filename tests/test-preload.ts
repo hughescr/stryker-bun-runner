@@ -3,12 +3,14 @@
  * Sets up module mocks using Bun's mock.module() API
  */
 
-// Fails any test that waits on the real clock; see the file for the policy.
-import './real-clock-guard.js';
 import * as actualChildProcess from 'node:child_process';
 import * as actualFs from 'node:fs/promises';
-import { mock } from 'bun:test';
+import { afterEach, mock } from 'bun:test';
 import * as actualProcessGroup from '../src/utils/process-group.js';
+// Fails any test (or file) that leaves state behind; see the file for the policy.
+import { failOnTestLeaks, registerSharedMocks } from './leak-guard.js';
+// Fails any test that waits on the real clock; see the file for the policy.
+import { failOnRealWaits } from './real-clock-guard.js';
 
 // CRITICAL: Capture functions as local variables BEFORE mock.module()
 // ESM namespace objects have live bindings, so after mock.module() the namespace
@@ -22,26 +24,31 @@ const originalReaddir = actualFs.readdir;
 const originalSpawn = actualChildProcess.spawn;
 const originalKillProcessGroup = actualProcessGroup.killProcessGroup;
 
+// The default implementations, kept as single function objects so a reset puts
+// back the very function each mock started with: tests/leak-guard.ts compares
+// a mock's implementation before and after every test by identity.
+const passThroughReadFile = (...args: Parameters<typeof actualFs.readFile>) => originalReadFile(...args);
+const passThroughWriteFile = (...args: Parameters<typeof actualFs.writeFile>) => originalWriteFile(...args);
+const passThroughRename = (...args: Parameters<typeof actualFs.rename>) => originalRename(...args);
+const passThroughMkdir = (...args: Parameters<typeof actualFs.mkdir>) => originalMkdir(...args);
+const passThroughUnlink = (...args: Parameters<typeof actualFs.unlink>) => originalUnlink(...args);
+const passThroughReaddir = (...args: Parameters<typeof actualFs.readdir>) => originalReaddir(...args);
+const passThroughSpawn = (...args: Parameters<typeof actualChildProcess.spawn>) => originalSpawn(...args);
+const inertKillProcessGroup = (_pid: number, _signal: NodeJS.Signals): boolean => false;
+
 // Create controllable mock functions for node:fs/promises
 // These start as pass-through implementations - unit tests configure them with mockResolvedValue/mockRejectedValue
 // Integration tests will use the real fs functions automatically
-export const mockReadFile = mock((...args: Parameters<typeof actualFs.readFile>) =>
-    originalReadFile(...args));
-export const mockWriteFile = mock((...args: Parameters<typeof actualFs.writeFile>) =>
-    originalWriteFile(...args));
-export const mockRename = mock((...args: Parameters<typeof actualFs.rename>) =>
-    originalRename(...args));
-export const mockMkdir = mock((...args: Parameters<typeof actualFs.mkdir>) =>
-    originalMkdir(...args));
-export const mockUnlink = mock((...args: Parameters<typeof actualFs.unlink>) =>
-    originalUnlink(...args));
-export const mockReaddir = mock((...args: Parameters<typeof actualFs.readdir>) =>
-    originalReaddir(...args));
+export const mockReadFile = mock(passThroughReadFile);
+export const mockWriteFile = mock(passThroughWriteFile);
+export const mockRename = mock(passThroughRename);
+export const mockMkdir = mock(passThroughMkdir);
+export const mockUnlink = mock(passThroughUnlink);
+export const mockReaddir = mock(passThroughReaddir);
 
 // Create controllable mock function for child_process.spawn
 // Used by process-runner to spawn bun test processes
-export const mockSpawn = mock((...args: Parameters<typeof actualChildProcess.spawn>) =>
-    originalSpawn(...args));
+export const mockSpawn = mock(passThroughSpawn);
 
 /**
  * The unmocked child_process.spawn, for tests that need genuine child
@@ -66,7 +73,7 @@ export const realSpawn = originalSpawn;
  * The real implementation is re-exported as {@link realKillProcessGroup} so an
  * integration test working with genuine child processes can opt back into it.
  */
-export const mockKillProcessGroup = mock((_pid: number, _signal: NodeJS.Signals): boolean => false);
+export const mockKillProcessGroup = mock(inertKillProcessGroup);
 
 /**
  * The unmocked killProcessGroup, for integration tests that spawn real
@@ -76,35 +83,30 @@ export const mockKillProcessGroup = mock((_pid: number, _signal: NodeJS.Signals)
 export const realKillProcessGroup = originalKillProcessGroup;
 
 /**
- * Reset all fs mocks to their default pass-through implementations.
- * Call this in afterEach() instead of mockClear() to ensure clean state between tests.
- * mockClear() only clears call history; mockReset() clears implementation too.
- * This function restores the pass-through behavior after reset.
+ * Put every fs mock back to its default pass-through implementation, with no
+ * recorded calls. Call it in the afterEach (or afterAll) of the test (or file)
+ * that configured or called the mocks: mockClear() only clears call history,
+ * mockReset() clears the implementation too, and this restores the
+ * pass-through behaviour after the reset.
  */
 export function resetFsMocks(): void {
     mockReadFile.mockReset();
-    mockReadFile.mockImplementation((...args: Parameters<typeof actualFs.readFile>) =>
-        originalReadFile(...args));
+    mockReadFile.mockImplementation(passThroughReadFile);
 
     mockWriteFile.mockReset();
-    mockWriteFile.mockImplementation((...args: Parameters<typeof actualFs.writeFile>) =>
-        originalWriteFile(...args));
+    mockWriteFile.mockImplementation(passThroughWriteFile);
 
     mockRename.mockReset();
-    mockRename.mockImplementation((...args: Parameters<typeof actualFs.rename>) =>
-        originalRename(...args));
+    mockRename.mockImplementation(passThroughRename);
 
     mockMkdir.mockReset();
-    mockMkdir.mockImplementation((...args: Parameters<typeof actualFs.mkdir>) =>
-        originalMkdir(...args));
+    mockMkdir.mockImplementation(passThroughMkdir);
 
     mockUnlink.mockReset();
-    mockUnlink.mockImplementation((...args: Parameters<typeof actualFs.unlink>) =>
-        originalUnlink(...args));
+    mockUnlink.mockImplementation(passThroughUnlink);
 
     mockReaddir.mockReset();
-    mockReaddir.mockImplementation((...args: Parameters<typeof actualFs.readdir>) =>
-        originalReaddir(...args));
+    mockReaddir.mockImplementation(passThroughReaddir);
 }
 
 /**
@@ -112,8 +114,7 @@ export function resetFsMocks(): void {
  */
 export function resetChildProcessMocks(): void {
     mockSpawn.mockReset();
-    mockSpawn.mockImplementation((...args: Parameters<typeof actualChildProcess.spawn>) =>
-        originalSpawn(...args));
+    mockSpawn.mockImplementation(passThroughSpawn);
 }
 
 /**
@@ -122,7 +123,7 @@ export function resetChildProcessMocks(): void {
  */
 export function resetProcessGroupMocks(): void {
     mockKillProcessGroup.mockReset();
-    mockKillProcessGroup.mockImplementation((_pid: number, _signal: NodeJS.Signals): boolean => false);
+    mockKillProcessGroup.mockImplementation(inertKillProcessGroup);
 }
 
 /**
@@ -163,6 +164,29 @@ mock.module('../src/utils/process-group.js', () => ({
     killProcessGroup: mockKillProcessGroup,
 }));
 
-// NOTE: No global afterEach here - each test file is responsible for its own cleanup
-// Tests should call resetAllMocks() in their own afterEach hooks
-// This follows the pattern from isambard where tests manage their own cleanup
+// Every test leaves these as it found them: no calls recorded, the default implementation.
+registerSharedMocks({
+    mockReadFile, mockWriteFile, mockRename, mockMkdir, mockUnlink, mockReaddir, mockSpawn, mockKillProcessGroup,
+});
+
+// The guards' end-of-test checks, in one hook: bun stops running afterEach hooks
+// at the first one that throws, so separate hooks would let one guard's failure
+// skip the other's check (and leave its state to fail the next test). Every
+// check runs; their reports are combined into one failure.
+afterEach(() => {
+    const failures: string[] = [];
+    for(const check of [failOnRealWaits, failOnTestLeaks]) {
+        try {
+            check();
+        } catch (error) {
+            failures.push((error as Error).message);
+        }
+    }
+    if(failures.length > 0) {
+        throw new Error(failures.join('\n\n'));
+    }
+});
+
+// There is no global reset of the mocks above: the test (or file) that configures
+// or calls them cleans up after itself, and tests/leak-guard.ts fails any that
+// does not.

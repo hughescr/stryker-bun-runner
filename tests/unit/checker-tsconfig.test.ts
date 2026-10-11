@@ -129,7 +129,6 @@ function infos(): string[] {
 }
 
 beforeEach(() => {
-    resetFsMocks();
     dir = '';
     warn = spyOn(console, 'warn').mockImplementation(() => undefined);
     info = spyOn(console, 'info').mockImplementation(() => undefined);
@@ -141,6 +140,8 @@ afterEach(async () => {
     if(dir !== '') {
         await rm(dir, { recursive: true, force: true });
     }
+    // Undo the fs mocks a test configured, and the calls its real-fs work recorded on them.
+    resetFsMocks();
 });
 
 describe('withTestFilesExcludedFromTypeCheck', () => {

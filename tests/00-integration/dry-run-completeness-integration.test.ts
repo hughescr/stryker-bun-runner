@@ -17,6 +17,7 @@ import { DryRunStatus, TestStatus, type DryRunResult } from '@stryker-mutator/ap
 import { describe, test, expect, beforeAll, afterAll, afterEach, spyOn } from 'bun:test';
 import { BunTestRunner } from '../../src/bun-test-runner.js';
 import { InspectorClient } from '../../src/inspector/inspector-client.js';
+import { killAllLiveChildren, removeSignalCleanup } from '../../src/process-runner.js';
 import { resolveRunTempDir } from '../../src/utils/private-temp-dir.js';
 import { allowRealTimersFromSource } from '../real-clock-guard.js';
 import { resetAllMocks } from '../test-preload.js';
@@ -132,7 +133,6 @@ describe('dry-run completeness gate (real bun children)', () => {
     }
 
     beforeAll(async () => {
-        resetAllMocks();
         // See inspector-integration.test.ts: a set FORCE_COLOR breaks the inspector-URL scrape.
         originalForceColor = process.env.FORCE_COLOR;
         delete process.env.FORCE_COLOR;
@@ -148,18 +148,22 @@ describe('dry-run completeness gate (real bun children)', () => {
         for(const spy of spies.splice(0)) {
             spy.mockRestore();
         }
+        // The runner's real children go through the preload's shared mocks (spawn,
+        // fs, process-group kill), which record every call, and its first spawn
+        // attaches the signal-cleanup listeners: undo both after each test.
+        killAllLiveChildren();
+        removeSignalCleanup();
+        resetAllMocks();
     });
 
     afterAll(async () => {
-        // The runner's real children go through the preload's shared mocks (spawn,
-        // process-group kill), which record every call: leave them clean for the
-        // files that run after this one.
-        resetAllMocks();
         if(originalForceColor !== undefined) {
             process.env.FORCE_COLOR = originalForceColor;
         }
         await fsPromises.rm(tempDir, { recursive: true, force: true });
         await fsPromises.rm(await resolveRunTempDir(), { recursive: true, force: true });
+        // The fixture writes above and the private-dir lookup go through the shared fs mocks.
+        resetAllMocks();
     });
 
     test('completes a suite using every legitimate source of a count difference, with each test\'s coverage on that test', async () => {

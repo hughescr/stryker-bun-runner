@@ -19,6 +19,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
+import { resetFsMocks } from '../test-preload.js';
 
 const SRC = (file: string): string => new URL(`../../src/${file}`, import.meta.url).href;
 
@@ -53,6 +54,8 @@ beforeAll(async () => {
 
 afterAll(async () => {
     await rm(fixture, { recursive: true, force: true });
+    // The fixture writes above went through the preload's shared fs mocks, which record every call.
+    resetFsMocks();
 });
 
 interface ChildRun { ran: string[], stdout: string, stderr: string, exitCode: number | null }

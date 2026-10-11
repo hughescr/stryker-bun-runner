@@ -6,6 +6,7 @@ import type { Logger } from '@stryker-mutator/api/logging';
 import { DryRunStatus, MutantRunStatus, type MutantRunOptions } from '@stryker-mutator/api/test-runner';
 import { describe, test, expect, beforeAll, afterAll, afterEach, jest } from 'bun:test';
 import { BunTestRunner } from '../../src/bun-test-runner.js';
+import { killAllLiveChildren, removeSignalCleanup } from '../../src/process-runner.js';
 import { resolveRunTempDir } from '../../src/utils/private-temp-dir.js';
 import { allowRealTimersFromSource } from '../real-clock-guard.js';
 import { resetAllMocks } from '../test-preload.js';
@@ -85,9 +86,6 @@ describe('Inspector Integration', () => {
     let originalForceColor: string | undefined;
 
     beforeAll(async () => {
-        // Reset all mocks to ensure clean state (unit tests may have set mock implementations)
-        resetAllMocks();
-
         // The real-spawn harness below inherits process.env (process-runner.ts spreads
         // process.env into the child's env). If FORCE_COLOR is set, bun colorizes piped
         // stderr/stdout and process-runner's inspector-URL regex (no ANSI tolerance) fails
@@ -204,7 +202,11 @@ describe('Inspector Integration', () => {
     });
 
     afterEach(() => {
-        // Reset all mocks and timers to prevent leakage to other tests
+        // The runner's real children go through the preload's shared mocks (spawn,
+        // fs, process-group kill), which record every call, and its first spawn
+        // attaches the signal-cleanup listeners: undo both, and any fake timers, after each test.
+        killAllLiveChildren();
+        removeSignalCleanup();
         resetAllMocks();
         jest.useRealTimers();
     });
@@ -221,6 +223,8 @@ describe('Inspector Integration', () => {
         // Clean up the run's private temp directory (and the dryRun registry the runner
         // leaves in it), resolved exactly as the runner resolves it for this process.
         await fsPromises.rm(await resolveRunTempDir(), { recursive: true, force: true });
+        // The fixture writes in beforeAll and the private-dir lookup go through the shared fs mocks.
+        resetAllMocks();
     });
 
     test('collects test names via inspector', async () => {

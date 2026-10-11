@@ -14,7 +14,7 @@
 import type { ChildProcess } from 'node:child_process';
 import path from 'node:path';
 import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
-import { runBunTests, SPAWN_DEPTH_ENV } from '../../src/process-runner.js';
+import { runBunTests, killAllLiveChildren, removeSignalCleanup, SPAWN_DEPTH_ENV } from '../../src/process-runner.js';
 import { MAX_TEST_FILE_ARGS_BYTES } from '../../src/utils/test-file-args.js';
 import { mockSpawn, resetChildProcessMocks, resetProcessGroupMocks } from '../test-preload.js';
 
@@ -38,7 +38,6 @@ describe('runBunTests test-file arguments', () => {
             kill: mock(() => true),
             pid:  12_345,
         };
-        mockSpawn.mockClear();
         mockSpawn.mockImplementation(() => child as unknown as ChildProcess);
     });
 
@@ -48,6 +47,9 @@ describe('runBunTests test-file arguments', () => {
         } else {
             process.env[SPAWN_DEPTH_ENV] = ambientSpawnDepth;
         }
+        // Forget any mock child still tracked and drop the signal listeners the spawn attached.
+        killAllLiveChildren();
+        removeSignalCleanup();
         resetChildProcessMocks();
         resetProcessGroupMocks();
     });

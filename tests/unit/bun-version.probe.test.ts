@@ -39,7 +39,6 @@ describe('checkBunVersion — probe lifecycle', () => {
     let probe: Probe;
 
     beforeEach(() => {
-        resetAllMocks();
         const handlers = new Map<string, (...args: never[]) => void>();
         const kill = mock();
         /* eslint-disable @typescript-eslint/no-explicit-any -- test mock of ChildProcess */

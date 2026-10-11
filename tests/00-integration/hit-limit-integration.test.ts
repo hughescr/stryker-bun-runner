@@ -10,8 +10,9 @@ import path from 'node:path';
 import type { StrykerOptions } from '@stryker-mutator/api/core';
 import type { Logger } from '@stryker-mutator/api/logging';
 import { DryRunStatus, MutantRunStatus, type MutantRunOptions } from '@stryker-mutator/api/test-runner';
-import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll, afterEach } from 'bun:test';
 import { BunTestRunner } from '../../src/bun-test-runner.js';
+import { killAllLiveChildren, removeSignalCleanup } from '../../src/process-runner.js';
 import { resolveRunTempDir } from '../../src/utils/private-temp-dir.js';
 import { allowRealTimersFromSource } from '../real-clock-guard.js';
 import { resetAllMocks } from '../test-preload.js';
@@ -157,7 +158,6 @@ describe('hit limit (real bun children)', () => {
     }
 
     beforeAll(async () => {
-        resetAllMocks();
         // See inspector-integration.test.ts: a set FORCE_COLOR breaks the inspector-URL scrape.
         originalForceColor = process.env.FORCE_COLOR;
         delete process.env.FORCE_COLOR;
@@ -192,11 +192,16 @@ describe('hit limit (real bun children)', () => {
         ].join('\n'));
     });
 
-    afterAll(async () => {
+    afterEach(() => {
         // The runner's real children go through the preload's shared mocks (spawn,
-        // process-group kill), which record every call: leave them clean for the
-        // files that run after this one.
+        // fs, process-group kill), which record every call, and its first spawn
+        // attaches the signal-cleanup listeners: undo both after each test.
+        killAllLiveChildren();
+        removeSignalCleanup();
         resetAllMocks();
+    });
+
+    afterAll(async () => {
         if(originalForceColor !== undefined) {
             process.env.FORCE_COLOR = originalForceColor;
         }
@@ -204,6 +209,8 @@ describe('hit limit (real bun children)', () => {
         // Clean up the run's private temp directory (and the dryRun registry the runner
         // leaves in it), resolved exactly as the runner resolves it for this process.
         await fsPromises.rm(await resolveRunTempDir(), { recursive: true, force: true });
+        // The fixture writes above and the private-dir lookup go through the shared fs mocks.
+        resetAllMocks();
     });
 
     test('the dry run reports the instrumenter\'s real hit counts', async () => {

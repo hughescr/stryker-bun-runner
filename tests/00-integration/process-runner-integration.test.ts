@@ -1,7 +1,8 @@
 import { mkdtemp, rm, writeFile, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { describe, expect, it } from 'bun:test';
+import { afterEach, describe, expect, it } from 'bun:test';
+import { resetFsMocks } from '../test-preload.js';
 
 async function exists(file: string): Promise<boolean> {
     try {
@@ -13,6 +14,11 @@ async function exists(file: string): Promise<boolean> {
 }
 
 describe('process runner integration', () => {
+    afterEach(() => {
+        // The fixture writes went through the preload's shared fs mocks, which record every call.
+        resetFsMocks();
+    });
+
     it('loads only the supplied covering test file in a real bun test child', async () => {
         const fixture = await mkdtemp(path.join(tmpdir(), 'stryker-bun-targeted-'));
         try {

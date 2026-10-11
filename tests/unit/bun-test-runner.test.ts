@@ -7931,12 +7931,14 @@ tests/example.test.ts:
             let writeFileSpy:  ReturnType<typeof spyOn>;
             let renameSpy:     ReturnType<typeof spyOn>;
             let originalPpid:  number;
+            let ppidDescriptor: PropertyDescriptor | undefined;
 
             beforeEach(() => {
                 mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
                 writeFileSpy = spyOn(fsPromises, 'writeFile').mockResolvedValue(undefined);
                 renameSpy    = spyOn(fsPromises, 'rename').mockResolvedValue(undefined);
                 originalPpid = process.ppid;
+                ppidDescriptor = Object.getOwnPropertyDescriptor(process, 'ppid');
 
                 mockInspectorClient.getTests.mockReturnValue([
                     { id: 1, name: 'path test', fullName: 'path test', type: 'test' as const, url: 'file:///proj/.stryker-tmp/sandbox-ABC/tests/path.test.ts', status: 'pass' },
@@ -7958,8 +7960,11 @@ tests/example.test.ts:
                 renameSpy.mockRestore();
                 // Restore process.ppid unconditionally — several tests below reassign it,
                 // and a leaked override would corrupt every other test file's registry
-                // path (including this file's own afterEach cleanup).
-                setPpid(originalPpid);
+                // path (including this file's own afterEach cleanup). Assigning turns
+                // bun's live accessor into a fixed value, so put the accessor itself back.
+                if(ppidDescriptor !== undefined) {
+                    Object.defineProperty(process, 'ppid', ppidDescriptor);
+                }
             });
 
             /** Runs a full dryRun and returns the final (non-.tmp) registry path fsPromises.rename was called with. */
@@ -9373,6 +9378,9 @@ tests/example.test.ts:
         const registryFile = (): string => path.join(runDir(), 'registry.json');
 
         beforeEach(async () => {
+            // Undo, for these real-fs tests, what this file's own outer beforeEach set up
+            // a moment ago for this same test: the private-dir stubs, and the no-op
+            // writeFile/rename (resetFsMocks puts them back to pass-through).
             ensurePrivateDirSpy.mockRestore();
             writePrivateFileSpy.mockRestore();
             resetFsMocks();
@@ -11408,9 +11416,6 @@ error: Third failure message
             const hierarchy = healthyHierarchy(65);
             mockInspectorClient.getTests.mockReturnValue(hierarchy);
             mockInspectorClient.getExecutionOrder.mockReturnValue(hierarchy.map(t => t.id));
-
-            mockWriteFile.mockClear();
-            mockRename.mockClear();
 
             const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
             await runner.init();

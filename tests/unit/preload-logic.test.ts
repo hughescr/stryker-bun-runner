@@ -33,6 +33,7 @@ import {
     type StrykerNamespace
 } from '../../src/coverage/preload-logic';
 import type { LateHitEntry } from '../../src/coverage/types';
+import { rememberEnv } from '../helpers/env.js';
 import { trackTimers } from '../helpers/fake-clock.js';
 
 /** The coverage file is opened for appending, created if absent, and never through a symlink at its path (O_NOFOLLOW). */
@@ -45,10 +46,14 @@ const FAKE_FD = 4242;
 
 describe('preload-logic', () => {
     describe('getPreloadConfig', () => {
-        const originalEnv = { ...process.env };
+        let restoreEnv: () => void;
+
+        beforeEach(() => {
+            restoreEnv = rememberEnv();
+        });
 
         afterEach(() => {
-            process.env = { ...originalEnv };
+            restoreEnv();
         });
 
         it('reads __STRYKER_SYNC_PORT__ from env', () => {

@@ -21,6 +21,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'bun:test';
 import { LIFELINE_FD_ENV } from '../../src/coverage/preload-logic.js';
 import { isProcessRunning, lifelineCut } from '../helpers/process-liveness.js';
+import { resetFsMocks } from '../test-preload.js';
 
 /**
  * The suite the runner's child runs. It installs fake timers and holds them
@@ -79,6 +80,8 @@ describe('orphan prevention', () => {
         if(dir !== undefined) {
             await rm(dir, { recursive: true, force: true });
         }
+        // The fixture write went through the preload's shared fs mocks, which record every call.
+        resetFsMocks();
     });
 
     it('a bun test child exits when its parent is killed while the suite has fake timers installed', async () => {

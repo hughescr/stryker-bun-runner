@@ -85,17 +85,20 @@ describe('runBunTests', () => {
         /* eslint-enable @typescript-eslint/no-explicit-any -- re-enable after mock setup */
 
         // Configure preload mock spawn to return our mock child process
-        mockSpawn.mockClear();
         mockSpawn.mockImplementation(() => mockChildProcess as ChildProcess);
     });
 
     afterEach(() => {
-        // Reset preload mocks and timers to prevent leakage to other tests
+        // Undo everything this test set up, so no later test inherits it.
         if(ambientSpawnDepth === undefined) {
             delete process.env[SPAWN_DEPTH_ENV];
         } else {
             process.env[SPAWN_DEPTH_ENV] = ambientSpawnDepth;
         }
+        // A mock child the test never closed is still tracked: forget it (the group
+        // signal goes to the inert mock), and drop the signal listeners the spawn attached.
+        killAllLiveChildren();
+        removeSignalCleanup();
         resetChildProcessMocks();
         resetProcessGroupMocks();
         jest.useRealTimers();
@@ -2452,7 +2455,6 @@ describe('runBunTests', () => {
         });
 
         it('attaches its signal listeners once and is idempotent thereafter', () => {
-            removeSignalCleanup();
             const before = CLEANUP_SIGNAL_NAMES.map(s => process.listenerCount(s));
 
             expect(ensureSignalCleanup()).toBe(true);
@@ -2482,8 +2484,8 @@ describe('runBunTests', () => {
                 await resultPromise;
             }
 
-            // At most one listener was added in total, no matter how many spawns.
-            expect(process.listenerCount('SIGINT') - before).toBeLessThanOrEqual(1);
+            // One listener was added in total, no matter how many spawns.
+            expect(process.listenerCount('SIGINT') - before).toBe(1);
         });
 
         it('falls back to the direct child when the process has no pid', async () => {

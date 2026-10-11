@@ -20,11 +20,6 @@ describe('generateSanitizedBunfig', () => {
     let ensurePrivateDirSpy: ReturnType<typeof spyOn>;
 
     beforeEach(() => {
-        mockMkdir.mockClear();
-        mockReadFile.mockClear();
-        mockWriteFile.mockClear();
-        mockUnlink.mockClear();
-
         mockMkdir.mockResolvedValue(undefined);
         mockWriteFile.mockResolvedValue(undefined);
         ensurePrivateDirSpy = spyOn(privateTempDir, 'ensurePrivateDir').mockImplementation((dir: string) => Promise.resolve(dir));
@@ -703,10 +698,6 @@ describe('readBunfigTestPreloads', () => {
 });
 
 describe('cleanupSanitizedBunfig', () => {
-    beforeEach(() => {
-        mockUnlink.mockClear();
-    });
-
     afterEach(() => {
         resetFsMocks();
     });
@@ -740,8 +731,8 @@ describe('generateSanitizedBunfig file safety (real filesystem)', () => {
     let privateDir: string;
 
     beforeEach(async () => {
-        // Pass-through fs mocks: these tests exercise the kernel's modes and symlinks.
-        resetFsMocks();
+        // The fs mocks are at their pass-through defaults (every test resets what it
+        // configures): these tests exercise the kernel's modes and symlinks.
         // Resolved: the directory checks refuse a symlink above the directory (macOS's /var -> /private/var).
         root = await realpath(await mkdtemp(path.join(tmpdir(), 'sbr-bunfig-safety-')));
         projectCwd = path.join(root, 'project');

@@ -23,11 +23,6 @@ describe('generatePreloadScript', () => {
         tempDir = path.join(root, 'run');
         coverageFile = path.join(tempDir, 'coverage.json');
 
-        // Clear the mock state before each test
-        mockMkdir.mockClear();
-        mockReadFile.mockClear();
-        mockWriteFile.mockClear();
-
         // Setup default return values. mkdir stays real: the directory checks run against the kernel.
         mockReadFile.mockResolvedValue('// preload script content');
         mockWriteFile.mockResolvedValue(undefined);
@@ -75,7 +70,8 @@ describe('generatePreloadScript', () => {
 
     describe('private file write (real fs)', () => {
         it('should write the preload with mode 0600, replacing a planted symlink instead of following it', async () => {
-            mockWriteFile.mockReset();
+            // Real writes here: undo the no-op writeFile and canned readFile this
+            // describe's own beforeEach set up for this test.
             resetFsMocks();
             mockReadFile.mockImplementationOnce(() => Promise.resolve('// real preload'));
             await mkdir(tempDir, { mode: 0o700 });
@@ -292,11 +288,6 @@ describe('generatePreloadScript', () => {
 });
 
 describe('cleanupPreloadScript', () => {
-    beforeEach(() => {
-        // Clear the mock state before each test
-        mockUnlink.mockClear();
-    });
-
     afterEach(() => {
         // Reset all fs mocks to pass-through state for next test
         resetFsMocks();
@@ -370,8 +361,9 @@ describe('resolveEagerModulesFromGlobs', () => {
     });
 
     afterEach(async () => {
-        // Clean up fixture dir
+        // Clean up fixture dir, and the calls these real-fs tests recorded on the shared fs mocks
         await rm(fixtureDir, { recursive: true, force: true });
+        resetFsMocks();
     });
 
     it('should return empty array for empty mutate globs', async () => {

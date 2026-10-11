@@ -18,7 +18,6 @@ describe('generateSanitizedBunfig dropped-key reporting', () => {
 
     beforeEach(() => {
         mockMkdir.mockResolvedValue(undefined);
-        mockWriteFile.mockClear();
         mockWriteFile.mockResolvedValue(undefined);
         ensurePrivateDirSpy = spyOn(privateTempDir, 'ensurePrivateDir').mockImplementation((dir: string) => Promise.resolve(dir));
     });

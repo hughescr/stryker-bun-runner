@@ -8,6 +8,13 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
 import { discoverTestFiles, findBuildOutputTestFiles } from '../../src/utils/test-file-discovery.js';
+import { resetFsMocks } from '../test-preload.js';
+
+// These tests work on real temp directories, through the preload's pass-through
+// fs mocks, which record every call: clear them after each test.
+afterEach(() => {
+    resetFsMocks();
+});
 
 describe('discoverTestFiles (symlink handling)', () => {
     let tmpDir: string;
