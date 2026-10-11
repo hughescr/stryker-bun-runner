@@ -1,11 +1,10 @@
 /**
  * Unit tests for utils/sync-server
  * Tests WebSocket synchronization server using mock injection
+ * (tests/00-integration/sync-server-socket-integration.test.ts runs it on a real socket)
  */
 
-import { once } from 'node:events';
 import { describe, it, expect, beforeEach, mock } from 'bun:test';
-import { WebSocket } from 'ws';
 import { SyncServer } from '../../src/utils/sync-server';
 
 // Mock WebSocket client
@@ -1133,43 +1132,5 @@ describe('preload sync dial address', () => {
         expect(template).not.toContain('ws://');
         expect(preloadLogic).not.toContain('ws://localhost:');
         expect(preloadLogic.match(/ws:\/\/127\.0\.0\.1:\$\{syncPort\}\/sync/g)).toHaveLength(1);
-    });
-});
-
-describe('SyncServer on a real socket', () => {
-    it('refuses a client dialing another token: its upgrade is answered 401 and never opens', async () => {
-        const server = new SyncServer();
-        await server.start();
-        try {
-            const client = new WebSocket(`ws://127.0.0.1:${server.port}/sync/${'0'.repeat(32)}`);
-            const [, response] = await once(client, 'unexpected-response') as [unknown, { statusCode: number }];
-
-            expect(response.statusCode).toBe(401);
-            expect(server.clientCount).toBe(0);
-            client.terminate();
-        } finally {
-            await server.close();
-        }
-    });
-
-    it('reports the port the OS gave it, and a client dialing that port with its token reaches it', async () => {
-        const server = new SyncServer();
-        await server.start();
-        try {
-            expect(server.port).toBeGreaterThan(0);
-
-            const client = new WebSocket(`ws://127.0.0.1:${server.port}/sync/${server.token}`);
-            const received = new Promise<string>((resolve, reject) => {
-                client.on('message', (data: Buffer) => resolve(data.toString('utf8')));
-                client.on('error', reject);
-            });
-            await once(client, 'open');
-            server.signalReady();
-
-            expect(await received).toBe('ready');
-            client.close();
-        } finally {
-            await server.close();
-        }
     });
 });

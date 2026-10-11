@@ -11,6 +11,10 @@
  * Real processes, so no fake clock in this file — and no real one either: every
  * wait is on an event. The child reports to this test over a socket it keeps
  * open, so EOF on that socket is the child's death (see lifelineCut).
+ *
+ * Bun 1.4.0 emits a net server's 'listening' from a 1 ms timer of its own, so
+ * timers scheduled outside tests/ run on real time in this file; a timer the
+ * test itself schedules still fails it.
  */
 
 import { once } from 'node:events';
@@ -21,7 +25,10 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'bun:test';
 import { LIFELINE_FD_ENV } from '../../src/coverage/preload-logic.js';
 import { isProcessRunning, lifelineCut } from '../helpers/process-liveness.js';
+import { allowRealTimersFromSource } from '../real-clock-guard.js';
 import { resetFsMocks } from '../test-preload.js';
+
+allowRealTimersFromSource();
 
 /**
  * The suite the runner's child runs. It installs fake timers and holds them
