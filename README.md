@@ -229,7 +229,7 @@ export default await withTestFilesExcludedFromTypeCheck({
 ```
 
 - The checker imports `@typescript/native/unstable/sync`. Its error message suggests a `typescript7` alias, but it never looks for one, so use the `@typescript/native` name above.
-- Pin TypeScript 7.0.x. TypeScript 7.1 renames the `unstable/sync` entry point to `sync`, and checker 10.0.0 cannot load it.
+- Pin TypeScript 7.0.2 exactly. TypeScript 7.1 renames the `unstable/sync` entry point to `sync`, which checker 10.0.0 cannot load, so this repository stays on 7.0.2 until a checker release loads the new entry point.
 - Your own `typescript` (6 or earlier) stays in place for everything else, including `withTestFilesExcludedFromTypeCheck`, which works the same with either checker. The alias does install a second `tsc` that takes over `node_modules/.bin/tsc`, so call TypeScript 6 by its path (`node node_modules/typescript/bin/tsc`) where that matters.
 - Checker 10.0.0 has a bug in this mode: the checker writes a copy of your tsconfig with `noUnusedLocals` and `noUnusedParameters` turned off, but when `tsconfigFile` is a relative path (the default, and what `withTestFilesExcludedFromTypeCheck` sets), the native compiler never receives that copy. Mutants whose only effect is an unused variable or parameter then count as compile errors and never get tested. On this repository that was 540 extra compile errors. This repository fixes it with a one-line `bun patch` ([`patches/@stryker-mutator%2Ftypescript-checker@10.0.0.patch`](patches/%40stryker-mutator%252Ftypescript-checker%4010.0.0.patch)), which you can copy into your own project. If your tsconfig turns neither option on, the bug does not affect you.
 
