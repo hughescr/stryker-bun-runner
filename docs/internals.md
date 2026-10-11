@@ -426,9 +426,11 @@ protocol-level stall, distinct from total silence.
 
 ### Start and end summaries
 
-Each Stryker worker logs two `info` lines, and nothing else at info for individual mutants:
+Each Stryker worker logs a start line at `debug` and an end line at `info`, and nothing else at info for individual mutants:
 
-- **Start**, once per runner at the end of `init()`:
+- **Start**, at `debug` (shown with `--logLevel debug`), once per runner at the end of `init()`.
+  It is not `info` because every worker process logs its own copy, which at high concurrency looks
+  like many dry runs; the dry run itself happens once, on one worker:
   `Bun test runner started: bun <version> at <bunPath>; <N> test file(s) from <source>; sanitized bunfig <path>[; bail on|off]`.
   `<source>` is `auto-discovery` or `bun.testFiles`; Stryker's `testFiles` option only arrives with
   the dry run, which names its source in the debug log. When discovery finds no files the line says

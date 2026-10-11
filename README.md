@@ -104,9 +104,7 @@ bunx stryker run
 Abridged output from a small project with one test file (your counts will differ):
 
 ```text
-INFO BunTestRunner Bun test runner started: bun 1.4.2 at bun; 1 test file(s) from auto-discovery; sanitized bunfig /tmp/stryker-bun-runner-1000-0bfd2cdbbb207a22-0/stryker-bun-runner-bunfig-29463-1791682615998.toml; bail on
 INFO DryRunExecutor Starting initial test run (bun test runner with "perTest" coverage analysis). This may take a while.
-INFO BunTestRunner Bun test runner started: bun 1.4.2 at bun; 1 test file(s) from auto-discovery; sanitized bunfig /tmp/stryker-bun-runner-1000-0bfd2cdbbb207a22-0/stryker-bun-runner-bunfig-29462-1791682616021.toml; bail on
 INFO DryRunExecutor Initial test run succeeded. Ran 2 tests in 0 seconds (net 1 ms, overhead 90 ms).
 [Survived] EqualityOperator
 src/math.ts:6:12
@@ -124,8 +122,11 @@ INFO BunTestRunner Mutant runs on this worker: 3 (killed 2, survived 1, timeout 
 INFO BunTestRunner Mutant runs on this worker: 4 (killed 4, survived 0, timeout 0, error 0); full-suite fallbacks: 0
 ```
 
-- Each Stryker **worker** process logs one `Bun test runner started` line, and one
-  `Mutant runs on this worker` line at the end, so you see as many of each as Stryker has workers.
+- Each Stryker **worker** process logs one `Mutant runs on this worker` line at the end, so you
+  see as many of them as Stryker has workers.
+- Each worker process also logs one `Bun test runner started` line (bun version and path, test
+  files, sanitized bunfig), but at `debug`, so it only shows with `--logLevel debug`. These are
+  one per worker process, not one per dry run: the dry run itself happens once, on one worker.
 - **`Initial test run succeeded`** means the [dry run](#terms) passed: your whole suite ran once,
   unmutated, and the runner recorded which tests reach which mutants.
 - **Killed** mutants made a test fail: good. A **Survived** mutant is a change to your code that no

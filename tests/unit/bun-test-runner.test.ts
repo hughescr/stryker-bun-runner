@@ -12056,14 +12056,26 @@ error: Third failure message
         }
 
         describe('start summary', () => {
-            it('logs one info line at the end of init(): bun version and path, test files and their source, the sanitized bunfig', async () => {
+            /** The start summary lines among the debug log; other debug lines are not its concern. */
+            const startLines = (): string[] => logged(mockLogger.debug).filter(line => line.startsWith('Bun test runner started'));
+
+            it('logs one debug line at the end of init(): bun version and path, test files and their source, the sanitized bunfig', async () => {
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
 
                 await runner.init();
 
-                expect(logged(mockLogger.info)).toEqual([
+                expect(startLines()).toEqual([
                     'Bun test runner started: bun 1.4.2 at bun; 2 test file(s) from auto-discovery; sanitized bunfig /tmp/stryker-bun-runner-bunfig-0-0.toml',
                 ]);
+            });
+
+            it('is not logged at info: every worker process logs its own copy, which reads like many dry runs', async () => {
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+
+                await runner.init();
+
+                expect(mockLogger.info).not.toHaveBeenCalled();
+                expect(logged(mockLogger.info).filter(line => line.includes('Bun test runner started'))).toEqual([]);
             });
 
             it('names the version the startup check reported and the configured bunPath', async () => {
@@ -12072,7 +12084,7 @@ error: Third failure message
 
                 await runner.init();
 
-                expect(logged(mockLogger.info)[0]).toStartWith('Bun test runner started: bun 1.5.7 at /opt/bun/bin/bun; ');
+                expect(startLines()[0]).toStartWith('Bun test runner started: bun 1.5.7 at /opt/bun/bin/bun; ');
             });
 
             it('reports bun.testFiles as the source, with its count', async () => {
@@ -12082,7 +12094,7 @@ error: Third failure message
 
                 await runner.init();
 
-                expect(logged(mockLogger.info)[0]).toContain('; 3 test file(s) from bun.testFiles; ');
+                expect(startLines()[0]).toContain('; 3 test file(s) from bun.testFiles; ');
             });
 
             it('reports the count of the files auto-discovery found', async () => {
@@ -12091,7 +12103,7 @@ error: Third failure message
 
                 await runner.init();
 
-                expect(logged(mockLogger.info)[0]).toContain('; 1 test file(s) from auto-discovery; ');
+                expect(startLines()[0]).toContain('; 1 test file(s) from auto-discovery; ');
             });
 
             it('says bun will discover the tests itself when the runner found no test files', async () => {
@@ -12100,7 +12112,7 @@ error: Third failure message
 
                 await runner.init();
 
-                expect(logged(mockLogger.info)).toEqual([
+                expect(startLines()).toEqual([
                     'Bun test runner started: bun 1.4.2 at bun; no test files found by the runner, bun will discover them itself; sanitized bunfig /tmp/stryker-bun-runner-bunfig-0-0.toml',
                 ]);
             });
@@ -12110,7 +12122,7 @@ error: Third failure message
 
                 await runner.init();
 
-                expect(logged(mockLogger.info)[0]).toEndWith('; bail off');
+                expect(startLines()[0]).toEndWith('; bail off');
             });
 
             it('reports bail as on when Stryker\'s disableBail is false', async () => {
@@ -12118,7 +12130,7 @@ error: Third failure message
 
                 await runner.init();
 
-                expect(logged(mockLogger.info)[0]).toEndWith('; bail on');
+                expect(startLines()[0]).toEndWith('; bail on');
             });
 
             it('omits bail when Stryker\'s options carry no disableBail', async () => {
@@ -12126,7 +12138,7 @@ error: Third failure message
 
                 await runner.init();
 
-                expect(logged(mockLogger.info)[0]).not.toContain('bail');
+                expect(startLines()[0]).not.toContain('bail');
             });
 
             it('is logged once per runner, however often init() runs', async () => {
@@ -12135,7 +12147,7 @@ error: Third failure message
                 await runner.init();
                 await runner.init();
 
-                expect(mockLogger.info).toHaveBeenCalledTimes(1);
+                expect(startLines()).toHaveLength(1);
             });
 
             it('is logged once even when the second init() runs in another cwd', async () => {
@@ -12146,7 +12158,7 @@ error: Third failure message
 
                 await runner.init();
 
-                expect(mockLogger.info).toHaveBeenCalledTimes(1);
+                expect(startLines()).toHaveLength(1);
                 cwdSpy.mockRestore();
             });
 
@@ -12155,10 +12167,10 @@ error: Third failure message
                 const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
 
                 await expect(runner.init()).rejects.toThrow('boom');
-                expect(mockLogger.info).not.toHaveBeenCalled();
+                expect(startLines()).toEqual([]);
 
                 await runner.init();
-                expect(mockLogger.info).toHaveBeenCalledTimes(1);
+                expect(startLines()).toHaveLength(1);
             });
 
             it('keeps the version from the one startup check when init() runs again', async () => {
@@ -12167,7 +12179,7 @@ error: Third failure message
 
                 await runner.init();
 
-                expect(logged(mockLogger.info)[0]).toContain('bun 1.6.0 at bun');
+                expect(startLines()[0]).toContain('bun 1.6.0 at bun');
             });
         });
 
