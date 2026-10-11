@@ -17,6 +17,18 @@ import { buildTestFileArgs } from './utils/test-file-args.js';
 const KILL_GRACE_PERIOD_MS = 500;
 
 /**
+ * How long (ms) to wait, once the child itself has exited, for its stdout and
+ * stderr to close. They close with the child unless a process it started still
+ * holds them, and one that left the child's process group is out of reach of
+ * every kill here: it could hold them, and with them the run, open
+ * indefinitely. Past this the run's result is taken with the output read so
+ * far ({@link BunProcessResult.outputIncomplete}). A few seconds: the length of
+ * the SIGTERM→SIGKILL escalation four times over, ample for a dying group to
+ * let go of the pipes under load.
+ */
+export const STDIO_CLOSE_GRACE_MS = 4 * KILL_GRACE_PERIOD_MS;
+
+/**
  * The child's descriptor for its parent lifeline: the fourth entry of the
  * spawn's stdio array. Named to the child in {@link LIFELINE_FD_ENV}.
  */
@@ -266,6 +278,14 @@ export interface BunProcessResult {
    * this field, not stderr matching, to detect the condition.
    */
     spawnError?: string
+
+    /**
+   * True when the child exited but its stdout or stderr was still open
+   * {@link STDIO_CLOSE_GRACE_MS} later (held by a process it started), so the
+   * result was taken without them: `stdout` and `stderr` hold what was read up
+   * to then and may be cut short. Absent otherwise.
+   */
+    outputIncomplete?: true
 }
 
 /**
@@ -602,6 +622,7 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
         let memoryLimitExceeded = false;
         let hasClosed = false;
         let rssIntervalHandle: ReturnType<typeof setInterval> | undefined;
+        let stdioCloseHandle: ReturnType<typeof setTimeout> | undefined;
         let onLeaderExitDuringTermination: (() => void) | undefined;
         let onAbort: (() => void) | undefined;
 
@@ -768,19 +789,11 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
         }
         // Stryker restore BooleanLiteral,BlockStatement,StringLiteral
 
-        // The exit event fires as soon as the leader is reaped, while close can
-        // be delayed by a descendant that inherited one of its stdio streams.
-        childProcess.on('exit', () => {
-            onLeaderExitDuringTermination?.();
-        });
-
-        // Handle process exit
-        // Stryker disable next-line BlockStatement,StringLiteral: Promise.resolve never called without 'close' handler → Timeout
-        childProcess.on('close', (code, signal) => {
-            hasClosed = true;
-            onLeaderExitDuringTermination?.();
+        /** Stop tracking the child and cancel every timer and listener of this run: its result is in. */
+        const release = (): void => {
             liveChildren.delete(childProcess);
             clearTimeout(timeoutHandle);
+            clearTimeout(stdioCloseHandle);
             if(options.signal && onAbort) {
                 options.signal.removeEventListener('abort', onAbort);
             }
@@ -788,6 +801,35 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
             if(rssIntervalHandle) {
                 clearInterval(rssIntervalHandle);
             }
+        };
+
+        // The exit event fires as soon as the leader is reaped, while close can
+        // be delayed by a descendant that inherited one of its stdio streams —
+        // indefinitely, by one outside the group that no kill here reaches. So
+        // the run ends at close, or STDIO_CLOSE_GRACE_MS after exit with the
+        // output read by then, whichever comes first.
+        childProcess.on('exit', (code, signal) => {
+            onLeaderExitDuringTermination?.();
+            stdioCloseHandle = setTimeout(() => {
+                release();
+                resolve({
+                    stdout:           Buffer.concat(stdoutChunks).toString(),
+                    stderr:           Buffer.concat(stderrChunks).toString(),
+                    exitCode:         processKilled ? null : code,
+                    signal:           signal ?? null,
+                    timedOut,
+                    memoryLimitExceeded,
+                    outputIncomplete: true,
+                });
+            }, STDIO_CLOSE_GRACE_MS);
+        });
+
+        // Handle process exit
+        // Stryker disable next-line BlockStatement,StringLiteral: Promise.resolve never called without 'close' handler → Timeout
+        childProcess.on('close', (code, signal) => {
+            hasClosed = true;
+            onLeaderExitDuringTermination?.();
+            release();
 
             resolve({
                 stdout:   Buffer.concat(stdoutChunks).toString(),
@@ -805,15 +847,7 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
         childProcess.on('error', (error) => {
             hasClosed = true;
             onLeaderExitDuringTermination?.();
-            liveChildren.delete(childProcess);
-            clearTimeout(timeoutHandle);
-            if(options.signal && onAbort) {
-                options.signal.removeEventListener('abort', onAbort);
-            }
-            // Stryker disable next-line ConditionalExpression: equivalent mutant — when rssIntervalHandle is undefined (maxChildRss not set), clearInterval(undefined) is a silent no-op in Node/Bun; mutating the guard to `true` cannot introduce an observable difference
-            if(rssIntervalHandle) {
-                clearInterval(rssIntervalHandle);
-            }
+            release();
             const stderrOutput = Buffer.concat(stderrChunks).toString();
 
             resolve({

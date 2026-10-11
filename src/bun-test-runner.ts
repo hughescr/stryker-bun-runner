@@ -42,7 +42,7 @@ import { InspectorClient, type InspectorCloseInfo } from './inspector/index.js';
 import type { TestInfo } from './inspector/types.js';
 import type { StrykerBunOptions } from './options.js';
 import { parseBunTestOutput, type ParsedTestResults } from './parsers/console-parser.js';
-import { runBunTests, stripAnsi, type BunProcessResult } from './process-runner.js';
+import { runBunTests, stripAnsi, STDIO_CLOSE_GRACE_MS, type BunProcessResult } from './process-runner.js';
 import { type DroppedBunfigKey, assertSupportedBunArgs, splitBunConfigArg, stripRandomizeArgs, checkBunVersion, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, mutantRunBunfigPath, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, TEST_FILE_SUFFIX_RE, discoverTestFiles, findBuildOutputTestFiles, buildTestFileArgs, MAX_TEST_FILE_ARGS_BYTES, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery, resolveRunTempDir, writePrivateFile, MutantWarnAggregator } from './utils/index.js';
 
 /**
@@ -218,7 +218,7 @@ function formatSpawnErrorMessage(spawnError: string): string {
  */
 function formatInspectorTimeoutMessage(
     inspectorTimeoutMs: number,
-    child:              { exitCode: number | null, signal?: NodeJS.Signals | null, stderr: string, spawnError?: string, timedOut?: boolean }
+    child:              { exitCode: number | null, signal?: NodeJS.Signals | null, stderr: string, spawnError?: string, timedOut?: boolean, outputIncomplete?: true }
 ): string {
     // The child never ran, so "exit code none" and a stderr tail would bury the real cause.
     if(child.spawnError !== undefined) {
@@ -230,16 +230,36 @@ function formatInspectorTimeoutMessage(
         ended = 'killed by the runner after the run timeout (bun.timeout)';
     }
     const prefix = `Timeout waiting for inspector URL after ${inspectorTimeoutMs}ms (raise bun.inspectorTimeout if bun is slow to start)`;
-    return `${prefix}; bun test ${ended}; last stderr: ${formatStderrTail(child.stderr)}`;
+    return `${prefix}; bun test ${ended}; last stderr: ${formatStderrTail(child)}`;
 }
 
 /**
  * The last 1000 characters of a child's stderr, trimmed, for a dry-run error:
  * the tail is where a child's own reason for exiting lands, the head is usually
- * just startup banner.
+ * just startup banner. When the run's result was taken before the child's
+ * output closed ({@link BunProcessResult.outputIncomplete}), it says so: the
+ * tail may then be missing its end.
  */
-function formatStderrTail(stderr: string): string {
-    return stderr.trim().slice(-1000) || '(empty)';
+function formatStderrTail(child: { stderr: string, outputIncomplete?: true }): string {
+    const tail = child.stderr.trim().slice(-1000) || '(empty)';
+    return child.outputIncomplete
+        ? `${tail} (possibly cut short: ${formatOutputIncomplete()})`
+        : tail;
+}
+
+/**
+ * The inspector URL for a log line, without its path: bun's random path is all
+ * that keeps another local process from attaching to the child's inspector
+ * while it is listening, and debug logs are kept and shared.
+ */
+function redactInspectorUrl(url: string): string {
+    const pathStart = url.indexOf('/', url.indexOf('//') + 2);
+    return pathStart === -1 ? url : `${url.slice(0, pathStart)}/[redacted]`;
+}
+
+/** Why a child's output may be incomplete: see {@link BunProcessResult.outputIncomplete}. */
+function formatOutputIncomplete(): string {
+    return `bun test exited, but its output was still held open ${STDIO_CLOSE_GRACE_MS}ms later by a process it started, so the run did not wait for the rest`;
 }
 
 /**
@@ -249,8 +269,8 @@ function formatStderrTail(stderr: string): string {
  * runner is lost, and whether the enable is refused or left unanswered is down
  * to timing; either way the child's stderr says why, so its tail goes with it.
  */
-function formatInspectorConnectMessage(error: string, child: { stderr: string }): string {
-    return `Failed to connect to Bun inspector: ${error}; last stderr: ${formatStderrTail(child.stderr)}`;
+function formatInspectorConnectMessage(error: string, child: { stderr: string, outputIncomplete?: true }): string {
+    return `Failed to connect to Bun inspector: ${error}; last stderr: ${formatStderrTail(child)}`;
 }
 
 /**
@@ -1736,7 +1756,7 @@ export class BunTestRunner implements TestRunner {
             }
 
             // Stryker disable next-line StringLiteral: logging message only
-            this.logger.debug('Inspector URL: %s', inspectorUrl);
+            this.logger.debug('Inspector URL: %s', redactInspectorUrl(inspectorUrl));
 
             // 5. Create inspector client
             const inspector = new InspectorClient({
@@ -1903,6 +1923,9 @@ export class BunTestRunner implements TestRunner {
             // 8. Wait for test process to complete
             const result = await testProcess;
             const totalElapsedMs = Date.now() - startTime;
+            if(result.outputIncomplete) {
+                this.logger.warn('%s; the dry run may report fewer tests than ran', formatOutputIncomplete());
+            }
 
             // 9. Drain the inspector socket, then get inspector data before closing.
             // expectClose() is called the instant we know the run is over — same tick,

@@ -1451,6 +1451,42 @@ describe('preload-logic', () => {
             expect(messages).toEqual([formatSyncNotReadyMessage('6501', 'could not be opened (bad url)')]);
         });
 
+        it('cuts the token out of an error that quotes the URL it could not open', async () => {
+            const { fail, messages } = createFail();
+            const outcome = awaitRunnerReady({
+                syncPort:   '6501',
+                syncToken:  'f00d',
+                keepOpen:   true,
+                openSocket: (url) => {
+                    throw new Error(`Invalid URL: ${url} (twice: ${url})`);
+                },
+                fail,
+            });
+            await outcome.catch(() => undefined);
+
+            expect(messages).toEqual([formatSyncNotReadyMessage(
+                '6501',
+                'could not be opened (Invalid URL: ws://127.0.0.1:6501/sync/[redacted] (twice: ws://127.0.0.1:6501/sync/[redacted]))'
+            )]);
+            expect(messages[0]).not.toContain('f00d');
+        });
+
+        it('leaves an open error as it is when there is no token to cut out', async () => {
+            const { fail, messages } = createFail();
+            const outcome = awaitRunnerReady({
+                syncPort:   '6501',
+                syncToken:  '',
+                keepOpen:   true,
+                openSocket: () => {
+                    throw new Error('bad url');
+                },
+                fail,
+            });
+            await outcome.catch(() => undefined);
+
+            expect(messages).toEqual([formatSyncNotReadyMessage('6501', 'could not be opened (bad url)')]);
+        });
+
         it('names a non-Error throw from opening the socket', async () => {
             const { fail, messages } = createFail();
             const outcome = awaitRunnerReady({

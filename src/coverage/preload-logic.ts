@@ -195,7 +195,10 @@ export async function awaitRunnerReady(deps: RunnerReadyDeps): Promise<RunnerRea
         // Listeners are added before this await yields, so no message can arrive unheard.
         outcome = await waitForSyncReady(socket);
     } catch (error) {
-        return fail(formatSyncNotReadyMessage(deps.syncPort, `could not be opened (${error instanceof Error ? error.message : String(error)})`));
+        // A WebSocket constructor's error quotes the URL it was given, token and all: the
+        // message ends up on stderr and in the dry run's error, so the token is cut out.
+        const reason = redactToken(error instanceof Error ? error.message : String(error), deps.syncToken);
+        return fail(formatSyncNotReadyMessage(deps.syncPort, `could not be opened (${reason})`));
     }
     if(!outcome.ready) {
         return fail(formatSyncNotReadyMessage(deps.syncPort, outcome.problem));
@@ -205,6 +208,11 @@ export async function awaitRunnerReady(deps: RunnerReadyDeps): Promise<RunnerRea
     }
     socket.close();
     return null;
+}
+
+/** `text` with every occurrence of the sync token replaced by `[redacted]`. */
+function redactToken(text: string, token: string): string {
+    return token === '' ? text : text.replaceAll(token, '[redacted]');
 }
 
 /**

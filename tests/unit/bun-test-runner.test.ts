@@ -1491,7 +1491,7 @@ tests/example.test.ts:
             }
         });
 
-        async function inspectorTimeoutMessageFor(child: { exitCode: number | null, signal: NodeJS.Signals | null, stderr: string }): Promise<string> {
+        async function inspectorTimeoutMessageFor(child: { exitCode: number | null, signal: NodeJS.Signals | null, stderr: string, outputIncomplete?: true }): Promise<string> {
             jest.useFakeTimers();
             try {
                 mockRunBunTests.mockImplementation(() => Promise.resolve({ ...child, stdout: '', timedOut: false }));
@@ -1523,6 +1523,12 @@ tests/example.test.ts:
         it('trims surrounding whitespace off the stderr tail, and reports (empty) for whitespace-only stderr', async () => {
             expect(await inspectorTimeoutMessageFor({ exitCode: 1, signal: null, stderr: '\n  preload failed  \n\n' })).toEndWith('last stderr: preload failed');
             expect(await inspectorTimeoutMessageFor({ exitCode: 1, signal: null, stderr: ' \n\t\n' })).toEndWith('last stderr: (empty)');
+        });
+
+        it('says the stderr tail may be cut short when the child\'s output was still open after it exited', async () => {
+            expect(await inspectorTimeoutMessageFor({ exitCode: 1, signal: null, stderr: 'preload failed\n', outputIncomplete: true })).toEndWith(
+                'last stderr: preload failed (possibly cut short: bun test exited, but its output was still held open 2000ms later by a process it started, so the run did not wait for the rest)'
+            );
         });
 
         it('names the spawn error clearly in the dry-run error when bun could not be started', async () => {
@@ -1953,6 +1959,24 @@ tests/example.test.ts:
             if(result.status === DryRunStatus.Error) {
                 expect(result.errorMessage).toBe('Failed to connect to Bun inspector: Connection refused; last stderr: (empty)');
             }
+        });
+
+        it('says the stderr tail may be cut short when the child it waited for after a connection failure left its output open', async () => {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+            mockRunBunTests.mockImplementation((options: any) => {
+                options.onInspectorReady?.('ws://127.0.0.1:6499/inspector');
+                return Promise.resolve({ exitCode: null, stdout: '', stderr: 'going away\n', timedOut: true, outputIncomplete: true });
+            });
+            mockInspectorClient.connect.mockRejectedValue(new Error('Connection refused'));
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+
+            expect(await runner.dryRun()).toEqual({
+                status:       DryRunStatus.Error,
+                errorMessage: 'Failed to connect to Bun inspector: Connection refused; last stderr: going away '
+                  + '(possibly cut short: bun test exited, but its output was still held open 2000ms later by a process it started, so the run did not wait for the rest)',
+            });
         });
 
         it('waits for the child once the inspector connection fails, and names what its stderr ends with', async () => {
@@ -2672,7 +2696,9 @@ tests/example.test.ts:
 
             expect(mockLogger.debug).toHaveBeenCalledWith('Sync server started on port %d', expect.any(Number));
 
-            expect(mockLogger.debug).toHaveBeenCalledWith('Inspector URL: %s', expect.any(String));
+            // Without its path: the random path is all that guards the live inspector.
+            expect(mockLogger.debug).toHaveBeenCalledWith('Inspector URL: %s', 'ws://127.0.0.1:6499/[redacted]');
+            expect(JSON.stringify((mockLogger.debug as ReturnType<typeof mock>).mock.calls)).not.toContain('/inspector');
 
             expect(mockLogger.debug).toHaveBeenCalledWith('Inspector connected and TestReporter enabled');
 
@@ -2680,6 +2706,43 @@ tests/example.test.ts:
 
             expect(mockLogger.debug).toHaveBeenCalledWith('Inspector collected %d tests in hierarchy, %d in execution order',
                 1, 1);
+        });
+
+        it('logs an inspector URL that has no path as it is', async () => {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+            mockRunBunTests.mockImplementation((options: any) => {
+                options.onInspectorReady?.('ws://127.0.0.1:6499');
+                return Promise.resolve({ exitCode: 0, stdout: ' 1 pass', stderr: '', timedOut: false });
+            });
+
+            const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+            await runner.init();
+            await runner.dryRun();
+
+            expect(mockLogger.debug).toHaveBeenCalledWith('Inspector URL: %s', 'ws://127.0.0.1:6499');
+        });
+
+        it('warns when the run ended before the child\'s output closed, and only then', async () => {
+            const outputIncompleteWarning = [
+                '%s; the dry run may report fewer tests than ran',
+                'bun test exited, but its output was still held open 2000ms later by a process it started, so the run did not wait for the rest',
+            ];
+            const dryRunWith = async (extra: object): Promise<void> => {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
+                mockRunBunTests.mockImplementation((options: any) => {
+                    options.onInspectorReady?.('ws://127.0.0.1:6499/inspector');
+                    return Promise.resolve({ exitCode: 0, stdout: ' 1 pass', stderr: '', timedOut: false, ...extra });
+                });
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                await runner.dryRun();
+            };
+
+            await dryRunWith({});
+            expect(mockLogger.warn).not.toHaveBeenCalledWith(...outputIncompleteWarning);
+
+            await dryRunWith({ outputIncomplete: true });
+            expect(mockLogger.warn).toHaveBeenCalledWith(...outputIncompleteWarning);
         });
 
         /**

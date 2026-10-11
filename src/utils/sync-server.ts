@@ -282,7 +282,8 @@ export class SyncServer {
    * Close the server and all client connections
    */
     async close(): Promise<void> {
-        // Reset the ready latch so the instance can be reused across runs
+        // Forget the run's ready latch and drain state. An instance is not reused:
+        // each dry run constructs its own server, with its own token.
         this.readyLatched = false;
         this.drainHandler = null;
         this.drainInFlight = null;

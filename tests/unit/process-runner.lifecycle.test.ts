@@ -11,8 +11,9 @@
 
 import type { ChildProcess } from 'node:child_process';
 import { describe, it, expect, beforeEach, afterEach, mock, jest, spyOn } from 'bun:test';
-import { runBunTests, killAllLiveChildren, removeSignalCleanup, SPAWN_DEPTH_ENV } from '../../src/process-runner.js';
+import { runBunTests, killAllLiveChildren, removeSignalCleanup, SPAWN_DEPTH_ENV, STDIO_CLOSE_GRACE_MS } from '../../src/process-runner.js';
 import * as processRss from '../../src/utils/process-rss.js';
+import { trackTimers } from '../helpers/fake-clock.js';
 import { mockSpawn, resetChildProcessMocks, mockKillProcessGroup, resetProcessGroupMocks } from '../test-preload.js';
 
 const PID = 12_345;
@@ -268,6 +269,109 @@ describe('process-runner child lifecycle', () => {
                 expect(fake.kill).not.toHaveBeenCalled();
                 expect(result.memoryLimitExceeded).toBe(false);
             });
+        });
+    });
+
+    describe('output still open after the child exits', () => {
+        /** Hand `text` to the run as a chunk of the child's stdout or stderr. */
+        const emit = (stream: 'stdout' | 'stderr', text: string): void => {
+            const { on } = fake.child[stream] as unknown as { on: ReturnType<typeof mock> };
+            const onData = on.mock.calls.find(([event]) => event === 'data')?.[1] as (data: Buffer) => void;
+            onData(Buffer.from(text));
+        };
+
+        it('ends the run STDIO_CLOSE_GRACE_MS after the child exits, with the output read so far, marked incomplete', async () => {
+            jest.useFakeTimers();
+            const resultPromise = runBunTests({ bunPath: 'bun', timeout: 60_000 });
+            emit('stdout', ' 1 pass\n');
+            emit('stderr', 'still writing');
+            fake.exit(3);
+
+            jest.advanceTimersByTime(STDIO_CLOSE_GRACE_MS - 1);
+            expect(Bun.peek.status(resultPromise)).toBe('pending');
+            jest.advanceTimersByTime(1);
+
+            expect(await resultPromise).toEqual({
+                stdout:              ' 1 pass\n',
+                stderr:              'still writing',
+                exitCode:            3,
+                signal:              null,
+                timedOut:            false,
+                memoryLimitExceeded: false,
+                outputIncomplete:    true,
+            });
+            expect(STDIO_CLOSE_GRACE_MS).toBe(2000);
+        });
+
+        it('reports the signal the child exited on', async () => {
+            jest.useFakeTimers();
+            const resultPromise = runBunTests({ bunPath: 'bun', timeout: 60_000 });
+            (fake.handler('exit') as (code: number | null, signal: NodeJS.Signals | null) => void)(null, 'SIGSEGV');
+            jest.advanceTimersByTime(STDIO_CLOSE_GRACE_MS);
+
+            const result = await resultPromise;
+            expect(result.signal).toBe('SIGSEGV');
+            expect(result.exitCode).toBeNull();
+        });
+
+        it('reports a run it killed as timed out, with no exit code', async () => {
+            jest.useFakeTimers();
+            const resultPromise = runBunTests({ bunPath: 'bun', timeout: 100 });
+            jest.advanceTimersByTime(100);
+            fake.exit(143);
+            jest.advanceTimersByTime(STDIO_CLOSE_GRACE_MS);
+
+            const result = await resultPromise;
+            expect(result.timedOut).toBe(true);
+            expect(result.exitCode).toBeNull();
+            expect(result.outputIncomplete).toBe(true);
+        });
+
+        it('stops tracking the child, and cancels its run timeout, abort and memory poll, once the run has ended this way', async () => {
+            jest.useFakeTimers();
+            const getRssSpy = spyOn(processRss, 'getProcessRssBytes').mockResolvedValue(1);
+            try {
+                const controller = new AbortController();
+                const resultPromise = runBunTests({ bunPath: 'bun', timeout: 3000, signal: controller.signal, maxChildRss: 10, rssCheckIntervalMs: 100 });
+                fake.exit(0);
+                jest.advanceTimersByTime(STDIO_CLOSE_GRACE_MS);
+                await resultPromise;
+                const probes = getRssSpy.mock.calls.length;
+
+                // Past the run timeout and several poll intervals, then an abort and a signal sweep.
+                jest.advanceTimersByTime(5000);
+                controller.abort();
+                killAllLiveChildren();
+
+                expect(getRssSpy).toHaveBeenCalledTimes(probes);
+                expect(groupSignals()).toEqual([]);
+                expect(fake.kill).not.toHaveBeenCalled();
+            } finally {
+                getRssSpy.mockRestore();
+            }
+        });
+
+        it('ends the run at close when close comes within the grace period, leaving no timer behind', async () => {
+            jest.useFakeTimers();
+            const timers = trackTimers();
+            try {
+                const resultPromise = runBunTests({ bunPath: 'bun', timeout: 60_000 });
+                fake.exit(0);
+                emit('stdout', ' 1 pass\n');
+                fake.close(0);
+
+                expect(await resultPromise).toEqual({
+                    stdout:              ' 1 pass\n',
+                    stderr:              '',
+                    exitCode:            0,
+                    signal:              null,
+                    timedOut:            false,
+                    memoryLimitExceeded: false,
+                });
+                expect(timers.pending()).toBe(0);
+            } finally {
+                timers.restore();
+            }
         });
     });
 

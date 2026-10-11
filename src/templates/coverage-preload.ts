@@ -80,12 +80,13 @@ const EAGER_MODULES: string[] = __EAGER_MODULES__;
 const config = getPreloadConfig();
 // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- Config from placeholder import
 const { syncPort, syncToken, coverageFile, activeMutant, hitLimit, hitLimitToken } = config;
-// Hide the hit-limit token from the code under test: anything that can read it
+// Hide the hit-limit token from the test files: anything that can read it
 // could print a sentinel the runner accepts. See formatHitLimitSentinel.
 // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- HIT_LIMIT_TOKEN_ENV from placeholder import
 delete process.env[HIT_LIMIT_TOKEN_ENV];
-// Likewise the sync token: only this preload dials the sync server, and a suite
-// that reads its environment (or runs this runner itself) must not see it.
+// Likewise the sync token: only this preload dials the sync server, so the test
+// files (and a run of this runner inside them) never see it. The project's own
+// [test].preload scripts load before this one, though, and can read both tokens.
 // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- SYNC_TOKEN_ENV from placeholder import
 delete process.env[SYNC_TOKEN_ENV];
 

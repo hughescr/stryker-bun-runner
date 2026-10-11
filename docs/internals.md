@@ -516,6 +516,11 @@ processes: signalling only the direct child would leave its grandchildren runnin
 PID 1, and a suite that starts a server or a database would leak one on every timed-out mutant. If
 the group signal cannot be delivered, the runner signals the direct child.
 
+A process your suite starts that leaves the group (with `setsid`, say) is out of reach of these
+signals, and if it inherited the child's stdout or stderr it keeps them open after the child exits.
+The runner waits at most 2 s after the child exits for them to close, then takes the run's result
+with the output read so far; a dry-run error then says its stderr tail may be cut short.
+
 A detached child is not in the terminal's foreground process group, so it does not die on its own
 when you press Ctrl-C. The runner therefore traps `SIGINT`, `SIGTERM` and `SIGHUP`, kills every
 live child's group, and re-raises the signal so the default behaviour is preserved.
