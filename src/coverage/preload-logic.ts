@@ -50,6 +50,8 @@ export interface StrykerNamespace {
 
 export interface PreloadConfig {
     syncPort?:      string
+    /** The token the runner's sync server expects in the path, see {@link awaitRunnerReady}. */
+    syncToken?:     string
     coverageFile?:  string
     activeMutant?:  string
     /** Stryker's hit limit for the active mutant (mutant runs only), see {@link installHitLimit}. */
@@ -61,9 +63,13 @@ export interface PreloadConfig {
 /** Env var carrying the per-run token the hit-limit sentinel must include. */
 export const HIT_LIMIT_TOKEN_ENV = '__STRYKER_HIT_LIMIT_TOKEN__';
 
+/** Env var carrying the token the dry run's sync server expects in the path the child dials. */
+export const SYNC_TOKEN_ENV = '__STRYKER_SYNC_TOKEN__';
+
 export function getPreloadConfig(): PreloadConfig {
     return {
         syncPort:      process.env.__STRYKER_SYNC_PORT__,
+        syncToken:     process.env[SYNC_TOKEN_ENV],
         coverageFile:  process.env.__STRYKER_COVERAGE_FILE__,
         activeMutant:  process.env.__STRYKER_ACTIVE_MUTANT__,
         hitLimit:      parseHitLimit(process.env.__STRYKER_HIT_LIMIT__),
@@ -140,6 +146,8 @@ export function waitForSyncReady(socket: SyncReadySocket): Promise<SyncReadyOutc
 /**
  * The runner's sync server address. Dialled at the literal loopback address
  * the server binds (127.0.0.1), never "localhost", which may resolve to ::1.
+ * The child dials it with its run's token appended (see {@link awaitRunnerReady});
+ * messages name it without.
  */
 function syncAddress(syncPort: string): string {
     return `ws://127.0.0.1:${syncPort}/sync`;
@@ -152,6 +160,8 @@ export type RunnerReadySocket = SyncReadySocket & { close(): void };
 export interface RunnerReadyDeps {
     /** The runner's sync port (`__STRYKER_SYNC_PORT__`). */
     syncPort:    string
+    /** The runner's sync token (`__STRYKER_SYNC_TOKEN__`), the last segment of the path dialled. */
+    syncToken:   string
     /** Keep the socket open after 'ready' (for the drain handshake) and return it; otherwise close it and return null. */
     keepOpen:    boolean
     /** Opens the socket. @default a WebSocket */
@@ -178,7 +188,10 @@ export async function awaitRunnerReady(deps: RunnerReadyDeps): Promise<RunnerRea
     let socket: RunnerReadySocket;
     let outcome: SyncReadyOutcome;
     try {
-        socket = openSocket(syncAddress(deps.syncPort));
+        // The token keeps this child off another run's sync server: once this run's
+        // server has closed, the OS can hand its port to a sync server of another
+        // run, which would otherwise release this child with its own 'ready'.
+        socket = openSocket(`${syncAddress(deps.syncPort)}/${deps.syncToken}`);
         // Listeners are added before this await yields, so no message can arrive unheard.
         outcome = await waitForSyncReady(socket);
     } catch (error) {

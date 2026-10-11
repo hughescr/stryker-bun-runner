@@ -29,7 +29,7 @@ import * as privateTempDir from '../../src/utils/private-temp-dir.js';
 import * as syncServerModule from '../../src/utils/sync-server.js';
 import * as testFileDiscovery from '../../src/utils/test-file-discovery.js';
 import { runUntilSettled } from '../helpers/fake-clock.js';
-import { mockGetAvailablePort, mockRename, mockWriteFile, resetAllMocks } from '../test-preload.js';
+import { mockRename, mockWriteFile, resetAllMocks } from '../test-preload.js';
 
 /**
  * Mirrors the run's private temp directory formula (src/utils/private-temp-dir.ts
@@ -68,6 +68,8 @@ describe('BunTestRunner mutation kill tests (first half of the runner)', () => {
         setDrainHandler: ReturnType<typeof mock>
         close:           ReturnType<typeof mock>
         clientCount:     number
+        port:            number
+        token:           string
     };
     let mockInspectorClient: {
         connect:                  ReturnType<typeof mock>
@@ -150,9 +152,6 @@ describe('BunTestRunner mutation kill tests (first half of the runner)', () => {
         generateSanitizedBunfigSpy = spyOn(bunfigSanitizer, 'generateSanitizedBunfig').mockImplementation(mockGenerateSanitizedBunfig);
         cleanupSanitizedBunfigSpy = spyOn(bunfigSanitizer, 'cleanupSanitizedBunfig').mockImplementation(mockCleanupSanitizedBunfig);
 
-        // Port utility mock comes from preload - just clear its state
-        mockGetAvailablePort.mockClear();
-
         // Mock sync server
         mockSyncServer = {
             start:           mock(),
@@ -160,6 +159,8 @@ describe('BunTestRunner mutation kill tests (first half of the runner)', () => {
             setDrainHandler: mock(),
             close:           mock(),
             clientCount:     0,
+            port:            6500,
+            token:           'run-token',
         };
         // @ts-expect-error - Mocking constructor, type system doesn't understand this pattern
         syncServerSpy = spyOn(syncServerModule, 'SyncServer').mockImplementation(() => mockSyncServer);
@@ -199,8 +200,6 @@ describe('BunTestRunner mutation kill tests (first half of the runner)', () => {
         mockCleanupPreloadScript.mockResolvedValue(undefined);
         mockGenerateSanitizedBunfig.mockResolvedValue('/tmp/stryker-bun-runner-bunfig-0-0.toml');
         mockCleanupSanitizedBunfig.mockResolvedValue(undefined);
-        let portCounter = 6499;
-        mockGetAvailablePort.mockImplementation(() => Promise.resolve(portCounter++));
         mockSyncServer.start.mockResolvedValue(undefined);
         mockSyncServer.signalReady.mockReturnValue(undefined);
         mockSyncServer.close.mockResolvedValue(undefined);
@@ -523,13 +522,39 @@ describe('BunTestRunner mutation kill tests (first half of the runner)', () => {
     // ---------------------------------------------------------------------
 
     describe('dryRun start-up', () => {
-        it('logs the inspector and sync ports it picked', async () => {
+        it('hands the child the port the sync server bound and its token, and lets bun pick its own inspector port', async () => {
+            // Neither port is chosen in advance: a port probed free and released can be
+            // bound by another process before the server or bun gets to it.
             mockChild();
             mockHealthyInspectorRun();
 
             await dryRunOnce();
 
-            expect(mockLogger.debug).toHaveBeenCalledWith('Using inspector port: %d, sync port: %d', 6499, 6500);
+            expect(mockRunBunTests).toHaveBeenCalledTimes(1);
+            expect(mockRunBunTests.mock.calls[0][0]).toMatchObject({ inspect: true, syncPort: 6500, syncToken: 'run-token' });
+            expect(mockLogger.debug).toHaveBeenCalledWith('Sync server started on port %d', 6500);
+        });
+
+        it('reads the sync port only once the server has started listening', async () => {
+            let started = false;
+            mockSyncServer.start.mockImplementation(() => {
+                started = true;
+                return Promise.resolve();
+            });
+            Object.defineProperty(mockSyncServer, 'port', {
+                get: () => {
+                    if(!started) {
+                        throw new Error('the sync server is not listening yet');
+                    }
+                    return 6501;
+                },
+            });
+            mockChild();
+            mockHealthyInspectorRun();
+
+            await dryRunOnce();
+
+            expect(mockRunBunTests.mock.calls[0][0]).toMatchObject({ syncPort: 6501 });
         });
 
         it('logs the error when the sync server cannot start, and reports it', async () => {
@@ -582,7 +607,7 @@ describe('BunTestRunner mutation kill tests (first half of the runner)', () => {
 
                 const result = await dryRunOnce();
 
-                expect(result).toEqual({ status: DryRunStatus.Error, errorMessage: 'Failed to connect to Bun inspector: refused' });
+                expect(result).toEqual({ status: DryRunStatus.Error, errorMessage: 'Failed to connect to Bun inspector: refused; last stderr: (empty)' });
                 expect(mockLogger.error).toHaveBeenCalledWith('Failed to connect inspector: %s', 'refused');
                 expect(abortedWhenClosing).toBe(true);
             });

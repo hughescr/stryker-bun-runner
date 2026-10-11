@@ -3,8 +3,22 @@
  * Used to coordinate inspector connection with test execution
  */
 
-import { createServer, type Server as HTTPServer } from 'node:http';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { createServer, type IncomingMessage, type Server as HTTPServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
+
+/**
+ * Whether an upgrade request's URL is exactly `expected` (`/sync/<token>`),
+ * compared in constant time so the comparison does not leak the token.
+ */
+function isExpectedPath(url: string | undefined, expected: Buffer): boolean {
+    if(url === undefined) {
+        return false;
+    }
+    const actual = Buffer.from(url);
+    return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
 
 /**
  * Decode a 'ws' message payload as UTF-8 text. RawData is a union of
@@ -21,17 +35,6 @@ function rawDataToString(data: RawData): string {
 }
 
 export interface SyncServerOptions {
-    /**
-   * Port to listen on
-   */
-    port: number
-
-    /**
-   * Timeout in milliseconds for client connections
-   * @default 5000
-   */
-    timeout?: number
-
     /**
    * Optional HTTP server factory for dependency injection (testing)
    * @default createServer
@@ -56,11 +59,19 @@ export interface SyncServerOptions {
  * Allows preload script to wait for "ready" signal before proceeding with tests
  */
 export class SyncServer {
+    /**
+   * This server's random token. A client must dial `/sync/<token>`; any other
+   * path is refused at the upgrade (401). The runner hands it to its child in
+   * `__STRYKER_SYNC_TOKEN__`. Without it, a child whose own server has already
+   * closed could reach a sync server of another run that the OS has since
+   * given the same port, and be released by that run's 'ready'.
+   */
+    readonly token = randomBytes(16).toString('hex');
     private httpServer:                    HTTPServer | null = null;
     private wss:                           WebSocketServer | null = null;
     private clients = new Set<WebSocket>();
     private readyLatched =                 false;
-    private readonly port:                 number;
+    private listeningPort:                 number | undefined;
     private readonly createHttpServer:     typeof createServer;
     private readonly WebSocketServerClass: typeof WebSocketServer;
     private readonly webSocketOpenState:   number;
@@ -92,15 +103,25 @@ export class SyncServer {
    */
     private pendingDrainClients = new Set<WebSocket>();
 
-    constructor(options: SyncServerOptions) {
-        this.port = options.port;
+    constructor(options: SyncServerOptions = {}) {
         this.createHttpServer = options.createHttpServer ?? createServer;
         this.WebSocketServerClass = options.WebSocketServerClass ?? WebSocketServer;
         this.webSocketOpenState = options.webSocketOpenState ?? WebSocket.OPEN;
     }
 
     /**
-   * Start the WebSocket server
+   * The loopback port the server is listening on, which the OS chose when
+   * {@link start} bound it. Throws before then: there is no port to hand out.
+   */
+    get port(): number {
+        if(this.listeningPort === undefined) {
+            throw new Error('the sync server is not listening yet');
+        }
+        return this.listeningPort;
+    }
+
+    /**
+   * Start the WebSocket server on a free loopback port; see {@link port}.
    */
     async start(): Promise<void> {
         // Stryker disable next-line BlockStatement: removing Promise body means resolve() never called → start() never resolves → Timeout
@@ -120,10 +141,12 @@ export class SyncServer {
                     }
                 });
 
-                // Create WebSocket server attached to HTTP server
+                // Create WebSocket server attached to HTTP server. No `path` option:
+                // verifyClient alone decides, accepting only /sync/<token>.
+                const expectedPath = Buffer.from(`/sync/${this.token}`);
                 this.wss = new this.WebSocketServerClass({
-                    server: this.httpServer,
-                    path:   '/sync',
+                    server:       this.httpServer,
+                    verifyClient: ({ req }: { req: IncomingMessage }) => isExpectedPath(req.url, expectedPath),
                 });
 
                 // Track client connections
@@ -160,11 +183,15 @@ export class SyncServer {
 
                 // Start listening. Bind to loopback only (never all interfaces): the
                 // sync channel is a local control signal and must not be reachable from
-                // other hosts. 127.0.0.1 matches the port probe (utils/port.ts) and the
-                // inspector (--inspect=127.0.0.1:<port>), and the preload dials the same
-                // literal address.
+                // other hosts. 127.0.0.1 matches the inspector (--inspect=127.0.0.1:0),
+                // and the preload dials the same literal address. Port 0: the OS picks a
+                // port that is free as it binds; a port probed free beforehand and
+                // released could be taken by another process first. {@link port} reads
+                // back what was bound, for the child's environment.
+                const httpServer = this.httpServer;
                 // Stryker disable next-line BlockStatement: removing listen callback body means resolve() never called → start() never resolves → Timeout
-                this.httpServer.listen(this.port, '127.0.0.1', () => {
+                httpServer.listen(0, '127.0.0.1', () => {
+                    this.listeningPort = (httpServer.address() as AddressInfo).port;
                     resolve();
                 });
             } catch (error) {

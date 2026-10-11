@@ -193,6 +193,10 @@ describe('hit limit (real bun children)', () => {
     });
 
     afterAll(async () => {
+        // The runner's real children go through the preload's shared mocks (spawn,
+        // process-group kill), which record every call: leave them clean for the
+        // files that run after this one.
+        resetAllMocks();
         if(originalForceColor !== undefined) {
             process.env.FORCE_COLOR = originalForceColor;
         }

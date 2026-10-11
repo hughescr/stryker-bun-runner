@@ -43,7 +43,7 @@ import type { TestInfo } from './inspector/types.js';
 import type { StrykerBunOptions } from './options.js';
 import { parseBunTestOutput, type ParsedTestResults } from './parsers/console-parser.js';
 import { runBunTests, stripAnsi, type BunProcessResult } from './process-runner.js';
-import { type DroppedBunfigKey, assertSupportedBunArgs, splitBunConfigArg, stripRandomizeArgs, checkBunVersion, getAvailablePort, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, mutantRunBunfigPath, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, TEST_FILE_SUFFIX_RE, discoverTestFiles, findBuildOutputTestFiles, buildTestFileArgs, MAX_TEST_FILE_ARGS_BYTES, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery, resolveRunTempDir, writePrivateFile, MutantWarnAggregator } from './utils/index.js';
+import { type DroppedBunfigKey, assertSupportedBunArgs, splitBunConfigArg, stripRandomizeArgs, checkBunVersion, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, mutantRunBunfigPath, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, TEST_FILE_SUFFIX_RE, discoverTestFiles, findBuildOutputTestFiles, buildTestFileArgs, MAX_TEST_FILE_ARGS_BYTES, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery, resolveRunTempDir, writePrivateFile, MutantWarnAggregator } from './utils/index.js';
 
 /**
  * Event-driven wait for the inspector URL bun prints on startup.
@@ -224,14 +224,33 @@ function formatInspectorTimeoutMessage(
     if(child.spawnError !== undefined) {
         return formatSpawnErrorMessage(child.spawnError);
     }
-    const stderrTail = child.stderr.trim().slice(-1000);
     // A timedOut child was SIGTERMed by the runner's own run timeout (it hung without printing the URL), not killed externally.
     let ended = child.signal ? `terminated by signal ${child.signal}` : `exit code ${child.exitCode ?? 'none'}`;
     if(child.timedOut === true) {
         ended = 'killed by the runner after the run timeout (bun.timeout)';
     }
     const prefix = `Timeout waiting for inspector URL after ${inspectorTimeoutMs}ms (raise bun.inspectorTimeout if bun is slow to start)`;
-    return `${prefix}; bun test ${ended}; last stderr: ${stderrTail || '(empty)'}`;
+    return `${prefix}; bun test ${ended}; last stderr: ${formatStderrTail(child.stderr)}`;
+}
+
+/**
+ * The last 1000 characters of a child's stderr, trimmed, for a dry-run error:
+ * the tail is where a child's own reason for exiting lands, the head is usually
+ * just startup banner.
+ */
+function formatStderrTail(stderr: string): string {
+    return stderr.trim().slice(-1000) || '(empty)';
+}
+
+/**
+ * User-facing dry-run error for an inspector connection (or TestReporter.enable)
+ * that failed after bun printed its URL. The usual cause is the child itself
+ * exiting, e.g. the coverage preload giving up when its sync channel to the
+ * runner is lost, and whether the enable is refused or left unanswered is down
+ * to timing; either way the child's stderr says why, so its tail goes with it.
+ */
+function formatInspectorConnectMessage(error: string, child: { stderr: string }): string {
+    return `Failed to connect to Bun inspector: ${error}; last stderr: ${formatStderrTail(child.stderr)}`;
 }
 
 /**
@@ -1588,16 +1607,15 @@ export class BunTestRunner implements TestRunner {
         const abortController = new AbortController();
         this.currentAbortController = abortController;
 
-        // 1. Get available ports for inspector and sync server
-        const inspectPort = await getAvailablePort();
-        const syncPort = await getAvailablePort();
-        // Stryker disable next-line StringLiteral: logging message only
-        this.logger.debug('Using inspector port: %d, sync port: %d', inspectPort, syncPort);
-
-        // 2. Start sync server
-        const syncServer = new SyncServer({ port: syncPort, timeout: this.inspectorTimeout });
+        // 1-2. Start the sync server. Neither it nor bun's inspector (see inspect
+        // below) is given a port chosen in advance: each binds port 0 and reports
+        // the port the OS gave it. A port probed free and released again can be
+        // bound by another process before the server or bun gets to it.
+        const syncServer = new SyncServer();
+        let syncPort: number;
         try {
             await syncServer.start();
+            syncPort = syncServer.port;
             // Stryker disable next-line StringLiteral: logging message only
             this.logger.debug('Sync server started on port %d', syncPort);
         } catch (error) {
@@ -1659,9 +1677,10 @@ export class BunTestRunner implements TestRunner {
                 bunfigPath,
                 preloadScript:         this.preloadScriptPath,
                 coverageFile:          this.coverageFilePath,
-                inspectWaitPort:       inspectPort,
+                inspect:               true,
                 sequentialMode:        true,  // Critical for correlation
                 syncPort, // Pass sync port to preload script via env var
+                syncToken:             syncServer.token,
                 testFiles,
                 signal:                abortController.signal,
                 smol:                  this.smol,
@@ -1779,9 +1798,13 @@ export class BunTestRunner implements TestRunner {
                 // process would keep running until its own timeout fires.
                 abortController.abort();
                 await inspector.close();
+                // The child may well be the one that went away (see
+                // formatInspectorConnectMessage): wait for it, already exiting or
+                // just aborted, so its stderr can say why.
+                const child = await testProcess;
                 return {
                     status:       DryRunStatus.Error,
-                    errorMessage: `Failed to connect to Bun inspector: ${errorMsg}`,
+                    errorMessage: formatInspectorConnectMessage(errorMsg, child),
                 };
             }
 

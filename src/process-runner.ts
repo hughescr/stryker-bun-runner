@@ -4,7 +4,7 @@
  */
 
 import { type ChildProcess, type SpawnOptions, spawn } from 'node:child_process';
-import { LIFELINE_FD_ENV } from './coverage/preload-logic.js';
+import { LIFELINE_FD_ENV, SYNC_TOKEN_ENV } from './coverage/preload-logic.js';
 import { killProcessGroup } from './utils/process-group.js';
 import { getProcessRssBytes } from './utils/process-rss.js';
 import { buildTestFileArgs } from './utils/test-file-args.js';
@@ -135,13 +135,14 @@ export interface BunTestRunOptions {
     bunfigPath?: string
 
     /**
-   * Port for --inspect flag
-   * When provided, adds --inspect=127.0.0.1:<port> flag to enable debugging.
-   * The host is pinned to 127.0.0.1 (not left bare) so bun's bind address and
-   * InspectorClient's dial address are always the same literal string — see
-   * the comment at the call site in runBunTests for why this matters.
+   * Enable bun's inspector: adds --inspect=127.0.0.1:0, so bun binds a
+   * loopback port the OS picks and prints it in the URL that
+   * {@link onInspectorReady} receives. The host is pinned to 127.0.0.1 (not
+   * left bare) so bun's bind address and InspectorClient's dial address are
+   * always the same literal string — see the comment at the call site in
+   * runBunTests for why this matters.
    */
-    inspectWaitPort?: number
+    inspect?: boolean
 
     /**
    * Whether to force sequential test execution
@@ -151,7 +152,7 @@ export interface BunTestRunOptions {
 
     /**
    * Callback invoked when inspector WebSocket URL is detected in stderr
-   * Only called when inspectWaitPort is set
+   * Only called when inspect is set
    */
     onInspectorReady?: (url: string) => void
 
@@ -160,6 +161,13 @@ export interface BunTestRunOptions {
    * When provided, sets __STRYKER_SYNC_PORT__ env var for preload script
    */
     syncPort?: number
+
+    /**
+   * The sync server's token (SyncServer.token), which the preload puts in the
+   * path it dials. Sets __STRYKER_SYNC_TOKEN__ when provided; an inherited one
+   * is removed otherwise.
+   */
+    syncToken?: string
 
     /**
    * Optional AbortSignal to kill the child process early.
@@ -465,13 +473,14 @@ function buildChildEnv(options: BunTestRunOptions, spawnDepth: number): Record<s
     // mutant switches off the nested dry run's coverage collection, an inherited
     // hit limit arms it in the wrong run (and an inherited token would let it sign
     // a sentinel the outer runner accepts), and an inherited coverage file or sync
-    // port points the nested preload at the outer run's file and sync server.
+    // port and token point the nested preload at the outer run's file and sync server.
     const preloadVars: Record<string, string | undefined> = {
         __STRYKER_ACTIVE_MUTANT__:   options.activeMutant === '' ? undefined : options.activeMutant,
         __STRYKER_HIT_LIMIT__:       options.hitLimit === undefined ? undefined : String(options.hitLimit),
         __STRYKER_HIT_LIMIT_TOKEN__: options.hitLimitToken,
         __STRYKER_COVERAGE_FILE__:   options.coverageFile === '' ? undefined : options.coverageFile,
         __STRYKER_SYNC_PORT__:       options.syncPort ? String(options.syncPort) : undefined,
+        [SYNC_TOKEN_ENV]:            options.syncToken,
         [LIFELINE_FD_ENV]:           String(LIFELINE_FD),
     };
     for(const [name, value] of Object.entries(preloadVars)) {
@@ -512,9 +521,13 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
     // eliminates the mismatch. This is behavioral, not diagnostic, so unlike
     // the disables below it is intentionally left un-disabled and is covered by
     // the exact-arg assertion in process-runner.test.ts (inspector debugging).
+    // Port 0 lets bun bind whatever free port the OS hands it; the stderr handler
+    // below reads the real port from bun's banner. A port probed free in advance
+    // and then released can be bound by another process before bun gets to it,
+    // and bun then exits with EADDRINUSE.
     // Stryker disable next-line ConditionalExpression,BlockStatement: all mutations here remove required args, causing dryRun to never emit inspector URL → Timeout
-    if(options.inspectWaitPort) {
-        args.push(`--inspect=127.0.0.1:${options.inspectWaitPort}`);
+    if(options.inspect) {
+        args.push('--inspect=127.0.0.1:0');
     }
 
     // Override the project bunfig with a sanitized copy to prevent coverage
@@ -725,7 +738,7 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
                 stderrChunks.push(data);
 
                 // If inspector is enabled, parse stderr for WebSocket URL
-                if(options.inspectWaitPort && !inspectorUrlExtracted && options.onInspectorReady) {
+                if(options.inspect && !inspectorUrlExtracted && options.onInspectorReady) {
                     const text = Buffer.concat(stderrChunks).toString();
                     // Look for pattern: "Listening:\n  ws://127.0.0.1:PORT/SESSION_ID"
                     // Bun echoes back whatever host we passed to --inspect (verified: bare

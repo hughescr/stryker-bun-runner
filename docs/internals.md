@@ -26,13 +26,17 @@ Stryker starts several worker processes, and each creates one `BunTestRunner`. E
 a `bun test` child is never reused across runs. The plugin talks to the child in three ways:
 
 - **Bun's inspector protocol** (a WebSocket on `127.0.0.1`, enabled with
-  `--inspect=127.0.0.1:<port>`). Its `TestReporter` events tell the runner which tests exist,
+  `--inspect=127.0.0.1:0`: bun binds a port the OS picks and prints its URL, which the runner
+  reads from bun's stderr). Its `TestReporter` events tell the runner which tests exist,
   when each starts and ends, and how it ended. This needs Bun 1.3.7 or later, which added those
   events ([oven-sh/bun#25986](https://github.com/oven-sh/bun/pull/25986)).
 - **A coverage preload** (`--preload`), a script the runner generates. It activates the mutant
   under test, records which mutants each test executed (dry run only), arms Stryker's hit
   limit, and guards against the child outliving its parent.
-- **A sync socket** (dry run only), a WebSocket server the runner opens on `127.0.0.1`, used for
+- **A sync socket** (dry run only), a WebSocket server the runner opens on `127.0.0.1`, on a port
+  the OS picks. The child is given the port and a random token in its environment, and dials
+  `/sync/<token>`; the server refuses any other path, so a child cannot be released by another
+  run's sync server that the OS has since given the same port. It is used for
   the start and end handshakes described in [The dry run in detail](#the-dry-run-in-detail).
 
 Every child runs with `--max-concurrency=1`, and the preload replaces `describe.concurrent`,

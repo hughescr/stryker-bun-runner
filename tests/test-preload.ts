@@ -7,9 +7,7 @@
 import './real-clock-guard.js';
 import * as actualChildProcess from 'node:child_process';
 import * as actualFs from 'node:fs/promises';
-import * as actualNet from 'node:net';
 import { mock } from 'bun:test';
-import * as actualPortUtils from '../src/utils/port.js';
 import * as actualProcessGroup from '../src/utils/process-group.js';
 
 // CRITICAL: Capture functions as local variables BEFORE mock.module()
@@ -21,9 +19,7 @@ const originalRename = actualFs.rename;
 const originalMkdir = actualFs.mkdir;
 const originalUnlink = actualFs.unlink;
 const originalReaddir = actualFs.readdir;
-const originalCreateServer = actualNet.createServer;
 const originalSpawn = actualChildProcess.spawn;
-const originalGetAvailablePort = actualPortUtils.getAvailablePort;
 const originalKillProcessGroup = actualProcessGroup.killProcessGroup;
 
 // Create controllable mock functions for node:fs/promises
@@ -42,11 +38,6 @@ export const mockUnlink = mock((...args: Parameters<typeof actualFs.unlink>) =>
 export const mockReaddir = mock((...args: Parameters<typeof actualFs.readdir>) =>
     originalReaddir(...args));
 
-// Create controllable mock function for net.createServer
-// Used by getAvailablePort() to find free ports
-export const mockCreateServer = mock((...args: Parameters<typeof actualNet.createServer>) =>
-    originalCreateServer(...args));
-
 // Create controllable mock function for child_process.spawn
 // Used by process-runner to spawn bun test processes
 export const mockSpawn = mock((...args: Parameters<typeof actualChildProcess.spawn>) =>
@@ -60,11 +51,6 @@ export const mockSpawn = mock((...args: Parameters<typeof actualChildProcess.spa
  * it is not itself the mock.
  */
 export const realSpawn = originalSpawn;
-
-// Create controllable mock function for getAvailablePort
-// Used by BunTestRunner to get inspector and sync server ports
-export const mockGetAvailablePort = mock((...args: Parameters<typeof actualPortUtils.getAvailablePort>) =>
-    originalGetAvailablePort(...args));
 
 /**
  * Mock for killProcessGroup.
@@ -122,30 +108,12 @@ export function resetFsMocks(): void {
 }
 
 /**
- * Reset net mocks to their default pass-through implementations.
- */
-export function resetNetMocks(): void {
-    mockCreateServer.mockReset();
-    mockCreateServer.mockImplementation((...args: Parameters<typeof actualNet.createServer>) =>
-        originalCreateServer(...args));
-}
-
-/**
  * Reset child_process mocks to their default pass-through implementations.
  */
 export function resetChildProcessMocks(): void {
     mockSpawn.mockReset();
     mockSpawn.mockImplementation((...args: Parameters<typeof actualChildProcess.spawn>) =>
         originalSpawn(...args));
-}
-
-/**
- * Reset port utility mocks to their default pass-through implementations.
- */
-export function resetPortMocks(): void {
-    mockGetAvailablePort.mockReset();
-    mockGetAvailablePort.mockImplementation((...args: Parameters<typeof actualPortUtils.getAvailablePort>) =>
-        originalGetAvailablePort(...args));
 }
 
 /**
@@ -162,9 +130,7 @@ export function resetProcessGroupMocks(): void {
  */
 export function resetAllMocks(): void {
     resetFsMocks();
-    resetNetMocks();
     resetChildProcessMocks();
-    resetPortMocks();
     resetProcessGroupMocks();
 }
 
@@ -182,25 +148,11 @@ mock.module('node:fs/promises', () => ({
     readdir:   mockReaddir,
 }));
 
-// Mock the net module for createServer
-// eslint-disable-next-line @typescript-eslint/no-floating-promises -- Module mock setup, doesn't need await
-mock.module('net', () => ({
-    ...actualNet,
-    createServer: mockCreateServer,
-}));
-
 // Mock the child_process module for spawn
 // eslint-disable-next-line @typescript-eslint/no-floating-promises -- Module mock setup, doesn't need await
 mock.module('node:child_process', () => ({
     ...actualChildProcess,
     spawn: mockSpawn,
-}));
-
-// Mock the port utilities module for getAvailablePort
-// eslint-disable-next-line @typescript-eslint/no-floating-promises -- Module mock setup, doesn't need await
-mock.module('../src/utils/port.js', () => ({
-    ...actualPortUtils,
-    getAvailablePort: mockGetAvailablePort,
 }));
 
 // Mock the process-group module so no test can signal a real process group

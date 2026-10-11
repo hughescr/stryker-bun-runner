@@ -21,9 +21,17 @@ import { mockRename, mockWriteFile, resetFsMocks } from '../test-preload.js';
 const REPO_ROOT = path.resolve(import.meta.dir, '../..');
 const ts = createRequire(path.join(REPO_ROOT, 'package.json'))('typescript') as typeof TypeScript;
 
+/**
+ * `lib` is spelled out because the default for an ES2022 target adds the DOM
+ * and web-worker declarations, which no project here uses. Parsing and binding
+ * them is most of the work in each of the several TypeScript programs a test
+ * builds (the helper's own and the ones `compile` checks), enough that a test
+ * could outrun bun's 5 s test timeout on a busy machine.
+ */
 const COMPILER_OPTIONS = {
     strict:           true,
     target:           'ES2022',
+    lib:              ['ES2022'],
     module:           'ESNext',
     moduleResolution: 'bundler',
     types:            [],
