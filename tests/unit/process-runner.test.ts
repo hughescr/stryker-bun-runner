@@ -87,6 +87,11 @@ describe('runBunTests', () => {
         // Configure preload mock spawn to return our mock child process
         mockSpawn.mockClear();
         mockSpawn.mockImplementation(() => mockChildProcess as ChildProcess);
+        // The process-group mock is shared by every file in the run, and files that
+        // drive real runBunTests children (the 00-integration ones) record calls on
+        // it too. Several tests here assert it was never called, so start each test
+        // from an empty history rather than relying on whichever test ran before.
+        resetProcessGroupMocks();
     });
 
     afterEach(() => {
