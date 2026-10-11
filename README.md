@@ -70,6 +70,10 @@ bun add -D @hughescr/stryker-bun-runner @stryker-mutator/core
 > `bun add -D 'typescript@<7'` on its own is not enough when `typescript` is listed under
 > `peerDependencies` (as `bun init` lists it): it rewrites that entry but leaves TypeScript 7
 > installed.
+>
+> This package declares an optional peer dependency on `typescript` below 7, so `npm install` stops
+> with `ERESOLVE could not resolve` when TypeScript 7 is present (bun prints nothing for optional
+> peers).
 
 ### 2. Configure
 
@@ -193,7 +197,7 @@ export default await withTestFilesExcludedFromTypeCheck({
 | Bun | 1.3.7 or later | Tested with 1.3.7, 1.3.14 and 1.4.2. Older versions lack the inspector test events the runner needs ([oven-sh/bun#25986](https://github.com/oven-sh/bun/pull/25986)). |
 | `@stryker-mutator/core` | 9.x or 10.x | Peer dependency. Stryker's `testFiles` option needs 9.6 or later. |
 | Node.js | 20 or later with Stryker 9; 22 or later with Stryker 10 | Stryker runs on Node; only the test processes run on Bun. |
-| `typescript` | 6 or earlier, when your project has a `tsconfig.json` | Stryker reads `tsconfig.json` with it, with or without a checker, and TypeScript 7's package cannot (see [Install](#1-install)). TypeScript 7 can only be added next to it, for the [native checker](#typescript-7s-native-checker-experimental). |
+| `typescript` | 6 or earlier, when your project has a `tsconfig.json` | Optional peer dependency (`<7`), so npm refuses to install next to TypeScript 7. Stryker reads `tsconfig.json` with it, with or without a checker, and TypeScript 7's package cannot (see [Install](#1-install)). TypeScript 7 can only be added next to it, for the [native checker](#typescript-7s-native-checker-experimental). |
 | `@stryker-mutator/typescript-checker` (optional) | the same version as `@stryker-mutator/core` | |
 | Operating system | Linux, macOS | |
 
