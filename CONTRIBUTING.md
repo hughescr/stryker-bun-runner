@@ -25,13 +25,29 @@ The local config is incremental: it reuses `reports/stryker-incremental.json` an
 what changed. Use `bun run mutate --force` (or delete that file) only when the cached results look
 wrong, that is, when they do not reflect a change you made.
 
-## Tests never wait on the real clock
+## Writing reliable tests
 
-Stryker re-runs a mutant's covering tests for every mutant, so any real wait in a test is paid
-thousands of times. Use bun:test's fake timers (`jest.useFakeTimers()`, with helpers in
-`tests/helpers/fake-clock.ts`) or wait on events (exit, close, a line of output).
-`tests/real-clock-guard.ts`, loaded by `tests/test-preload.ts`, fails any test whose real timer
-with a delay above zero fires, and ESLint rejects timer imports in tests.
+Each rule below comes from a test that failed only some of the time.
+
+- **Clean up after yourself.** Undo each mock, spy, fake timer, env change and listener after the test
+  (or, for a `beforeAll` fixture, the file) that made it; never reset state before a test instead.
+  Module mocks go only in `tests/test-preload.ts`. `tests/leak-guard.ts` enforces all this.
+- **Never wait on the real clock.** Use fake timers (`jest.useFakeTimers()`, helpers in
+  `tests/helpers/fake-clock.ts`) or wait on an event. Stryker pays any real wait once per mutant.
+  `tests/real-clock-guard.ts` fails a test whose real timer fires.
+- **Assert only on what your test created.** Global totals such as `jest.getTimerCount()` include
+  work you did not start (Stryker's preload adds its own). Count your own timers with `trackTimers()`.
+- **Wait on the event that proves the state you need, not on polling or time.** Let the OS allocate
+  resources atomically: bind port 0 and read the port back, never check that a port is free and
+  then use it.
+- **Write process tests against the final state.** A process changes state in stages: a dying one
+  closes its pipes before it is reaped, and a signal sent between two steps can be lost.
+- **Keep tests fast.** A test that times out keeps running, and what it does late lands in the next
+  test. Under CI load, a slow test times out.
+- **Keep the evidence on error paths.** Carry the child's stderr (or similar) into the error, so a
+  failure can be diagnosed instead of being called flaky.
+- **Stress a new test before landing it.** Run it many times with different `--seed` values and
+  under CPU load (`yes > /dev/null` a few times over). When it breaks, keep the seed.
 
 ## Checking orphan prevention on a machine
 
