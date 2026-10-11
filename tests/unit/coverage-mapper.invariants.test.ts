@@ -38,6 +38,24 @@ describe('restoreHitTotals invariants', () => {
         expect(restoreHitTotals(raw, raw)).toEqual(raw);
     });
 
+    it('finds each mutant\'s bucket without searching every bucket per mutant (a 40,000-test suite stays well inside the test timeout)', () => {
+        // A suite's size: one bucket per test, each mutant in a different one. Searching the
+        // buckets once per mutant is quadratic: about 8 × 10⁸ lookups here, over 40 s, which
+        // added 30 s to the dry run of a real 15,000-test, 40,000-mutant project.
+        const MUTANTS = 40_000;
+        const perTest: Record<string, Record<string, number>> = {};
+        for(let i = 0; i < MUTANTS; i++) {
+            perTest[`t${i}`] = { [String(i)]: 2 };
+        }
+        const raw: MutantCoverage = { 'static': {}, perTest };
+        const mapped: MutantCoverage = { 'static': {}, perTest: { ...perTest, [`t${MUTANTS - 1}`]: { [String(MUTANTS - 1)]: 1 } } };
+
+        const result = restoreHitTotals(raw, mapped);
+
+        expect(result.perTest[`t${MUTANTS - 1}`]).toEqual({ [String(MUTANTS - 1)]: 2 });
+        expect(Object.keys(result.perTest)).toHaveLength(MUTANTS);
+    });
+
     it('throws a clear internal-invariant error when a mapped mutant has more hits than its raw total', () => {
         // A future mapping change that copies an entry would inflate the mapped total. Subtracting
         // would then give a negative "shortfall", driving counts to <= 0 or NaN, which Stryker core's
