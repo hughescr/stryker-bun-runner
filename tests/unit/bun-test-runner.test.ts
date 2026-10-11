@@ -95,6 +95,7 @@ describe('BunTestRunner', () => {
         close:           ReturnType<typeof mock>
         clientCount:     number
         port:            number
+        token:           string
     };
     let mockInspectorClient: {
         connect:                  ReturnType<typeof mock>
@@ -185,6 +186,7 @@ describe('BunTestRunner', () => {
             close:           mock(),
             clientCount:     0,
             port:            6500,
+            token:           'run-token',
         };
         // @ts-expect-error - Mocking constructor, type system doesn't understand this pattern
         syncServerSpy = spyOn(syncServerModule, 'SyncServer').mockImplementation(() => mockSyncServer);
@@ -12594,6 +12596,7 @@ describe('mutantRun testFilter integration', () => {
         close:           ReturnType<typeof mock>
         clientCount:     number
         port:            number
+        token:           string
     };
     let mockInspectorClient: {
         connect:               ReturnType<typeof mock>
@@ -12657,6 +12660,7 @@ describe('mutantRun testFilter integration', () => {
             close:           mock().mockResolvedValue(undefined),
             clientCount:     0,
             port:            7000,
+            token:           'run-token',
         };
         // @ts-expect-error - Mocking constructor
         syncServerSpy = spyOn(syncServerModule, 'SyncServer').mockImplementation(() => mockSyncServer);

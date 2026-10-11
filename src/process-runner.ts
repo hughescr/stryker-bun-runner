@@ -4,7 +4,7 @@
  */
 
 import { type ChildProcess, type SpawnOptions, spawn } from 'node:child_process';
-import { LIFELINE_FD_ENV } from './coverage/preload-logic.js';
+import { LIFELINE_FD_ENV, SYNC_TOKEN_ENV } from './coverage/preload-logic.js';
 import { killProcessGroup } from './utils/process-group.js';
 import { getProcessRssBytes } from './utils/process-rss.js';
 import { buildTestFileArgs } from './utils/test-file-args.js';
@@ -161,6 +161,13 @@ export interface BunTestRunOptions {
    * When provided, sets __STRYKER_SYNC_PORT__ env var for preload script
    */
     syncPort?: number
+
+    /**
+   * The sync server's token (SyncServer.token), which the preload puts in the
+   * path it dials. Sets __STRYKER_SYNC_TOKEN__ when provided; an inherited one
+   * is removed otherwise.
+   */
+    syncToken?: string
 
     /**
    * Optional AbortSignal to kill the child process early.
@@ -466,13 +473,14 @@ function buildChildEnv(options: BunTestRunOptions, spawnDepth: number): Record<s
     // mutant switches off the nested dry run's coverage collection, an inherited
     // hit limit arms it in the wrong run (and an inherited token would let it sign
     // a sentinel the outer runner accepts), and an inherited coverage file or sync
-    // port points the nested preload at the outer run's file and sync server.
+    // port and token point the nested preload at the outer run's file and sync server.
     const preloadVars: Record<string, string | undefined> = {
         __STRYKER_ACTIVE_MUTANT__:   options.activeMutant === '' ? undefined : options.activeMutant,
         __STRYKER_HIT_LIMIT__:       options.hitLimit === undefined ? undefined : String(options.hitLimit),
         __STRYKER_HIT_LIMIT_TOKEN__: options.hitLimitToken,
         __STRYKER_COVERAGE_FILE__:   options.coverageFile === '' ? undefined : options.coverageFile,
         __STRYKER_SYNC_PORT__:       options.syncPort ? String(options.syncPort) : undefined,
+        [SYNC_TOKEN_ENV]:            options.syncToken,
         [LIFELINE_FD_ENV]:           String(LIFELINE_FD),
     };
     for(const [name, value] of Object.entries(preloadVars)) {

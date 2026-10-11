@@ -116,6 +116,7 @@ describe('BunTestRunner cheapest-first file order and fixed test order in mutant
             close:           mock().mockResolvedValue(undefined),
             clientCount:     0,
             port:            6500,
+            token:           'run-token',
         };
         // @ts-expect-error - Mocking constructor, type system doesn't understand this pattern
         spyOn(syncServerModule, 'SyncServer').mockImplementation(() => mockSyncServer);

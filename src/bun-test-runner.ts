@@ -1680,6 +1680,7 @@ export class BunTestRunner implements TestRunner {
                 inspect:               true,
                 sequentialMode:        true,  // Critical for correlation
                 syncPort, // Pass sync port to preload script via env var
+                syncToken:             syncServer.token,
                 testFiles,
                 signal:                abortController.signal,
                 smol:                  this.smol,

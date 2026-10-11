@@ -34,7 +34,9 @@ a `bun test` child is never reused across runs. The plugin talks to the child in
   under test, records which mutants each test executed (dry run only), arms Stryker's hit
   limit, and guards against the child outliving its parent.
 - **A sync socket** (dry run only), a WebSocket server the runner opens on `127.0.0.1`, on a port
-  the OS picks that the child is given in its environment, used for
+  the OS picks. The child is given the port and a random token in its environment, and dials
+  `/sync/<token>`; the server refuses any other path, so a child cannot be released by another
+  run's sync server that the OS has since given the same port. It is used for
   the start and end handshakes described in [The dry run in detail](#the-dry-run-in-detail).
 
 Every child runs with `--max-concurrency=1`, and the preload replaces `describe.concurrent`,

@@ -161,6 +161,52 @@ describe('SyncServer', () => {
         });
     });
 
+    describe('token', () => {
+        /** Start `server` and return whether the verifyClient it hands the WebSocketServer accepts each upgrade URL. */
+        async function verifierOf(server: SyncServer): Promise<(url: string | undefined) => boolean> {
+            await server.start();
+            const [options] = mockWssClass.mock.calls[0] as [{ verifyClient: (info: { req: { url?: string } }) => boolean }];
+            return url => options.verifyClient({ req: { url } });
+        }
+
+        it('is 32 random hex characters, different for every server', () => {
+            const first = createServer().token;
+            const second = createServer().token;
+
+            expect(first).toMatch(/^[\da-f]{32}$/);
+            expect(second).toMatch(/^[\da-f]{32}$/);
+            expect(first).not.toBe(second);
+        });
+
+        it('accepts an upgrade to /sync/<its token>', async () => {
+            const server = createServer();
+            const accepts = await verifierOf(server);
+            expect(accepts(`/sync/${server.token}`)).toBe(true);
+        });
+
+        it('refuses an upgrade carrying another token of the same length, as another run\'s child would', async () => {
+            const server = createServer();
+            const accepts = await verifierOf(server);
+            const other = server.token.replace(/^./, c => (c === '0' ? '1' : '0'));
+            expect(accepts(`/sync/${other}`)).toBe(false);
+        });
+
+        it('refuses an upgrade with no token, or with anything around it', async () => {
+            const server = createServer();
+            const accepts = await verifierOf(server);
+            const token = server.token;
+            for(const url of ['/sync', '/sync/', `/sync/${token}x`, `/sync/${token}?a=1`, `/x/sync/${token}`, `/sync/${token.slice(1)}`, undefined]) {
+                expect(accepts(url)).toBe(false);
+            }
+        });
+
+        it('leaves the path to verifyClient, so ws does not accept /sync without a token', async () => {
+            await createServer().start();
+            const [options] = mockWssClass.mock.calls[0] as [{ path?: string }];
+            expect(options.path).toBeUndefined();
+        });
+    });
+
     describe('HTTP request handler', () => {
         it('returns 404 for non-/sync paths', async () => {
             const server = createServer();
@@ -234,8 +280,8 @@ describe('SyncServer', () => {
             const server = createServer();
             await server.start();
             expect(mockWssClass).toHaveBeenCalledWith({
-                server: mockHttpServer,
-                path:   '/sync',
+                server:       mockHttpServer,
+                verifyClient: expect.any(Function),
             });
         });
 
@@ -1091,13 +1137,28 @@ describe('preload sync dial address', () => {
 });
 
 describe('SyncServer on a real socket', () => {
-    it('reports the port the OS gave it, and a client dialing that port reaches it', async () => {
+    it('refuses a client dialing another token: its upgrade is answered 401 and never opens', async () => {
+        const server = new SyncServer();
+        await server.start();
+        try {
+            const client = new WebSocket(`ws://127.0.0.1:${server.port}/sync/${'0'.repeat(32)}`);
+            const [, response] = await once(client, 'unexpected-response') as [unknown, { statusCode: number }];
+
+            expect(response.statusCode).toBe(401);
+            expect(server.clientCount).toBe(0);
+            client.terminate();
+        } finally {
+            await server.close();
+        }
+    });
+
+    it('reports the port the OS gave it, and a client dialing that port with its token reaches it', async () => {
         const server = new SyncServer();
         await server.start();
         try {
             expect(server.port).toBeGreaterThan(0);
 
-            const client = new WebSocket(`ws://127.0.0.1:${server.port}/sync`);
+            const client = new WebSocket(`ws://127.0.0.1:${server.port}/sync/${server.token}`);
             const received = new Promise<string>((resolve, reject) => {
                 client.on('message', (data: Buffer) => resolve(data.toString('utf8')));
                 client.on('error', reject);

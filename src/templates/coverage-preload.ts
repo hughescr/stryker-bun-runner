@@ -12,6 +12,7 @@ import {
     setActiveMutant,
     installHitLimit,
     HIT_LIMIT_TOKEN_ENV,
+    SYNC_TOKEN_ENV,
     formatCoverageData,
     detectGapWindowBleed,
     writeCoverageToFile,
@@ -78,11 +79,15 @@ const EAGER_MODULES: string[] = __EAGER_MODULES__;
 // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
 const config = getPreloadConfig();
 // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- Config from placeholder import
-const { syncPort, coverageFile, activeMutant, hitLimit, hitLimitToken } = config;
+const { syncPort, syncToken, coverageFile, activeMutant, hitLimit, hitLimitToken } = config;
 // Hide the hit-limit token from the code under test: anything that can read it
 // could print a sentinel the runner accepts. See formatHitLimitSentinel.
 // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- HIT_LIMIT_TOKEN_ENV from placeholder import
 delete process.env[HIT_LIMIT_TOKEN_ENV];
+// Likewise the sync token: only this preload dials the sync server, and a suite
+// that reads its environment (or runs this runner itself) must not see it.
+// eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- SYNC_TOKEN_ENV from placeholder import
+delete process.env[SYNC_TOKEN_ENV];
 
 // Skip coverage collection during mutant runs (only need pass/fail)
 // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
@@ -184,7 +189,8 @@ const lateHits: LateHitEntry[] = [];
 // The socket is kept open for the drain handshake only when collecting coverage.
 if(syncPort) {
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
-    ws = await awaitRunnerReady({ syncPort, keepOpen: shouldCollectCoverage });
+    // A missing token dials a path no sync server serves, so the wait fails loudly.
+    ws = await awaitRunnerReady({ syncPort, syncToken: syncToken ?? '', keepOpen: shouldCollectCoverage });
 }
 
 // ============================================================================

@@ -1229,7 +1229,7 @@ describe('runBunTests', () => {
                 activeMutant: '',
                 coverageFile: '',
                 syncPort:     0,
-                env:          { __STRYKER_ACTIVE_MUTANT__: '17', __STRYKER_COVERAGE_FILE__: '/tmp/outer-run/coverage.json', __STRYKER_SYNC_PORT__: '41234' },
+                env:          { __STRYKER_ACTIVE_MUTANT__: '17', __STRYKER_COVERAGE_FILE__: '/tmp/outer-run/coverage.json', __STRYKER_SYNC_PORT__: '41234', __STRYKER_SYNC_TOKEN__: 'outer' },
             });
 
             mockChildProcess.closeHandler?.(0);
@@ -1239,6 +1239,7 @@ describe('runBunTests', () => {
             expect(Object.hasOwn(env, '__STRYKER_ACTIVE_MUTANT__')).toBe(false);
             expect(Object.hasOwn(env, '__STRYKER_COVERAGE_FILE__')).toBe(false);
             expect(Object.hasOwn(env, '__STRYKER_SYNC_PORT__')).toBe(false);
+            expect(Object.hasOwn(env, '__STRYKER_SYNC_TOKEN__')).toBe(false);
         });
 
         it('should override inherited __STRYKER_* variables with the values this run was given', async () => {
@@ -1248,7 +1249,8 @@ describe('runBunTests', () => {
                 activeMutant: '42',
                 coverageFile: '/tmp/this-run/coverage.json',
                 syncPort:     8080,
-                env:          { __STRYKER_ACTIVE_MUTANT__: '17', __STRYKER_COVERAGE_FILE__: '/tmp/outer-run/coverage.json', __STRYKER_SYNC_PORT__: '41234' },
+                syncToken:    'inner',
+                env:          { __STRYKER_ACTIVE_MUTANT__: '17', __STRYKER_COVERAGE_FILE__: '/tmp/outer-run/coverage.json', __STRYKER_SYNC_PORT__: '41234', __STRYKER_SYNC_TOKEN__: 'outer' },
             });
 
             mockChildProcess.closeHandler?.(0);
@@ -1258,6 +1260,7 @@ describe('runBunTests', () => {
                 __STRYKER_ACTIVE_MUTANT__: '42',
                 __STRYKER_COVERAGE_FILE__: '/tmp/this-run/coverage.json',
                 __STRYKER_SYNC_PORT__:     '8080',
+                __STRYKER_SYNC_TOKEN__:    'inner',
             });
         });
     });

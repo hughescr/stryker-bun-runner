@@ -3,9 +3,22 @@
  * Used to coordinate inspector connection with test execution
  */
 
-import { createServer, type Server as HTTPServer } from 'node:http';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { createServer, type IncomingMessage, type Server as HTTPServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
+
+/**
+ * Whether an upgrade request's URL is exactly `expected` (`/sync/<token>`),
+ * compared in constant time so the comparison does not leak the token.
+ */
+function isExpectedPath(url: string | undefined, expected: Buffer): boolean {
+    if(url === undefined) {
+        return false;
+    }
+    const actual = Buffer.from(url);
+    return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
 
 /**
  * Decode a 'ws' message payload as UTF-8 text. RawData is a union of
@@ -46,6 +59,14 @@ export interface SyncServerOptions {
  * Allows preload script to wait for "ready" signal before proceeding with tests
  */
 export class SyncServer {
+    /**
+   * This server's random token. A client must dial `/sync/<token>`; any other
+   * path is refused at the upgrade (401). The runner hands it to its child in
+   * `__STRYKER_SYNC_TOKEN__`. Without it, a child whose own server has already
+   * closed could reach a sync server of another run that the OS has since
+   * given the same port, and be released by that run's 'ready'.
+   */
+    readonly token = randomBytes(16).toString('hex');
     private httpServer:                    HTTPServer | null = null;
     private wss:                           WebSocketServer | null = null;
     private clients = new Set<WebSocket>();
@@ -120,10 +141,12 @@ export class SyncServer {
                     }
                 });
 
-                // Create WebSocket server attached to HTTP server
+                // Create WebSocket server attached to HTTP server. No `path` option:
+                // verifyClient alone decides, accepting only /sync/<token>.
+                const expectedPath = Buffer.from(`/sync/${this.token}`);
                 this.wss = new this.WebSocketServerClass({
-                    server: this.httpServer,
-                    path:   '/sync',
+                    server:       this.httpServer,
+                    verifyClient: ({ req }: { req: IncomingMessage }) => isExpectedPath(req.url, expectedPath),
                 });
 
                 // Track client connections

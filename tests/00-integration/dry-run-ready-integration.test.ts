@@ -114,7 +114,8 @@ describe('dry-run ready handshake (real bun children)', () => {
         await fsPromises.writeFile(firstFile, [
             "import { test } from 'bun:test';",
             "import { cover } from './cover.js';",
-            "test('one', () => { cover('1'); });",
+            // The preload hides the sync token from the suite once it has dialled with it.
+            "test('one', () => { if(process.env.__STRYKER_SYNC_TOKEN__ !== undefined) { throw new Error('the sync token is visible to tests'); } cover('1'); });",
             "test('two', () => { cover('2'); });",
             "test('three', () => { cover('3'); });",
         ].join('\n'));

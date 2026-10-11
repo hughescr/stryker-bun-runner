@@ -69,6 +69,7 @@ describe('BunTestRunner mutation kill tests (first half of the runner)', () => {
         close:           ReturnType<typeof mock>
         clientCount:     number
         port:            number
+        token:           string
     };
     let mockInspectorClient: {
         connect:                  ReturnType<typeof mock>
@@ -159,6 +160,7 @@ describe('BunTestRunner mutation kill tests (first half of the runner)', () => {
             close:           mock(),
             clientCount:     0,
             port:            6500,
+            token:           'run-token',
         };
         // @ts-expect-error - Mocking constructor, type system doesn't understand this pattern
         syncServerSpy = spyOn(syncServerModule, 'SyncServer').mockImplementation(() => mockSyncServer);
@@ -520,7 +522,7 @@ describe('BunTestRunner mutation kill tests (first half of the runner)', () => {
     // ---------------------------------------------------------------------
 
     describe('dryRun start-up', () => {
-        it('hands the child the port the sync server bound, and lets bun pick its own inspector port', async () => {
+        it('hands the child the port the sync server bound and its token, and lets bun pick its own inspector port', async () => {
             // Neither port is chosen in advance: a port probed free and released can be
             // bound by another process before the server or bun gets to it.
             mockChild();
@@ -529,7 +531,7 @@ describe('BunTestRunner mutation kill tests (first half of the runner)', () => {
             await dryRunOnce();
 
             expect(mockRunBunTests).toHaveBeenCalledTimes(1);
-            expect(mockRunBunTests.mock.calls[0][0]).toMatchObject({ inspect: true, syncPort: 6500 });
+            expect(mockRunBunTests.mock.calls[0][0]).toMatchObject({ inspect: true, syncPort: 6500, syncToken: 'run-token' });
             expect(mockLogger.debug).toHaveBeenCalledWith('Sync server started on port %d', 6500);
         });
 

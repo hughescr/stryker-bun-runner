@@ -27,6 +27,7 @@ import {
     waitForSyncReady,
     formatSyncNotReadyMessage,
     awaitRunnerReady,
+    SYNC_TOKEN_ENV,
     type SyncReadySocket,
     type PreloadConfig,
     type StrykerNamespace
@@ -54,6 +55,14 @@ describe('preload-logic', () => {
             process.env.__STRYKER_SYNC_PORT__ = '8080';
             const config = getPreloadConfig();
             expect(config.syncPort).toBe('8080');
+        });
+
+        it('reads the sync token from __STRYKER_SYNC_TOKEN__', () => {
+            expect(SYNC_TOKEN_ENV).toBe('__STRYKER_SYNC_TOKEN__');
+            process.env.__STRYKER_SYNC_TOKEN__ = 'a1b2c3';
+            expect(getPreloadConfig().syncToken).toBe('a1b2c3');
+            delete process.env.__STRYKER_SYNC_TOKEN__;
+            expect(getPreloadConfig().syncToken).toBeUndefined();
         });
 
         it('reads __STRYKER_COVERAGE_FILE__ from env', () => {
@@ -1376,11 +1385,14 @@ describe('preload-logic', () => {
             };
         }
 
-        it('dials the sync address and returns the open socket on ready when the caller keeps it open', async () => {
+        it('dials the sync address with its run\'s token, and returns the open socket on ready when the caller keeps it open', async () => {
+            // The token is the path: a sync server of another run that happens to be
+            // listening on this port refuses it, instead of releasing this child.
             const { socket, closed } = createOpenedSocket();
             const urls: string[] = [];
             const outcome = awaitRunnerReady({
                 syncPort:   '6501',
+                syncToken:  'f00d',
                 keepOpen:   true,
                 openSocket: (url) => {
                     urls.push(url);
@@ -1390,13 +1402,13 @@ describe('preload-logic', () => {
             socket.dispatchEvent(new MessageEvent('message', { data: 'ready' }));
 
             expect(await outcome).toBe(socket);
-            expect(urls).toEqual(['ws://127.0.0.1:6501/sync']);
+            expect(urls).toEqual(['ws://127.0.0.1:6501/sync/f00d']);
             expect(closed()).toBe(0);
         });
 
         it('closes the socket and returns null on ready when the caller does not keep it', async () => {
             const { socket, closed } = createOpenedSocket();
-            const outcome = awaitRunnerReady({ syncPort: '6501', keepOpen: false, openSocket: () => socket });
+            const outcome = awaitRunnerReady({ syncPort: '6501', syncToken: 'f00d', keepOpen: false, openSocket: () => socket });
             socket.dispatchEvent(new MessageEvent('message', { data: 'ready' }));
 
             expect(await outcome).toBeNull();
@@ -1406,18 +1418,22 @@ describe('preload-logic', () => {
         it('fails with the problem when the socket closes before ready', async () => {
             const { socket } = createOpenedSocket();
             const { fail, messages } = createFail();
-            const outcome = awaitRunnerReady({ syncPort: '6501', keepOpen: true, openSocket: () => socket, fail });
+            const outcome = awaitRunnerReady({ syncPort: '6501', syncToken: 'f00d', keepOpen: true, openSocket: () => socket, fail });
             socket.dispatchEvent(Object.assign(new Event('close'), { code: 1006, reason: '' }));
 
             expect(outcome).rejects.toThrow('exited');
             await outcome.catch(() => undefined);
             expect(messages).toEqual([formatSyncNotReadyMessage('6501', 'closed (code 1006)')]);
+            // The message names the server, not the run's token.
+            expect(messages[0]).toContain('(ws://127.0.0.1:6501/sync) ');
+            expect(messages[0]).not.toContain('f00d');
         });
 
         it('fails when the socket cannot even be opened', async () => {
             const { fail, messages } = createFail();
             const outcome = awaitRunnerReady({
                 syncPort:   '6501',
+                syncToken:  'f00d',
                 keepOpen:   true,
                 openSocket: () => {
                     throw new Error('bad url');
@@ -1434,6 +1450,7 @@ describe('preload-logic', () => {
             const { fail, messages } = createFail();
             const outcome = awaitRunnerReady({
                 syncPort:   '6501',
+                syncToken:  'f00d',
                 keepOpen:   true,
                 openSocket: () => {
                     throw 'refused';
@@ -1452,7 +1469,7 @@ describe('preload-logic', () => {
                 throw new Error('process.exit');
             });
             try {
-                const outcome = awaitRunnerReady({ syncPort: '6501', keepOpen: true, openSocket: () => socket });
+                const outcome = awaitRunnerReady({ syncPort: '6501', syncToken: 'f00d', keepOpen: true, openSocket: () => socket });
                 socket.dispatchEvent(new Event('error'));
                 await outcome.catch(() => undefined);
 
@@ -1471,7 +1488,7 @@ describe('preload-logic', () => {
                 throw new Error('process.exit');
             });
             try {
-                await awaitRunnerReady({ syncPort: '1', keepOpen: true }).catch(() => undefined);
+                await awaitRunnerReady({ syncPort: '1', syncToken: 'f00d', keepOpen: true }).catch(() => undefined);
 
                 expect(errorSpy.mock.calls[0]?.[0]).toStartWith('[Stryker] stryker-bun-runner: the dry run\'s sync connection to the runner (ws://127.0.0.1:1/sync) ');
                 expect(exitSpy).toHaveBeenCalledWith(1);
