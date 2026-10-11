@@ -213,9 +213,18 @@ export function restoreHitTotals(rawCoverage: MutantCoverage, mapped: MutantCove
         'static': { ...mapped.static },
         perTest:  Object.fromEntries(Object.entries(mapped.perTest).map(([testId, counts]) => [testId, { ...counts }])),
     };
-    const buckets = [result.static, ...Object.values(result.perTest)];
+    // The first bucket holding each mutant, found in one pass over all of them: searching
+    // the buckets once per mutant costs mutants × tests, which is minutes for a large suite.
+    const firstHolder = new Map<string, Record<string, number>>();
+    for(const counts of [result.static, ...Object.values(result.perTest)]) {
+        for(const mutantId of Object.keys(counts)) {
+            if(!firstHolder.has(mutantId)) {
+                firstHolder.set(mutantId, counts);
+            }
+        }
+    }
     for(const [mutantId, mappedTotal] of sumHitsByMutant(result)) {
-        const bucket = buckets.find(counts => mutantId in counts)!;
+        const bucket = firstHolder.get(mutantId)!;
         const rawTotal = rawTotals.get(mutantId);
         if(rawTotal === undefined) {
             throw new Error(`Internal invariant violated: mutant ${mutantId} has ${mappedTotal} mapped hits but no raw hits`);
