@@ -42,3 +42,6 @@ yarn-error.log*
 .claude/settings.local.json
 .eslintcache
 .claude/scheduled_tasks.lock
+
+# Benchmark harness output
+/bench/out/
