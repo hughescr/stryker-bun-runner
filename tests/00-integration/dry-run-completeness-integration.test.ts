@@ -263,6 +263,47 @@ describe('dry-run completeness gate (real bun children)', () => {
         });
     }, 60_000);
 
+    test('keeps every hit recorded while no test runs (module load, between tests, after the last test) as static, with its count', async () => {
+        // Hits outside a test go to the static bucket wherever they happen: at module load, in a
+        // describe's beforeAll between two tests (the gap window the bleed check watches), in a
+        // file's afterAll and in the next file's module code. A static mutant's hits inside tests
+        // move to static too ("static wins"), so each total is every hit the mutant had.
+        const staticA = path.join(tempDir, 'static-a.test.ts');
+        await fsPromises.writeFile(staticA, [
+            "import { describe, test, beforeAll, afterAll } from 'bun:test';",
+            "import { cover } from './cover.js';",
+            "cover('loadA'); cover('loadA');",
+            "test('first', () => { cover('loadA'); cover('ownA'); });",
+            "describe('group', () => {",
+            "    beforeAll(() => { cover('gapA'); });",
+            "    test('second', () => { cover('gapA'); cover('ownB'); cover('ownB'); });",
+            '});',
+            "afterAll(() => { cover('tailA'); });",
+        ].join('\n'));
+        const staticB = path.join(tempDir, 'static-b.test.ts');
+        await fsPromises.writeFile(staticB, [
+            "import { test } from 'bun:test';",
+            "import { cover } from './cover.js';",
+            "cover('loadB');",
+            "test('third', () => { cover('loadB'); cover('ownC'); });",
+        ].join('\n'));
+
+        const result = await dryRun([staticA, staticB]);
+
+        expect(result.status).toBe(DryRunStatus.Complete);
+        if(result.status !== DryRunStatus.Complete) {
+            return;
+        }
+        expect(result.mutantCoverage).toEqual({
+            'static': { loadA: 3, gapA: 2, tailA: 1, loadB: 2 },
+            perTest:  {
+                'static-a.test.ts > first':          { ownA: 1 },
+                'static-a.test.ts > group > second': { ownB: 2 },
+                'static-b.test.ts > third':          { ownC: 1 },
+            },
+        });
+    }, 60_000);
+
     test('fails the dry run, naming the early exit, when a test calls process.exit before bun can print its summary', async () => {
         const exitFile = path.join(tempDir, 'exit.test.ts');
         await fsPromises.writeFile(exitFile, [

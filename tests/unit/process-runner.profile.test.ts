@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { Logger } from '@stryker-mutator/api/logging';
 import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
+import { PRELOAD_TIMINGS_ENV } from '../../src/coverage/preload-logic.js';
 import { runBunTests, killAllLiveChildren, removeSignalCleanup, PROFILE_ENV, SPAWN_DEPTH_ENV } from '../../src/process-runner.js';
 import { SPAWN_MARKS, WorkerProfiler, type RunRecord } from '../../src/run-profile.js';
 import { rememberEnv } from '../helpers/env.js';
@@ -126,6 +127,29 @@ describe('process-runner run profile', () => {
         fake.emit('child', 'close', 0, null);
         await resultPromise;
         expect(spawnedEnv()).not.toHaveProperty(PROFILE_ENV);
+    });
+
+    it('asks the preload of a profiled dry run (the one with a sync port) for its timings, and no other child', async () => {
+        const profiler = new WorkerProfiler(file, {} as Logger);
+        process.env[PRELOAD_TIMINGS_ENV] = '1'; // inherited from outside: must not leak into unprofiled children
+
+        const runs: [string, Parameters<typeof runBunTests>[0]][] = [
+            ['profiled dry run', { bunPath: 'bun', timeout: 5000, syncPort: 4321, profile: profiler.startRun('dry') }],
+            ['profiled mutant run', { bunPath: 'bun', timeout: 5000, profile: profiler.startRun('mutant', '5') }],
+            ['unprofiled dry run', { bunPath: 'bun', timeout: 5000, syncPort: 4321 }],
+        ];
+        const seen: Record<string, string | undefined> = {};
+        for(const [name, options] of runs) {
+            fake = makeFakeChild();
+            const resultPromise = runBunTests(options);
+            fake.emit('child', 'close', 0, null);
+            // eslint-disable-next-line no-await-in-loop -- one fake child at a time
+            await resultPromise;
+            const call = mockSpawn.mock.calls.at(-1) as unknown as [string, string[], { env: Record<string, string | undefined> }];
+            seen[name] = call[2].env[PRELOAD_TIMINGS_ENV];
+        }
+
+        expect(seen).toEqual({ 'profiled dry run': '1', 'profiled mutant run': undefined, 'unprofiled dry run': undefined });
     });
 
     it('leaves an unprofiled spawn\'s environment alone and writes nothing', async () => {

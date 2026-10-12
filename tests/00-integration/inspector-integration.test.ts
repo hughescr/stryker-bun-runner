@@ -140,11 +140,11 @@ describe('Inspector Integration', () => {
 
         // Backlog item 2 (coverage-bleed detection): a deterministic trigger for the
         // preload's gap-window check (see emitCoverageBleedWarnings in
-        // bun-test-runner.ts and detectGapWindowBleed in preload-logic.ts).
+        // bun-test-runner.ts and StaticGapTracker in preload-logic.ts).
         //
-        // The gap window is the span between one test's afterEach (which snapshots
-        // globalThis.__stryker__.mutantCoverage.static) and the NEXT test's beforeEach
-        // (which diffs against that snapshot). A fire-and-forget setTimeout/promise
+        // The gap window is the span between one test's afterEach (which swaps an empty
+        // bucket in for globalThis.__stryker__.mutantCoverage.static) and the NEXT test's
+        // beforeEach (which puts the real one back). A fire-and-forget setTimeout/promise
         // chain is NOT a reliable way to land code there: empirically (bun 1.3.14),
         // bun's test dispatch loop chains hook/test invocations purely via microtask
         // continuations with no macrotask-phase yield in between when hooks/tests are

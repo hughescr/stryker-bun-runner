@@ -19,6 +19,7 @@ import { BunTestRunner } from '../../src/bun-test-runner.js';
 import * as coverageCollector from '../../src/coverage/collector.js';
 import * as coverageMapper from '../../src/coverage/coverage-mapper.js';
 import * as preloadGenerator from '../../src/coverage/preload-generator.js';
+import { formatPreloadTimings } from '../../src/coverage/preload-logic.js';
 import * as dryRunCompleteness from '../../src/dry-run-completeness.js';
 import * as inspectorModule from '../../src/inspector/inspector-client.js';
 import type { TestInfo } from '../../src/inspector/types.js';
@@ -207,5 +208,35 @@ describe('BunTestRunner run profile', () => {
         expect(mutant.patternBytes).toBeUndefined();
         expect(summary.runs).toBe(2);
         expect(Object.keys(summary.groups)).toEqual(['all', 'dry', 'dry/complete', 'mutant', 'mutant/*/static', 'mutant/survived', 'mutant/survived/static']);
+    });
+
+    it('adds the dry run\'s finer timings: the preload\'s, from its stderr line, and the runner\'s own steps after the child', async () => {
+        process.env[processRunner.PROFILE_ENV] = file;
+        const preloadEpoch = Date.now();
+        mockRunBunTests.mockImplementation((options: SpawnOptions) => {
+            options.profile?.beginSpawn(false, options.testFiles, options.testNamePattern);
+            options.profile?.mark('spawned');
+            options.onInspectorReady?.('ws://127.0.0.1:6499/inspector');
+            options.profile?.mark('close');
+            const timings = formatPreloadTimings({ 'at.preloadStart': preloadEpoch, 'ms.beforeEach': 1.5, tests: 1 });
+            return Promise.resolve({ exitCode: 0, stdout: '', stderr: ` 1 pass\n${timings}`, timedOut: false });
+        });
+
+        await workerLife();
+
+        const text = await fs.promises.readFile(file, 'utf8');
+        const [dry, mutant] = text.trimEnd().split('\n').map(line => JSON.parse(line) as RunRecord);
+        const detail = dry.detail ?? {};
+        // The preload's epoch time, relative to the run's start like every mark.
+        expect(detail['at.preload.preloadStart']).toBeCloseTo(preloadEpoch - dry.startEpochMs, 0);
+        expect(detail['preload.ms.beforeEach']).toBe(1.5);
+        expect(detail['preload.tests']).toBe(1);
+        const steps = ['inspectorClosed', 'outputParsed', 'coverageRead', 'coverageMapped', 'testsBuilt', 'gateChecked', 'coverageChecked', 'registryWritten'];
+        const times = steps.map(step => detail[`at.${step}`]);
+        expect(times.every(time => typeof time === 'number')).toBe(true);
+        expect(times).toEqual(times.toSorted((a, b) => a - b));
+        expect(times.at(-1)).toBeLessThanOrEqual(dry.totalMs);
+        // Mutant runs carry no detail.
+        expect(mutant.detail).toBeUndefined();
     });
 });

@@ -14,7 +14,11 @@
  *   times the peak number of workers;
  * - per group (dry run; mutant runs by status, by scope, and both), count, mean,
  *   p50, p95 and total milliseconds of every phase, the run's total, and the
- *   numbers of test files handed to bun and of file headers it printed.
+ *   numbers of test files handed to bun and of file headers it printed;
+ * - for each dry run, its finer timings step by step (see RunRecord.detail): the
+ *   coverage preload's (start, ready, eager imports, first test, its hooks' total
+ *   time, the coverage write and its size, the drain handshake) and the runner's
+ *   own steps after the child exits.
  */
 
 /* eslint-disable no-console -- a command-line script: its output is the point */
@@ -68,6 +72,34 @@ function groupTable(name: string, group: GroupStats): string {
         statsRow('file headers seen', group.fileHeaders, String)
     );
     return `${name} (${group.runs} run${group.runs === 1 ? '' : 's'})\n${table(rows)}`;
+}
+
+/**
+ * A dry run's finer timings (its `detail`): every point in time (the runner's
+ * `at.*` and the preload's `at.preload.*`) in order, with the time since the
+ * point before it, then the durations and sizes.
+ */
+function dryRunDetailTable(run: RunRecord): string {
+    const detail = run.detail ?? {};
+    const points = Object.entries(detail).filter(([name]) => name.startsWith('at.')).toSorted((a, b) => a[1] - b[1]);
+    const rows = [['point (ms after request)', 'at', 'since previous']];
+    let previous = 0;
+    for(const [name, at] of points) {
+        rows.push([name.slice(3), ms(at), ms(at - previous)]);
+        previous = at;
+    }
+    rows.push(['= returned', ms(run.totalMs), ms(run.totalMs - previous)]);
+    const values = Object.entries(detail).filter(([name]) => !name.startsWith('at.')).map(([name, value]) => `${name}=${value}`);
+    return [table(rows), ...(values.length > 0 ? [values.join('  ')] : [])].join('\n');
+}
+
+/** Print {@link dryRunDetailTable} for each dry run that has finer timings. */
+function printDryRunDetails(runs: readonly RunRecord[]): void {
+    for(const run of runs.filter(record => record.kind === 'dry' && record.detail)) {
+        console.log('');
+        console.log(`dry run of worker ${run.pid} (${run.status}), step by step`);
+        console.log(dryRunDetailTable(run));
+    }
 }
 
 function parseRuns(text: string): { runs: RunRecord[], skipped: number } {
@@ -134,6 +166,7 @@ async function main(): Promise<number> {
             console.log(groupTable(name, group));
         }
     }
+    printDryRunDetails(runs);
     return 0;
 }
 

@@ -1,7 +1,7 @@
 /**
  * Shared duplicate-name ' [N]' suffix tie-break, used identically by
  * bun-test-runner.ts's v2 registry dedup (buildTestsFromInspector) and
- * coverage-mapper.ts's resolveEachTestName/buildRemappedPerTest, so that a
+ * coverage-mapper.ts's resolveEachTestName/buildMappedCoverage, so that a
  * physical test with a duplicate title gets the SAME suffix in both the
  * registry (test.id) and the mutant coverage perTest key.
  *

@@ -125,6 +125,13 @@ export interface RunRecord {
     fileHeaders?:  number
     startEpochMs:  number
     totalMs:       number
+    /**
+     * Finer timings inside the phases, dry run only: points in time (`at.*`, ms
+     * after `requested`, from the runner and, converted from epoch, from the
+     * coverage preload in the child), durations (`ms.*`) and sizes (`bytes.*`).
+     * Absent when none were recorded.
+     */
+    detail?:       Record<string, number>
     /** Each child's marks, relative to `requested`. */
     marks:         Partial<Record<SpawnMark, number>>[]
     phases:        Partial<Record<Phase, number>>
@@ -319,6 +326,7 @@ interface SpawnState {
 export class RunProfile {
     private readonly requestedAt: number;
     private readonly spawnStates: SpawnState[] = [];
+    private readonly details:     Record<string, number> = {};
 
     private scope?:        RunScope;
     private files?:        number;
@@ -411,6 +419,32 @@ export class RunProfile {
         return state.scanning;
     }
 
+    /** Record the point in time `at.<name>` (now, ms after `requested`) in the run's detail; the first call for a name counts. */
+    public at(name: string): void {
+        this.details[`at.${name}`] ??= round3(this.clock.now() - this.requestedAt);
+    }
+
+    /** Record the epoch time `epochMs` (from another process, say) as the point `at.<name>` of the run's detail. */
+    public atEpoch(name: string, epochMs: number): void {
+        this.details[`at.${name}`] ??= round3(epochMs - (this.clock.origin + this.requestedAt));
+    }
+
+    /** Take in the coverage preload's own timings (see readPreloadTimings): its `at.*` points are epoch times, the rest are kept as they are, prefixed `preload.`. */
+    public preloadTimings(timings: Readonly<Record<string, number>> | undefined): void {
+        for(const [name, value] of Object.entries(timings ?? {})) {
+            if(name.startsWith('at.')) {
+                this.atEpoch(`preload.${name.slice(3)}`, value);
+            } else {
+                this.detail(`preload.${name}`, value);
+            }
+        }
+    }
+
+    /** Record a value (a duration `ms.*` or a size `bytes.*`, say) under `name` in the run's detail. */
+    public detail(name: string, value: number): void {
+        this.details[name] = round3(value);
+    }
+
     /** The run returns `status` to Stryker now (`returned`): record it. */
     public finish(status: string): void {
         this.owner.record(this.toRecord(status, this.clock.now()));
@@ -445,6 +479,7 @@ export class RunProfile {
             fileHeaders:  last?.fileHeaders,
             startEpochMs: round3(this.clock.origin + this.requestedAt),
             totalMs:      round3(returnedAt - this.requestedAt),
+            detail:       Object.keys(this.details).length > 0 ? { ...this.details } : undefined,
             marks:        this.spawnStates.map(state => Object.fromEntries(
                 SPAWN_MARKS.flatMap(mark => (state.marks[mark] === undefined ? [] : [[mark, round3(state.marks[mark] - this.requestedAt)]]))
             )),
