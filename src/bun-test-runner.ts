@@ -43,7 +43,7 @@ import type { TestInfo } from './inspector/types.js';
 import type { StrykerBunOptions } from './options.js';
 import { parseBunTestOutput, type ParsedTestResults } from './parsers/console-parser.js';
 import { runBunTests, stripAnsi, STDIO_CLOSE_GRACE_MS, type BunProcessResult } from './process-runner.js';
-import { type DroppedBunfigKey, assertSupportedBunArgs, splitBunConfigArg, stripRandomizeArgs, checkBunVersion, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, mutantRunBunfigPath, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, TEST_FILE_SUFFIX_RE, discoverTestFiles, findBuildOutputTestFiles, buildTestFileArgs, MAX_TEST_FILE_ARGS_BYTES, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery, resolveRunTempDir, writePrivateFile, MutantWarnAggregator } from './utils/index.js';
+import { type DroppedBunfigKey, assertSupportedBunArgs, splitBunConfigArg, stripRandomizeArgs, checkBunVersion, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, mutantRunBunfigPath, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, TEST_FILE_SUFFIX_RE, discoverTestFiles, findBuildOutputTestFiles, buildTestFileArgs, MAX_TEST_FILE_ARGS_BYTES, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery, resolveRunTempDir, writePrivateFile, MutantWarnAggregator, KillHistory, isNamedAfter, mutantIdsInInstrumentedSource, mutantsByTestFile, orderLikelyKillersFirst, type KillerRank } from './utils/index.js';
 
 /**
  * Event-driven wait for the inspector URL bun prints on startup.
@@ -340,6 +340,14 @@ interface RegistryFileV2 {
      * alphabetical file order.
      */
     testFileDurations?: [string, number][]
+    /**
+     * Per test file (project-relative), the ids of the mutants its tests executed in the
+     * dry run, static mutants included (see mutantsByTestFile), so every worker can rank a
+     * mutant run's files likely killers first. Optional and additive, like
+     * testFileDurations: without it (or with a malformed one) the files are ranked by kill
+     * history and name only.
+     */
+    testFileMutants?:   [string, string[]][]
 }
 
 /** Union of the per-test result shapes the runner produces for Stryker. */
@@ -444,6 +452,21 @@ function isFileDurationEntry(entry: unknown): entry is [string, number] {
  */
 function parseTestFileDurations(value: unknown): Map<string, number> | undefined {
     return Array.isArray(value) && value.every(entry => isFileDurationEntry(entry)) ? new Map(value) : undefined;
+}
+
+/** True for a `[file, mutantIds]` registry entry. */
+function isFileMutantsEntry(entry: unknown): entry is [string, string[]] {
+    return Array.isArray(entry) && entry.length === 2 && typeof entry[0] === 'string' && Array.isArray(entry[1]) && entry[1].every(id => typeof id === 'string');
+}
+
+/**
+ * The registry's testFileMutants as a map of sets, or undefined when it is absent or
+ * malformed. Advisory like testFileDurations: it orders files, it never selects them.
+ */
+function parseTestFileMutants(value: unknown): Map<string, Set<string>> | undefined {
+    return Array.isArray(value) && value.every(entry => isFileMutantsEntry(entry))
+        ? new Map(value.map(([file, ids]) => [file, new Set(ids)]))
+        : undefined;
 }
 
 /**
@@ -596,6 +619,12 @@ interface MutantRunContext {
      * --test-name-pattern. See {@link BunTestRunner.resolveTestFileFilter}.
      */
     testFileScope?:    string[]
+    /**
+     * For a run with no covering test ids (static mutant, no coverage, file-scoped), the
+     * test files whose tests executed any mutant of the mutated source file in the dry
+     * run; ranks its files likely killers first. See {@link BunTestRunner.orderForMutantRun}.
+     */
+    sourceCoverers?:   ReadonlySet<string>
 }
 
 /**
@@ -629,6 +658,20 @@ export class BunTestRunner implements TestRunner {
      * ascending order of it; undefined when neither had any, and the order is then left alone.
      */
     private testFileDurations?:           Map<string, number>;
+    /**
+     * Per test file (project-relative), the ids of the mutants its tests executed in the dry
+     * run, from this worker's dry run or the shared registry; undefined when neither had any.
+     * Ranks a mutant run's files likely killers first (see orderForMutantRun).
+     */
+    private testFileMutants?:             Map<string, Set<string>>;
+    /**
+     * Per instrumented source file (MutantRunOptions.sandboxFileName), the test files whose
+     * tests executed any of its mutants in the dry run. Derived from {@link testFileMutants}
+     * and the file's mutant switches on a full-suite run's first need; cleared when that changes.
+     */
+    private readonly sourceFileCoverers = new Map<string, Set<string>>();
+    /** Per mutated source file, the test files that killed its mutants in this worker, and whether any ended in Timeout or Error. */
+    private readonly killHistory = new KillHistory();
     /** The user's bunfig named by `--config`/`-c` in `bun.bunArgs`, as written: the source the runner sanitizes and reads `[test].root` from. */
     private readonly sourceBunfig?:       string;
     private readonly testFilesOverride?:  string[];
@@ -897,6 +940,121 @@ export class BunTestRunner implements TestRunner {
         const cost = (file: string): number => this.testFileDurations?.get(normalizeTestFilePath(file) ?? file) ?? Number.POSITIVE_INFINITY;
         // Infinity - Infinity is NaN, which a sort comparator treats as "equal".
         return files?.toSorted((a, b) => cost(a) - cost(b));
+    }
+
+    /**
+   * True when a mutant run may hand bun its files likely killers first rather than
+   * cheapest first (see orderForMutantRun): it bails, Stryker named the mutated
+   * source file, and no earlier run for that source file in this worker ended in
+   * Timeout or Error.
+   *
+   * Without bail every file runs whatever the order, so reordering saves nothing.
+   * The Timeout/Error rule is the safety rule: a reorder changes a verdict only for a
+   * mutant that fails a test in one of its files and hangs, trips the hit limit or
+   * crashes bun in another, since the first of those to run decides. A source file
+   * that has produced one such run is where that mix is likeliest, so its mutants keep
+   * the baseline order for the rest of this worker's life.
+   */
+    private mayOrderLikelyKillersFirst(options: MutantRunOptions): boolean {
+        const sourceFile = options.activeMutant.fileName as string | undefined;
+        return !options.disableBail && sourceFile !== undefined && !this.killHistory.isUnsettled(sourceFile);
+    }
+
+    /**
+   * `files` in the order a mutant run hands them to bun: cheapest first (see
+   * orderCheapestFirst), then, when {@link mayOrderLikelyKillersFirst} allows it,
+   * with the files likeliest to kill this mutant moved to the front, ranked by
+   * dry-run coverage, this worker's kills of the same source file's mutants, and
+   * a name match (see likely-killer-order.ts). Files that rank the same keep their
+   * cheapest-first order, so with no signal at all the order is cheapest first.
+   *
+   * @param sourceFileCoverers - For a full-suite run, the test files whose tests
+   *        executed any mutant of the mutated source file in the dry run
+   */
+    private orderForMutantRun(files: readonly string[] | undefined, options: MutantRunOptions, sourceFileCoverers: ReadonlySet<string> | undefined): string[] | undefined {
+        const cheapest = this.orderCheapestFirst(files);
+        if(cheapest === undefined || cheapest.length < 2 || !this.mayOrderLikelyKillersFirst(options)) {
+            return cheapest;
+        }
+        const { id: mutantId, fileName: sourceFile } = options.activeMutant;
+        const rankOf = (file: string): KillerRank => {
+            const projectFile = normalizeTestFilePath(file) ?? file;
+            let coverage: KillerRank['coverage'] = 2;
+            if(this.testFileMutants?.get(projectFile)?.has(mutantId)) {
+                coverage = 0;
+            } else if(sourceFileCoverers?.has(projectFile)) {
+                coverage = 1;
+            }
+            return { coverage, kills: this.killHistory.kills(sourceFile, projectFile), namedAfter: isNamedAfter(file, sourceFile) };
+        };
+        const ordered = orderLikelyKillersFirst(cheapest, rankOf);
+        if(ordered[0] !== cheapest[0]) {
+            // Stryker disable next-line StringLiteral: diagnostic logging message
+            this.logger.debug('Mutant %s: running %s first as its likeliest killer (cheapest first would start with %s)', mutantId, ordered[0], cheapest[0]);
+        }
+        return ordered;
+    }
+
+    /** Replace the dry-run per-file mutant coverage, and drop everything derived from the old one. */
+    private setTestFileMutants(testFileMutants: Map<string, Set<string>> | undefined): void {
+        this.testFileMutants = testFileMutants;
+        this.sourceFileCoverers.clear();
+    }
+
+    /**
+   * The test files whose tests executed any mutant of the instrumented source file
+   * `sandboxFileName` in the dry run, or undefined without dry-run coverage. The
+   * file's mutants are read from its mutant switches (see
+   * mutantIdsInInstrumentedSource) once per worker; a file that cannot be read
+   * counts as having none, which only leaves its mutants' coverage rank unused.
+   */
+    private async sourceFileCoverersFor(sandboxFileName: string): Promise<Set<string> | undefined> {
+        const fileMutants = this.testFileMutants;
+        if(fileMutants === undefined) {
+            return undefined;
+        }
+        const cached = this.sourceFileCoverers.get(sandboxFileName);
+        if(cached !== undefined) {
+            return cached;
+        }
+        let mutantIds = new Set<string>();
+        try {
+            mutantIds = mutantIdsInInstrumentedSource(await fsPromises.readFile(sandboxFileName, 'utf8'));
+        } catch (error) {
+            // Stryker disable next-line StringLiteral: diagnostic logging message
+            this.logger.debug('Could not read %s for its mutant ids (%s); its full-suite runs rank test files without same-file coverage', sandboxFileName, error instanceof Error ? error.message : String(error));
+        }
+        const coverers = new Set<string>();
+        for(const [file, mutants] of fileMutants) {
+            for(const mutantId of mutantIds) {
+                if(mutants.has(mutantId)) {
+                    coverers.add(file);
+                    break;
+                }
+            }
+        }
+        this.sourceFileCoverers.set(sandboxFileName, coverers);
+        return coverers;
+    }
+
+    /**
+   * Learn from a mutant run's verdict for the likely-killers order: a kill credits the
+   * killing tests' files (the id prefix) for the mutated source file; a Timeout or
+   * Error marks that source file unsettled (see mayOrderLikelyKillersFirst).
+   */
+    private recordVerdict(sourceFile: string | undefined, result: MutantRunResult): void {
+        if(sourceFile === undefined) {
+            return;
+        }
+        if(result.status === MutantRunStatus.Killed) {
+            const files = result.killedBy.flatMap((testId) => {
+                const sepIdx = testId.indexOf(TEST_ID_FILE_SEPARATOR);
+                return sepIdx === -1 ? [] : [testId.slice(0, sepIdx)];
+            });
+            this.killHistory.recordKill(sourceFile, files);
+        } else if(result.status === MutantRunStatus.Timeout || result.status === MutantRunStatus.Error) {
+            this.killHistory.recordUnsettled(sourceFile);
+        }
     }
 
     /**
@@ -1370,6 +1528,7 @@ export class BunTestRunner implements TestRunner {
                 this.strykerTestFiles = { cwd: process.cwd(), files: selectedFiles };
             }
             this.testFileDurations = parseTestFileDurations(parsed.testFileDurations);
+            this.setTestFileMutants(parseTestFileMutants(parsed.testFileMutants));
             // Stryker disable next-line StringLiteral: diagnostic logging message
             this.logger.debug('Loaded dryRun registry from %s (%d entries)', registryPath, this.cachedTestNames.size);
         } catch (err) {
@@ -2053,7 +2212,7 @@ export class BunTestRunner implements TestRunner {
         coverageAnalysis:       CoverageAnalysis | undefined
     ): Promise<DryRunResult> {
         // 13. Collect and remap coverage data
-        const { coverage: mutantCoverage, inspectorIdToProjectFile, coverageKeys } = await this.collectAndRemapCoverage(testHierarchy, executionOrder);
+        const { coverage: mutantCoverage, inspectorIdToProjectFile, coverageKeys, testFileMutants } = await this.collectAndRemapCoverage(testHierarchy, executionOrder);
 
         // 14. Build test results from inspector data: one result per test. A retried
         // test is started once per attempt, so its id repeats in executionOrder; its
@@ -2091,7 +2250,7 @@ export class BunTestRunner implements TestRunner {
         }
 
         // Cache test names and persist registry for killedBy resolution in mutantRun
-        await this.buildAndPersistTestRegistry(tests, testNameIndex);
+        await this.buildAndPersistTestRegistry(tests, testNameIndex, testFileMutants);
 
         this.warnOnUnidentifiedDryRunFailure(result, parsed, tests);
         this.warnOnTightDryRunTimeout(totalElapsedMs);
@@ -2205,7 +2364,8 @@ export class BunTestRunner implements TestRunner {
    */
     private async buildAndPersistTestRegistry(
         tests: RunnerTestResult[],
-        testNameIndex: Map<string, string>
+        testNameIndex: Map<string, string>,
+        testFileMutants?: Map<string, Set<string>>
     ): Promise<void> {
         this.cachedTestNames = new Set(tests.map(t => t.name));
         // Stryker disable all: defensive check — buildTestsFromInspector always deduplicates names, so tests.length === cachedTestNames.size in normal operation; this entire block is unreachable defensive code
@@ -2255,6 +2415,7 @@ export class BunTestRunner implements TestRunner {
         this.testNameIndex = testNameIndex;
         this.testFileDurations = sumDurationsByFile(tests);
         this.logger.debug('Recorded dry-run durations for %d test file(s) to order mutant runs cheapest-first', this.testFileDurations.size);
+        this.setTestFileMutants(testFileMutants);
 
         try {
             // registryPath lives in the run's private temp directory, resolved (created/verified)
@@ -2272,6 +2433,8 @@ export class BunTestRunner implements TestRunner {
                 // Omitted (JSON drops undefined) when Stryker selected no files.
                 testFiles:         this.selectedTestFilesFor(process.cwd()),
                 testFileDurations: [...this.testFileDurations.entries()],
+                // Omitted when the dry run collected no per-test coverage.
+                testFileMutants:   testFileMutants && [...testFileMutants].map(([file, ids]): [string, string[]] => [file, [...ids]]),
             } satisfies RegistryFileV2);
             // The tmp file is created owner-only and exclusively, replacing anything at its path.
             await writePrivateFile(tmpPath, registryData);
@@ -2430,6 +2593,13 @@ export class BunTestRunner implements TestRunner {
         const strykerTimeoutMs = isUsableTimeout(options.timeout) ? options.timeout : undefined;
         const limitMs = strykerTimeoutMs === undefined ? this.timeout : limitFromStrykerTimeout(strykerTimeoutMs);
 
+        // A run with no covering ids runs every file (or every file Stryker selected): rank
+        // the ones that exercise the mutated source file first. A targeted run's files all
+        // cover the mutant itself, so it needs no such set.
+        const sourceFileCoverers = filterIds.length === 0 && this.mayOrderLikelyKillersFirst(options)
+            ? await this.sourceFileCoverersFor(options.sandboxFileName)
+            : undefined;
+
         const result = await this.executeMutantRun({
             options,
             bunfigPath,
@@ -2439,8 +2609,10 @@ export class BunTestRunner implements TestRunner {
             deadline:          startedAt + limitMs,
             strykerTimeoutMs,
             testFileScope,
+            sourceCoverers:    sourceFileCoverers,
         }, testNamePattern, this.resolveCoveringTestFiles(filterIds));
         this.mutantRunsByStatus[result.status]++;
+        this.recordVerdict(options.activeMutant.fileName, result);
         return result;
     }
 
@@ -2513,9 +2685,10 @@ export class BunTestRunner implements TestRunner {
         // Narrowed to the covering tests' own files when the run is targeted; the full
         // list whenever it is not, or whenever the narrowing cannot be proven safe (see
         // resolveCoveringTestFiles). A file-scoped run (Stryker's testFiles option) runs
-        // exactly its files, whatever was discovered. Either way cheapest first.
+        // exactly its files, whatever was discovered. Either way cheapest first, with the
+        // likeliest killers moved ahead when that is safe (see orderForMutantRun).
         // Then kept within the argv budget: see fitTestFiles.
-        const ordered = this.orderCheapestFirst(ctx.testFileScope ?? (testNamePattern === undefined ? this.effectiveTestFiles : (coveringTestFiles ?? this.effectiveTestFiles)));
+        const ordered = this.orderForMutantRun(ctx.testFileScope ?? (testNamePattern === undefined ? this.effectiveTestFiles : (coveringTestFiles ?? this.effectiveTestFiles)), options, ctx.sourceCoverers);
         const testFiles = this.fitTestFiles(ordered, ctx.testFileScope === undefined ? this.explicitTestFilesSource(process.cwd()) : 'Stryker\'s testFiles option');
         let result;
         try {
@@ -3117,6 +3290,8 @@ export class BunTestRunner implements TestRunner {
         coverage:                 MutantCoverage | undefined
         inspectorIdToProjectFile: Map<number, string>
         coverageKeys:             CoverageKeyCounts | undefined
+        /** Per test file, the mutants its tests executed (see mutantsByTestFile); undefined without per-test coverage. */
+        testFileMutants?:         Map<string, Set<string>>
     }> {
         const testMap = new Map(testHierarchy.map(t => [t.id, t]));
 
@@ -3139,6 +3314,10 @@ export class BunTestRunner implements TestRunner {
             return { coverage: undefined, inspectorIdToProjectFile: new Map(), coverageKeys: undefined };
         }
 
+        // From the raw keys, before mapping: they name each test's file, and still hold the
+        // per-test hits of static mutants that the mapped coverage strips.
+        const testFileMutants = mutantsByTestFile(rawCoverage.perTest);
+
         // Map coverage counter keys to full test names and extract the inspector-ID → project-file
         // mapping in a single pass. The new file-prefixed format ("relativeFile@@test-N") produces
         // a populated inspectorIdToProjectFile; legacy keys ("test-N") and unknown formats return
@@ -3148,7 +3327,12 @@ export class BunTestRunner implements TestRunner {
         // No length guard: with no lateHits, emitCoverageBleedWarnings logs nothing.
         this.emitCoverageBleedWarnings(lateHits, counterKeyToTestName);
 
-        return { coverage, inspectorIdToProjectFile, coverageKeys: { keyCount: rawKeyCount, unmatchedKeyCount: orphanedKeyCount } };
+        return {
+            coverage,
+            inspectorIdToProjectFile,
+            coverageKeys:    { keyCount: rawKeyCount, unmatchedKeyCount: orphanedKeyCount },
+            testFileMutants: testFileMutants.size > 0 ? testFileMutants : undefined,
+        };
     }
 
     /**
