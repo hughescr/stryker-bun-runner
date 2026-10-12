@@ -6,8 +6,7 @@
  * uses these functions.
  */
 
-import { appendFileSync, closeSync, constants, createReadStream, openSync, writeSync } from 'node:fs';
-import type { Readable } from 'node:stream';
+import { appendFileSync, closeSync, constants, openSync, writeSync } from 'node:fs';
 import type { MutantCoverage } from '@stryker-mutator/api/core';
 import type { CoverageFileData, LateHitEntry } from './types.js';
 
@@ -27,6 +26,12 @@ export type { LateHitEntry } from './types.js';
  * the preload's final afterAll, with no error — the dry run would then find no
  * coverage file. Calls go through this object instead; this module's own
  * tests spy on it, not on node:fs.
+ *
+ * They are captured here even though a mutant run rarely writes: loading
+ * node:fs costs each `bun test` child about 2 ms (bun 1.4.2), but looking it up
+ * only when writing (`require`, `process.getBuiltinModule`) would return the
+ * module object a spy on node:fs's default export patches, and would lose the
+ * hit-limit sentinel to such a spy.
  */
 export const preloadFs = { appendFileSync, closeSync, openSync, writeSync };
 
@@ -512,8 +517,8 @@ export interface ParentLifelineDeps {
      * about its parent, with the reason.
      */
     onUnavailable: (reason: string) => void
-    /** Opens the descriptor for reading. Defaults to an fs read stream on it. */
-    open?:         (fd: number) => Readable
+    /** Opens the descriptor for reading. Defaults to {@link openLifelineReader}. */
+    open?:         (fd: number) => LifelineStream
 }
 
 /** An error's code when it has one (EBADF, ENOTSUP), else its message. */
@@ -536,6 +541,82 @@ function parseLifelineFd(value: string | undefined): number | undefined {
 }
 
 /**
+ * What {@link watchParentLifeline} needs from an open lifeline. A Node
+ * `Readable` fits it, and so does {@link openLifelineReader}'s reader.
+ */
+export interface LifelineStream {
+    once(event: 'end', listener: () => void): unknown
+    on(event: 'error', listener: (error: unknown) => void): unknown
+    resume(): unknown
+}
+
+/**
+ * The part of `Bun.file` that {@link openLifelineReader} uses. Declared here
+ * rather than taken from bun's types, which the declaration bundle is built
+ * without.
+ */
+export type LifelineFile = (fd: number) => { stream: () => { getReader: () => { read: () => Promise<{ done: boolean }> } } };
+
+/**
+ * Opens the lifeline descriptor for reading through bun's native file stream,
+ * `Bun.file(fd).stream()`. This is {@link watchParentLifeline}'s default.
+ *
+ * Not `fs.createReadStream`: on bun 1.4.2, a read stream on the lifeline pipe
+ * costs every `bun test` child about 18 ms of CPU before its first test. A
+ * trivial test file, spawned the way process-runner.ts spawns it, took 29.3 ms
+ * with it, 11.6 ms with this reader and 11.3 ms with no lifeline at all. That
+ * is more than the whole of a small mutant run's own work, paid on every run.
+ * This reader reports end-of-file as soon as the parent's end closes, arms no
+ * timer, and drains whatever the parent writes.
+ *
+ * The reader is created before this returns, so a descriptor bun cannot open
+ * (EBADF, EISDIR) throws here, and watchParentLifeline reports that as
+ * unavailable. A read that fails later emits 'error'.
+ *
+ * Creating the reader duplicates `fd` (close-on-exec), and the reader reads the
+ * duplicate (bun 1.4.2). Closing `fd` itself afterwards is therefore harmless,
+ * and the processes a suite spawns do not inherit the duplicate. What would
+ * break the watch is something in the process closing the duplicate's number,
+ * such as a helper that closes every descriptor from 3 up, or a double close.
+ * The pending read then hangs, so the parent goes unwatched (failing open). If
+ * the number is then reused, the reader can see another descriptor's
+ * end-of-file and exit as if orphaned, or swallow its bytes. Either needs a bug
+ * in the suite: the runner hands every child a socketpair (Node and bun hosts
+ * alike) and never touches it again.
+ *
+ * @param file - `Bun.file`; tests pass a stand-in
+ */
+export function openLifelineReader(fd: number, file?: LifelineFile): LifelineStream {
+    const openFile = file ?? ((lifelineFd: number) => (globalThis as unknown as { Bun: { file: LifelineFile } }).Bun.file(lifelineFd));
+    const reader = openFile(fd).stream().getReader();
+    let onEnd: (() => void) | undefined;
+    let onError: ((error: unknown) => void) | undefined;
+    const drain = async (): Promise<void> => {
+        for(;;) {
+            // eslint-disable-next-line no-await-in-loop -- one read at a time: each waits until the parent writes or goes away
+            const { done } = await reader.read();
+            if(done) {
+                onEnd?.();
+                return;
+            }
+        }
+    };
+    return {
+        once(_event, listener) {
+            onEnd = listener;
+        },
+        on(_event, listener) {
+            onError = listener;
+        },
+        resume() {
+            drain().catch((error: unknown) => {
+                onError?.(error);
+            });
+        },
+    };
+}
+
+/**
  * Calls `onOrphaned` when the process that spawned this one dies, so a
  * `bun test` child never outlives the Stryker worker that started it — even
  * when that worker is killed with SIGKILL, which gives it no chance to run any
@@ -549,13 +630,14 @@ function parseLifelineFd(value: string | undefined): number | undefined {
  * timers, because bun moves a real interval that ticks while fake timers are
  * installed into the fake-timer queue, where it never fires again on its own
  * (bun 1.4.2). Capturing the real timer functions does not avoid that: the
- * timer itself is moved. Reading also drains anything the parent writes.
+ * timer itself is moved. Reading also drains anything the parent writes. The
+ * default reader is {@link openLifelineReader}.
  *
- * Only end-of-file counts. A descriptor that is not open (EBADF), or one this
- * platform cannot read this way, errors and closes without one, and says
- * nothing about the parent: that, an unusable `fdValue`, or an `open` that
- * throws is reported through `onUnavailable` instead, so the caller can watch
- * the parent some other way (see {@link guardAgainstOrphaning}).
+ * Only end-of-file counts. A descriptor that cannot be opened (EBADF, EISDIR),
+ * or a read that fails before end-of-file, says nothing about the parent: that,
+ * an unusable `fdValue`, or an `open` that throws is reported through
+ * `onUnavailable` instead, so the caller can watch the parent some other way
+ * (see {@link guardAgainstOrphaning}).
  */
 export function watchParentLifeline(deps: ParentLifelineDeps): void {
     let settled = false;
@@ -570,8 +652,8 @@ export function watchParentLifeline(deps: ParentLifelineDeps): void {
         unavailable(`${LIFELINE_FD_ENV}=${deps.fdValue ?? '(unset)'} names no lifeline descriptor`);
         return;
     }
-    const open = deps.open ?? ((lifelineFd: number) => createReadStream('', { fd: lifelineFd }));
-    let lifeline: Readable;
+    const open = deps.open ?? ((lifelineFd: number) => openLifelineReader(lifelineFd));
+    let lifeline: LifelineStream;
     try {
         lifeline = open(fd);
     } catch (error) {
@@ -645,7 +727,7 @@ export interface OrphanGuardDeps {
     /** Receives the one line saying the lifeline was unavailable; see {@link orphanDebugLog}. */
     log?:        (message: string) => void
     /** Opens the lifeline descriptor; see {@link ParentLifelineDeps.open}. */
-    open?:       (fd: number) => Readable
+    open?:       (fd: number) => LifelineStream
     /** Fallback watchdog poll interval in milliseconds. @default 1000 */
     intervalMs?: number
 }
