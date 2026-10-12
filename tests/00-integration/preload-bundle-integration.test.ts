@@ -3,7 +3,7 @@
  * logic inlined, loaded by a real `bun test` child exactly as the built package would load it.
  */
 
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, test, expect, beforeAll, afterAll, afterEach } from 'bun:test';
@@ -38,7 +38,8 @@ describe('prebuilt single-file preload (real bun child)', () => {
     let bundlePath: string;
 
     beforeAll(async () => {
-        root = await mkdtemp(path.join(tmpdir(), 'stryker-preload-bundle-'));
+        // Resolved (macOS: /var -> /private/var): the private temp directory check refuses a symlinked ancestor.
+        root = await realpath(await mkdtemp(path.join(tmpdir(), 'stryker-preload-bundle-')));
         bundleDir = path.join(root, 'dist', 'templates');
         bundlePath = await buildPreloadBundle(bundleDir);
     });

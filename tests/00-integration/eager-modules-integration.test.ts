@@ -7,7 +7,7 @@
  * files.
  */
 
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
@@ -35,7 +35,8 @@ describe('eager module imports in a real bun test child', () => {
     let preloadScript: string;
 
     beforeEach(async () => {
-        fixture = await mkdtemp(path.join(tmpdir(), 'stryker-bun-eager-'));
+        // Resolved (macOS: /var -> /private/var): the private temp directory check refuses a symlinked ancestor.
+        fixture = await realpath(await mkdtemp(path.join(tmpdir(), 'stryker-bun-eager-')));
         await writeFile(path.join(fixture, 'eager.ts'), EAGER_SOURCE);
         await writeFile(path.join(fixture, 'probe.test.ts'), PROBE_SUITE);
         preloadScript = await generatePreloadScript({

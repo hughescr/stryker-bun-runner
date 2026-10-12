@@ -15,7 +15,7 @@
  * because runBunTests resolves relative files against the cwd.
  */
 
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
@@ -35,7 +35,8 @@ function fixtureFile(label: string, tests: number, failAt?: number): string {
 let fixture: string;
 
 beforeAll(async () => {
-    fixture = await mkdtemp(path.join(tmpdir(), 'stryker-bun-file-order-'));
+    // Resolved (macOS: /var -> /private/var): the sanitized bunfig goes in fixture/private, which must be private to the user with no symlinked ancestor.
+    fixture = await realpath(await mkdtemp(path.join(tmpdir(), 'stryker-bun-file-order-')));
     await mkdir(path.join(fixture, 'tests', 'unit'), { recursive: true });
     await mkdir(path.join(fixture, 'tests', '00-integration'), { recursive: true });
     await mkdir(path.join(fixture, 'dist', 'tests', 'unit'), { recursive: true });

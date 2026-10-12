@@ -18,7 +18,7 @@
  */
 
 import { once } from 'node:events';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { createServer, type AddressInfo, type Server, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -68,6 +68,27 @@ function parentScript(fixture: string, port: number): string {
     ].join('\n');
 }
 
+/** How much of the host's stderr to keep for the failure report. */
+const STDERR_TAIL_CHARS = 4000;
+
+/**
+ * Keeps the last STDERR_TAIL_CHARS characters of `stream`. `done` settles once
+ * the stream ends (the host's stderr closes when it exits, as nothing else
+ * holds it open: the runner gives its child pipes of its own).
+ */
+function captureTail(stream: AsyncIterable<Uint8Array>): { tail: () => string, done: Promise<void> } {
+    const decoder = new TextDecoder();
+    let tail = '';
+    const done = (async () => {
+        for await (const chunk of stream) {
+            tail = (tail + decoder.decode(chunk, { stream: true })).slice(-STDERR_TAIL_CHARS);
+        }
+    })().catch(() => {
+        // The stream closing abnormally just ends the capture; the tail so far stands.
+    });
+    return { tail: () => tail, done };
+}
+
 describe('orphan prevention', () => {
     let fixture: string | undefined;
     let server: Server | undefined;
@@ -92,7 +113,10 @@ describe('orphan prevention', () => {
     });
 
     it('a bun test child exits when its parent is killed while the suite has fake timers installed', async () => {
-        fixture = await mkdtemp(path.join(tmpdir(), 'stryker-bun-orphan-'));
+        // Resolved (macOS: tmpdir() is under the /var -> /private/var symlink): the host
+        // generates the preload under this directory, and the private temp directory
+        // check rejects any path with a symlinked ancestor.
+        fixture = await realpath(await mkdtemp(path.join(tmpdir(), 'stryker-bun-orphan-')));
         await writeFile(path.join(fixture, 'orphan.test.ts'), fixtureSuite());
         server = createServer();
         const reported = once(server, 'connection') as Promise<[Socket]>;
@@ -100,10 +124,28 @@ describe('orphan prevention', () => {
         await once(server, 'listening');
         const { port } = server.address() as AddressInfo;
 
-        parent = Bun.spawn([process.execPath, '--eval', parentScript(fixture, port)], { cwd: fixture, stdout: 'ignore', stderr: 'ignore' });
+        const spawned = Bun.spawn([process.execPath, '--eval', parentScript(fixture, port)], { cwd: fixture, stdout: 'ignore', stderr: 'pipe' });
+        parent = spawned;
+        const hostStderr = captureTail(spawned.stderr);
+        // Resolves (never rejects) with a description of the host's exit. It fails the
+        // test at once when the host dies before the child has reported in, instead of
+        // leaving the test to wait out its whole timeout.
+        const hostFailed = spawned.exited.then(async () => {
+            await hostStderr.done;
+            const how = spawned.signalCode === null ? `exit code ${spawned.exitCode}` : `signal ${spawned.signalCode}`;
+            const tail = hostStderr.tail().trim();
+            const stderrNote = tail === '' ? 'It wrote nothing to stderr.' : `Its stderr ended with:\n${tail}`;
+            return new Error(`the host process exited (${how}) before the child reported in. ${stderrNote}`);
+        });
+        const unlessHostExits = async <T>(promise: Promise<T>): Promise<T> => Promise.race([
+            promise,
+            hostFailed.then((error) => {
+                throw error;
+            }),
+        ]);
 
-        const [report] = await reported;
-        const [firstLine] = await once(report, 'data') as [Buffer];
+        const [report] = await unlessHostExits(reported);
+        const [firstLine] = await unlessHostExits(once(report, 'data')) as [Buffer];
         childPid = Number(firstLine.toString().trim());
         const childGone = lifelineCut(report);
         expect(isProcessRunning(childPid)).toBe(true);

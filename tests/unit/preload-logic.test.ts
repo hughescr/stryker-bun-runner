@@ -1190,7 +1190,8 @@ describe('preload-logic', () => {
          * The test holds both ends, so closing the parent's end is exactly what the
          * parent's death looks like to the child: the kernel closes every descriptor
          * of a process that dies. The runner always hands the child a socketpair (on
-         * Node and bun hosts alike); bun reads a FIFO differently, so both are covered.
+         * Node and bun hosts alike), so that is covered everywhere; a FIFO, which
+         * bun reads differently, is covered on Linux only (see the table below).
          */
         describe('default reader on real descriptors', () => {
             let dir: string;
@@ -1268,12 +1269,21 @@ describe('preload-logic', () => {
                 };
             }
 
+            // The FIFO case runs on Linux only. Observed on macOS (bun 1.4.3, darwin
+            // arm64): a Bun.file reader on an O_NONBLOCK FIFO never sees the writer's
+            // data or its close, so the drain, arms-no-timer and EOF-on-close cases all
+            // hang until their timeout; the socketpair cases pass there. Production is
+            // unaffected: the runner always gives the child a socketpair (on Node and
+            // bun hosts alike), never a FIFO, so the FIFO is only a second kind of
+            // descriptor for the reader to be exercised on.
+            //
             // Each test collects garbage just before the parent's end closes: a reader
             // whose stream or pending read the GC could reclaim would never see EOF.
-            describe.each([
-                ['FIFO', fifoLifeline],
+            const lifelineKinds: [string, () => Lifeline][] = [
+                ...(process.platform === 'linux' ? [['FIFO', fifoLifeline] as [string, () => Lifeline]] : []),
                 ['socketpair', socketpairLifeline],
-            ])('on a %s', (_kind, openLifeline) => {
+            ];
+            describe.each(lifelineKinds)('on a %s', (_kind, openLifeline) => {
                 it('reports the parent gone when, and only when, the parent end closes', async () => {
                     const { readFd, closeParentEnd } = openLifeline();
                     const { onOrphaned, orphaned } = orphanedSignal();
