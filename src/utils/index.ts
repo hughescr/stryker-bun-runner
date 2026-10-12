@@ -12,4 +12,6 @@ export type { TestFileArgs } from './test-file-args.js';
 export { getProcessRssBytes, parseVmRss, parsePsRssOutput } from './process-rss.js';
 export { buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery } from './duplicate-suffix.js';
 export { MutantWarnAggregator } from './mutant-warn-aggregator.js';
+export { TestFileCoverage, namedAfter, mutantIdsInInstrumentedSource, orderLikelyKillersFirst } from './likely-killer-order.js';
+export type { KillerRank, TestFileCoverageJson } from './likely-killer-order.js';
 export { ensurePrivateDir, resolveRunTempDir, writePrivateFile, UnsafeTempDirError } from './private-temp-dir.js';

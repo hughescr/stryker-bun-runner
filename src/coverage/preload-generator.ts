@@ -114,6 +114,45 @@ export async function resolveEagerModulesFromGlobs(
     return resolved;
 }
 
+/** Where the preload template lives and how the generated copy is named. */
+export interface PreloadTemplateLocation {
+    /** Absolute path of the template to read. */
+    templatePath:     string
+    /** Absolute path the template's `__PRELOAD_LOGIC_PATH__` import is pointed at, or undefined when the template is a bundle with the logic inlined. */
+    preloadLogicPath: string | undefined
+    /** Extension of the generated preload: `ts` for the source template, `js` for the prebuilt bundle. */
+    extension:        'ts' | 'js'
+}
+
+/**
+ * Locate the preload template for the module directory this code runs from.
+ *
+ * - Bundled (this code is in dist/): templates/coverage-preload.js, which
+ *   scripts/build-preload.ts emitted as ONE plain-JavaScript file with the logic
+ *   inlined, so a `bun test` child loads one file and transpiles nothing.
+ * - Source (this code is in src/coverage/): the TypeScript template, which imports
+ *   the TypeScript logic module by absolute path.
+ *
+ * @param moduleDir - Directory of this module (`import.meta.url`'s directory)
+ */
+export function resolvePreloadTemplate(moduleDir: string): PreloadTemplateLocation {
+    // Detect if running from bundled dist (has templates/ subdirectory) or source
+    // Stryker disable next-line ConditionalExpression,LogicalOperator,MethodExpression: a real checkout directory is never named dist, so the source branch cannot be told from a bundled one without an actual dist build; tests/unit/preload-generator.test.ts covers both outcomes through explicit directories
+    const isBundled = moduleDir.endsWith('dist') || moduleDir.includes('dist/');
+    if(isBundled) {
+        return {
+            templatePath:     path.join(moduleDir, 'templates/coverage-preload.js'),
+            preloadLogicPath: undefined,
+            extension:        'js',
+        };
+    }
+    return {
+        templatePath:     path.join(moduleDir, '../templates/coverage-preload.ts'),
+        preloadLogicPath: path.join(moduleDir, 'preload-logic.ts'),
+        extension:        'ts',
+    };
+}
+
 /**
  * Generate the coverage preload script
  *
@@ -124,64 +163,67 @@ export async function resolveEagerModulesFromGlobs(
  * directory verified private to the current user, as a fresh owner-only file
  * that replaces (never writes through) whatever was at the path.
  *
+ * @param options - See {@link PreloadOptions}
+ * @param moduleDir - Directory this module runs from; only tests pass it, to exercise the bundled layout
  * @returns Path to the generated preload script
  */
-export async function generatePreloadScript(options: PreloadOptions): Promise<string> {
-    const preloadPath = path.join(options.tempDir, `stryker-coverage-preload-${process.pid}.ts`);
-
+export async function generatePreloadScript(
+    options: PreloadOptions,
+    moduleDir: string = path.dirname(fileURLToPath(import.meta.url))
+): Promise<string> {
     await ensurePrivateDir(options.tempDir);
 
-    // Get the path to the template file
-    // Path differs between source and bundled builds:
-    // - Bundled: __dirname is dist/, templates at dist/templates/, logic at dist/coverage/preload-logic.js
-    // - Source: __dirname is src/coverage/, templates at src/templates/, logic at src/coverage/preload-logic.ts
-    const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-    // Detect if running from bundled dist (has templates/ subdirectory) or source
-    // Stryker disable next-line ConditionalExpression,LogicalOperator,MethodExpression: bundled path detection only testable with actual dist build
-    const isBundled = __dirname.endsWith('dist') || __dirname.includes('dist/');
-
-    // Stryker disable StringLiteral: bundled paths only used when running from dist/
-    const templatePath = isBundled
-        ? path.join(__dirname, 'templates/coverage-preload.ts')
-        : path.join(__dirname, '../templates/coverage-preload.ts');
-    // Stryker restore StringLiteral
+    const { templatePath, preloadLogicPath, extension } = resolvePreloadTemplate(moduleDir);
+    const preloadPath = path.join(options.tempDir, `stryker-coverage-preload-${process.pid}.${extension}`);
 
     // Read the template
     const template = await readFile(templatePath, 'utf8');
-
-    // Calculate the absolute path to preload-logic
-    // Extension differs: .js for bundled, .ts for source (Bun handles both)
-    // Stryker disable StringLiteral: bundled paths only used when running from dist/
-    const preloadLogicPath = isBundled
-        ? path.join(__dirname, 'coverage/preload-logic.js')
-        : path.join(__dirname, 'preload-logic.ts');
-    // Stryker restore StringLiteral
 
     // Use caller-provided eager module list (resolved from StrykerOptions.mutate).
     // Falls back to empty array when not provided — coverage still works, but
     // module-level mutants may record to perTest instead of static.
     const eagerModules = options.eagerModules ?? [];
+    // The list goes in a file of its own, which only the dry run reads: every
+    // `bun test` child parses the preload, and inlined as an array literal the
+    // list cost each mutant run ~1.4 µs per mutated file (bun 1.4.2; 7 ms per
+    // child at 5,000 files) for imports only the dry run makes.
+    const eagerModulesFile = eagerModules.length > 0 ? eagerModulesFileFor(preloadPath) : null;
 
     // Replace placeholders with runtime values.
-    // JSON.stringify produces a valid TS/JS array literal and handles path escaping.
-    const content = template
-        .replace('__PRELOAD_LOGIC_PATH__', preloadLogicPath)
-        .replace('__EAGER_MODULES__', JSON.stringify(eagerModules));
+    // JSON.stringify produces a valid JS string literal (or null) and handles path escaping.
+    // The prebuilt bundle has the logic inlined, so only the source template has a logic path to fill in.
+    // Replacer functions, not replacement strings: a path holding `$&`, `` $` `` or `$'` would otherwise be expanded as a pattern.
+    const withLogic = preloadLogicPath === undefined ? template : template.replace('__PRELOAD_LOGIC_PATH__', () => preloadLogicPath);
+    const content = withLogic.replace('__EAGER_MODULES_FILE__', () => JSON.stringify(eagerModulesFile));
 
     // Write the template to the temp location
     await writePrivateFile(preloadPath, content);
+    // The dry run imports every path in the list, so it is written as privately as the preload itself.
+    if(eagerModulesFile !== null) {
+        await writePrivateFile(eagerModulesFile, JSON.stringify(eagerModules));
+    }
 
     return preloadPath;
 }
 
 /**
- * Clean up generated preload script
+ * The file holding the eager module list of the preload at `preloadPath`: beside
+ * it, in the same private directory, named after it.
+ */
+export function eagerModulesFileFor(preloadPath: string): string {
+    return `${preloadPath.replace(/\.[jt]s$/, '')}.eager-modules.json`;
+}
+
+/**
+ * Clean up generated preload script, and the eager module list beside it
  */
 export async function cleanupPreloadScript(preloadPath: string): Promise<void> {
-    try {
-        await unlink(preloadPath);
-    } catch{
-    // Ignore errors - file may not exist or may have already been deleted
+    for(const file of [preloadPath, eagerModulesFileFor(preloadPath)]) {
+        try {
+            // eslint-disable-next-line no-await-in-loop -- two unlinks; order does not matter, and each failure is ignored on its own
+            await unlink(file);
+        } catch{
+            // Ignore errors - file may not exist (no list was written) or may have already been deleted
+        }
     }
 }

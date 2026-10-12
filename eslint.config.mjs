@@ -19,7 +19,13 @@ export default defineConfig([
             '*.json',
 
             // Template files use placeholder imports that are replaced at runtime
-            'src/templates/'
+            'src/templates/',
+
+            // Vendored third-party library used as the benchmark fixture (see bench/fixture/UPSTREAM.md)
+            'bench/fixture/',
+
+            // Git worktrees created by Claude Code agents (each is a full repo copy)
+            '.claude/worktrees/'
         ]
     },
     {

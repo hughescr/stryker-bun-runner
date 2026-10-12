@@ -1,0 +1,55 @@
+/* eslint-disable unicorn/consistent-boolean-name --
+ * TODO [>2] -- This rule is on-point! The function's name should communicate
+ * more clearly that it returns a boolean value.
+ */
+
+import { purry } from "./purry";
+
+/**
+ * Determines whether all predicates return true for the input data.
+ *
+ * @param data - The input data for predicates.
+ * @param fns - The list of predicates.
+ * @signature
+ *    allPass(data, fns)
+ * @example
+ *    const isDivisibleBy3 = (x: number) => x % 3 === 0
+ *    const isDivisibleBy4 = (x: number) => x % 4 === 0
+ *    const fns = [isDivisibleBy3, isDivisibleBy4]
+ *    allPass(12, fns) // => true
+ *    allPass(8, fns) // => false
+ * @dataFirst
+ * @category Array
+ */
+export function allPass<T>(
+  data: T,
+  fns: readonly ((data: T) => boolean)[],
+): boolean;
+
+/**
+ * Determines whether all predicates return true for the input data.
+ *
+ * @param fns - The list of predicates.
+ * @signature
+ *    allPass(fns)(data)
+ * @example
+ *    const isDivisibleBy3 = (x: number) => x % 3 === 0
+ *    const isDivisibleBy4 = (x: number) => x % 4 === 0
+ *    const fns = [isDivisibleBy3, isDivisibleBy4]
+ *    allPass(fns)(12) // => true
+ *    allPass(fns)(8) // => false
+ * @dataLast
+ * @category Array
+ */
+export function allPass<T>(
+  fns: readonly ((data: T) => boolean)[],
+): (data: T) => boolean;
+
+export function allPass(...args: readonly unknown[]): unknown {
+  return purry(allPassImplementation, args);
+}
+
+const allPassImplementation = <T>(
+  data: T,
+  fns: readonly ((data: T) => boolean)[],
+): boolean => fns.every((fn) => fn(data));

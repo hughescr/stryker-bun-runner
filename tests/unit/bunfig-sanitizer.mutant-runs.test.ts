@@ -1,13 +1,22 @@
 /**
  * The mutant-run copy of the sanitized bunfig.
  *
- * `[test].randomize` shuffles both the order of test files and the order of
- * tests within each file (measured on bun 1.4.2), and `[test].seed` turns it on
- * with a fixed seed. The dry run keeps the project's setting, but mutant runs
- * must run files in the runner's cheapest-first order, so the sanitizer writes a
- * second file for them with `randomize = false` and no `seed`, and reports the
- * two keys as dropped for mutant runs only. There is no bun flag that turns
- * randomize off, so a separate file is the only way.
+ * Every sanitized bunfig gets one: mutant runs use it, the dry run uses the
+ * sanitized bunfig itself. It differs only in `[test]`:
+ *
+ * - `onlyFailures = true`, so bun prints no line for a passing, skipped or pending
+ *   test (measured on bun 1.4.0 and 1.4.2: the failing tests with their file
+ *   headers, bun's summary, the bail line, the zero-match error and unhandled
+ *   errors all still print). The dry run keeps `onlyFailures = false`. A
+ *   `--only-failures` flag would not do: the sanitized bunfig's explicit
+ *   `onlyFailures = false` wins over it.
+ * - When the project randomizes: `randomize = false` and no `seed`.
+ *   `[test].randomize` shuffles both the order of test files and the order of
+ *   tests within each file (measured on bun 1.4.2), and `[test].seed` turns it
+ *   on with a fixed seed. The dry run keeps the project's setting, but mutant
+ *   runs must run files in the runner's cheapest-first order, so the two keys
+ *   are reported as dropped for mutant runs only. There is no bun flag that
+ *   turns randomize off.
  */
 
 import { lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
@@ -64,26 +73,26 @@ describe('generateSanitizedBunfig: the mutant-run copy', () => {
         return { outPath, drops: onDropped.mock.calls[0][0], writes };
     }
 
-    it('writes the copy next to the sanitized bunfig, after it, with randomize = false', async () => {
+    it('writes the copy next to the sanitized bunfig, after it, with onlyFailures = true and randomize = false', async () => {
         const { outPath, writes } = await run('[test]\nrandomize = true\ntimeout = 9\n');
 
         expect(writes.map(w => w.file)).toEqual([outPath, mutantRunBunfigPath(outPath)]);
         expect(writes[0].content.test).toEqual({ randomize: true, timeout: 9, coverage: false, onlyFailures: false });
-        expect(writes[1].content.test).toEqual({ randomize: false, timeout: 9, coverage: false, onlyFailures: false });
+        expect(writes[1].content.test).toEqual({ randomize: false, timeout: 9, coverage: false, onlyFailures: true });
     });
 
     it('drops seed from the copy and keeps it in the dry-run bunfig', async () => {
         const { writes } = await run('[test]\nrandomize = true\nseed = 5\n');
 
         expect(writes[0].content.test).toMatchObject({ randomize: true, seed: 5 });
-        expect(writes[1].content.test).toEqual({ randomize: false, coverage: false, onlyFailures: false });
+        expect(writes[1].content.test).toEqual({ randomize: false, coverage: false, onlyFailures: true });
     });
 
     it('writes the copy for a seed alone', async () => {
         const { writes } = await run('[test]\nseed = 0\n');
 
         expect(writes).toHaveLength(2);
-        expect(writes[1].content.test).toEqual({ randomize: false, coverage: false, onlyFailures: false });
+        expect(writes[1].content.test).toEqual({ randomize: false, coverage: false, onlyFailures: true });
     });
 
     it('carries every other section into the copy unchanged', async () => {
@@ -92,7 +101,7 @@ describe('generateSanitizedBunfig: the mutant-run copy', () => {
         expect(writes[1].content).toEqual({
             define: { X: '1' },
             loader: { '.txt': 'file' },
-            test:   { randomize: false, preload: path.resolve(projectCwd, './p.ts'), coverage: false, onlyFailures: false },
+            test:   { randomize: false, preload: path.resolve(projectCwd, './p.ts'), coverage: false, onlyFailures: true },
         });
     });
 
@@ -106,25 +115,47 @@ describe('generateSanitizedBunfig: the mutant-run copy', () => {
         expect(drops.find(d => d.key === 'test.retry')?.mutantRunsOnly).toBeUndefined();
     });
 
-    it('needs no copy, and reports nothing, for randomize = false', async () => {
-        const { writes, drops } = await run('[test]\nrandomize = false\n');
+    it('writes the copy, differing only in onlyFailures, and reports nothing, for randomize = false', async () => {
+        const { outPath, writes, drops } = await run('[test]\nrandomize = false\n');
 
-        expect(writes).toHaveLength(1);
+        expect(writes.map(w => w.file)).toEqual([outPath, mutantRunBunfigPath(outPath)]);
         expect(writes[0].content.test).toEqual({ randomize: false, coverage: false, onlyFailures: false });
+        expect(writes[1].content.test).toEqual({ randomize: false, coverage: false, onlyFailures: true });
         expect(drops).toEqual([]);
     });
 
-    it('needs no copy without randomize or seed', async () => {
-        const { writes, drops } = await run('[test]\ntimeout = 1\n');
+    it('writes the copy without randomize or seed, and adds neither to it', async () => {
+        const { writes, drops } = await run('[install]\nexact = true\n[test]\ntimeout = 1\n');
 
-        expect(writes).toHaveLength(1);
+        expect(writes).toHaveLength(2);
+        expect(writes[0].content).toEqual({ install: { exact: true }, test: { timeout: 1, coverage: false, onlyFailures: false } });
+        expect(writes[1].content).toEqual({ install: { exact: true }, test: { timeout: 1, coverage: false, onlyFailures: true } });
         expect(drops).toEqual([]);
     });
 
-    it('needs no copy when [test] is not a table', async () => {
+    it('writes the copy for a project with no bunfig at all', async () => {
+        mockReadFile.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+        const outPath = await generateSanitizedBunfig(projectCwd, tmpDir);
+
+        const writes = (mockWriteFile.mock.calls as unknown as [string, string][]).map(([file, content]) => ({ file, content: parse(content) }));
+        expect(writes).toEqual([
+            { file: outPath, content: { test: { coverage: false, onlyFailures: false } } },
+            { file: mutantRunBunfigPath(outPath), content: { test: { coverage: false, onlyFailures: true } } },
+        ]);
+    });
+
+    it('forces onlyFailures = true into the copy whatever the project set', async () => {
+        const { writes } = await run('[test]\nonlyFailures = false\n');
+
+        expect(writes[0].content.test).toEqual({ coverage: false, onlyFailures: false });
+        expect(writes[1].content.test).toEqual({ coverage: false, onlyFailures: true });
+    });
+
+    it('writes the copy when [test] is not a table', async () => {
         const { writes } = await run('test = 5\n');
 
-        expect(writes).toHaveLength(1);
+        expect(writes).toHaveLength(2);
+        expect(writes[1].content.test).toEqual({ coverage: false, onlyFailures: true });
     });
 });
 
@@ -141,7 +172,7 @@ describe('cleanupSanitizedBunfig and the mutant-run copy', () => {
         expect(mockUnlink.mock.calls).toEqual([['/tmp/s.toml'], ['/tmp/s.mutant-runs.toml']]);
     });
 
-    it('ignores a missing copy (there is none when the bunfig does not randomize)', async () => {
+    it('ignores a missing copy', async () => {
         mockUnlink.mockImplementation((file: unknown) => (String(file).endsWith('.mutant-runs.toml')
             ? Promise.reject(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }))
             : Promise.resolve()));
@@ -191,7 +222,7 @@ describe('the mutant-run copy on a real filesystem', () => {
 
         const { mode } = await stat(copy);
         expect(mode & 0o777).toBe(0o600); // eslint-disable-line no-bitwise -- extracting permission bits
-        expect(parse(await readFile(copy, 'utf8'))).toEqual({ test: { randomize: false, coverage: false, onlyFailures: false } });
+        expect(parse(await readFile(copy, 'utf8'))).toEqual({ test: { randomize: false, coverage: false, onlyFailures: true } });
 
         await cleanupSanitizedBunfig(outPath);
 

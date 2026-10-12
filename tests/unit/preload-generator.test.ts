@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, it, expect, beforeEach, afterEach, spyOn, type Mock } from 'bun:test';
 import * as tinyglobby from 'tinyglobby';
-import { generatePreloadScript, cleanupPreloadScript, resolveEagerModulesFromGlobs } from '../../src/coverage/preload-generator.js';
+import { generatePreloadScript, cleanupPreloadScript, eagerModulesFileFor, resolveEagerModulesFromGlobs, resolvePreloadTemplate } from '../../src/coverage/preload-generator.js';
 import { UnsafeTempDirError } from '../../src/utils/private-temp-dir.js';
 import { mockMkdir, mockReadFile, mockWriteFile, mockUnlink, resetFsMocks } from '../test-preload.js';
 
@@ -245,46 +245,122 @@ describe('generatePreloadScript', () => {
         });
     });
 
-    describe('__EAGER_MODULES__ substitution', () => {
-        it('should replace __EAGER_MODULES__ placeholder with empty array when no eagerModules provided', async () => {
-            const templateContent = 'const EAGER_MODULES = __EAGER_MODULES__;\n// rest';
+    describe('__EAGER_MODULES_FILE__ substitution', () => {
+        it('should replace __EAGER_MODULES_FILE__ with null and write no list file when no eagerModules are provided', async () => {
+            const templateContent = 'const EAGER_MODULES_FILE = __EAGER_MODULES_FILE__;\n// rest';
             mockReadFile.mockResolvedValue(templateContent);
 
             await generatePreloadScript({ tempDir, coverageFile });
 
-            expect(mockWriteFile).toHaveBeenCalled();
+            expect(mockWriteFile).toHaveBeenCalledTimes(1);
             const [, writtenContent] = mockWriteFile.mock.calls[0] as [string, string];
-            expect(writtenContent).not.toContain('__EAGER_MODULES__');
-            // Must be exactly the empty JSON array, not ['Stryker was here'] or similar
-            expect(writtenContent).toContain('= []');
+            expect(writtenContent).toBe('const EAGER_MODULES_FILE = null;\n// rest');
         });
 
-        it('should replace __EAGER_MODULES__ placeholder with JSON array of provided paths', async () => {
-            const templateContent = 'const EAGER_MODULES: string[] = __EAGER_MODULES__;';
-            mockReadFile.mockResolvedValue(templateContent);
+        it('should replace __EAGER_MODULES_FILE__ with null for an empty eagerModules list', async () => {
+            mockReadFile.mockResolvedValue('__EAGER_MODULES_FILE__');
+
+            await generatePreloadScript({ tempDir, coverageFile, eagerModules: [] });
+
+            expect(mockWriteFile).toHaveBeenCalledTimes(1);
+            expect(mockWriteFile.mock.calls[0][1]).toBe('null');
+        });
+
+        // Every bun test child parses the preload, but only the dry run imports the
+        // eager modules. Inlined, the list cost each mutant run ~1.4 µs per mutated
+        // file (bun 1.4.2: +7 ms per child at 5,000 files), so it lives in a file of
+        // its own that only the dry run reads.
+        it('should keep the eager module paths out of the preload source and name the list file instead', async () => {
+            mockReadFile.mockResolvedValue('const EAGER_MODULES_FILE: string | null = __EAGER_MODULES_FILE__;');
             const paths = ['/abs/src/a.ts', '/abs/src/b.ts'];
 
-            await generatePreloadScript({ tempDir, coverageFile, eagerModules: paths });
+            const preloadPath = await generatePreloadScript({ tempDir, coverageFile, eagerModules: paths });
 
-            expect(mockWriteFile).toHaveBeenCalled();
-            const [, writtenContent] = mockWriteFile.mock.calls[0] as [string, string];
-            expect(writtenContent).not.toContain('__EAGER_MODULES__');
-            expect(writtenContent).toContain(JSON.stringify(paths));
+            const [writtenPath, writtenContent] = mockWriteFile.mock.calls[0] as [string, string];
+            expect(writtenPath).toBe(preloadPath);
+            expect(writtenContent).not.toContain('/abs/src/a.ts');
+            expect(writtenContent).toBe(`const EAGER_MODULES_FILE: string | null = ${JSON.stringify(eagerModulesFileFor(preloadPath))};`);
         });
 
-        it('should produce valid JSON array literal for paths with backslashes', async () => {
-            const templateContent = '__EAGER_MODULES__';
-            mockReadFile.mockResolvedValue(templateContent);
-            // Windows-style paths with backslashes need JSON escaping
-            const paths = [String.raw`C:\src\foo.ts`];
+        it.each(['$&', '$`', '$\'', '$$', '$1'])('should insert a list path containing %s literally, not as a replacement pattern', async (pattern) => {
+            mockReadFile.mockResolvedValue('before __EAGER_MODULES_FILE__ after');
+            const oddTempDir = path.join(root, `we${pattern}ird`);
 
-            await generatePreloadScript({ tempDir, coverageFile, eagerModules: paths });
+            const preloadPath = await generatePreloadScript({ tempDir: oddTempDir, coverageFile, eagerModules: ['/abs/a.ts'] });
 
             const [, writtenContent] = mockWriteFile.mock.calls[0] as [string, string];
-            // JSON.stringify escapes backslashes, so the literal should be parseable
-            expect(() => JSON.parse(writtenContent)).not.toThrow();
-            expect(JSON.parse(writtenContent)).toEqual(paths);
+            expect(writtenContent).toBe(`before ${JSON.stringify(eagerModulesFileFor(preloadPath))} after`);
         });
+
+        it('should write the eager module list as a JSON array beside the preload, owner-only and exclusively created', async () => {
+            // Backslashes (Windows-style paths) must survive the JSON round trip.
+            const paths = ['/abs/src/a.ts', String.raw`C:\src\foo.ts`];
+
+            const preloadPath = await generatePreloadScript({ tempDir, coverageFile, eagerModules: paths });
+
+            expect(mockWriteFile).toHaveBeenCalledTimes(2);
+            const [listPath, listContent, options] = mockWriteFile.mock.calls[1] as [string, string, unknown];
+            expect(listPath).toBe(eagerModulesFileFor(preloadPath));
+            expect(path.dirname(listPath)).toBe(tempDir);
+            expect(JSON.parse(listContent)).toEqual(paths);
+            expect(options).toEqual({ encoding: 'utf8', flag: 'wx', mode: 0o600 });
+        });
+    });
+});
+
+describe('eagerModulesFileFor', () => {
+    it.each(['ts', 'js'])('names a JSON file beside a .%s preload, distinct from it', (extension) => {
+        const preloadPath = `/tmp/run/stryker-coverage-preload-123.${extension}`;
+        expect(eagerModulesFileFor(preloadPath)).toBe('/tmp/run/stryker-coverage-preload-123.eager-modules.json');
+    });
+});
+
+describe('resolvePreloadTemplate', () => {
+    it('points a source checkout at the TypeScript template and logic module, generating a .ts preload', () => {
+        expect(resolvePreloadTemplate('/work/repo/src/coverage')).toEqual({
+            templatePath:     '/work/repo/src/templates/coverage-preload.ts',
+            preloadLogicPath: '/work/repo/src/coverage/preload-logic.ts',
+            extension:        'ts',
+        });
+    });
+
+    it.each(['/work/repo/dist', '/usr/lib/node_modules/@hughescr/stryker-bun-runner/dist', '/work/repo/dist/coverage'])(
+        'points a built package (%s) at the prebuilt single-file JavaScript template with no separate logic module',
+        (moduleDir) => {
+            expect(resolvePreloadTemplate(moduleDir)).toEqual({
+                templatePath:     path.join(moduleDir, 'templates/coverage-preload.js'),
+                preloadLogicPath: undefined,
+                extension:        'js',
+            });
+        }
+    );
+});
+
+describe('generatePreloadScript from a built package layout', () => {
+    let root: string;
+    let tempDir: string;
+
+    beforeEach(async () => {
+        root = await realpath(await mkdtemp(path.join(tmpdir(), 'stryker-preload-dist-test-')));
+        tempDir = path.join(root, 'run');
+        mockWriteFile.mockResolvedValue(undefined);
+    });
+
+    afterEach(async () => {
+        resetFsMocks();
+        await rm(root, { recursive: true, force: true });
+    });
+
+    it('reads the prebuilt bundle, substitutes only the eager module list file, and writes a .js preload', async () => {
+        mockReadFile.mockResolvedValue('import "bun:test";\nvar EAGER_MODULES_FILE = __EAGER_MODULES_FILE__;\n// __PRELOAD_LOGIC_PATH__ stays: nothing to fill in');
+
+        const result = await generatePreloadScript({ tempDir, coverageFile: path.join(tempDir, 'c.json'), eagerModules: ['/abs/a.ts'] }, '/pkg/dist');
+
+        expect(result).toBe(path.join(tempDir, `stryker-coverage-preload-${process.pid}.js`));
+        expect(mockReadFile.mock.calls[0][0]).toBe('/pkg/dist/templates/coverage-preload.js');
+        const [target, content] = mockWriteFile.mock.calls[0] as [string, string];
+        expect(target).toBe(result);
+        expect(content).toBe(`import "bun:test";\nvar EAGER_MODULES_FILE = ${JSON.stringify(eagerModulesFileFor(result))};\n// __PRELOAD_LOGIC_PATH__ stays: nothing to fill in`);
     });
 });
 
@@ -301,6 +377,25 @@ describe('cleanupPreloadScript', () => {
         await cleanupPreloadScript(preloadPath);
 
         expect(mockUnlink).toHaveBeenCalledWith(preloadPath);
+    });
+
+    it('should delete the eager module list beside the preload too', async () => {
+        mockUnlink.mockResolvedValue(undefined);
+
+        const preloadPath = '/tmp/stryker-coverage-preload.ts';
+        await cleanupPreloadScript(preloadPath);
+
+        expect(mockUnlink).toHaveBeenCalledWith(eagerModulesFileFor(preloadPath));
+    });
+
+    it('should still delete the eager module list when the preload is already gone', async () => {
+        mockUnlink.mockRejectedValueOnce(new Error('ENOENT: no such file or directory'));
+        mockUnlink.mockResolvedValueOnce(undefined);
+
+        const preloadPath = '/tmp/stryker-coverage-preload.ts';
+        await cleanupPreloadScript(preloadPath);
+
+        expect(mockUnlink).toHaveBeenCalledWith(eagerModulesFileFor(preloadPath));
     });
 
     it('should not throw error if file does not exist', async () => {
@@ -328,7 +423,8 @@ describe('cleanupPreloadScript', () => {
         await cleanupPreloadScript(preloadPath);
         await cleanupPreloadScript(preloadPath);
 
-        expect(mockUnlink).toHaveBeenCalledTimes(2);
+        // The preload and its eager module list, each time
+        expect(mockUnlink).toHaveBeenCalledTimes(4);
     });
 
     it('should handle paths with special characters', async () => {
@@ -518,12 +614,15 @@ describe('eager-import determinism guard', () => {
     // reworking coverage-mapper.ts.
     it('template eagerly imports EAGER_MODULES during coverage collection', async () => {
         const templateSource = await Bun.file(new URL('../../src/templates/coverage-preload.ts', import.meta.url)).text();
-        expect(templateSource).toContain('const EAGER_MODULES: string[] = __EAGER_MODULES__;');
-        // Whitespace-tolerant: proves the for-loop sits inside the
-        // shouldCollectCoverage block (no closing brace may intervene) without
-        // tripping on a pure reformat of the template.
-        expect(templateSource).toMatch(/if\s*\(shouldCollectCoverage\)\s*\{[^}]*for\s*\(const modPath of EAGER_MODULES\)/);
+        expect(templateSource).toContain('const EAGER_MODULES_FILE: string | null = __EAGER_MODULES_FILE__;');
+        // Whitespace-tolerant: proves the list is read, and the for-loop runs,
+        // only inside the shouldCollectCoverage block (no closing brace may
+        // intervene), so a mutant run never reads the list, without tripping on
+        // a pure reformat of the template.
+        expect(templateSource).toMatch(/if\s*\(shouldCollectCoverage\)\s*\{[^}]*readEagerModules\(EAGER_MODULES_FILE\)[^}]*for\s*\(const modPath of EAGER_MODULES\)/);
         expect(templateSource).toContain('await import(modPath);');
+        // Declared once and read once: nothing outside that block touches the list.
+        expect(templateSource.match(/\bEAGER_MODULES_FILE\b/g)).toHaveLength(2);
     });
 });
 

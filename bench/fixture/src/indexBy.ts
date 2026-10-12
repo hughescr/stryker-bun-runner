@@ -1,0 +1,71 @@
+import type { BoundedPartial } from "./internal/types/BoundedPartial";
+import { purry } from "./purry";
+
+/**
+ * Converts a list of objects into an object indexing the objects by the given
+ * key.
+ *
+ * There are several other functions that could be used to build an object from
+ * an array:
+ * * `fromKeys` - Builds an object from an array of *keys* and a mapper for values.
+ * * `pullObject` - Builds an object from an array of items with mappers for *both* keys and values.
+ * * `fromEntries` - Builds an object from an array of key-value pairs.
+ * Refer to the docs for more details.
+ *
+ * @param data - The array.
+ * @param mapper - The indexing function.
+ * @signature
+ *    indexBy(array, fn)
+ * @example
+ *    indexBy(['one', 'two', 'three'], x => x.length) // => {3: 'two', 5: 'three'}
+ * @dataFirst
+ * @category Array
+ */
+export function indexBy<T, K extends PropertyKey>(
+  data: readonly T[],
+  mapper: (item: T, index: number, data: readonly T[]) => K,
+): BoundedPartial<Record<K, T>>;
+
+/**
+ * Converts a list of objects into an object indexing the objects by the given
+ * key.
+ *
+ * There are several other functions that could be used to build an object from
+ * an array:
+ * * `fromKeys` - Builds an object from an array of *keys* and a mapper for values.
+ * * `pullObject` - Builds an object from an array of items with mappers for *both* keys and values.
+ * * `fromEntries` - Builds an object from an array of key-value pairs.
+ * Refer to the docs for more details.
+ *
+ * @param mapper - The indexing function.
+ * @signature
+ *    indexBy(fn)(array)
+ * @example
+ *    pipe(
+ *      ['one', 'two', 'three'],
+ *      indexBy(x => x.length)
+ *    ) // => {3: 'two', 5: 'three'}
+ * @dataLast
+ * @category Array
+ */
+export function indexBy<T, K extends PropertyKey>(
+  mapper: (item: T, index: number, data: readonly T[]) => K,
+): (data: readonly T[]) => BoundedPartial<Record<K, T>>;
+
+export function indexBy(...args: readonly unknown[]): unknown {
+  return purry(indexByImplementation, args);
+}
+
+function indexByImplementation<T, K extends PropertyKey>(
+  data: readonly T[],
+  mapper: (item: T, index: number, data: readonly T[]) => K,
+): BoundedPartial<Record<K, T>> {
+  const out: Partial<Record<K, T>> = {};
+
+  for (const [index, item] of data.entries()) {
+    const key = mapper(item, index, data);
+    out[key] = item;
+  }
+
+  return out as BoundedPartial<Record<K, T>>;
+}

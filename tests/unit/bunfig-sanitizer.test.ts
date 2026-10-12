@@ -59,7 +59,8 @@ describe('generateSanitizedBunfig', () => {
         it('writes a config with only the override keys', async () => {
             await generateSanitizedBunfig(projectCwd, tmpDir);
 
-            expect(mockWriteFile).toHaveBeenCalledTimes(1);
+            // The sanitized bunfig, then its mutant-run copy (see bunfig-sanitizer.mutant-runs.test.ts).
+            expect(mockWriteFile).toHaveBeenCalledTimes(2);
             const [, written] = mockWriteFile.mock.calls[0] as [string, string, string];
             const parsed = parse(written) as Record<string, unknown>;
 

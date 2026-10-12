@@ -1,0 +1,19 @@
+import type { IsNever } from "type-fest";
+
+type DefinitelyError<T> =
+  IsNever<Extract<T, Error>> extends true ? Error : Extract<T, Error>;
+/**
+ * A function that checks if the passed parameter is an Error and narrows its type accordingly.
+ *
+ * @param data - The variable to check.
+ * @returns True if the passed input is an Error, false otherwise.
+ * @signature
+ *    isError(data)
+ * @example
+ *    isError(new Error('message')) //=> true
+ *    isError('somethingElse') //=> false
+ * @category Guard
+ */
+export function isError<T>(data: Error | T): data is DefinitelyError<T> {
+  return data instanceof Error;
+}

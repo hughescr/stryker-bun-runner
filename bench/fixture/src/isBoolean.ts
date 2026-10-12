@@ -1,0 +1,20 @@
+import type { NarrowedTo } from "./internal/types/NarrowedTo";
+
+/**
+ * A function that checks if the passed parameter is a boolean and narrows its type accordingly.
+ *
+ * @param data - The variable to check.
+ * @returns True if the passed input is a boolean, false otherwise.
+ * @signature
+ *    isBoolean(data)
+ * @example
+ *    isBoolean(true) //=> true
+ *    isBoolean(false) //=> true
+ *    isBoolean('somethingElse') //=> false
+ * @category Guard
+ */
+export function isBoolean<T>(
+  data: T | boolean,
+): data is NarrowedTo<T, boolean> {
+  return typeof data === "boolean";
+}

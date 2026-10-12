@@ -1,0 +1,64 @@
+import type { Merge } from "type-fest";
+import { purry } from "./purry";
+
+/**
+ * Merges two objects into one by combining their properties, effectively
+ * creating a new object that incorporates elements from both. The merge
+ * operation prioritizes the second object's properties, allowing them to
+ * overwrite those from the first object with the same names.
+ *
+ * Equivalent to `{ ...data, ...source }`.
+ *
+ * @param data - The destination object, serving as the basis for the merge.
+ * Properties from this object are included in the new object, but will be
+ * overwritten by properties from the source object with matching keys.
+ * @param source - The source object, whose properties will be included in the
+ * new object. If properties in this object share keys with properties in the
+ * destination object, the values from the source object will be used in the
+ * new object.
+ * @returns An object fully containing `source`, and any properties from `data`
+ * that don't share a name with any property in `source`.
+ * @signature
+ *    merge(data, source)
+ * @example
+ *    merge({ x: 1, y: 2 }, { y: 10, z: 2 }) // => { x: 1, y: 10, z: 2 }
+ * @dataFirst
+ * @category Object
+ */
+export function merge<T, Source>(data: T, source: Source): Merge<T, Source>;
+
+/**
+ * Merges two objects into one by combining their properties, effectively
+ * creating a new object that incorporates elements from both. The merge
+ * operation prioritizes the second object's properties, allowing them to
+ * overwrite those from the first object with the same names.
+ *
+ * Equivalent to `{ ...data, ...source }`.
+ *
+ * @param source - The source object, whose properties will be included in the
+ * new object. If properties in this object share keys with properties in the
+ * destination object, the values from the source object will be used in the
+ * new object.
+ * @returns An object fully containing `source`, and any properties from `data`
+ * that don't share a name with any property in `source`.
+ * @signature
+ *    merge(source)(data)
+ * @example
+ *    pipe(
+ *      { x: 1, y: 2 },
+ *      merge({ y: 10, z: 2 }),
+ *    ); // => { x: 1, y: 10, z: 2 }
+ * @dataLast
+ * @category Object
+ */
+export function merge<Source>(source: Source): <T>(data: T) => Merge<T, Source>;
+
+export function merge(...args: readonly unknown[]): unknown {
+  return purry(mergeImplementation, args);
+}
+
+const mergeImplementation = <T, Source>(
+  data: T,
+  source: Source,
+  // @ts-expect-error [ts2322] - TypeScript is failing to infer that the result of spreading the two objects satisfies the more complex Merge type.
+): Merge<T, Source> => ({ ...data, ...source });

@@ -77,7 +77,7 @@ export interface ParsedTestResults {
  * is the shared TEST_FILE_SUFFIX_PATTERN so this grammar can never drift from the
  * prefix-stripping in buildTestNamePattern.
  */
-const fileHeaderRe = new RegExp(String.raw`^(?:::group::)?([^:]+${TEST_FILE_SUFFIX_PATTERN}):$`, 'i');
+export const fileHeaderRe = new RegExp(String.raw`^(?:::group::)?([^:]+${TEST_FILE_SUFFIX_PATTERN}):$`, 'i');
 
 /**
  * GitHub Actions workflow-command lines (`::group::Section`, `::endgroup::`,
@@ -124,14 +124,19 @@ function headerFilter(lines: readonly string[], testFiles: readonly string[] | u
     if(testFiles === undefined) {
         return () => true;
     }
-    const roots = testFiles.map(file => path.resolve(file));
+    const roots = new Set(testFiles.map(file => path.resolve(file)));
+    // A header is in the run when it IS a listed entry or lies below one (a directory entry): that is, when it or one of
+    // its parent directories is in the set. A walk up its few parents replaces comparing it with every entry.
     const isRunFile = (file: string): boolean => {
-        const resolved = path.resolve(file);
-        return roots.some((root) => {
-            const relative = path.relative(root, resolved);
-            // '' is the entry itself; anything starting '..' is outside it.
-            return relative !== '..' && !relative.startsWith(`..${path.sep}`);
-        });
+        let candidate = path.resolve(file);
+        while(!roots.has(candidate)) {
+            const parent = path.dirname(candidate);
+            if(parent === candidate) {
+                return false;
+            }
+            candidate = parent;
+        }
+        return true;
     };
     const namesRunFile = lines.some((line) => {
         const file = parseFilePath(line);
@@ -293,7 +298,7 @@ interface SummaryCounts {
 }
 
 /** `Ran 4 tests across 1 file. [7.00ms]` (`Ran 1 test across…` for one): bun's last summary line. */
-const RAN_LINE = /^\s*Ran\s+(\d+)\s+tests?\b/;
+export const RAN_LINE = /^\s*Ran\s+(\d+)\s+tests?\b/;
 /** The first line of bun's summary block. It is printed on every run that reaches the summary, even with a count of 0. */
 const PASS_LINE = /^\s*\d+\s+pass\s*$/;
 /** One count line of the summary block: the pass, skip, pending-test, fail and error(s) counts, e.g. ` 2 pass` or ` 2 errors`. */

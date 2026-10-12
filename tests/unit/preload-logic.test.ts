@@ -1,19 +1,25 @@
 import { once } from 'node:events';
 import * as fs from 'node:fs';
+import fsDefault from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { PassThrough, type Readable } from 'node:stream';
 import type { MutantCoverage } from '@stryker-mutator/api/core';
+import { dlopen, FFIType, ptr } from 'bun:ffi';
 import { describe, it, expect, spyOn, beforeEach, afterEach, test, mock, jest } from 'bun:test';
 import {
     getPreloadConfig,
     shouldCollectCoverage,
     initializeStrykerNamespace,
     setActiveMutant,
-    formatCoverageData,
-    detectGapWindowBleed,
+    serializeCoverageData,
+    StaticGapTracker,
     writeCoverageToFile,
+    formatPreloadTimings,
+    readPreloadTimings,
+    PRELOAD_TIMINGS_PREFIX,
     watchParentLifeline,
+    openLifelineReader,
     startOrphanWatchdog,
     guardAgainstOrphaning,
     orphanDebugLog,
@@ -28,11 +34,13 @@ import {
     formatSyncNotReadyMessage,
     awaitRunnerReady,
     SYNC_TOKEN_ENV,
+    readEagerModules,
     type SyncReadySocket,
+    type LifelineFile,
     type PreloadConfig,
     type StrykerNamespace
 } from '../../src/coverage/preload-logic';
-import type { LateHitEntry } from '../../src/coverage/types';
+import type { CoverageFileData, LateHitEntry } from '../../src/coverage/types';
 import { rememberEnv } from '../helpers/env.js';
 import { trackTimers } from '../helpers/fake-clock.js';
 
@@ -43,6 +51,41 @@ const COVERAGE_OPEN_FLAGS = fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.c
 const COVERAGE_FILE_MODE = 0o600;
 /** The descriptor the mocked openSync hands out. */
 const FAKE_FD = 4242;
+
+/** A stand-in for Bun.file whose stream's reader answers every read with `read()`. */
+function lifelineFileReading(read: () => Promise<{ done: boolean }>): LifelineFile {
+    const reader = { read };
+    const stream = { getReader: () => reader };
+    return () => ({ stream: () => stream });
+}
+
+/**
+ * A connected AF_UNIX stream socketpair, made with socketpair(2) through bun:ffi:
+ * neither node:fs nor Bun.spawn hands the calling process both ends of one.
+ */
+function unixSocketPair(): [number, number] {
+    const libc = dlopen(process.platform === 'darwin' ? 'libc.dylib' : 'libc.so.6', {
+        socketpair: { args: [FFIType.i32, FFIType.i32, FFIType.i32, FFIType.ptr], returns: FFIType.i32 },
+    });
+    try {
+        const fds = new Int32Array(2);
+        // AF_UNIX and SOCK_STREAM are both 1 on Linux and macOS.
+        expect(libc.symbols.socketpair(1, 1, 0, ptr(fds))).toBe(0);
+        return [fds[0], fds[1]];
+    } finally {
+        libc.close();
+    }
+}
+
+/** Yields `count` macrotask turns (setImmediate: no clock wait, and real under fake timers). */
+async function macrotaskTurns(count: number): Promise<void> {
+    for(let turn = 0; turn < count; turn++) {
+        // eslint-disable-next-line no-await-in-loop -- one turn after another is the point
+        await new Promise<void>((resolve) => {
+            setImmediate(resolve);
+        });
+    }
+}
 
 describe('preload-logic', () => {
     describe('getPreloadConfig', () => {
@@ -379,62 +422,138 @@ describe('preload-logic', () => {
         });
     });
 
-    describe('detectGapWindowBleed', () => {
-        it('returns [] when the static bucket is unchanged', () => {
-            const snapshot = new Map([['1', 1], ['2', 3]]);
-            const result = detectGapWindowBleed(snapshot, { '1': 1, '2': 3 });
-            expect(result).toEqual([]);
+    describe('StaticGapTracker', () => {
+        /** A hit the way Stryker's instrumenter records one: it reads `static` afresh on every hit. */
+        function hit(coverage: { 'static': Record<string, number> }, id: string): void {
+            const bucket = coverage.static;
+            bucket[id] = (bucket[id] || 0) + 1;
+        }
+
+        it('returns [] from close() when no gap is open, and leaves the static bucket alone', () => {
+            const coverage = { 'static': { '1': 2 } };
+            const original = coverage.static;
+            const tracker = new StaticGapTracker(coverage);
+
+            expect(tracker.close()).toEqual([]);
+            expect(coverage.static).toBe(original);
+            expect(coverage.static).toEqual({ '1': 2 });
         });
 
-        it('reports a key that is newly present (not in the snapshot at all)', () => {
-            const snapshot = new Map([['1', 1]]);
-            const result = detectGapWindowBleed(snapshot, { '1': 1, '2': 1 });
-            expect(result).toEqual(['2']);
+        it('returns [] when nothing was hit during the gap, and puts the real bucket back', () => {
+            const coverage = { 'static': { '1': 2 } };
+            const original = coverage.static;
+            const tracker = new StaticGapTracker(coverage);
+
+            tracker.open();
+            expect(tracker.close()).toEqual([]);
+            expect(coverage.static).toBe(original);
+            expect(coverage.static).toEqual({ '1': 2 });
         });
 
-        it('reports a key whose count increased even though it already existed in the snapshot', () => {
-            // This is the case a key-presence check would miss: '1' was already in the
-            // snapshot (it bled once before), and it bleeds AGAIN — the count increases.
-            const snapshot = new Map([['1', 1]]);
-            const result = detectGapWindowBleed(snapshot, { '1': 2 });
-            expect(result).toEqual(['1']);
+        it('reports the mutants hit during the gap and adds every gap hit to the real bucket with its count', () => {
+            const coverage: { 'static': Record<string, number> } = { 'static': { '1': 1, '2': 1 } };
+            const original = coverage.static;
+            const tracker = new StaticGapTracker(coverage);
+
+            tracker.open();
+            hit(coverage, '1');
+            hit(coverage, '3');
+            hit(coverage, '3');
+
+            expect(tracker.close().toSorted((a, b) => a.localeCompare(b))).toEqual(['1', '3']);
+            expect(coverage.static).toBe(original);
+            expect(coverage.static).toEqual({ '1': 2, '2': 1, '3': 2 });
         });
 
-        it('does not report a key whose count decreased', () => {
-            // Not expected in practice (counts are monotonic), but the comparison must
-            // not misreport a decrease as a bleed.
-            const snapshot = new Map([['1', 5]]);
-            const result = detectGapWindowBleed(snapshot, { '1': 3 });
-            expect(result).toEqual([]);
+        it('reports a mutant again each time it is hit in a later gap (a mutant that already bled once still counts)', () => {
+            const coverage = { 'static': {} as Record<string, number> };
+            const tracker = new StaticGapTracker(coverage);
+
+            tracker.open();
+            hit(coverage, '1');
+            expect(tracker.close()).toEqual(['1']);
+
+            hit(coverage, '1'); // while a test runs the instrumenter records per test, but a static hit outside the gap is not bleed
+            tracker.open();
+            expect(tracker.close()).toEqual([]);
+
+            tracker.open();
+            hit(coverage, '1');
+            expect(tracker.close()).toEqual(['1']);
+            expect(coverage.static).toEqual({ '1': 3 });
         });
 
-        it('does not report a key whose count is unchanged', () => {
-            const snapshot = new Map([['1', 2]]);
-            const result = detectGapWindowBleed(snapshot, { '1': 2 });
-            expect(result).toEqual([]);
+        it('keeps the hits of a gap that is never closed explicitly when the next gap opens', () => {
+            const coverage = { 'static': {} as Record<string, number> };
+            const tracker = new StaticGapTracker(coverage);
+
+            tracker.open();
+            hit(coverage, '1');
+            tracker.open(); // a second afterEach with no beforeEach between them
+            hit(coverage, '2');
+
+            expect(tracker.close()).toEqual(['2']);
+            expect(coverage.static).toEqual({ '1': 1, '2': 1 });
         });
 
-        it('returns [] when staticCoverageNow is undefined', () => {
-            const snapshot = new Map([['1', 1]]);
-            const result = detectGapWindowBleed(snapshot, undefined);
-            expect(result).toEqual([]);
-        });
+        it('keeps hits recorded straight into the bucket a caller held on to before the gap opened', () => {
+            const coverage: { 'static': Record<string, number> } = { 'static': { '1': 1 } };
+            const held = coverage.static;
+            const tracker = new StaticGapTracker(coverage);
 
-        it('returns [] for an empty snapshot and empty current counts', () => {
-            const result = detectGapWindowBleed(new Map(), {});
-            expect(result).toEqual([]);
-        });
+            tracker.open();
+            held['1'] += 1;
+            hit(coverage, '2');
 
-        it('reports multiple bled keys in the same gap window', () => {
-            const snapshot = new Map([['1', 1], ['2', 1]]);
-            const result = detectGapWindowBleed(snapshot, { '1': 2, '2': 1, '3': 1 });
-            expect(result.toSorted((a, b) => a.localeCompare(b))).toEqual(['1', '3']);
+            expect(tracker.close()).toEqual(['2']);
+            expect(coverage.static).toEqual({ '1': 2, '2': 1 });
         });
     });
 
-    describe('formatCoverageData', () => {
+    describe('preload timings (STRYKER_BUN_PROFILE)', () => {
+        it('reads back the timings formatPreloadTimings wrote among other stderr output', () => {
+            const timings = { 'at.preloadStart': 1_760_000_000_123.5, 'ms.beforeEach': 12.25, tests: 3 };
+            const stderr = `bun test v1.4.2\npartial line${formatPreloadTimings(timings)} 3 pass\nRan 3 tests across 1 file.\n`;
+
+            expect(readPreloadTimings(stderr)).toEqual(timings);
+        });
+
+        it('starts the line on a line of its own', () => {
+            expect(formatPreloadTimings({ tests: 1 })).toBe(`\n${PRELOAD_TIMINGS_PREFIX}{"tests":1}\n`);
+        });
+
+        it('takes the last timings line, and keeps only numeric values', () => {
+            const stderr = `${formatPreloadTimings({ tests: 1 })}\n${PRELOAD_TIMINGS_PREFIX}{"tests":2,"name":"x"}`;
+
+            expect(readPreloadTimings(stderr)).toEqual({ tests: 2 });
+        });
+
+        it('returns undefined without a timings line, or with a malformed one', () => {
+            expect(readPreloadTimings('bun test v1.4.2\n 1 pass\n')).toBeUndefined();
+            expect(readPreloadTimings(`\n${PRELOAD_TIMINGS_PREFIX}{not json}\n`)).toBeUndefined();
+            expect(readPreloadTimings(`\n${PRELOAD_TIMINGS_PREFIX}[1,2]\n`)).toBeUndefined();
+            // Only at the start of a line: a test that prints the prefix mid-line is not read.
+            expect(readPreloadTimings(`text ${PRELOAD_TIMINGS_PREFIX}{"tests":1}\n`)).toBeUndefined();
+        });
+    });
+
+    describe('serializeCoverageData', () => {
+        /** The line serializeCoverageData returns, parsed back. */
+        function serialized(coverage: MutantCoverage | undefined, lateHits?: LateHitEntry[]): CoverageFileData {
+            return JSON.parse(serializeCoverageData(coverage, lateHits)) as CoverageFileData;
+        }
+
+        it('returns one line of JSON with perTest first, then static, then lateHits when there are any', () => {
+            const coverage: MutantCoverage = { 'static': { '2': 1 }, perTest: { 'f@@test-1': { '1': 3 } } };
+            const lateHits: LateHitEntry[] = [{ testId: 'f@@test-1', mutantIds: ['2'] }];
+
+            expect(serializeCoverageData(coverage)).toBe('{"perTest":{"f@@test-1":{"1":3}},"static":{"2":1}}');
+            expect(serializeCoverageData(coverage, lateHits))
+                .toBe('{"perTest":{"f@@test-1":{"1":3}},"static":{"2":1},"lateHits":[{"testId":"f@@test-1","mutantIds":["2"]}]}');
+        });
+
         it('returns empty data for undefined coverage', () => {
-            const result = formatCoverageData(undefined, new Map());
+            const result = serialized(undefined);
             expect(result).toEqual({
                 perTest:  {},
                 'static': {},
@@ -449,7 +568,7 @@ describe('preload-logic', () => {
                     'test-2': { '3': 1 },
                 },
             };
-            const result = formatCoverageData(coverage, new Map());
+            const result = serialized(coverage);
             expect(result.perTest).toEqual({
                 'test-1': { '1': 1, '2': 1 },
                 'test-2': { '3': 1 },
@@ -461,56 +580,45 @@ describe('preload-logic', () => {
                 'static': { '1': 5, '2': 10 },
                 perTest:  { 'test-1': { '3': 100, '4': 200 } },
             };
-            const result = formatCoverageData(coverage, new Map());
+            const result = serialized(coverage);
             expect(result.static).toEqual({ '1': 5, '2': 10 });
             expect(result.perTest).toEqual({ 'test-1': { '3': 100, '4': 200 } });
         });
 
-        it('snapshots the counts — hits recorded after formatting do not leak into the written data', () => {
+        it('snapshots the counts — hits recorded after serializing do not leak into the written data', () => {
             const coverage: MutantCoverage = {
                 'static': { '1': 1 },
                 perTest:  { 'test-1': { '2': 1 } },
             };
-            const result = formatCoverageData(coverage, new Map());
+            const line = serializeCoverageData(coverage);
             coverage.static['1'] = 99;
             coverage.perTest['test-1']['2'] = 99;
+            const result = JSON.parse(line) as CoverageFileData;
             expect(result.static).toEqual({ '1': 1 });
             expect(result.perTest).toEqual({ 'test-1': { '2': 1 } });
         });
 
-        it('remaps counter IDs to names using counterToName map', () => {
-            const coverage: MutantCoverage = {
-                'static': {},
-                perTest:  {
-                    'test-1': { '1': 1 },
-                    'test-2': { '2': 1 },
-                },
-            };
-            const counterToName = new Map([
-                ['test-1', 'should test feature A'],
-                ['test-2', 'should test feature B'],
-            ]);
-            const result = formatCoverageData(coverage, counterToName);
-            expect(result.perTest).toEqual({
-                'should test feature A': { '1': 1 },
-                'should test feature B': { '2': 1 },
-            });
+        it('closes a gap the tracker has open first, so it writes the real static bucket with the gap\'s hits', () => {
+            const coverage: MutantCoverage = { 'static': { '1': 1 }, perTest: {} };
+            const tracker = new StaticGapTracker(coverage);
+            tracker.open();
+            coverage.static['2'] = 1; // a hit during the gap, the way the instrumenter records one
+
+            const result = JSON.parse(serializeCoverageData(coverage, [], tracker)) as CoverageFileData;
+
+            expect(result.static).toEqual({ '1': 1, '2': 1 });
+            expect(tracker.close()).toEqual([]);
         });
 
-        it('falls back to original ID if not in map', () => {
-            const coverage: MutantCoverage = {
-                'static': {},
-                perTest:  {
-                    'test-1': { '1': 1 },
-                    'test-2': { '2': 1 },
-                },
-            };
-            const counterToName = new Map([['test-1', 'named test']]);
-            const result = formatCoverageData(coverage, counterToName);
-            expect(result.perTest).toEqual({
-                'named test': { '1': 1 },
-                'test-2':     { '2': 1 },
-            });
+        it('is handed the preload\'s gap tracker by the template\'s coverage write', async () => {
+            const template = await Bun.file(new URL('../../src/templates/coverage-preload.ts', import.meta.url)).text();
+            expect(template).toMatch(/serializeCoverageData\([^)]*, gapTracker\)/);
+        });
+
+        it('does not modify the coverage it serializes', () => {
+            const coverage: MutantCoverage = { 'static': { '1': 1 }, perTest: { 'test-1': { '2': 1 } } };
+            serializeCoverageData(coverage, [{ testId: 'test-1', mutantIds: ['1'] }]);
+            expect(coverage).toEqual({ 'static': { '1': 1 }, perTest: { 'test-1': { '2': 1 } } });
         });
 
         it('copies static coverage with its counts', () => {
@@ -518,7 +626,7 @@ describe('preload-logic', () => {
                 'static': { '1': 1, '2': 3, '3': 7 },
                 perTest:  {},
             };
-            const result = formatCoverageData(coverage, new Map());
+            const result = serialized(coverage);
             expect(result.static).toEqual({ '1': 1, '2': 3, '3': 7 });
         });
 
@@ -527,7 +635,7 @@ describe('preload-logic', () => {
                 'static': { '1': 1 },
                 perTest:  {},
             };
-            const result = formatCoverageData(coverage, new Map());
+            const result = serialized(coverage);
             expect(result.perTest).toEqual({});
             expect(result.static).toEqual({ '1': 1 });
         });
@@ -537,7 +645,7 @@ describe('preload-logic', () => {
                 'static': {},
                 perTest:  { 'test-1': { '1': 1 } },
             };
-            const result = formatCoverageData(coverage, new Map());
+            const result = serialized(coverage);
             expect(result.perTest).toEqual({ 'test-1': { '1': 1 } });
             expect(result.static).toEqual({});
         });
@@ -547,7 +655,7 @@ describe('preload-logic', () => {
                 'static': {},
                 perTest:  {},
             };
-            const result = formatCoverageData(coverage, new Map());
+            const result = serialized(coverage);
             expect(result).toEqual({
                 perTest:  {},
                 'static': {},
@@ -559,7 +667,7 @@ describe('preload-logic', () => {
                 'static': { '1': 1 },
                 perTest:  undefined as unknown as Record<string, Record<string, number>>,
             };
-            const result = formatCoverageData(coverage, new Map());
+            const result = serialized(coverage);
             expect(result.perTest).toEqual({});
         });
 
@@ -568,23 +676,23 @@ describe('preload-logic', () => {
                 'static': undefined as unknown as Record<string, number>,
                 perTest:  { 'test-1': { '1': 1 } },
             };
-            const result = formatCoverageData(coverage, new Map());
+            const result = serialized(coverage);
             expect(result.static).toEqual({});
         });
 
-        describe('lateHits (3rd arg)', () => {
+        describe('lateHits (2nd arg)', () => {
             const coverage: MutantCoverage = {
                 'static': { '1': 1 },
                 perTest:  {},
             };
 
             it('omitted 3rd arg leaves lateHits undefined', () => {
-                const result = formatCoverageData(coverage, new Map());
+                const result = serialized(coverage);
                 expect(result.lateHits).toBeUndefined();
             });
 
             it('empty lateHits array leaves lateHits undefined', () => {
-                const result = formatCoverageData(coverage, new Map(), []);
+                const result = serialized(coverage, []);
                 expect(result.lateHits).toBeUndefined();
             });
 
@@ -592,21 +700,21 @@ describe('preload-logic', () => {
                 const lateHits: LateHitEntry[] = [
                     { testId: 'tests/foo.test.ts@@test-1', mutantIds: ['5', '6'] },
                 ];
-                const result = formatCoverageData(coverage, new Map(), lateHits);
+                const result = serialized(coverage, lateHits);
                 expect(result.lateHits).toEqual(lateHits);
             });
 
-            it('returns a copy — mutating the caller array afterward does not change the returned data', () => {
+            it('is a snapshot — mutating the caller array afterward does not change the returned line', () => {
                 const lateHits: LateHitEntry[] = [
                     { testId: 'tests/foo.test.ts@@test-1', mutantIds: ['5'] },
                 ];
-                const result = formatCoverageData(coverage, new Map(), lateHits);
+                const line = serializeCoverageData(coverage, lateHits);
 
                 // Mutate the caller's array after the call
                 lateHits.push({ testId: 'tests/foo.test.ts@@test-2', mutantIds: ['7'] });
                 lateHits.length = 0;
 
-                expect(result.lateHits).toEqual([
+                expect((JSON.parse(line) as CoverageFileData).lateHits).toEqual([
                     { testId: 'tests/foo.test.ts@@test-1', mutantIds: ['5'] },
                 ]);
             });
@@ -713,6 +821,13 @@ describe('preload-logic', () => {
             expect(appendFileSyncSpy).toHaveBeenCalledWith(FAKE_FD, '{"perTest":{},"static":{}}\n', 'utf8');
         });
 
+        it('writes an already serialized line as it is, with its newline', () => {
+            const line = serializeCoverageData({ perTest: { 'f@@test-1': { '1': 2 } }, 'static': { '3': 1 } });
+            writeCoverageToFile('/tmp/coverage.json', line);
+
+            expect(appendFileSyncSpy).toHaveBeenCalledWith(FAKE_FD, `${line}\n`, 'utf8');
+        });
+
         describe('real filesystem', () => {
             let dir: string;
 
@@ -753,6 +868,30 @@ describe('preload-logic', () => {
                     spyOn(fs, 'openSync').mockImplementation(() => FAKE_FD),
                     spyOn(fs, 'appendFileSync').mockImplementation(() => {}),
                     spyOn(fs, 'closeSync').mockImplementation(() => {}),
+                ];
+                const file = path.join(dir, 'coverage.json');
+                try {
+                    writeCoverageToFile(file, { perTest: { a: { '1': 1 } }, 'static': {} });
+                } finally {
+                    for(const spy of spies) {
+                        spy.mockRestore();
+                    }
+                }
+
+                expect(await fs.promises.readFile(file, 'utf8')).toBe('{"perTest":{"a":{"1":1}},"static":{}}\n');
+            });
+
+            it('still writes the real file while a test has the default node:fs export (require("node:fs")) spied on', async () => {
+                // A spy on the default export patches the module object that
+                // require('node:fs') and process.getBuiltinModule('node:fs') return.
+                // A preload that looked node:fs up when it wrote, instead of capturing
+                // it at load (to save loading it in runs that never write), would call
+                // the spy (measured, bun 1.4.2), losing the coverage write and the
+                // hit-limit sentinel alike.
+                const spies = [
+                    spyOn(fsDefault, 'openSync').mockImplementation(() => FAKE_FD),
+                    spyOn(fsDefault, 'appendFileSync').mockImplementation(() => {}),
+                    spyOn(fsDefault, 'closeSync').mockImplementation(() => {}),
                 ];
                 const file = path.join(dir, 'coverage.json');
                 try {
@@ -1028,17 +1167,228 @@ describe('preload-logic', () => {
 
         it('reads a real descriptor by default', async () => {
             // /dev/null reads as immediate end-of-file: exactly what a lifeline
-            // whose parent has died looks like. The stream closes the descriptor.
+            // whose parent has died looks like. The reader leaves the descriptor open.
             // eslint-disable-next-line n/no-sync -- a descriptor number is the input under test
             const fd = fs.openSync('/dev/null', 'r');
             const { onOrphaned, orphaned } = orphanedSignal();
 
             const onUnavailable = mock();
-            watchParentLifeline({ fdValue: String(fd), onOrphaned, onUnavailable });
-            await orphaned;
+            try {
+                watchParentLifeline({ fdValue: String(fd), onOrphaned, onUnavailable });
+                await orphaned;
+            } finally {
+                // eslint-disable-next-line n/no-sync -- closing the descriptor the test opened
+                fs.closeSync(fd);
+            }
 
             expect(onOrphaned).toHaveBeenCalledTimes(1);
             expect(onUnavailable).not.toHaveBeenCalled();
+        });
+
+        /**
+         * The default reader (openLifelineReader, through Bun.file) on real descriptors.
+         * The test holds both ends, so closing the parent's end is exactly what the
+         * parent's death looks like to the child: the kernel closes every descriptor
+         * of a process that dies. The runner always hands the child a socketpair (on
+         * Node and bun hosts alike), so that is covered everywhere; a FIFO, which
+         * bun reads differently, is covered on Linux only (see the table below).
+         */
+        describe('default reader on real descriptors', () => {
+            let dir: string;
+            let openFds: number[];
+
+            beforeEach(() => {
+                // eslint-disable-next-line n/no-sync -- fixture setup
+                dir = fs.mkdtempSync(path.join(tmpdir(), 'stryker-lifeline-'));
+                openFds = [];
+            });
+
+            afterEach(() => {
+                /* eslint-disable n/no-sync -- fixture teardown */
+                for(const fd of openFds) {
+                    fs.closeSync(fd);
+                }
+                fs.rmSync(dir, { recursive: true, force: true });
+                /* eslint-enable n/no-sync -- end of fixture teardown */
+            });
+
+            /** The lifeline's end and the parent's end of one connection, both closed in afterEach unless a test closed the parent's. */
+            interface Lifeline {
+                readFd:         number
+                closeParentEnd: () => void
+                parentWrites:   (text: string) => void
+            }
+
+            function lifeline(readFd: number, parentFd: number): Lifeline {
+                openFds.push(readFd, parentFd);
+                /* eslint-disable n/no-sync -- the parent's end of the descriptor under test */
+                return {
+                    readFd,
+                    closeParentEnd: () => {
+                        openFds.splice(openFds.indexOf(parentFd), 1);
+                        fs.closeSync(parentFd);
+                    },
+                    parentWrites: (text) => {
+                        fs.writeSync(parentFd, text);
+                    },
+                };
+                /* eslint-enable n/no-sync -- end of the parent's end */
+            }
+
+            /** A FIFO opened at both ends. */
+            function fifoLifeline(): Lifeline {
+                const fifo = path.join(dir, 'lifeline');
+                /* eslint-disable n/no-sync -- fixture setup; descriptor numbers are the input under test */
+                expect(Bun.spawnSync(['mkfifo', fifo]).exitCode).toBe(0);
+                // Non-blocking, or opening the read end would wait for a writer.
+                // eslint-disable-next-line no-bitwise -- open(2) flags are a bitmask
+                const readFd = fs.openSync(fifo, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+                return lifeline(readFd, fs.openSync(fifo, fs.constants.O_WRONLY));
+                /* eslint-enable n/no-sync -- end of descriptor setup */
+            }
+
+            /** A connected AF_UNIX stream socketpair: what the runner's spawn gives the child. */
+            function socketpairLifeline(): Lifeline {
+                const [readFd, parentFd] = unixSocketPair();
+                return lifeline(readFd, parentFd);
+            }
+
+            /**
+             * Bun.file, with every read's result reported to `onRead`, so a test
+             * can wait until the reader has consumed what the parent wrote.
+             */
+            function observedBunFile(onRead: (done: boolean) => void): LifelineFile {
+                return (fd) => {
+                    const reader = Bun.file(fd).stream().getReader();
+                    const observedRead = async (): Promise<{ done: boolean }> => {
+                        const result = await reader.read();
+                        onRead(result.done);
+                        return result;
+                    };
+                    return lifelineFileReading(observedRead)(fd);
+                };
+            }
+
+            // The FIFO case runs on Linux only. Observed on macOS (bun 1.4.3, darwin
+            // arm64): a Bun.file reader on an O_NONBLOCK FIFO never sees the writer's
+            // data or its close, so the drain, arms-no-timer and EOF-on-close cases all
+            // hang until their timeout; the socketpair cases pass there. Production is
+            // unaffected: the runner always gives the child a socketpair (on Node and
+            // bun hosts alike), never a FIFO, so the FIFO is only a second kind of
+            // descriptor for the reader to be exercised on.
+            //
+            // Each test collects garbage just before the parent's end closes: a reader
+            // whose stream or pending read the GC could reclaim would never see EOF.
+            const lifelineKinds: [string, () => Lifeline][] = [
+                ...(process.platform === 'linux' ? [['FIFO', fifoLifeline] as [string, () => Lifeline]] : []),
+                ['socketpair', socketpairLifeline],
+            ];
+            describe.each(lifelineKinds)('on a %s', (_kind, openLifeline) => {
+                it('reports the parent gone when, and only when, the parent end closes', async () => {
+                    const { readFd, closeParentEnd } = openLifeline();
+                    const { onOrphaned, orphaned } = orphanedSignal();
+                    const onUnavailable = mock();
+                    watchParentLifeline({ fdValue: String(readFd), onOrphaned, onUnavailable });
+
+                    // Give a read that wrongly ends early the chance to report first.
+                    await macrotaskTurns(3);
+                    Bun.gc(true);
+                    expect(onOrphaned).not.toHaveBeenCalled();
+
+                    closeParentEnd();
+                    await orphaned;
+
+                    expect(onOrphaned).toHaveBeenCalledTimes(1);
+                    expect(onUnavailable).not.toHaveBeenCalled();
+                });
+
+                it('drains what the parent writes without reporting the parent gone', async () => {
+                    const { readFd, closeParentEnd, parentWrites } = openLifeline();
+                    const { onOrphaned, orphaned } = orphanedSignal();
+                    const onUnavailable = mock();
+                    let dataRead!: () => void;
+                    const firstDataRead = new Promise<void>((resolve) => {
+                        dataRead = resolve;
+                    });
+                    const file = observedBunFile((done) => {
+                        if(!done) {
+                            dataRead();
+                        }
+                    });
+                    watchParentLifeline({ fdValue: String(readFd), onOrphaned, onUnavailable, open: fd => openLifelineReader(fd, file) });
+
+                    parentWrites('x');
+                    await firstDataRead;
+                    expect(onOrphaned).not.toHaveBeenCalled();
+
+                    Bun.gc(true);
+                    closeParentEnd();
+                    await orphaned;
+                    expect(onOrphaned).toHaveBeenCalledTimes(1);
+                    expect(onUnavailable).not.toHaveBeenCalled();
+                });
+
+                it('arms no timer, and reports the parent gone while fake timers are installed', async () => {
+                    const { readFd, closeParentEnd } = openLifeline();
+                    const { onOrphaned, orphaned } = orphanedSignal();
+                    jest.useFakeTimers();
+                    const timers = trackTimers();
+                    try {
+                        watchParentLifeline({ fdValue: String(readFd), onOrphaned, onUnavailable: mock() });
+                        expect(timers.delays).toEqual([]);
+
+                        Bun.gc(true);
+                        closeParentEnd();
+                        await orphaned;
+                    } finally {
+                        timers.restore();
+                    }
+
+                    expect(onOrphaned).toHaveBeenCalledTimes(1);
+                });
+            });
+
+            it.each([
+                ['not open', 'EBADF', (): number => {
+                    /* eslint-disable n/no-sync -- a descriptor number is the input under test */
+                    const fd = fs.openSync('/dev/null', 'r');
+                    fs.closeSync(fd);
+                    /* eslint-enable n/no-sync -- end of descriptor setup */
+                    return fd;
+                }],
+                ['a directory', 'EISDIR', (): number => {
+                    // eslint-disable-next-line n/no-sync -- a descriptor number is the input under test
+                    const fd = fs.openSync(dir, 'r');
+                    openFds.push(fd);
+                    return fd;
+                }],
+            ])('reports a descriptor that is %s as the lifeline unavailable, never the parent gone', (_label, code, descriptor) => {
+                const fd = descriptor();
+                const onOrphaned = mock();
+                const onUnavailable = mock();
+
+                watchParentLifeline({ fdValue: String(fd), onOrphaned, onUnavailable });
+
+                expect(onUnavailable).toHaveBeenCalledTimes(1);
+                expect(onUnavailable).toHaveBeenCalledWith(`opening fd ${fd} failed: ${code}`);
+                expect(onOrphaned).not.toHaveBeenCalled();
+            });
+
+            it('reports a read that fails before end-of-file as the lifeline unavailable, never the parent gone', async () => {
+                let reported!: (reason: string) => void;
+                const unavailable = new Promise<string>((resolve) => {
+                    reported = resolve;
+                });
+                const onOrphaned = mock();
+                const failingFile = lifelineFileReading(async () => {
+                    throw Object.assign(new Error('input/output error'), { code: 'EIO' });
+                });
+
+                watchParentLifeline({ fdValue: '3', onOrphaned, onUnavailable: reason => reported(reason), open: fd => openLifelineReader(fd, failingFile) });
+
+                expect(await unavailable).toBe('reading fd 3 failed: EIO');
+                expect(onOrphaned).not.toHaveBeenCalled();
+            });
         });
     });
 
@@ -1611,5 +1961,49 @@ describe('preload-logic', () => {
             // before any test files execute.
             expect(true).toBe(true);
         });
+    });
+});
+
+describe('readEagerModules', () => {
+    it('reads nothing and returns no modules when there is no list file', async () => {
+        const readJson = mock(() => Promise.resolve(['/never.ts']));
+        const warn = mock((_message: string) => {});
+
+        expect(await readEagerModules(null, { readJson, warn })).toEqual([]);
+        expect(readJson).not.toHaveBeenCalled();
+        expect(warn).not.toHaveBeenCalled();
+    });
+
+    it('returns the paths the list file holds, in order', async () => {
+        const readJson = mock((_file: string) => Promise.resolve(['/abs/b.ts', '/abs/a.ts']));
+
+        expect(await readEagerModules('/run/list.json', { readJson })).toEqual(['/abs/b.ts', '/abs/a.ts']);
+        expect(readJson).toHaveBeenCalledWith('/run/list.json');
+    });
+
+    it('reads a real list file through Bun.file by default', async () => {
+        const dir = await fs.promises.mkdtemp(path.join(tmpdir(), 'stryker-eager-list-'));
+        try {
+            const file = path.join(dir, 'list.json');
+            await Bun.write(file, JSON.stringify([String.raw`C:\src\foo.ts`, '/abs/a.ts']));
+            expect(await readEagerModules(file)).toEqual([String.raw`C:\src\foo.ts`, '/abs/a.ts']);
+        } finally {
+            await fs.promises.rm(dir, { recursive: true, force: true });
+        }
+    });
+
+    it.each([
+        ['an unreadable file', () => Promise.reject(Object.assign(new Error('no such file'), { code: 'ENOENT' })), 'ENOENT'],
+        ['a non-array', () => Promise.resolve({ a: 1 }), 'not a JSON array of module paths'],
+        ['an array holding a non-string', () => Promise.resolve(['/abs/a.ts', 3]), 'not a JSON array of module paths'],
+    ])('warns on one [Stryker] line and imports nothing for %s', async (_label, readJson, reason) => {
+        const warn = mock((_message: string) => {});
+
+        expect(await readEagerModules('/run/list.json', { readJson, warn })).toEqual([]);
+        expect(warn).toHaveBeenCalledTimes(1);
+        const [message] = warn.mock.calls[0];
+        expect(message).toStartWith('[Stryker] Could not read the eager module list /run/list.json');
+        expect(message).toContain(reason);
+        expect(message).not.toContain('\n');
     });
 });

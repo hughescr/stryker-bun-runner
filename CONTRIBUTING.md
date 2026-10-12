@@ -49,6 +49,33 @@ Each rule below comes from a test that failed only some of the time.
 - **Stress a new test before landing it.** Run it many times with different `--seed` values and
   under CPU load (`yes > /dev/null` a few times over). When it breaks, keep the seed.
 
+## Profiling a run
+
+To see where the wall-clock of a `stryker run` goes, set `STRYKER_BUN_PROFILE` to the absolute
+path of a file in the environment Stryker runs in, then summarise it:
+
+```bash
+STRYKER_BUN_PROFILE=/tmp/profile.jsonl bun run mutate
+bun bench/profile-summary.ts /tmp/profile.jsonl
+```
+
+Every worker appends one JSON line per dry or mutant run (its phases: `prep`, `spawn`, `startup`,
+`inspector`, `load`, `tests`, `teardown`, `stdio`, `finish`, with the marks between them) and one
+summary line when it is disposed. The script prints each phase's share of the time and its count,
+mean, p50, p95 and total by run status and scope (targeted, static, fallback, files). The dry run's
+line also carries a `detail` of finer timings, which the script prints step by step: the coverage
+preload's own (start, `ready`, eager imports, first test, its hooks' total time, the coverage write
+and its size, the drain handshake), reported on the child's stderr only when profiling, and the
+runner's steps after the child exits (coverage read, mapping, tests built, gate, registry). Unset, empty,
+`0` or `false` means off, and a value that is not an absolute path is warned about and also means
+off. Off, the runner does no timing at all. See `src/run-profile.ts` for the line formats.
+
+Mutant runs hide passing tests, and bun writes nothing to stderr until the first file that fails or
+prints something (its header), or its summary. So a mutant run's `startup` runs to that point and
+holds the loading and the tests before it; in a run where nothing prints before the decisive line,
+`load` and `tests` are 0 and `file headers seen` counts only the files that printed. Compare
+`startup` + `load` + `tests` across runs.
+
 ## Checking orphan prevention on a machine
 
 ```bash

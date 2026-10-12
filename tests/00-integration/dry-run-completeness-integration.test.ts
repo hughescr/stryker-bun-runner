@@ -98,8 +98,8 @@ describe('dry-run completeness gate (real bun children)', () => {
     let originalForceColor: string | undefined;
     const spies: { mockRestore: () => void }[] = [];
 
-    async function dryRun(testFiles: string[]): Promise<DryRunResult> {
-        const runner = new BunTestRunner(silentLogger, {
+    async function dryRun(testFiles: string[], logger: Logger = silentLogger): Promise<DryRunResult> {
+        const runner = new BunTestRunner(logger, {
             bun: {
                 bunPath:          'bun',
                 timeout:          60_000,
@@ -260,6 +260,54 @@ describe('dry-run completeness gate (real bun children)', () => {
             'x@@y/at.test.ts > first':  { first: 1 },
             'x@@y/at.test.ts > second': { second: 1 },
             'other.test.ts > third':    { third: 1 },
+        });
+    }, 60_000);
+
+    test('keeps every hit recorded while no test runs (module load, between tests, after the last test) as static, with its count', async () => {
+        // Hits outside a test go to the static bucket wherever they happen: at module load, in a
+        // describe's beforeAll between two tests (the gap window the bleed check watches), in a
+        // file's afterAll and in the next file's module code. A static mutant's hits inside tests
+        // move to static too ("static wins"), so each total is every hit the mutant had.
+        const staticA = path.join(tempDir, 'static-a.test.ts');
+        await fsPromises.writeFile(staticA, [
+            "import { describe, test, beforeAll, afterAll } from 'bun:test';",
+            "import { cover } from './cover.js';",
+            "cover('loadA'); cover('loadA');",
+            "test('first', () => { cover('loadA'); cover('ownA'); });",
+            "describe('group', () => {",
+            "    beforeAll(() => { cover('gapA'); });",
+            "    test('second', () => { cover('gapA'); cover('ownB'); cover('ownB'); });",
+            '});',
+            "afterAll(() => { cover('tailA'); });",
+        ].join('\n'));
+        const staticB = path.join(tempDir, 'static-b.test.ts');
+        await fsPromises.writeFile(staticB, [
+            "import { test, afterAll } from 'bun:test';",
+            "import { cover } from './cover.js';",
+            "cover('loadB');",
+            "test('third', () => { cover('loadB'); cover('ownC'); });",
+            "afterAll(() => { cover('tailB'); });",
+        ].join('\n'));
+        const warnings: string[] = [];
+        const logger = { ...silentLogger, warn: (...args: unknown[]) => warnings.push(args.map(String).join(' ')) } as unknown as Logger;
+
+        const result = await dryRun([staticA, staticB], logger);
+
+        expect(result.status).toBe(DryRunStatus.Complete);
+        if(result.status !== DryRunStatus.Complete) {
+            return;
+        }
+        // The last file's afterAll runs after its last test with no beforeEach after it: only
+        // the preload's own final afterAll closes that gap, puts its hits into static and
+        // reports them as trailing bleed. Whichever file bun runs last, its tail is that hit.
+        expect(warnings.some(line => line.includes('mutant coverage was recorded between tests') && /tail[AB]/.test(line))).toBe(true);
+        expect(result.mutantCoverage).toEqual({
+            'static': { loadA: 3, gapA: 2, tailA: 1, loadB: 2, tailB: 1 },
+            perTest:  {
+                'static-a.test.ts > first':          { ownA: 1 },
+                'static-a.test.ts > group > second': { ownB: 2 },
+                'static-b.test.ts > third':          { ownC: 1 },
+            },
         });
     }, 60_000);
 

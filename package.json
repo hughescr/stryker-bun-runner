@@ -35,12 +35,14 @@
     "dist"
   ],
   "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target node --format esm --packages external && bun build src/coverage/preload-logic.ts --outdir dist/coverage --target bun --format esm --packages external && dts-bundle-generator --config dts-bundle-generator.config.json && cp -r src/templates dist/",
+    "build": "rm -rf dist && bun build src/index.ts --outdir dist --target node --format esm --packages external && bun scripts/build-preload.ts dist/templates && dts-bundle-generator --config dts-bundle-generator.config.json",
     "lint": "eslint --cache --format unix .",
     "mutate": "stryker run",
     "prepublishOnly": "bun run build",
     "test": "bun test",
     "typecheck": "node node_modules/typescript/bin/tsc --noEmit && node node_modules/typescript/bin/tsc --noEmit -p scripts",
+    "bench": "sh bench/lock.sh --exclusive -- bun bench/run.ts",
+    "checks": "sh bench/lock.sh --shared -- sh -c 'bun test && bun run lint && bun run typecheck'",
     "postversion": "git commit -m \"Bump package version to $npm_package_version\" package.json; git flow release start $npm_package_version; git flow release finish -m $npm_package_version $npm_package_version; git checkout develop; git merge main"
   },
   "dependencies": {

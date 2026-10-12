@@ -1,0 +1,228 @@
+import type {
+  AllUnionFields,
+  ConditionalKeys,
+  EmptyObject,
+  IsNever,
+  Simplify,
+} from "type-fest";
+import type { ArrayRequiredPrefix } from "./internal/types/ArrayRequiredPrefix";
+import type { BoundedPartial } from "./internal/types/BoundedPartial";
+import type { FilteredArray } from "./internal/types/FilteredArray";
+import type { IterableContainer } from "./internal/types/IterableContainer";
+import type { TupleParts } from "./internal/types/TupleParts";
+import { purry } from "./purry";
+
+type GroupByProp<T extends IterableContainer, Prop extends GroupableProps<T>> =
+  // Distribute unions.
+  T extends unknown
+    ? FixEmptyObject<EnsureValuesAreNonEmpty<GroupByPropRaw<T, Prop>>>
+    : never;
+
+// For each possible value of the prop we filter the input tuple with the prop
+// assigned to the value, e.g. `{ type: "cat" }`
+type GroupByPropRaw<
+  T extends IterableContainer,
+  Prop extends GroupableProps<T>,
+> = {
+  [Value in AllPropValues<T, Prop>]: FilteredArray<T, Record<Prop, Value>>;
+};
+
+// We can only group by props that only have values that could be used to key
+// an object (i.e. PropertyKey), or if they are undefined (which would filter
+// them out of the grouping).
+type GroupableProps<T extends IterableContainer> = ConditionalKeys<
+  ItemsSuperObject<T>,
+  PropertyKey | undefined
+>;
+
+// The union of all possible values that the prop could have within the tuple.
+type AllPropValues<
+  T extends IterableContainer,
+  Prop extends GroupableProps<T>,
+> = Extract<ItemsSuperObject<T>[Prop], PropertyKey>;
+
+// Creates a singular object type that all items in the tuple would extend. This
+// provides us a way to check, for each prop, what are all values it would
+// have within the tuple. We use this to map which props are candidates for
+// grouping, and when a prop is selected, the full list of values that would
+// exist in the output. For example:
+// `{ a: number, b: "cat", c: string } | { b: "dog", c: Date }` is groupable
+// by 'a' and 'b', but not 'c', and when selecting by 'b', the output would
+// have a prop for "cat" and a prop for "dog".
+type ItemsSuperObject<T extends IterableContainer> = AllUnionFields<
+  // If the input tuple contains optional elements they would add `undefined` to
+  // T[number] (and could technically show up in the array itself). Because
+  // undefined breaks AllUnionFields we need to remove it from the union. This
+  // is OK because we handle this in the implementation too.
+  Exclude<T[number], undefined>
+>;
+
+// When the input array is empty the constructed result type would be `{}`
+// because our mapped type would never run; but this doesn't represent the
+// semantics of the return value for that case, because it effectively means
+// "any object" and not "empty object". This can happen in 2 situations:
+// A union of tuples where one of the tuples doesn't have any item with the
+// groupable prop, or when the groupable prop has a value of `undefined` for
+// all items. The former is extra problematic because it would add `| {}` to the
+// result type which effectively cancels out all other parts of the union.
+type FixEmptyObject<T> = IsNever<keyof T> extends true ? EmptyObject : T;
+
+// Group by can never return an empty tuple but our filtered arrays might not
+// represent that. We need to reshape the tuples so that they always have at
+// least one item in them.
+type EnsureValuesAreNonEmpty<T extends Record<PropertyKey, IterableContainer>> =
+  Simplify<
+    Omit<T, PossiblyEmptyArrayKeys<T>> &
+      BoundedPartial<CoercedNonEmptyValues<Pick<T, PossiblyEmptyArrayKeys<T>>>>
+  >;
+
+// Go over the keys the object and return those that their value can accept an
+// empty array.
+type PossiblyEmptyArrayKeys<T extends Record<PropertyKey, IterableContainer>> =
+  keyof T extends infer Key extends unknown
+    ? Key extends keyof T
+      ? IsNonEmptyArray<T[Key]> extends true
+        ? never
+        : Key
+      : never
+    : never;
+
+// An array is non-empty if any of the fixed parts are non-empty.
+type IsNonEmptyArray<T extends IterableContainer> =
+  IsNonEmptyFixedTuple<TupleParts<T>["required"]> extends true
+    ? true
+    : IsNonEmptyFixedTuple<TupleParts<T>["suffix"]> extends true
+      ? true
+      : false;
+
+// A fixed tuple (one without optional or a rest element in it) is non-empty if
+// we can't extract the empty tuple from it.
+type IsNonEmptyFixedTuple<T> = IsNever<Extract<T, readonly []>>;
+
+// We coerce the arbitrary array values to have a prefix of at least one item.
+type CoercedNonEmptyValues<T extends Record<PropertyKey, IterableContainer>> = {
+  [P in keyof T]: ArrayRequiredPrefix<T[P], 1>;
+};
+
+/**
+ * Groups the elements of an array of objects based on the values of a
+ * specified property of those objects. The result would contain a property for
+ * each unique value of the specific property, with it's value being the input
+ * array filtered to only items that have that property set to that value.
+ * For any object where the property is missing, or if it's value is
+ * `undefined` the item would be filtered out.
+ *
+ * The grouping property is enforced at the type level to exist in at least one
+ * item and to never have a value that cannot be used as an object key (e.g. it
+ * must be `PropertyKey | undefined`).
+ *
+ * The resulting arrays are filtered with the prop and it's value as a
+ * type-guard, effectively narrowing the items in each output arrays. This
+ * means that when the grouping property is the discriminator of a
+ * discriminated union type each output array would contain just the subtype for
+ * that value.
+ *
+ * If you need more control over the grouping you should use `groupBy` instead.
+ *
+ * @param data - The items to group.
+ * @param prop - The property name to group by.
+ * @signature
+ *    groupByProp(data, prop)
+ * @example
+ *    const result = groupByProp(
+ *      //  ^? { cat: [{ a: 'cat' }], dog: [{ a: 'dog' }] }
+ *      [{ a: 'cat' }, { a: 'dog' }] as const,
+ *      'a',
+ *    );
+ * @dataFirst
+ * @category Array
+ */
+export function groupByProp<
+  T extends IterableContainer,
+  const Prop extends GroupableProps<T>,
+>(data: T, prop: Prop): GroupByProp<T, Prop>;
+
+/**
+ * Groups the elements of an array of objects based on the values of a
+ * specified property of those objects. The result would contain a property for
+ * each unique value of the specific property, with it's value being the input
+ * array filtered to only items that have that property set to that value.
+ * For any object where the property is missing, or if it's value is
+ * `undefined` the item would be filtered out.
+ *
+ * The grouping property is enforced at the type level to exist in at least one
+ * item and to never have a value that cannot be used as an object key (e.g. it
+ * must be `PropertyKey | undefined`).
+ *
+ * The resulting arrays are filtered with the prop and it's value as a
+ * type-guard, effectively narrowing the items in each output arrays. This
+ * means that when the grouping property is the discriminator of a
+ * discriminated union type each output array would contain just the subtype for
+ * that value.
+ *
+ * If you need more control over the grouping you should use `groupBy` instead.
+ *
+ * @param prop - The property name to group by.
+ * @signature
+ *    groupByProp(prop)(data);
+ * @example
+ *    const result = pipe(
+ *      //  ^? { cat: [{ a: 'cat' }], dog: [{ a: 'dog' }] }
+ *      [{ a: 'cat' }, { a: 'dog' }] as const,
+ *      groupByProp('a'),
+ *    );
+ * @dataLast
+ * @category Array
+ */
+export function groupByProp<
+  T extends IterableContainer,
+  const Prop extends GroupableProps<T>,
+>(prop: Prop): (data: T) => GroupByProp<T, Prop>;
+
+export function groupByProp(...args: readonly unknown[]): unknown {
+  return purry(groupByPropImplementation, args);
+}
+
+function groupByPropImplementation<
+  T extends IterableContainer,
+  Prop extends GroupableProps<T>,
+>(data: T, prop: Prop): GroupByProp<T, Prop> {
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- Using Object.create(null) allows us to remove everything from the prototype chain, leaving it as a pure object that only has the keys *we* add to it. This prevents issues like the one raised in #1046
+  const output: BoundedPartial<Record<AllPropValues<T, Prop>, T[number][]>> =
+    Object.create(null);
+
+  for (const item of data) {
+    const key = item?.[prop];
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- This is incorrect and a result of TypeScript not inferring the type of `key` correctly. It stems from a chain of bad inferences which start with `item` being inferred eagerly as `unknown` (because of: https://github.com/microsoft/TypeScript/issues/61750). When accessing a prop on `unknown` TypeScript then infers the result as `{}[Prop] | undefined`. What follows is that `{}[Prop]` is inferred as `never` (because we are accessing an object with no props defined on it), leading the union to simplify to just `undefined`. The correct type should have been `AllPropValues<T, Prop> | undefined`.
+    if (key !== undefined) {
+      // Once the prototype chain is fixed, it is safe to access the prop
+      // directly without needing to check existence or types.
+      const items = output[key];
+
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- Following the problem above, TypeScript then thinks that `key` is `never`, and also types `items` as `never`.
+      if (items === undefined) {
+        // It is more performant to create a 1-element array over creating an
+        // empty array and falling through to a unified the push. It is also
+        // more performant to mutate the existing object over using spread to
+        // continually create new objects on every unique key.
+        // @ts-expect-error [ts7053] -- For the same reasons as mentioned above, TypeScript isn't inferring `key` correctly, and therefore is erroring when trying to access the output object using it.
+        output[key] = [item];
+      } else {
+        // It is more performant to add the items to an existing array instead
+        // of creating a new array via spreading every time we add an item to
+        // it (e.g., `[...current, item]`).
+        // @ts-expect-error [ts2339] -- And again here `items` is still `never`.
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-call -- See above.
+        items.push(item);
+      }
+    }
+  }
+
+  // Set the prototype as if we initialized our object as a normal object (e.g.
+  // `{}`). Without this none of the built-in object methods like `toString`
+  // would work on this object and it would act differently than expected.
+  Object.setPrototypeOf(output, Object.prototype);
+
+  // @ts-expect-error [ts2322] -- This is fine! We use a broader type for output while we build it because it more accurately represents the shape of the object *while it is being built*. TypeScript can't tell that we finished building the object so can't ensure that output matches the expected output at this point.
+  return output;
+}

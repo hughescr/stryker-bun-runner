@@ -117,13 +117,60 @@ For each mutant, Stryker tells the runner which tests covered it in the dry run.
    (from the dry-run registry), and passes bun only the files those tests live in. A pattern over
    100,000 UTF-8 bytes would risk the operating system's argument limits, so the runner runs the
    full suite instead.
-2. **Orders the files cheapest first.** The dry run records how long each test file took (the
-   sum of its tests' durations as bun reports them; time spent loading the file or in `beforeAll`
-   hooks is not counted) and shares it through the registry. Every mutant run hands bun its files
-   in ascending order of that time: the covering files for a targeted run, every file for a
-   full-suite run. With bail, a fast unit test usually kills the mutant before a slow integration
-   file even loads. Files with the same time keep their alphabetical order; files with no
-   recorded time go last.
+2. **Orders the files: cheapest first, and a static mutant's likeliest killers before that.** The
+   dry run records how long each test file took (the sum of its tests' durations as bun reports
+   them; time spent loading the file or in `beforeAll` hooks is not counted) and shares it through
+   the registry. Every mutant run hands bun its files in ascending order of that time: the
+   covering files for a targeted run, every file for a full-suite run. With bail, a fast unit test
+   usually kills the mutant before a slow integration file even loads. Files with the same time
+   keep their alphabetical order; files with no recorded time go last.
+
+   A planned full-suite run (a static mutant, a mutant with no coverage, or a run scoped to
+   Stryker's `testFiles`) that bails then moves the files likeliest to kill its mutant to the
+   front. Most files of a full suite never call into the mutated module, and under cheapest first
+   a killed static mutant typically ran a third of the suite before the file that killed it. The
+   ranks, in this order (files that rank the same stay cheapest first):
+   - **The mutant's own coverage**: the files whose tests executed this mutant in the dry run. The
+     dry run records which mutants each test file's tests executed, from the raw per-test coverage,
+     so a static mutant's per-test hits count even though the coverage handed to Stryker drops
+     them. The registry holds it as a table of test files plus, per mutant, the indices of its
+     files.
+   - **The source file's coverage**: then the files whose tests executed more of the mutated source
+     file's other mutants, usually the module's own unit tests. The runner reads a source file's
+     mutant ids from its instrumented copy in the sandbox, once per worker.
+   - **Name**: then the test file named after the source file (`src/foo.ts`, `foo.test.ts`).
+
+   Everything else keeps cheapest first: targeted runs (their files all executed the mutant, and
+   on the benchmark fixture fewer than 3% of killed targeted mutants needed a second file), the
+   full-suite fallbacks below (Stryker sized their deadline for the covering tests only, so moving
+   a slower file ahead of the killer could turn a kill into an inconclusive Error), and runs with
+   `disableBail` (every file runs whatever the order).
+
+   **What the order can and cannot change.** The runner assumes an order-independent suite: each
+   test file passes or fails under a mutant whatever ran before it in the same process. (A suite
+   that leaks state between files, such as a `mock.module()` that is never restored, is a bug in
+   the suite; see below.) Under that assumption:
+   - *A mutant that every file survives stays Survived.* Only a failure (bail), a hang (the
+     deadline) or the hit limit stops a run early. If no file fails, every file runs in any order,
+     the same tests pass, and the run takes the same total time against the same deadline. A
+     reorder never runs fewer files when nothing fails.
+   - *A detected mutant stays detected, as Killed or Timeout.* When some file fails, hangs or trips
+     the hit limit, every order stops at the first such file it reaches, and which one that is can
+     change the verdict between Killed and Timeout:
+     - one file fails a test and another hangs or loops: whichever runs first decides;
+     - files that pass but run slowly: the deadline is for the whole run, so reaching the killer
+       later can let the deadline fire first (Timeout), and earlier the reverse;
+     - the hit counter is cumulative over the run: passing files that execute the mutant add to
+       it, so a different set of them before the killer can trip the limit sooner or later;
+     - bun's per-test timeout (`[test].timeout`) against the runner's deadline: an awaited hang
+       is a failing test (Killed) if bun's timeout fires first and a Timeout if the deadline does,
+       so when the hanging test starts matters.
+   - *The exception: a mutant that crashes bun or exits the process.* If the mutant makes one file
+     crash bun (a signal) or call `process.exit()`, and another file kills it, the order decides
+     which ends the run. A crash, or a non-zero exit with no failing test, is Error; an exit with
+     code 0 reads as Survived. Any order has this exposure, cheapest first included: it needs a
+     mutant that drives the code under test into a crash or an exit, which a normal test never
+     reaches.
 3. **Turns randomized order off.** `[test].randomize` (and `[test].seed`, or `--randomize` and
    `--seed` in `bun.bunArgs`) shuffles both the file order and the test order within each file.
    The dry run keeps your setting, so order-dependent tests still show up there. Mutant runs turn
@@ -134,14 +181,24 @@ For each mutant, Stryker tells the runner which tests covered it in the dry run.
 4. **Bails on the first failing test** unless Stryker's `disableBail` is set. Dry runs never bail.
    A bail flag in `bun.bunArgs` (`--bail`, `--bail=<N>`, `--bail <N>`) is removed: bail is
    decided by `disableBail` alone.
-5. **Runs the child** with the mutant active, under the time limit described in
+5. **Hides passing tests.** The mutant-run copy of the sanitized bunfig also sets
+   `onlyFailures = true`, so bun prints no line for a passing, skipped or `todo` test. A mutant run
+   is scored only from what still prints: the failing tests with their file headers, bun's summary
+   counts, the `Ran N tests` and `Bailed out` lines, the zero-match error, `# Unhandled error
+   between tests` blocks, and whatever the tests and the coverage preload print themselves (bun
+   prints a file's header before them too). On a 165-file suite that cuts a full run's stderr from
+   126 KB to 115 bytes and makes its `bun test` about 36 ms faster (bun 1.4.2). The dry run prints
+   every test.
+6. **Runs the child** with the mutant active, under the time limit described in
    [Timeouts](#timeouts) and Stryker's hit limit.
 
-Because mutant runs order files by cost rather than in the dry run's order, a suite whose test
-files depend on each other's order may behave differently in mutant runs. The usual cause is a
+Because mutant runs order files by kill likelihood and cost rather than in the dry run's order,
+and two mutants' runs may order the same files differently, a suite whose test files depend on
+each other's order may behave differently in mutant runs. The usual cause is a
 `mock.module()` (or another global change) in one file that leaks into the files bun runs after
 it in the same process. Fix such leaks (restore the mock in `afterAll`, or avoid module mocks in
-files that share a process) rather than relying on file order.
+files that share a process) rather than relying on file order. With bail, `killedBy` names the
+first failing test, so which test it names depends on the order too.
 
 **Zero-match retry.** A `--test-name-pattern` can match no test at all, usually because the mutant
 changed a value interpolated into an `it.each` title. Bun then exits with an error. The runner
@@ -267,15 +324,18 @@ layering on top of it, so:
   `smol`, `randomize` and `seed` are forwarded; any other `[test]` key is dropped and logged at
   debug with the reason. If you need another `[test]` key forwarded, please open an issue.
 - **Forced off**: `coverage = false` and `onlyFailures = false`. A `coverageThreshold` miss makes
-  bun exit 1 even when no test fails, which would be mistaken for a mutant kill, and hiding passing
-  tests would hide results the runner needs.
+  bun exit 1 even when no test fails, which would be mistaken for a mutant kill, and the dry run
+  reads every test's result. Mutant runs set `onlyFailures = true` themselves (see below).
 - **Dropped with a warning**: `retry` and `rerunEach`. Bun then runs with no retry and no rerun.
   They re-run tests, which multiplies the cost of every mutant run and repeats test names, so a
   `killedBy` test cannot be resolved to one test; neither can improve a mutation score. A per-test
   `{ retry: N }` in test code cannot be controlled by the runner and still applies.
-- **Randomization for the dry run only**: when `randomize` or `seed` turns randomization on, the
-  runner also writes a copy for mutant runs, next to the sanitized file with `.mutant-runs.toml`
-  in place of `.toml`, with `randomize = false` and no `seed` (see [Mutant runs](#mutant-runs)).
+- **A copy for mutant runs**: next to the sanitized file, with `.mutant-runs.toml` in place of
+  `.toml`, the same except `onlyFailures = true` and, when `randomize` or `seed` turns
+  randomization on, `randomize = false` and no `seed` (see [Mutant runs](#mutant-runs)).
+  Randomization applies to the dry run only. A copy is needed because the sanitized file's
+  `onlyFailures = false` wins over a `--only-failures` flag, and bun has no flag that turns
+  randomize off.
 - **Paths**: relative `preload` (top-level and `[test]`) and `[test].root` paths are made absolute,
   anchored at the project (sandbox) directory. Bun resolves relative bunfig paths against its
   working directory, not the bunfig's location, and the sanitized file lives in the temp directory.
@@ -466,13 +526,13 @@ affected more than one mutant:
 | `dryRun registry file has an unexpected version (skipped)`, `dryRun registry file is malformed (treated as absent)`, `failed to load the dryRun registry file` | a worker that never ran the dry run could not use the shared registry; it retries on every mutant |
 
 The signal and no-evidence warnings include the first 600 (signal) or 500 (no evidence) characters
-of bun's output. Run Stryker with `logLevel: 'debug'` (or `--logLevel debug`) to see every
-occurrence.
+of bun's output, which in a mutant run lists no passing test (see [Mutant runs](#mutant-runs)).
+Run Stryker with `logLevel: 'debug'` (or `--logLevel debug`) to see every occurrence.
 
 ## Temporary files
 
 The runner's temporary files (the coverage preload script every `bun test` child executes, the
-coverage data file, the sanitized bunfig and its mutant-run copy, and the dry-run test registry)
+list of mutated modules beside it that the dry run imports before any test, the coverage data file, the sanitized bunfig and its mutant-run copy, and the dry-run test registry)
 live in one directory per Stryker run, private to the user running Stryker:
 
 ```text
@@ -544,14 +604,29 @@ live child's group, and re-raises the signal so the default behaviour is preserv
   the fake-timer queue, where it never fires again on its own, so a polling check would be lost in
   any suite that uses fake timers. No native addon or `prctl(PR_SET_PDEATHSIG)` is involved, and
   the processes a suite spawns do not inherit the pipe.
-- **Fallback.** If the lifeline is unavailable (the descriptor cannot be opened, or reading it
-  fails with an error such as `EBADF` or `ENOTSUP` before end-of-file), the child falls back to
-  polling its own `process.ppid` once a second on an unref'd interval: the operating system
-  reparents an orphan as soon as its parent exits, so a changed `ppid` means the parent is gone.
-  That covers every suite that does not use fake timers. The fallback is silent unless the
-  environment variable `STRYKER_BUN_RUNNER_DEBUG` is set to anything other than empty, `0` or
-  `false` (in the environment Stryker runs in, or in `bun.env`); the child then writes one line to
-  its stderr giving the reason.
+- **How the pipe is read.** The preload reads the lifeline through Bun's own file stream,
+  `Bun.file(fd).stream()`, not Node's `fs.createReadStream`. On Bun 1.4.2 a Node read stream on
+  the pipe costs every `bun test` child about 18 ms of CPU before its first test. That is more than
+  a small mutant run's own work, and it is paid on every run: a trivial test file took 29.3 ms with
+  it and 11.6 ms with Bun's stream, against 11.3 ms with no lifeline at all. On the benchmark
+  fixture, switching readers took a whole Stryker run from 28.7 s to 22.8 s.
+  - Whether Stryker runs on Node or on Bun, descriptor 3 is one end of a socketpair.
+  - Bun reads a close-on-exec duplicate of descriptor 3, made when the stream opens (Bun 1.4.2).
+    Closing descriptor 3 itself is therefore harmless, and processes the suite spawns do not
+    inherit the duplicate.
+  - What would break the watch is something in the process closing the duplicate's number, such
+    as a helper that closes every descriptor from 3 up, or a double close. The read then hangs and
+    the parent goes unwatched. If the number is reused, the child can see another descriptor's
+    end-of-file and exit as if orphaned, or swallow that descriptor's bytes. Either takes a bug in
+    the suite; the runner never touches the descriptor after the spawn.
+- **Fallback.** If the lifeline is unavailable, the child falls back to polling its own
+  `process.ppid` once a second on an unref'd interval. Unavailable means the descriptor cannot be
+  opened (`EBADF`, `EISDIR`), or a read fails before end-of-file. The operating system reparents an
+  orphan as soon as its parent exits, so a changed `ppid` means the parent is gone. That covers
+  every suite that does not use fake timers. The fallback is silent unless the environment
+  variable `STRYKER_BUN_RUNNER_DEBUG` is set to anything other than empty, `0` or `false` (in the
+  environment Stryker runs in, or in `bun.env`); the child then writes one line to its stderr
+  giving the reason.
 
 To check the lifeline on a given machine, run `bun scripts/verify-orphan-lifeline.ts` from a clone
 of this repository (see [CONTRIBUTING.md](../CONTRIBUTING.md#checking-orphan-prevention-on-a-machine)).

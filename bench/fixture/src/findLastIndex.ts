@@ -1,0 +1,73 @@
+import { purry } from "./purry";
+
+/**
+ * Iterates the array in reverse order and returns the index of the first
+ * element that satisfies the provided testing function. If no elements satisfy
+ * the testing function, -1 is returned.
+ *
+ * See also `findLast` which returns the value of last element that satisfies
+ * the testing function (rather than its index).
+ *
+ * @param data - The items to search in.
+ * @param predicate - A function to execute for each element in the array. It
+ * should return `true` to indicate a matching element has been found, and
+ * `false` otherwise.
+ * @returns The index of the last (highest-index) element in the array that
+ * passes the test. Otherwise -1 if no matching element is found.
+ * @signature
+ *    findLastIndex(data, predicate)
+ * @example
+ *    findLastIndex([1, 3, 4, 6], n => n % 2 === 1) // => 1
+ * @dataFirst
+ * @category Array
+ */
+export function findLastIndex<T>(
+  data: readonly T[],
+  predicate: (value: T, index: number, data: readonly T[]) => boolean,
+): number;
+
+/**
+ * Iterates the array in reverse order and returns the index of the first
+ * element that satisfies the provided testing function. If no elements satisfy
+ * the testing function, -1 is returned.
+ *
+ * See also `findLast` which returns the value of last element that satisfies
+ * the testing function (rather than its index).
+ *
+ * @param predicate - A function to execute for each element in the array. It
+ * should return `true` to indicate a matching element has been found, and
+ * `false` otherwise.
+ * @returns The index of the last (highest-index) element in the array that
+ * passes the test. Otherwise -1 if no matching element is found.
+ * @signature
+ *    findLastIndex(fn)(items)
+ * @example
+ *    pipe(
+ *      [1, 3, 4, 6],
+ *      findLastIndex(n => n % 2 === 1)
+ *    ) // => 1
+ * @dataLast
+ * @category Array
+ */
+export function findLastIndex<T>(
+  predicate: (value: T, index: number, data: readonly T[]) => boolean,
+): (array: readonly T[]) => number;
+
+export function findLastIndex(...args: readonly unknown[]): unknown {
+  return purry(findLastIndexImplementation, args);
+}
+
+const findLastIndexImplementation = <T>(
+  data: readonly T[],
+  predicate: (value: T, index: number, data: readonly T[]) => boolean,
+): number => {
+  // TODO [>2]: When node 18 reaches end-of-life bump target lib to ES2023+ and use `Array.prototype.findLastIndex` here.
+
+  for (let i = data.length - 1; i >= 0; i--) {
+    if (predicate(data[i]!, i, data)) {
+      return i;
+    }
+  }
+
+  return -1;
+};
