@@ -4,7 +4,7 @@
  */
 
 import { type ChildProcess, type SpawnOptions, spawn } from 'node:child_process';
-import { LIFELINE_FD_ENV, SYNC_TOKEN_ENV } from './coverage/preload-logic.js';
+import { LIFELINE_FD_ENV, PRELOAD_TIMINGS_ENV, SYNC_TOKEN_ENV } from './coverage/preload-logic.js';
 import type { RunProfile } from './run-profile.js';
 import { killProcessGroup } from './utils/process-group.js';
 import { getProcessRssBytes } from './utils/process-rss.js';
@@ -532,6 +532,12 @@ function buildChildEnv(options: BunTestRunOptions, spawnDepth: number): Record<s
     env[SPAWN_DEPTH_ENV] = String(spawnDepth + 1);
     if(options.profile) {
         delete env[PROFILE_ENV];
+    }
+    // A profiled dry run's preload reports its own timings on stderr (see formatPreloadTimings).
+    if(options.profile && options.syncPort) {
+        env[PRELOAD_TIMINGS_ENV] = '1';
+    } else {
+        delete env[PRELOAD_TIMINGS_ENV];
     }
     return env;
 }

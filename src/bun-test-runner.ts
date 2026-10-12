@@ -36,7 +36,7 @@ import {
     mapCoverageToInspectorIds,
     type LateHitEntry
 } from './coverage/index.js';
-import { HIT_LIMIT_SENTINEL } from './coverage/preload-logic.js';
+import { HIT_LIMIT_SENTINEL, readPreloadTimings } from './coverage/preload-logic.js';
 import { findDryRunDataLoss, type CoverageKeyCounts, type DryRunCompletenessFacts } from './dry-run-completeness.js';
 import { InspectorClient, type InspectorCloseInfo } from './inspector/index.js';
 import type { TestInfo } from './inspector/types.js';
@@ -588,6 +588,27 @@ function readReportedHitCount(stderr: string, token: string): number | undefined
     return match ? Number(match[1]) : undefined;
 }
 
+/** {@link dryRunStepMarker} without a profile: records nothing. */
+function ignoreStep(): void {
+    // Nothing to record: profiling is off.
+}
+
+/**
+ * Once the dry run's child has exited: take the coverage preload's timings from
+ * its stderr into the run's profile, and return the recorder of the runner's own
+ * steps after that (RunProfile.at). Without a profile, nothing is read and the
+ * recorder does nothing.
+ */
+function dryRunStepMarker(profile: RunProfile | undefined, stderr: string): (step: string) => void {
+    if(profile === undefined) {
+        return ignoreStep;
+    }
+    profile.preloadTimings(readPreloadTimings(stderr));
+    return (step) => {
+        profile.at(step);
+    };
+}
+
 /** Per-mutant-run state shared by the first spawn and the zero-match full-suite retry. */
 interface MutantRunContext {
     options:           MutantRunOptions
@@ -606,14 +627,14 @@ interface MutantRunContext {
      * --test-name-pattern. See {@link BunTestRunner.resolveTestFileFilter}.
      */
     testFileScope?:    string[]
-    /** The run's timing profile; set only when profiling is on (see src/run-profile.ts). */
-    profile?:          RunProfile
     /**
      * For a run with no covering test ids (static mutant, no coverage, file-scoped), per
      * test file, how many of the mutated source file's mutants its tests executed in the
      * dry run; ranks its files likely killers first. See {@link BunTestRunner.orderForMutantRun}.
      */
     sourceCoverage?:   ReadonlyMap<string, number>
+    /** The run's timing profile; set only when profiling is on (see src/run-profile.ts). */
+    profile?:          RunProfile
 }
 
 /**
@@ -2007,6 +2028,7 @@ export class BunTestRunner implements TestRunner {
             // (now 40s) backstop in the preload.
             syncServer.setDrainHandler(async () => {
                 const drainRequestReceivedAt = Date.now();
+                profile?.at('drainRequest');
                 const countsAtRequest = inspector.getEventCounts();
                 const gapsAtRequest = inspector.getFoundIdGaps();
                 // debug, not warn: every healthy dry run performs this handshake. The one
@@ -2045,6 +2067,7 @@ export class BunTestRunner implements TestRunner {
                     // give-up, releasing the child immediately — otherwise the child would
                     // idle out its own (now 40s) backstop on every failed handshake.
                 } finally {
+                    profile?.at('drainSettled');
                     cancelSilence();
                     const elapsedMs = Date.now() - drainRequestReceivedAt;
                     const countsAtSettle = inspector.getEventCounts();
@@ -2074,6 +2097,7 @@ export class BunTestRunner implements TestRunner {
             // 8. Wait for test process to complete
             const result = await testProcess;
             const totalElapsedMs = Date.now() - startTime;
+            const markStep = dryRunStepMarker(profile, result.stderr);
             if(result.outputIncomplete) {
                 this.logger.warn('%s; the dry run may report fewer tests than ran', formatOutputIncomplete());
             }
@@ -2087,6 +2111,7 @@ export class BunTestRunner implements TestRunner {
             // race that let a truncated inspector stream go undetected in production.
             inspector.expectClose();
             await inspector.waitForClose(INSPECTOR_DRAIN_TIMEOUT_MS);
+            markStep('inspectorClosed');
             const testHierarchy = inspector.getTests();
             const executionOrder = inspector.getExecutionOrder();
             const wasClosedUnexpectedly = inspector.wasClosedUnexpectedly;
@@ -2131,6 +2156,7 @@ export class BunTestRunner implements TestRunner {
 
             // 10–12. Handle timeout and process errors; parse output
             const parsed = parseBunTestOutput(result.stdout, result.stderr);
+            markStep('outputParsed');
             const earlyResult = this.checkDryRunProcessResult(result, parsed, testHierarchy);
             if(earlyResult) {
                 return earlyResult;
@@ -2142,7 +2168,8 @@ export class BunTestRunner implements TestRunner {
             return await this.buildGatedDryRunResult(
                 result, parsed, testHierarchy, executionOrder, totalElapsedMs,
                 { wasClosedUnexpectedly, closeInfo, duplicateFoundIdCount: collisionStats.duplicateFoundIdCount },
-                coverageAnalysis
+                coverageAnalysis,
+                profile
             );
         } finally {
             // Abort the child process if it is still running.  This is idempotent —
@@ -2200,10 +2227,12 @@ export class BunTestRunner implements TestRunner {
         executionOrder:        number[],
         totalElapsedMs:        number,
         inspectorState:        { wasClosedUnexpectedly: boolean, closeInfo: InspectorCloseInfo, duplicateFoundIdCount: number },
-        coverageAnalysis:       CoverageAnalysis | undefined
+        coverageAnalysis:       CoverageAnalysis | undefined,
+        profile?:               RunProfile
     ): Promise<DryRunResult> {
         // 13. Collect and remap coverage data
-        const { coverage: mutantCoverage, inspectorIdToProjectFile, coverageKeys, testFileCoverage } = await this.collectAndRemapCoverage(testHierarchy, executionOrder);
+        const { coverage: mutantCoverage, inspectorIdToProjectFile, coverageKeys, testFileCoverage } = await this.collectAndRemapCoverage(testHierarchy, executionOrder, profile);
+        profile?.at('coverageMapped');
 
         // 14. Build test results from inspector data: one result per test. A retried
         // test is started once per attempt, so its id repeats in executionOrder; its
@@ -2214,6 +2243,7 @@ export class BunTestRunner implements TestRunner {
         // This is critical for Stryker's incremental mode - test IDs are assigned
         // based on order, so inconsistent order breaks coveredBy correlation
         tests.sort((a, b) => a.name.localeCompare(b.name));
+        profile?.at('testsBuilt');
 
         // Completeness gate — run AFTER tests are built (so it can see whether the run
         // otherwise looks GREEN, and compare them with the coverage) but BEFORE persisting
@@ -2229,6 +2259,7 @@ export class BunTestRunner implements TestRunner {
             duplicateFoundIdCount: inspectorState.duplicateFoundIdCount,
         };
         const gateResult = this.checkCompletenessGate(facts, parsed.summaryFailed, inspectorState.wasClosedUnexpectedly, tests, inspectorState.closeInfo, result.stderr);
+        profile?.at('gateChecked');
         if(gateResult) {
             return gateResult;
         }
@@ -2241,7 +2272,9 @@ export class BunTestRunner implements TestRunner {
         }
 
         // Cache test names and persist registry for killedBy resolution in mutantRun
+        profile?.at('coverageChecked');
         await this.buildAndPersistTestRegistry(tests, testNameIndex, testFileCoverage);
+        profile?.at('registryWritten');
 
         this.warnOnUnidentifiedDryRunFailure(result, parsed, tests);
         this.warnOnTightDryRunTimeout(totalElapsedMs);
@@ -2600,8 +2633,8 @@ export class BunTestRunner implements TestRunner {
             deadline:          startedAt + limitMs,
             strykerTimeoutMs,
             testFileScope,
-            profile,
             sourceCoverage,
+            profile,
         }, testNamePattern, this.resolveCoveringTestFiles(filterIds));
         this.mutantRunsByStatus[result.status]++;
         profile?.finish(result.status);
@@ -3279,7 +3312,8 @@ export class BunTestRunner implements TestRunner {
    */
     private async collectAndRemapCoverage(
         testHierarchy:  TestInfo[],
-        executionOrder: number[]
+        executionOrder: number[],
+        profile?:       RunProfile
     ): Promise<{
         coverage:                 MutantCoverage | undefined
         inspectorIdToProjectFile: Map<number, string>
@@ -3296,13 +3330,13 @@ export class BunTestRunner implements TestRunner {
         if(!this.coverageFilePath) {
             return { coverage: undefined, inspectorIdToProjectFile: new Map(), coverageKeys: undefined };
         }
-        // Read coverage and lateHits together, before cleanup deletes the file.
-        // Two reads of the same (small, dry-run-only) file — see collectLateHits'
-        // doc comment for why this doesn't share a read with collectCoverage.
+        // Read coverage and lateHits together, before cleanup deletes the file. Called
+        // together, the two share one read and parse of the file (see collectLateHits).
         const [rawCoverage, lateHits] = await Promise.all([
             collectCoverage(this.coverageFilePath, this.logger),
             collectLateHits(this.coverageFilePath, this.logger),
         ]);
+        profile?.at('coverageRead');
         await cleanupCoverageFile(this.coverageFilePath);
         if(!rawCoverage) {
             return { coverage: undefined, inspectorIdToProjectFile: new Map(), coverageKeys: undefined };
@@ -3539,6 +3573,19 @@ export class BunTestRunner implements TestRunner {
    * still find the registry (with concurrency 1, the disposing worker IS the
    * only one, so a "last one out" check would delete it from under its successor).
    */
+    /**
+     * Append the worker's profile summary, if profiling. Profiling is diagnostic
+     * only: a summary that throws is warned about, never allowed to stop
+     * dispose() from stopping the child and cleaning up.
+     */
+    private writeProfileSummary(): void {
+        try {
+            this.profiler?.writeSummary();
+        } catch (error) {
+            this.logger.warn('Could not write the run profile\'s summary: %s', error instanceof Error ? error.message : String(error));
+        }
+    }
+
     public async dispose(): Promise<void> {
         // Stryker disable next-line StringLiteral: logging message only
         this.logger.debug('Disposing BunTestRunner');
@@ -3546,7 +3593,7 @@ export class BunTestRunner implements TestRunner {
         // Summaries first: a cleanup failure below must not swallow them.
         this.logMutantRunSummary();
         this.mutantWarnings.flush();
-        this.profiler?.writeSummary();
+        this.writeProfileSummary();
 
         // If a dryRun/mutantRun child is still in flight when Stryker disposes
         // this runner (e.g. a hung worker being torn down), kill it rather than

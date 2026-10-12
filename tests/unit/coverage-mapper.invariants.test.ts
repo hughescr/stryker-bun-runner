@@ -78,7 +78,7 @@ describe('restoreHitTotals invariants', () => {
     });
 });
 
-describe('retry merging in buildRemappedPerTest', () => {
+describe('retry merging', () => {
     it('sums the hit counts a retry adds to a mutant the test already held, keeping them on that test', () => {
         // Mutant 30 is held by test one AND by the retried test two. Subtracting the retry's
         // hits instead of adding them would be hidden by restoreHitTotals for a single holder,
@@ -107,6 +107,145 @@ describe('retry merging in buildRemappedPerTest', () => {
                 'tests/a.test.ts > two': { '30': 32 },
             },
         });
+    });
+});
+
+describe('file-prefixed mapping in one pass', () => {
+    /** Deterministic pseudo-random numbers (a 32-bit LCG), so a failure reproduces. */
+    function lcg(seed: number): (below: number) => number {
+        let state = seed;
+        return (below) => {
+            state = ((state * 1_664_525) + 1_013_904_223) % 4_294_967_296;
+            return state % below;
+        };
+    }
+
+    /**
+     * A random dry run: files of tests, some retried (started again at once), the
+     * per-start coverage keys the preload records, some keys past the last start (orphaned),
+     * and a static bucket some of whose mutants the tests also hit.
+     */
+    function randomRun(seed: number): { raw: MutantCoverage, executionOrder: number[], hierarchy: Map<number, TestInfo>, names: Map<string, string | undefined> } {
+        const random = lcg(seed);
+        const hierarchy = new Map<number, TestInfo>();
+        const executionOrder: number[] = [];
+        const keys: string[] = [];
+        const names = new Map<string, string | undefined>();
+        let id = 0;
+        for(let f = 0; f < 3; f++) {
+            const file = `tests/f${f}.test.ts`;
+            let position = 0;
+            for(let t = 0, tests = 1 + random(5); t < tests; t++) {
+                id++;
+                hierarchy.set(id, { id, name: `t${t}`, fullName: `t${t}`, type: 'test', url: fileUrl(file) });
+                for(let attempt = 0, attempts = 1 + (random(4) === 0 ? 1 + random(2) : 0); attempt < attempts; attempt++) {
+                    executionOrder.push(id);
+                    position++;
+                    keys.push(`${file}@@test-${position}`);
+                    names.set(`${file}@@test-${position}`, `${file} > t${t}`);
+                }
+            }
+        }
+        // Keys with no start of their own: past the end of the global order, so orphaned.
+        for(let extra = 0, extras = random(3); extra < extras; extra++) {
+            keys.push(`tests/f0.test.ts@@test-${100 + extra}`);
+            names.set(`tests/f0.test.ts@@test-${100 + extra}`, undefined);
+        }
+        const perTest: Record<string, Record<string, number>> = {};
+        for(const key of keys) {
+            const counts: Record<string, number> = {};
+            for(let m = 0, mutants = random(5); m < mutants; m++) {
+                const mutantId = String(1 + random(12));
+                counts[mutantId] = (counts[mutantId] ?? 0) + 1 + random(4);
+            }
+            perTest[key] = counts;
+        }
+        const staticCounts: Record<string, number> = {};
+        for(let m = 0, mutants = random(4); m < mutants; m++) {
+            staticCounts[String(1 + random(12))] = 1 + random(3);
+        }
+        return { raw: { 'static': staticCounts, perTest }, executionOrder, hierarchy, names };
+    }
+
+    /** What the mapping did in three passes: credit keys to tests, strip static mutants, restore the raw hit totals. */
+    function referenceMapping(raw: MutantCoverage, names: Map<string, string | undefined>): MutantCoverage {
+        const remapped: Record<string, Record<string, number>> = {};
+        const counterIds = Object.keys(raw.perTest).toSorted((a, b) => Number(a.split('@@test-')[1]) - Number(b.split('@@test-')[1]));
+        for(const key of counterIds) {
+            const name = names.get(key);
+            if(name === undefined) {
+                continue;
+            }
+            const into = remapped[name] ??= {};
+            for(const [mutantId, hits] of Object.entries(raw.perTest[key])) {
+                into[mutantId] = (into[mutantId] ?? 0) + hits;
+            }
+        }
+        const staticIds = new Set(Object.keys(raw.static));
+        const stripped: Record<string, Record<string, number>> = {};
+        for(const [name, counts] of Object.entries(remapped)) {
+            const kept = Object.fromEntries(Object.entries(counts).filter(([mutantId]) => !staticIds.has(mutantId)));
+            if(Object.keys(kept).length > 0) {
+                stripped[name] = kept;
+            }
+        }
+        return restoreHitTotals(raw, { 'static': raw.static, perTest: stripped });
+    }
+
+    it('gives the same coverage, in the same order, as crediting, stripping static mutants and restoring hit totals one after the other', () => {
+        let orphanedRuns = 0;
+        for(let seed = 1; seed <= 300; seed++) {
+            const { raw, executionOrder, hierarchy, names } = randomRun(seed);
+            const rawBefore = structuredClone(raw);
+
+            const { coverage, orphanedKeyCount } = mapCoverageToInspectorIds(raw, executionOrder, hierarchy);
+
+            const expected = referenceMapping(raw, names);
+            expect({ seed, coverage: JSON.stringify(coverage) }).toEqual({ seed, coverage: JSON.stringify(expected) });
+            expect(raw).toEqual(rawBefore);
+            orphanedRuns += orphanedKeyCount > 0 ? 1 : 0;
+        }
+        // The generator did produce the orphaned keys whose hits must still be counted.
+        expect(orphanedRuns).toBeGreaterThan(50);
+    });
+
+    it('keeps a static mutant\'s hits from every test, a retry included, on static, and drops a test left with no mutant', () => {
+        const rawCoverage: MutantCoverage = {
+            'static': { '1': 2 },
+            perTest:  {
+                'tests/a.test.ts@@test-1': { '1': 3 },
+                'tests/a.test.ts@@test-2': { '1': 1, '2': 4 },
+                'tests/a.test.ts@@test-3': { '1': 5, '2': 1 },
+            },
+        };
+        const testHierarchy = new Map<number, TestInfo>([
+            [1, { id: 1, name: 'only static', fullName: 'only static', type: 'test', url: fileUrl('tests/a.test.ts') }],
+            [2, { id: 2, name: 'retried', fullName: 'retried', type: 'test', url: fileUrl('tests/a.test.ts') }],
+        ]);
+
+        const { coverage } = mapCoverageToInspectorIds(rawCoverage, [1, 2, 2], testHierarchy);
+
+        expect(coverage).toEqual({ 'static': { '1': 11 }, perTest: { 'tests/a.test.ts > retried': { '2': 5 } } });
+    });
+
+    it('adds an orphaned key\'s hits to the first test that holds the mutant, and leaves out a mutant only it holds', () => {
+        const rawCoverage: MutantCoverage = {
+            'static': {},
+            perTest:  {
+                'tests/a.test.ts@@test-1': { '1': 1 },
+                'tests/a.test.ts@@test-2': { '1': 2 },
+                'tests/a.test.ts@@test-3': { '1': 4, '9': 7 },
+            },
+        };
+        const testHierarchy = new Map<number, TestInfo>([
+            [1, { id: 1, name: 'one', fullName: 'one', type: 'test', url: fileUrl('tests/a.test.ts') }],
+            [2, { id: 2, name: 'two', fullName: 'two', type: 'test', url: fileUrl('tests/a.test.ts') }],
+        ]);
+
+        const { coverage, orphanedKeyCount } = mapCoverageToInspectorIds(rawCoverage, [1, 2], testHierarchy);
+
+        expect(orphanedKeyCount).toBe(1);
+        expect(coverage).toEqual({ 'static': {}, perTest: { 'tests/a.test.ts > one': { '1': 5 }, 'tests/a.test.ts > two': { '1': 2 } } });
     });
 });
 

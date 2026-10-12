@@ -234,6 +234,50 @@ export function formatSyncNotReadyMessage(syncPort: string, problem: string): st
 }
 
 // ============================================================================
+// Opt-in preload timings (STRYKER_BUN_PROFILE)
+// ============================================================================
+
+/** Env var the runner sets on a profiled dry run's child: the preload then reports its timings (see {@link formatPreloadTimings}). */
+export const PRELOAD_TIMINGS_ENV = '__STRYKER_PRELOAD_TIMINGS__';
+
+/** The epoch time in milliseconds, to the sub-millisecond, for the preload's `at.*` timings. */
+export function preloadEpochNow(): number {
+    return performance.timeOrigin + performance.now();
+}
+
+/** Start of the stderr line carrying the preload's timings. */
+export const PRELOAD_TIMINGS_PREFIX = '[Stryker Timings] ';
+
+/**
+ * The stderr line reporting the preload's timings: epoch milliseconds for
+ * points in time (`at.*`), milliseconds for durations (`ms.*`), and sizes
+ * (`bytes.*`, counts). It starts with a newline because bun may have just
+ * written a partial line.
+ */
+export function formatPreloadTimings(timings: Record<string, number>): string {
+    return `\n${PRELOAD_TIMINGS_PREFIX}${JSON.stringify(timings)}\n`;
+}
+
+/** The timings of the last {@link formatPreloadTimings} line in `stderr`, or undefined when it has none (or it is malformed). */
+export function readPreloadTimings(stderr: string): Record<string, number> | undefined {
+    const start = stderr.lastIndexOf(`\n${PRELOAD_TIMINGS_PREFIX}`);
+    if(start === -1) {
+        return undefined;
+    }
+    const jsonStart = start + 1 + PRELOAD_TIMINGS_PREFIX.length;
+    const end = stderr.indexOf('\n', jsonStart);
+    try {
+        const parsed: unknown = JSON.parse(stderr.slice(jsonStart, end === -1 ? stderr.length : end));
+        if(typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+            return undefined;
+        }
+        return Object.fromEntries(Object.entries(parsed).filter((entry): entry is [string, number] => typeof entry[1] === 'number'));
+    } catch{
+        return undefined;
+    }
+}
+
+// ============================================================================
 // Stryker Namespace Initialization
 // ============================================================================
 
@@ -338,67 +382,95 @@ interface PartialMutantCoverage {
 }
 
 /**
- * Detect cross-test async coverage bleed within a single gap window (the span
- * between one test's afterEach and the next test's beforeEach).
+ * Detects cross-test async coverage bleed: mutant coverage recorded in a gap
+ * window, the span between one test's afterEach ({@link open}) and the next
+ * test's beforeEach ({@link close}), while no test is running.
  *
- * Compares the static bucket's per-key hit COUNTS at the start of the gap
- * (`staticCountsAtLastBoundary`, snapshotted in afterEach) against the counts
- * now (`staticCoverageNow`, read at the end of the gap). Any key whose count
- * increased — or that is newly present — proves code executed while no test
- * was active, i.e. after the previous test ended.
+ * The instrumenter records a hit made while no test is running into
+ * `mutantCoverage.static`, reading that property afresh on every hit
+ * (`var c = cov.static` in Stryker's `stryCov_9fa48`). So for the gap the
+ * tracker installs an empty bucket in its place, and when the gap closes it
+ * puts the real bucket back, adds the gap's hits to it and reports which
+ * mutants were hit. Every hit lands in the real static bucket with its count,
+ * exactly as without the tracker; the work per test is proportional to the
+ * hits made in the gap, not to the size of the static bucket (a snapshot and
+ * diff of the whole bucket per test cost the dry run about 170 ms on a
+ * 2,000-test suite).
  *
- * Using count deltas rather than key presence is deliberate: a mutant that
- * already bled once (and so already exists in the snapshot) must still be
- * detected the next time it bleeds again.
+ * A mutant hit again in a later gap is reported again: each gap starts empty.
  *
- * @param staticCountsAtLastBoundary - Static bucket counts snapshotted at the start of the gap window
- * @param staticCoverageNow - Current static bucket counts (`strykerGlobal.mutantCoverage.static`), or undefined
- * @returns Mutant ids whose static-bucket count increased during the gap window
+ * The swap is only safe under two conditions:
+ *
+ * 1. The coverage is read (written out) only with no gap open: while one is,
+ *    `mutantCoverage.static` is the gap bucket, not the real one. So
+ *    {@link serializeCoverageData} takes the tracker and closes any open gap first.
+ * 2. Nothing may hold the gap bucket past {@link close} and write to it later:
+ *    hits made to it after the close are lost. The instrumenter never holds it
+ *    (it reads `cov.static` on every hit); code that grabs
+ *    `__stryker__.mutantCoverage.static` itself and keeps it would.
  */
-export function detectGapWindowBleed(
-    staticCountsAtLastBoundary: Map<string, number>,
-    staticCoverageNow: Record<string, number> | undefined
-): string[] {
-    if(!staticCoverageNow) {
-        return [];
+export class StaticGapTracker {
+    /** The real static bucket while a gap bucket is installed in its place. */
+    private held: Record<string, number> | undefined;
+
+    constructor(private readonly coverage: { 'static': Record<string, number> }) {}
+
+    /** A test ended: route static hits into a fresh gap bucket until {@link close}. */
+    public open(): void {
+        this.close();
+        this.held = this.coverage.static;
+        this.coverage.static = {};
     }
 
-    const bledIds: string[] = [];
-    for(const [id, countNow] of Object.entries(staticCoverageNow)) {
-        const countAtBoundary = staticCountsAtLastBoundary.get(id) ?? 0;
-        if(countNow > countAtBoundary) {
-            bledIds.push(id);
+    /**
+     * End the gap, if one is open: put the real static bucket back with the gap's
+     * hits added to it.
+     *
+     * @returns The ids of the mutants hit during the gap; [] when none were or no gap was open.
+     */
+    public close(): string[] {
+        const held = this.held;
+        if(held === undefined) {
+            return [];
         }
+        const gap = this.coverage.static;
+        this.coverage.static = held;
+        this.held = undefined;
+        const ids = Object.keys(gap);
+        for(const id of ids) {
+            held[id] = (held[id] ?? 0) + gap[id];
+        }
+        return ids;
     }
-    return bledIds;
 }
 
-export function formatCoverageData(
+/**
+ * The coverage file's line (without its newline) for `mutantCoverage` and the
+ * bleed observations: `{"perTest":…,"static":…}`, plus `"lateHits"` when
+ * there are any. Hit counts are kept, not just the covered ids: Stryker sums
+ * them per mutant to size each mutant run's hitLimit (100 × dry-run hits).
+ *
+ * Serialised straight from the live objects, with no copy: the string is the
+ * snapshot, so hits recorded afterwards cannot change it. (Copying every
+ * per-test record first cost about 30 ms on a 2,000-test suite.)
+ *
+ * `gapTracker`, when given, is the tracker swapping `mutantCoverage.static`:
+ * any gap it has open is closed first, so the real static bucket is written.
+ */
+export function serializeCoverageData(
     mutantCoverage: PartialMutantCoverage | undefined,
-    counterToName: Map<string, string>,
-    lateHits: LateHitEntry[] = []
-): CoverageFileData {
-    if(!mutantCoverage) {
-        return { perTest: {}, 'static': {} };
-    }
-
-    // Hit counts are kept, not just the covered ids: Stryker sums them per mutant
-    // to size each mutant run's hitLimit (100 × dry-run hits). Copied so later
-    // hits cannot change what is written.
-    const perTest: Record<string, Record<string, number>> = {};
-    for(const [testId, coverage] of Object.entries(mutantCoverage.perTest ?? {})) {
-        const actualName = counterToName.get(testId) ?? testId;
-        perTest[actualName] = { ...coverage };
-    }
-
-    const staticCoverage = { ...mutantCoverage.static };
-
-    return {
-        perTest,
-        'static': staticCoverage,
-        // Copy so later mutation of the caller's accumulator array doesn't retroactively change already-written data.
-        ...(lateHits.length > 0 ? { lateHits: [...lateHits] } : {}),
+    lateHits: readonly LateHitEntry[] = [],
+    gapTracker?: StaticGapTracker
+): string {
+    // An open gap has the gap bucket in place of the static one: put the real one
+    // back, with the gap's hits, before reading it (see StaticGapTracker).
+    gapTracker?.close();
+    const data: CoverageFileData = {
+        perTest:  mutantCoverage?.perTest ?? {},
+        'static': mutantCoverage?.static ?? {},
+        ...(lateHits.length > 0 ? { lateHits: lateHits as LateHitEntry[] } : {}),
     };
+    return JSON.stringify(data);
 }
 
 // ============================================================================
@@ -410,11 +482,13 @@ export function formatCoverageData(
 const COVERAGE_APPEND_FLAGS = constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW;
 
 /* eslint-disable n/no-sync -- sync required in afterAll hook to ensure write completes before process exit */
-export function writeCoverageToFile(coverageFile: string, data: CoverageFileData): void {
+/** Append `data` as one line: a string is taken as already serialised (see {@link serializeCoverageData}). */
+export function writeCoverageToFile(coverageFile: string, data: CoverageFileData | string): void {
+    const line = typeof data === 'string' ? data : JSON.stringify(data);
     // mode applies only when the open creates the file: owner-only, like everything else in the runner's private temp dir.
     const fd = preloadFs.openSync(coverageFile, COVERAGE_APPEND_FLAGS, 0o600);
     try {
-        preloadFs.appendFileSync(fd, `${JSON.stringify(data)}\n`, 'utf8');
+        preloadFs.appendFileSync(fd, `${line}\n`, 'utf8');
     } finally {
         preloadFs.closeSync(fd);
     }

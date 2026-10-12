@@ -13,8 +13,8 @@ import {
     installHitLimit,
     HIT_LIMIT_TOKEN_ENV,
     SYNC_TOKEN_ENV,
-    formatCoverageData,
-    detectGapWindowBleed,
+    serializeCoverageData,
+    StaticGapTracker,
     writeCoverageToFile,
     readEagerModules,
     guardAgainstOrphaning,
@@ -22,9 +22,24 @@ import {
     awaitRunnerReady,
     LIFELINE_FD_ENV,
     ORPHAN_DEBUG_ENV,
+    PRELOAD_TIMINGS_ENV,
+    formatPreloadTimings,
+    preloadEpochNow,
+    preloadFs,
     type StrykerNamespace,
     type LateHitEntry
 } from '__PRELOAD_LOGIC_PATH__';
+
+// Opt-in timings for STRYKER_BUN_PROFILE (the runner sets PRELOAD_TIMINGS_ENV on a
+// profiled dry run only): epoch-ms points and summed durations, reported on stderr
+// once the drain handshake is over. Undefined, and never touched, otherwise.
+// eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- PRELOAD_TIMINGS_ENV from placeholder import
+const timings: Record<string, number> | undefined = process.env[PRELOAD_TIMINGS_ENV] ? {} : undefined;
+// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- from placeholder import
+const nowEpoch: () => number = preloadEpochNow;
+if(timings) {
+    timings['at.preloadStart'] = nowEpoch();
+}
 
 // ============================================================================
 // Section 0: Orphan prevention
@@ -173,13 +188,17 @@ function extractFilePrefix(bunMain: string): string {
 // emitCoverageBleedWarnings in bun-test-runner.ts for how this surfaces as a
 // warning; it never changes coverage attribution.
 //
-// lastEndedTestId / lastFilePrefix / staticSnapshotAtLastBoundary are updated
-// in afterEach (the start of a gap window) and consumed in the NEXT
-// beforeEach (the end of that gap window) — see both hooks below.
+// lastEndedTestId / lastFilePrefix are updated in afterEach, which also opens
+// the gap window (gapTracker, created in Section 2: a StaticGapTracker swaps an
+// empty bucket in for the static one), and consumed in the NEXT beforeEach,
+// which closes it and learns which mutants were hit in it — see both hooks below.
 let lastEndedTestId: string | undefined;
 let lastFilePrefix: string | undefined;
-let staticSnapshotAtLastBoundary = new Map<string, number>();
 const lateHits: LateHitEntry[] = [];
+// beforeEach's cache of extractFilePrefix for the test file running now: Bun.main
+// changes only when bun moves on to the next file.
+let lastBunMain: string | undefined;
+let currentFilePrefix = '';
 
 // Only the dry run sets a sync port. No test may start before the runner says
 // 'ready', which it does once its inspector is connected, TestReporter is
@@ -196,6 +215,9 @@ if(syncPort) {
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
     // A missing token dials a path no sync server serves, so the wait fails loudly.
     ws = await awaitRunnerReady({ syncPort, syncToken: syncToken ?? '', keepOpen: shouldCollectCoverage });
+    if(timings) {
+        timings['at.preloadReady'] = nowEpoch();
+    }
 }
 
 // ============================================================================
@@ -206,6 +228,8 @@ const g = globalThis as unknown as StrykerGlobal;
 const strykerGlobal = initializeStrykerNamespace(g as Record<string, unknown>);
 // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access -- StrykerGlobal from placeholder import
 const mutantCoverage = strykerGlobal.mutantCoverage!;
+// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
+const gapTracker = new StaticGapTracker(mutantCoverage);
 
 // Set active mutant for mutant runs
 if(activeMutant) {
@@ -244,6 +268,10 @@ if(shouldCollectCoverage) {
             console.warn(`[Stryker] Eager import failed for ${modPath}:`, err);
         }
     }
+    if(timings) {
+        timings['at.eagerImported'] = nowEpoch();
+        timings.eagerModules = EAGER_MODULES.length;
+    }
 }
 
 // ============================================================================
@@ -256,14 +284,20 @@ const writeCoverageData = () => {
         return;
     }
 
-    // counterToName is not populated (test names are resolved by coverage-mapper
-    // from the inspector data, not stored here), so pass an empty Map.
+    // Test names are resolved by coverage-mapper from the inspector data, not here.
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Placeholder import replaced at runtime
-    const data = formatCoverageData(strykerGlobal.mutantCoverage, new Map<string, string>(), lateHits);
+    const data: string = serializeCoverageData(strykerGlobal.mutantCoverage, lateHits, gapTracker);
+    if(timings) {
+        timings['at.coverageFormatted'] = nowEpoch();
+        timings['bytes.coverage'] = data.length;
+    }
 
     try {
         // eslint-disable-next-line @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
         writeCoverageToFile(coverageFile, data);
+        if(timings) {
+            timings['at.coverageWritten'] = nowEpoch();
+        }
     } catch (error) {
         // One self-contained line: the runner surfaces stderr lines starting with
         // '[Stryker Coverage]', and console.error(prefix, error) would put bun's code
@@ -277,6 +311,7 @@ const writeCoverageData = () => {
 // ============================================================================
 if(shouldCollectCoverage) {
     beforeEach(() => {
+        const hookStart = timings ? performance.now() : 0;
         // Assign a stable, per-file test ID by combining the normalized test
         // file path with a per-file counter.
         //
@@ -292,13 +327,19 @@ if(shouldCollectCoverage) {
         // @ts-expect-error -- Bun global is available at runtime but not in TS typings
         // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- Bun global accessed at runtime
         const bunMain = String((globalThis as unknown as { Bun?: { main?: string } }).Bun?.main ?? '');
-        const filePrefix = extractFilePrefix(bunMain);
+        if(bunMain !== lastBunMain) {
+            lastBunMain = bunMain;
+            currentFilePrefix = extractFilePrefix(bunMain);
+        }
+        const filePrefix = currentFilePrefix;
 
         // Gap-window bleed check: this beforeEach is the END of the gap window that
-        // started when the previous test's afterEach ran (see afterEach below). Diff
-        // the static bucket now against the snapshot taken back then; any mutant whose
-        // count increased executed while no test was active — i.e. after the previous
-        // test ended.
+        // started when the previous test's afterEach ran (see afterEach below). Closing
+        // it puts the real static bucket back with the gap's hits added; any mutant hit
+        // in the gap executed while no test was active — i.e. after the previous test
+        // ended. The gap is always closed, so its hits always reach the static bucket.
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Placeholder import replaced at runtime
+        const bledMutantIds: string[] = gapTracker.close();
         if(filePrefix !== lastFilePrefix) {
             // FILE-BOUNDARY SKIP: this test starts a new file relative to the last one
             // that ended. A new file's module-level code (imports, describe-level setup)
@@ -307,13 +348,8 @@ if(shouldCollectCoverage) {
             // This trades missed cross-file leaks for zero file-boundary false positives,
             // which is the safer default for a diagnostic-only warning.
             lastEndedTestId = undefined;
-            staticSnapshotAtLastBoundary = new Map();
-        } else if(lastEndedTestId !== undefined) {
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-argument -- Placeholder import replaced at runtime
-            const bledMutantIds = detectGapWindowBleed(staticSnapshotAtLastBoundary, mutantCoverage.static);
-            if(bledMutantIds.length > 0) {
-                lateHits.push({ testId: lastEndedTestId, mutantIds: bledMutantIds });
-            }
+        } else if(lastEndedTestId !== undefined && bledMutantIds.length > 0) {
+            lateHits.push({ testId: lastEndedTestId, mutantIds: bledMutantIds });
         }
 
         const prevCount = perFileCounters.get(filePrefix) ?? 0;
@@ -324,12 +360,17 @@ if(shouldCollectCoverage) {
         strykerGlobal.currentTestId = testId;
         // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- MutantCoverage from placeholder import
         mutantCoverage.perTest[testId] ??= {};
+        if(timings) {
+            timings['at.firstTest'] ??= nowEpoch();
+            timings['ms.beforeEach'] = (timings['ms.beforeEach'] ?? 0) + (performance.now() - hookStart);
+            timings.tests = (timings.tests ?? 0) + 1;
+        }
     });
 
     afterEach(() => {
-        // Record the gap-window START: which test just ended, and the static bucket's
-        // counts at this instant. The NEXT beforeEach (above) diffs against this
-        // snapshot to detect any coverage recorded in between — see
+        const hookStart = timings ? performance.now() : 0;
+        // Record the gap-window START: which test just ended, and open the gap, so
+        // the static hits until the NEXT beforeEach (above) are told apart — see
         // "Cross-test async coverage-bleed detection" above.
         // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-assignment -- StrykerGlobal from placeholder import
         const endedTestId: string | undefined = strykerGlobal.currentTestId;
@@ -339,15 +380,22 @@ if(shouldCollectCoverage) {
             const sepIdx = endedTestId.lastIndexOf('@@');
             lastFilePrefix = sepIdx === -1 ? endedTestId : endedTestId.slice(0, sepIdx);
         }
-        // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-argument -- MutantCoverage from placeholder import
-        staticSnapshotAtLastBoundary = new Map(Object.entries(mutantCoverage.static));
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Placeholder import replaced at runtime
+        gapTracker.open();
 
         // Clear currentTestId so any subsequent code records to static
         // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access -- StrykerGlobal from placeholder import
         strykerGlobal.currentTestId = undefined;
+        if(timings) {
+            timings['ms.afterEach'] = (timings['ms.afterEach'] ?? 0) + (performance.now() - hookStart);
+        }
     });
 
     afterAll(async () => {
+        if(timings) {
+            timings['at.afterAll'] = nowEpoch();
+            timings.afterAlls = (timings.afterAlls ?? 0) + 1;
+        }
         // Final gap check, best-effort: catches bleed that has already recorded a
         // counter delta by the time afterAll runs, with no following beforeEach
         // left to catch it any other way. This preload's afterAll fires once per
@@ -363,13 +411,12 @@ if(shouldCollectCoverage) {
         // Fully catching trailing leaks would need a deliberate strict-drain
         // mode (draining the microtask/timer queue before treating the run as
         // over) — deliberately out of scope here (event-loop starvation risk);
-        // see "Coverage bleed" in docs/internals.md.
-        if(lastEndedTestId !== undefined) {
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-argument -- Placeholder import replaced at runtime
-            const bledMutantIds = detectGapWindowBleed(staticSnapshotAtLastBoundary, mutantCoverage.static);
-            if(bledMutantIds.length > 0) {
-                lateHits.push({ testId: lastEndedTestId, mutantIds: bledMutantIds });
-            }
+        // see "Coverage bleed" in docs/internals.md. Closing the gap also puts its
+        // hits into the static bucket, which must happen before the write below.
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Placeholder import replaced at runtime
+        const trailingBleed: string[] = gapTracker.close();
+        if(lastEndedTestId !== undefined && trailingBleed.length > 0) {
+            lateHits.push({ testId: lastEndedTestId, mutantIds: trailingBleed });
         }
 
         // Coverage must be finalized — gap check above, then the write itself —
@@ -431,6 +478,9 @@ if(shouldCollectCoverage) {
                     };
 
                     try {
+                        if(timings) {
+                            timings['at.drainRequested'] = nowEpoch();
+                        }
                         wsForDrain.send('drain-request');
                     } catch {
                         clearTimeout(timeout);
@@ -440,6 +490,11 @@ if(shouldCollectCoverage) {
             } catch (error) {
                 console.warn('[Stryker] Error during drain handshake:', error);
             }
+        }
+        if(timings) {
+            timings['at.drained'] = nowEpoch();
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- from placeholder import
+            preloadFs.writeSync(2, formatPreloadTimings(timings));
         }
 
         ws?.close();

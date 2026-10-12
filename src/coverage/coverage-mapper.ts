@@ -388,13 +388,13 @@ function resolveCounterKeys(
             // Stryker disable next-line LogicalOperator: equivalent mutant — fallback value only appears in the debug message, not in any mapping logic
             fileToInspectorIds.get(filePrefix)?.length ?? 0
         );
-        // Stryker disable next-line StringLiteral: equivalent mutant — the unknown name is only used as a Map key that is immediately skipped (testInfo: null) in buildRemappedPerTest
+        // Stryker disable next-line StringLiteral: equivalent mutant — the unknown name is only used as a Map key that is immediately skipped (testInfo: null) in buildMappedCoverage
         return { name: `unknown-${key}`, testInfo: null, inspectorId: undefined };
     });
 }
 
 /**
- * Second-pass: build remapped perTest from resolved counter keys.
+ * How the second pass ({@link buildMappedCoverage}) names the tests of resolved counter keys.
  *
  * Two distinct deduplication cases:
  *  1. Retries: multiple counter keys resolved to the SAME inspectorId (same test ran
@@ -412,7 +412,7 @@ function resolveCounterKeys(
 function buildNameInspectorIds(resolved: ResolvedCounterKey[]): Map<string, Set<number | undefined>> {
     const nameInspectorIds = new Map<string, Set<number | undefined>>();
     for(const { name, inspectorId, testInfo } of resolved) {
-        // Stryker disable next-line ConditionalExpression,BlockStatement: equivalent mutants — null-testInfo entries use name "unknown-<key>" (unique) so including them doesn't produce duplicate counts for valid names; the second pass in buildRemappedPerTest skips them anyway
+        // Stryker disable next-line ConditionalExpression,BlockStatement: equivalent mutants — null-testInfo entries use name "unknown-<key>" (unique) so including them doesn't produce duplicate counts for valid names; the second pass in buildMappedCoverage skips them anyway
         if(!testInfo) {
             continue;
         }
@@ -501,40 +501,144 @@ function resolveEachTestName(
     return `${baseName} [${index}]`;
 }
 
-function buildRemappedPerTest(
+/**
+ * The mapped coverage of file-prefixed counter keys, built in one pass over the
+ * raw hits. It is exactly
+ * `restoreHitTotals(raw, stabilizeCoverage({ static: raw.static, perTest: remapped }))`,
+ * where `remapped` credits each resolved key's hits to its final test name
+ * (merging the attempts of a retried test), without building and copying those
+ * three intermediate results: on a 2,000-test suite they cost the dry run about
+ * 150 ms, mostly in allocation and garbage collection.
+ *
+ * - A resolved key's hit on a mutant that is in `static` goes to `static`
+ *   ("static wins", with the hits kept for the mutant's hitLimit); any other
+ *   hit goes to the key's test.
+ * - A test left with no mutant is left out.
+ * - An orphaned key's hits (a key resolved to no test) go to the first bucket
+ *   that holds the mutant: `static`, else the first test, in order, that does.
+ *   A mutant no bucket holds is left out, since adding it would invent coverage.
+ *
+ * So every mutant keeps its raw hit total wherever it still appears, as
+ * {@link restoreHitTotals} guarantees. The raw coverage is not modified, but the
+ * result shares per-test records with it.
+ */
+function buildMappedCoverage(
     counterIds: string[],
     resolved: ResolvedCounterKey[],
-    rawPerTest: MutantCoverage['perTest'],
+    rawCoverage: MutantCoverage,
     testHierarchy: Map<number, TestInfo>
-): Record<string, Record<string, number>> {
+): MutantCoverage {
     const nameInspectorIds = buildNameInspectorIds(resolved);
     const duplicateNameIndex = buildDuplicateNameIndex(nameInspectorIds, testHierarchy);
-    const remappedPerTest: Partial<Record<string, Record<string, number>>> = {};
+    const staticCounts: Record<string, number> = { ...rawCoverage.static };
+    const staticIds = new Set(Object.keys(staticCounts));
+    const creditedByName = new Map<string, Record<string, number>>();
+    // The records built here, which may be written to. A test credited with exactly one
+    // key's hits, none of them static (most tests), shares that key's raw record instead
+    // of copying it hit by hit; a shared record is copied before anything is added to it.
+    const owned = new Set<Record<string, number>>();
+    const orphaned: Record<string, number>[] = [];
 
     for(const [i, key] of counterIds.entries()) {
+        const incoming = rawCoverage.perTest[key] ?? {};
         const { name: baseName, testInfo, inspectorId } = resolved[i];
-
         if(!testInfo) {
+            orphaned.push(incoming);
             continue;
         }
-
         const finalName = resolveEachTestName(baseName, inspectorId, nameInspectorIds, duplicateNameIndex);
-
-        // Merge coverage data: if the entry already exists (retry of same test),
-        // accumulate hit counts rather than overwriting.
-        const incoming = rawPerTest[key];
-        const existing = remappedPerTest[finalName];
-        if(existing) {
-            // Retry case: merge hit counts
-            for(const [mutantId, count_] of Object.entries(incoming)) {
-                existing[mutantId] = (existing[mutantId] ?? 0) + count_;
-            }
-        } else {
-            remappedPerTest[finalName] = { ...incoming };
+        const credited = creditedByName.get(finalName);
+        if(!credited && !holdsAny(incoming, staticIds)) {
+            creditedByName.set(finalName, incoming);
+            continue;
         }
+        let writable = credited;
+        if(!writable || !owned.has(writable)) {
+            writable = { ...credited };
+            owned.add(writable);
+            creditedByName.set(finalName, writable);
+        }
+        creditHits(incoming, writable, staticIds, staticCounts);
     }
 
-    return remappedPerTest as Record<string, Record<string, number>>;
+    const perTest = nonEmptyTests(creditedByName, orphaned.length > 0 ? owned : undefined);
+    if(orphaned.length > 0) {
+        creditOrphanedHits(orphaned, staticCounts, perTest);
+    }
+    return { 'static': staticCounts, perTest };
+}
+
+/** Add one key's hits to its test, or to `static` for a static mutant ("static wins"). See {@link buildMappedCoverage}. */
+function creditHits(
+    incoming: Record<string, number>,
+    credited: Record<string, number>,
+    staticIds: ReadonlySet<string>,
+    staticCounts: Record<string, number>
+): void {
+    for(const mutantId of Object.keys(incoming)) {
+        const hits = incoming[mutantId];
+        if(staticIds.has(mutantId)) {
+            staticCounts[mutantId] += hits;
+        } else {
+            // Retries merge: each attempt's hits add to the same test.
+            credited[mutantId] = (credited[mutantId] ?? 0) + hits;
+        }
+    }
+}
+
+/**
+ * The tests credited with any mutant, in the order they were first credited. With
+ * `owned` (when more hits are still to be added), each record not in it — one shared
+ * with the raw coverage — is copied, so the raw coverage is never written to.
+ */
+function nonEmptyTests(
+    creditedByName: ReadonlyMap<string, Record<string, number>>,
+    owned: ReadonlySet<Record<string, number>> | undefined
+): Record<string, Record<string, number>> {
+    const perTest: Record<string, Record<string, number>> = {};
+    for(const [name, counts] of creditedByName) {
+        if(Object.keys(counts).length > 0) {
+            perTest[name] = owned && !owned.has(counts) ? { ...counts } : counts;
+        }
+    }
+    return perTest;
+}
+
+/** Whether `counts` holds any of `mutantIds`. */
+function holdsAny(counts: Record<string, number>, mutantIds: ReadonlySet<string>): boolean {
+    for(const mutantId of Object.keys(counts)) {
+        if(mutantIds.has(mutantId)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Add orphaned keys' hits to the first bucket holding each mutant: `static`, else
+ * the first test in `perTest` order. See {@link buildMappedCoverage}.
+ */
+function creditOrphanedHits(
+    orphaned: readonly Record<string, number>[],
+    staticCounts: Record<string, number>,
+    perTest: Record<string, Record<string, number>>
+): void {
+    const firstHolder = new Map<string, Record<string, number>>();
+    for(const counts of [staticCounts, ...Object.values(perTest)]) {
+        for(const mutantId of Object.keys(counts)) {
+            if(!firstHolder.has(mutantId)) {
+                firstHolder.set(mutantId, counts);
+            }
+        }
+    }
+    for(const counts of orphaned) {
+        for(const mutantId of Object.keys(counts)) {
+            const holder = firstHolder.get(mutantId);
+            if(holder) {
+                holder[mutantId] += counts[mutantId];
+            }
+        }
+    }
 }
 
 /**
@@ -663,7 +767,6 @@ function mapFilePrefixedCounterKeys(
     const counterIds = globallyOrderedKeys.toSorted((a, b) => splitCounterKey(a).position - splitCounterKey(b).position);
 
     const resolved = resolveCounterKeys(counterIds, fileToInspectorIds, testHierarchy, logger);
-    const remappedPerTest = buildRemappedPerTest(counterIds, resolved, rawCoverage.perTest, testHierarchy);
 
     // Raw counter key -> resolved full test name, for keys whose testInfo resolved.
     // Lets callers (e.g. coverage-bleed warnings) resolve a pre-remap counter key
@@ -679,10 +782,7 @@ function mapFilePrefixedCounterKeys(
     // feeds the dry-run completeness gate (bun-test-runner.ts).
     const orphanedKeyCount = reportOrphanedKeys(resolved, counterIds, logger);
 
-    const coverage = restoreHitTotals(rawCoverage, stabilizeCoverage({
-        'static': rawCoverage.static,
-        perTest:  remappedPerTest,
-    }));
+    const coverage = buildMappedCoverage(counterIds, resolved, rawCoverage, testHierarchy);
 
     return {
         coverage,

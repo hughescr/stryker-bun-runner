@@ -19,11 +19,12 @@ import { BunTestRunner } from '../../src/bun-test-runner.js';
 import * as coverageCollector from '../../src/coverage/collector.js';
 import * as coverageMapper from '../../src/coverage/coverage-mapper.js';
 import * as preloadGenerator from '../../src/coverage/preload-generator.js';
+import { formatPreloadTimings } from '../../src/coverage/preload-logic.js';
 import * as dryRunCompleteness from '../../src/dry-run-completeness.js';
 import * as inspectorModule from '../../src/inspector/inspector-client.js';
 import type { TestInfo } from '../../src/inspector/types.js';
 import * as processRunner from '../../src/process-runner.js';
-import { RunProfile, type RunRecord, type WorkerSummary } from '../../src/run-profile.js';
+import { RunProfile, WorkerProfiler, type RunRecord, type WorkerSummary } from '../../src/run-profile.js';
 import * as bunVersion from '../../src/utils/bun-version.js';
 import * as bunfigSanitizer from '../../src/utils/bunfig-sanitizer.js';
 import * as privateTempDir from '../../src/utils/private-temp-dir.js';
@@ -207,5 +208,68 @@ describe('BunTestRunner run profile', () => {
         expect(mutant.patternBytes).toBeUndefined();
         expect(summary.runs).toBe(2);
         expect(Object.keys(summary.groups)).toEqual(['all', 'dry', 'dry/complete', 'mutant', 'mutant/*/static', 'mutant/survived', 'mutant/survived/static']);
+    });
+
+    it('still stops the in-flight child and cleans up at dispose when the profile summary throws', async () => {
+        process.env[processRunner.PROFILE_ENV] = file;
+        spyOn(WorkerProfiler.prototype, 'writeSummary').mockImplementation(() => {
+            throw new RangeError('Maximum call stack size exceeded.');
+        });
+        // A dry run whose child only ends when it is aborted.
+        let aborted = false;
+        let spawned!: () => void;
+        const childStarted = new Promise<void>((resolve) => {
+            spawned = resolve;
+        });
+        mockRunBunTests.mockImplementation((options: SpawnOptions & { signal?: AbortSignal }) => new Promise((resolve) => {
+            spawned();
+            options.onInspectorReady?.('ws://127.0.0.1:6499/inspector');
+            options.signal?.addEventListener('abort', () => {
+                aborted = true;
+                resolve({ exitCode: null, stdout: '', stderr: '', timedOut: true });
+            });
+        }));
+        const cleanupSpy = spyOn(preloadGenerator, 'cleanupPreloadScript').mockResolvedValue(undefined);
+        const runner = new BunTestRunner(mockLogger, {} as StrykerOptions);
+        await runner.init();
+        const dryRun = runner.dryRun();
+        await childStarted;
+
+        await runner.dispose();
+        await dryRun;
+
+        expect(aborted).toBe(true);
+        expect(cleanupSpy).toHaveBeenCalledWith('/tmp/preload.ts');
+        expect((mockLogger.warn as ReturnType<typeof mock>).mock.calls.some(call => String(call[0]).includes('run profile\'s summary'))).toBe(true);
+    });
+
+    it('adds the dry run\'s finer timings: the preload\'s, from its stderr line, and the runner\'s own steps after the child', async () => {
+        process.env[processRunner.PROFILE_ENV] = file;
+        const preloadEpoch = Date.now();
+        mockRunBunTests.mockImplementation((options: SpawnOptions) => {
+            options.profile?.beginSpawn(false, options.testFiles, options.testNamePattern);
+            options.profile?.mark('spawned');
+            options.onInspectorReady?.('ws://127.0.0.1:6499/inspector');
+            options.profile?.mark('close');
+            const timings = formatPreloadTimings({ 'at.preloadStart': preloadEpoch, 'ms.beforeEach': 1.5, tests: 1 });
+            return Promise.resolve({ exitCode: 0, stdout: '', stderr: ` 1 pass\n${timings}`, timedOut: false });
+        });
+
+        await workerLife();
+
+        const text = await fs.promises.readFile(file, 'utf8');
+        const [dry, mutant] = text.trimEnd().split('\n').map(line => JSON.parse(line) as RunRecord);
+        const detail = dry.detail ?? {};
+        // The preload's epoch time, relative to the run's start like every mark.
+        expect(detail['at.preload.preloadStart']).toBeCloseTo(preloadEpoch - dry.startEpochMs, 0);
+        expect(detail['preload.ms.beforeEach']).toBe(1.5);
+        expect(detail['preload.tests']).toBe(1);
+        const steps = ['inspectorClosed', 'outputParsed', 'coverageRead', 'coverageMapped', 'testsBuilt', 'gateChecked', 'coverageChecked', 'registryWritten'];
+        const times = steps.map(step => detail[`at.${step}`]);
+        expect(times.every(time => typeof time === 'number')).toBe(true);
+        expect(times).toEqual(times.toSorted((a, b) => a - b));
+        expect(times.at(-1)).toBeLessThanOrEqual(dry.totalMs);
+        // Mutant runs carry no detail.
+        expect(mutant.detail).toBeUndefined();
     });
 });

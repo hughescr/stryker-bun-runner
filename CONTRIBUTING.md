@@ -62,7 +62,11 @@ bun bench/profile-summary.ts /tmp/profile.jsonl
 Every worker appends one JSON line per dry or mutant run (its phases: `prep`, `spawn`, `startup`,
 `inspector`, `load`, `tests`, `teardown`, `stdio`, `finish`, with the marks between them) and one
 summary line when it is disposed. The script prints each phase's share of the time and its count,
-mean, p50, p95 and total by run status and scope (targeted, static, fallback, files). Unset, empty,
+mean, p50, p95 and total by run status and scope (targeted, static, fallback, files). The dry run's
+line also carries a `detail` of finer timings, which the script prints step by step: the coverage
+preload's own (start, `ready`, eager imports, first test, its hooks' total time, the coverage write
+and its size, the drain handshake), reported on the child's stderr only when profiling, and the
+runner's steps after the child exits (coverage read, mapping, tests built, gate, registry). Unset, empty,
 `0` or `false` means off, and a value that is not an absolute path is warned about and also means
 off. Off, the runner does no timing at all. See `src/run-profile.ts` for the line formats.
 
