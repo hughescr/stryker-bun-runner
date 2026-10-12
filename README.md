@@ -364,7 +364,7 @@ More: [Mutant runs](docs/internals.md#mutant-runs), [the dry run in detail](docs
 - **Error** when the run proves nothing either way: the process crashed with no failing test that
   matches a known test, could not be started, exited with an error but no failing test and no failure
   count, exited 0 before running every selected test (a test, hook or module called
-  `process.exit(0)`) with no failing test, or a full-suite fallback ran out of the time Stryker sized
+  `process.exit(0)`) with no failing test that matches a known test, or a full-suite fallback ran out of the time Stryker sized
   for the covering tests. An early exit is never Survived: the tests after it never ran.
 
 The full table and the reasoning: [How results are scored](docs/internals.md#how-results-are-scored).

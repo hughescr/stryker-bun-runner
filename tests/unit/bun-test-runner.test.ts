@@ -7017,7 +7017,7 @@ tests/example.test.ts:
                 expect(warns[0]).toEqual(['Mutant %s: %s — scoring as Error rather than Survived', '1', errorMessage]);
             });
 
-            it('scores a targeted run whose last test exited 0 after printing as Error, quoting stderr first', async () => {
+            it('scores a targeted run whose last test exited 0 after printing as Error, quoting stdout then stderr', async () => {
                 mockRunBunTests.mockResolvedValue({
                     exitCode: 0,
                     stdout:   'bun test v1.4.2 (744846f84)\nhello from e2\n',
@@ -7027,14 +7027,20 @@ tests/example.test.ts:
 
                 const result = await run(['e.test.ts > e1', 'e.test.ts > e2 last exits']);
 
-                expect(result).toEqual({
-                    status:       MutantRunStatus.Error,
-                    errorMessage: expect.stringMatching(new RegExp(String.raw`^${EARLY_EXIT_REASON}: .*: e\.test\.ts:$`, 's')),
-                });
+                expect(result.status).toBe(MutantRunStatus.Error);
+                if(result.status === MutantRunStatus.Error) {
+                    expect(result.errorMessage).toStartWith(`${EARLY_EXIT_REASON}: `);
+                    expect(result.errorMessage).toEndWith('no test reported a failure: bun test v1.4.2 (744846f84)\nhello from e2\n\n\ne.test.ts:');
+                }
             });
 
-            it('quotes at most 500 characters of the output, without colour codes', async () => {
-                mockRunBunTests.mockResolvedValue({ exitCode: 0, stdout: 'on stdout', stderr: `\u001B[31m${'y'.repeat(600)}\u001B[0m`, timedOut: false });
+            it('quotes the last 500 characters of the output, where the exit happened, without colour codes', async () => {
+                mockRunBunTests.mockResolvedValue({
+                    exitCode: 0,
+                    stdout:   'on stdout',
+                    stderr:   `${'h'.repeat(300)}\u001B[31m${'y'.repeat(500)}\u001B[0m\n`,
+                    timedOut: false,
+                });
 
                 const result = await run([]);
 
@@ -7067,6 +7073,25 @@ tests/example.test.ts:
                 const result = await run(['f.test.ts > f1 fails', 'f.test.ts > f2 exits', 'f.test.ts > f3'], { disableBail: true });
 
                 expect(result).toMatchObject({ status: MutantRunStatus.Killed, killedBy: ['f.test.ts > f1 fails'] });
+            });
+
+            it('scores it Error, not Killed, when the failing lines it printed match no known test (a test logged one)', async () => {
+                mockRunBunTests.mockResolvedValue({
+                    exitCode: 0,
+                    stdout:   'bun test v1.4.2 (744846f84)\n',
+                    stderr:   '\nf.test.ts:\n(fail) logged by a test, not a test [1.00ms]\n',
+                    timedOut: false,
+                });
+
+                const result = await run(['f.test.ts > f1', 'f.test.ts > f2 exits'], { disableBail: true });
+
+                expect(result.status).toBe(MutantRunStatus.Error);
+                if(result.status === MutantRunStatus.Error) {
+                    expect(result.errorMessage).toStartWith(`${EARLY_EXIT_REASON}: `);
+                    expect(result.errorMessage).toContain('the 1 failing test(s) it reported could not be attributed to a known test: ');
+                    expect(result.errorMessage).toEndWith('(fail) logged by a test, not a test [1.00ms]');
+                }
+                expect((mockLogger.warn as ReturnType<typeof mock>).mock.calls.filter(call => String(call[0]).includes('rather than Survived'))).toHaveLength(1);
             });
 
             it.each([
