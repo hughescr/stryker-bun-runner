@@ -13,7 +13,7 @@
 
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { access, appendFile, mkdir, open, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, appendFile, copyFile, mkdir, open, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
@@ -41,6 +41,19 @@ const BUSY_WARN_PCT = 25;
 /** Mutation status by stable mutant key. */
 type StatusMap = Record<string, string>;
 
+/** What the report says about one mutant; saved per run to make disagreements diagnosable. */
+interface MutantDetail {
+    readonly status:          string
+    readonly id:              string
+    readonly mutatorName:     string
+    readonly file:            string
+    readonly location:        string
+    readonly statusReason?:   unknown
+    readonly testsCompleted?: unknown
+    readonly coveredBy?:      unknown
+    readonly killedBy?:       unknown
+}
+
 interface RunResult {
     readonly index:         number
     readonly wallSeconds:   number
@@ -52,6 +65,13 @@ interface RunResult {
     readonly contention:    boolean
     readonly log:           string
     readonly statuses:      StatusMap
+    readonly details:       Record<string, MutantDetail>
+}
+
+/** A mutant whose status differs between runs: one entry per run, in run order. */
+interface Disagreement {
+    readonly key:  string
+    readonly runs: readonly MutantDetail[]
 }
 
 interface Mismatch {
@@ -94,7 +114,7 @@ interface Analysis {
     readonly stats:              Stats
     readonly counts:             Record<string, number>
     readonly runsAgree:          boolean
-    readonly runMismatches:      readonly Mismatch[]
+    readonly runDisagreements:   readonly Disagreement[]
     readonly baselineMismatches: readonly Mismatch[]
     readonly mismatchedKeys:     number
     readonly statusDiff:         string
@@ -287,6 +307,7 @@ interface MutantEntry {
     readonly column:      number
     readonly endLine:     number
     readonly endColumn:   number
+    readonly extras:      Pick<MutantDetail, 'coveredBy' | 'killedBy' | 'statusReason' | 'testsCompleted'>
 }
 
 function parseMutant(file: string, raw: unknown): MutantEntry {
@@ -307,6 +328,12 @@ function parseMutant(file: string, raw: unknown): MutantEntry {
         column:      start.column,
         endLine:     end.line,
         endColumn:   end.column,
+        extras:      {
+            statusReason:   raw.statusReason,
+            testsCompleted: raw.testsCompleted,
+            coveredBy:      raw.coveredBy,
+            killedBy:       raw.killedBy,
+        },
     };
 }
 
@@ -327,22 +354,22 @@ function mutantKey(file: string, mutant: MutantEntry): string {
 }
 
 /** Mutants identical in file, extent, mutator and replacement (should not happen) get `#2`, `#3`... in the order given. */
-function uniqueKey(base: string, statuses: StatusMap): string {
+function uniqueKey(base: string, taken: Record<string, unknown>): string {
     let key = base;
     let n = 2;
-    while(key in statuses) {
+    while(key in taken) {
         key = `${base}#${String(n)}`;
         n++;
     }
     return key;
 }
 
-async function buildStatusMap(reportPath: string): Promise<StatusMap> {
+async function buildMutantDetails(reportPath: string): Promise<Record<string, MutantDetail>> {
     const report = await readJson(reportPath);
     if(!isRecord(report) || !isRecord(report.files)) {
         throw new Error(`report ${reportPath} has no "files" object`);
     }
-    const statuses: StatusMap = {};
+    const details: Record<string, MutantDetail> = {};
     for(const [file, value] of Object.entries(report.files)) {
         if(!isRecord(value) || !Array.isArray(value.mutants)) {
             throw new TypeError(`report: no mutants array for ${file}`);
@@ -351,10 +378,38 @@ async function buildStatusMap(reportPath: string): Promise<StatusMap> {
         const mutants = (value.mutants as unknown[]).map(raw => parseMutant(file, raw))
             .toSorted((a, b) => Number(a.id) - Number(b.id));
         for(const mutant of mutants) {
-            statuses[uniqueKey(mutantKey(file, mutant), statuses)] = mutant.status;
+            details[uniqueKey(mutantKey(file, mutant), details)] = {
+                status:      mutant.status,
+                id:          mutant.id,
+                mutatorName: mutant.mutatorName,
+                file,
+                location:    `${String(mutant.line)}:${String(mutant.column)}-${String(mutant.endLine)}:${String(mutant.endColumn)}`,
+                ...mutant.extras,
+            };
         }
     }
-    return statuses;
+    return details;
+}
+
+function statusesOf(details: Record<string, MutantDetail>): StatusMap {
+    return Object.fromEntries(Object.entries(details).map(([key, detail]) => [key, detail.status]));
+}
+
+function absent(key: string): MutantDetail {
+    return { status: '<absent>', id: '', mutatorName: '', file: key, location: '' };
+}
+
+/** Mutants whose status is not the same in every run (a key present in only some runs counts, as `<absent>`). */
+function findDisagreements(results: readonly RunResult[]): Disagreement[] {
+    const keys = new Set(results.flatMap(run => Object.keys(run.details)));
+    const found: Disagreement[] = [];
+    for(const key of keys) {
+        const runs = results.map(run => run.details[key] ?? absent(key));
+        if(new Set(runs.map(detail => detail.status)).size > 1) {
+            found.push({ key, runs });
+        }
+    }
+    return found.toSorted((a, b) => a.key.localeCompare(b.key));
 }
 
 function sortedEntries(map: StatusMap): [string, string][] {
@@ -432,8 +487,9 @@ async function benchOnce(options: Options, stamp: string, index: number): Promis
 
     const load1 = os.loadavg()[0];
     const cpuBusyPct = await sampleCpuBusyPct();
-    // Run 1's load average is clean evidence; later runs inherit the previous run's own load, so judge them by the live CPU sample.
-    const contention = (index === 0 && load1 > 1) || (cpuBusyPct ?? 0) > BUSY_WARN_PCT;
+    // The 1-minute load average lags: right after another benchmark (or this run's predecessor) it is high on an idle machine.
+    // So the live CPU sample decides; the load average only decides when /proc/stat is unavailable, and only for run 1.
+    const contention = cpuBusyPct === undefined ? index === 0 && load1 > 1 : cpuBusyPct > BUSY_WARN_PCT;
     const busy = cpuBusyPct === undefined ? 'n/a' : `${cpuBusyPct.toFixed(0)}%`;
     const warning = contention ? '  WARNING: machine not idle, timing is unreliable' : '';
     say(`bench: run ${label} starting (load1=${load1.toFixed(2)}, cpu_busy=${busy})${warning}`);
@@ -450,7 +506,11 @@ async function benchOnce(options: Options, stamp: string, index: number): Promis
     if(!await exists(reportPath)) {
         die(`run ${label}: stryker succeeded but wrote no ${reportPath}; log: ${logRel}`);
     }
-    const statuses = await buildStatusMap(reportPath);
+    const details = await buildMutantDetails(reportPath);
+    const statuses = statusesOf(details);
+    const runPrefix = path.join(outDir, `${stamp}-run${String(index + 1)}`);
+    await writeFile(`${runPrefix}-statuses.json`, `${JSON.stringify(Object.fromEntries(Object.entries(details).toSorted(([a], [b]) => a.localeCompare(b))), null, 1)}\n`);
+    await copyFile(reportPath, `${runPrefix}-mutation.json`);
     const dry = parseDryRun(log);
     if(dry.seconds === undefined) {
         console.error(`bench: warning: no "Initial test run succeeded" line in ${logRel}`);
@@ -466,6 +526,7 @@ async function benchOnce(options: Options, stamp: string, index: number): Promis
         contention,
         log:           logRel,
         statuses,
+        details,
     };
     say(`RUN ${label} wall=${seconds.toFixed(1)}s dryrun=${dry.seconds?.toFixed(1) ?? 'n/a'}s tests=${String(dry.tests ?? 'n/a')} mutants=${String(result.mutants)} load1=${load1.toFixed(2)}${contention ? ' LOAD-WARNING' : ''} log=${logRel}`);
     return result;
@@ -496,7 +557,7 @@ function computeStats(results: readonly RunResult[]): Stats {
 
 async function analyse(results: readonly RunResult[]): Promise<Analysis> {
     const [first] = results;
-    const runMismatches = results.slice(1).flatMap(run => diffStatuses(first.statuses, run.statuses, run.index));
+    const runDisagreements = findDisagreements(results);
     const baselineStatuses = await readJson(baselineStatusesPath) as StatusMap | undefined;
     const baseline = await readJson(baselineJsonPath) as BaselineJson | undefined;
     const baselineMismatches = baselineStatuses
@@ -512,8 +573,8 @@ async function analyse(results: readonly RunResult[]): Promise<Analysis> {
     return {
         stats:     computeStats(results),
         counts:    countStatuses(first.statuses),
-        runsAgree: runMismatches.length === 0,
-        runMismatches,
+        runsAgree: runDisagreements.length === 0,
+        runDisagreements,
         baselineMismatches,
         mismatchedKeys,
         statusDiff,
@@ -546,9 +607,10 @@ function printReport(sha: string, results: readonly RunResult[], analysis: Analy
         say('BENCH-WARNING the machine was not idle at the start of at least one run; timings are unreliable (check for other CPU-heavy work).');
     }
     if(!runsAgree) {
-        say(`\nRuns disagree with each other (${String(analysis.runMismatches.length)} differences vs run 1; up to ${String(SHOWN_MISMATCHES)} shown):`);
-        for(const m of analysis.runMismatches.slice(0, SHOWN_MISMATCHES)) {
-            say(`  ${m.key}: run 1 ${m.expected}, run ${String(m.run)} ${m.actual}`);
+        say(`\nRuns disagree on ${String(analysis.runDisagreements.length)} mutants (up to ${String(SHOWN_MISMATCHES)} shown; per-run maps in bench/out/<stamp>-run<i>-statuses.json):`);
+        for(const d of analysis.runDisagreements.slice(0, SHOWN_MISMATCHES)) {
+            const perRun = d.runs.map((detail, i) => `run${String(i + 1)}=${detail.status}(id ${detail.id || '-'})`).join(' ');
+            say(`  ${d.key}\n    ${d.runs[0].mutatorName} at ${d.runs[0].file}:${d.runs[0].location}  ${perRun}`);
         }
     }
     if(analysis.baselineMismatches.length > 0) {
@@ -701,18 +763,20 @@ async function main(): Promise<void> {
     const { stats } = analysis;
     const summary = {
         sha,
-        runs:                results.length,
-        medianSeconds:       stats.median,
-        minSeconds:          stats.min,
-        maxSeconds:          stats.max,
-        spreadPct:           stats.spreadPct,
-        dryRunMedianSeconds: stats.dryRunMedian ?? null,
-        mutants:             results[0].mutants,
-        statusCounts:        analysis.counts,
-        runsAgree:           analysis.runsAgree,
-        statusDiff:          analysis.statusDiff,
-        mismatches:          analysis.baselineMismatches.slice(0, SHOWN_MISMATCHES),
-        runDetails:          results.map(({ statuses: _statuses, ...rest }) => rest),
+        runs:                 results.length,
+        medianSeconds:        stats.median,
+        minSeconds:           stats.min,
+        maxSeconds:           stats.max,
+        spreadPct:            stats.spreadPct,
+        dryRunMedianSeconds:  stats.dryRunMedian ?? null,
+        mutants:              results[0].mutants,
+        statusCounts:         analysis.counts,
+        runsAgree:            analysis.runsAgree,
+        statusDiff:           analysis.statusDiff,
+        mismatches:           analysis.baselineMismatches.slice(0, SHOWN_MISMATCHES),
+        runDisagreements:     analysis.runDisagreements.slice(0, SHOWN_MISMATCHES),
+        runDisagreementCount: analysis.runDisagreements.length,
+        runDetails:           results.map(({ statuses: _statuses, details: _details, ...rest }) => rest),
     };
     await writeFile(path.join(outDir, `${stamp}-summary.json`), `${JSON.stringify(summary, null, 2)}\n`);
     if(options.json) {

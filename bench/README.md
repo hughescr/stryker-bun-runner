@@ -86,11 +86,18 @@ BENCH sha=3589d9f runs=3 median=118.4s min=117.9s max=121.0s spread=2.6% dryrun_
 - `mutants` — number of mutants in `reports/mutation/mutation.json`.
 - `runs_agree` — `NO` if the runs' per-mutant statuses differ from each other.
 - `status_diff` — `OK`, `NO_BASELINE`, or `<k> mismatches vs baseline`; mismatches are listed below the summary (first 20).
-- `load1` — 1-minute load average at the start of a run. The harness also samples system-wide CPU busy % for 1 s and prints `WARNING: machine not idle` (and `BENCH-WARNING` after the summary) if run 1 starts with load1 > 1.0 or any run starts with CPU > 25 % busy. Later runs inherit the previous run's own load average, which is why only run 1 is judged by load1. **A warned benchmark is not trustworthy; find the other CPU user and re-run.**
+- `load1` — 1-minute load average at the start of a run, for information. It lags (it is high right after another benchmark or the previous run on an idle machine), so the warning is decided by a live reading instead: the harness samples system-wide CPU busy % for 1 s before each run and prints `WARNING: machine not idle` (and `BENCH-WARNING` after the summary) if it is above 25 %. (Only if `/proc/stat` is unreadable does run 1 fall back to warning on load1 > 1.0.) **A warned benchmark is not trustworthy; find the other CPU user and re-run.**
 
 Exit codes: `0` ok; `1` Stryker or build failed (log tail printed, nothing recorded); `2` usage or missing lock; `3` per-mutant statuses differ from the baseline or between runs.
 
-Every run's full Stryker output is in `bench/out/<timestamp>-run<i>.log` and a machine-readable summary in `bench/out/<timestamp>-summary.json` (`bench/out/` is gitignored).
+Everything for an invocation lands in `bench/out/` (gitignored), named by its start timestamp:
+
+- `<stamp>-run<i>.log`: Stryker's full output for run *i*.
+- `<stamp>-run<i>-statuses.json`: that run's map from key to `{status, id, mutatorName, file, location, statusReason, coveredBy, killedBy, testsCompleted}`.
+- `<stamp>-run<i>-mutation.json`: a copy of Stryker's `mutation.json` for the run (the fixture's `reports/` is wiped before every run).
+- `<stamp>-summary.json`: the summary. `mismatches` lists differences from the baseline; `runDisagreements` (with `runDisagreementCount`) lists mutants whose status differs between runs, each with its per-run details.
+
+When `runs_agree=NO`, the text output prints each disagreeing mutant as its key, mutator, location, and `run<i>=<status>(id <id>)` for every run; `diff` the `-statuses.json` files or read `statusReason` and `coveredBy` in them for the cause. Compare the per-worker `killed/survived/timeout` totals in the logs, too: a run whose totals differ had a real status change, not a key problem.
 
 ## The invariant: per-mutant statuses must match the baseline exactly
 
