@@ -237,6 +237,12 @@ run stopped at the deadline as a normal Timeout.
 Stryker shows Error as RuntimeError and leaves it out of the mutation score. Each Error is logged
 at warn (see [Log output](#log-output)).
 
+**Coloured output.** `FORCE_COLOR` set where Stryker runs reaches every `bun test` child, and bun
+then colours its output even when piped, printing `✗ name` for `(fail) name` with colour codes
+around both. The runner removes colour codes from each line before reading it, so failing tests,
+file headers and the summary read the same with or without colour, and so do `killedBy` and every
+result above.
+
 **Why load failures are Killed.** A mutant can stop a test file from loading: a source module
 throws at import (a mutated module-level constant or config object, say), a source file no longer
 parses, or a `describe` body throws. Bun reports that only in its summary. Stryker only mutates

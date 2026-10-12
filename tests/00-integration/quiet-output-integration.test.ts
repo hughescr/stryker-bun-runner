@@ -28,7 +28,7 @@ import { DryRunStatus, MutantRunStatus, type MutantRunOptions, type MutantRunRes
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test';
 import { BunTestRunner } from '../../src/bun-test-runner.js';
 import { parseBunTestOutput } from '../../src/parsers/console-parser.js';
-import { killAllLiveChildren, removeSignalCleanup, runBunTests, type BunProcessResult } from '../../src/process-runner.js';
+import { killAllLiveChildren, removeSignalCleanup, runBunTests, stripAnsi, type BunProcessResult } from '../../src/process-runner.js';
 import { generateSanitizedBunfig, mutantRunBunfigPath } from '../../src/utils/bunfig-sanitizer.js';
 import { resolveRunTempDir } from '../../src/utils/private-temp-dir.js';
 import { rememberEnv } from '../helpers/env.js';
@@ -185,7 +185,7 @@ describe('the mutant-run bunfig in a real bun test child', () => {
         bunfig.mutantRun = mutantRunBunfigPath(bunfig.dryRun);
     });
 
-    function run(bunfigPath: string, outcome: Outcome): Promise<BunProcessResult> {
+    function run(bunfigPath: string, outcome: Outcome, env?: Record<string, string>): Promise<BunProcessResult> {
         return runBunTests({
             bunPath:         process.execPath,
             timeout:         30_000,
@@ -196,12 +196,14 @@ describe('the mutant-run bunfig in a real bun test child', () => {
             sequentialMode:  true,
             testFiles,
             testNamePattern: outcome.pattern,
+            env,
         });
     }
 
     /** Everything the runner scores a mutant run from. */
     function verdict(result: BunProcessResult): Record<string, unknown> {
         const parsed = parseBunTestOutput(result.stdout, result.stderr, testFiles);
+        const stderr = stripAnsi(result.stderr);
         return {
             exitCode:       result.exitCode,
             signal:         result.signal,
@@ -215,21 +217,29 @@ describe('the mutant-run bunfig in a real bun test child', () => {
             summaryTodo:    parsed.summaryTodo,
             summaryErrors:  parsed.summaryErrors,
             summaryPrinted: parsed.summaryPrinted,
-            zeroMatch:      result.stderr.includes('matched 0 tests.'),
-            unhandled:      result.stderr.includes('# Unhandled error between tests'),
-            ranLine:        /^Ran \d+ tests? across/m.exec(result.stderr)?.[0],
-            bailLine:       /^Bailed out after \d+ failures?$/m.exec(result.stderr)?.[0],
+            zeroMatch:      stderr.includes('matched 0 tests.'),
+            unhandled:      stderr.includes('# Unhandled error between tests'),
+            ranLine:        /^Ran \d+ tests? across/m.exec(stderr)?.[0],
+            bailLine:       /^Bailed out after \d+ failures?$/m.exec(stderr)?.[0],
         };
     }
 
     for(const [outcome, expected] of OUTCOMES) {
-        test(`${outcome.name}: the same verdict from both bunfigs`, async () => {
-            const [full, quiet] = await Promise.all([run(bunfig.dryRun, outcome), run(bunfig.mutantRun, outcome)]);
+        // FORCE_COLOR set where Stryker runs reaches every child, and bun then colours its output even when piped.
+        test(`${outcome.name}: the same verdict from both bunfigs, with and without FORCE_COLOR`, async () => {
+            const [full, quiet, colouredQuiet] = await Promise.all([
+                run(bunfig.dryRun, outcome),
+                run(bunfig.mutantRun, outcome),
+                run(bunfig.mutantRun, outcome, { FORCE_COLOR: '1' }),
+            ]);
 
             const fullVerdict = verdict(full);
             // The fixture really produces this outcome.
             expect({ ...fullVerdict, failedTests: (fullVerdict.failedTests as string[]).length }).toMatchObject(expected);
             expect(verdict(quiet)).toEqual(fullVerdict);
+            // The colour is real, and changes nothing the runner reads.
+            expect(colouredQuiet.stdout + colouredQuiet.stderr).toContain('\u001B[');
+            expect(verdict(colouredQuiet)).toEqual(fullVerdict);
         }, 60_000);
     }
 
@@ -316,6 +326,25 @@ describe('mutant-run verdicts through a real BunTestRunner', () => {
         const result = await mutantRun('kill', [id('a1'), id('a2')]);
 
         expect(result).toMatchObject({ status: MutantRunStatus.Killed, killedBy: [id('a2')], nrOfTests: 1 });
+    }, 60_000);
+
+    /** `run` with FORCE_COLOR set, as it is in the children when it is set where Stryker runs. */
+    async function withForceColor<T>(run: () => Promise<T>): Promise<T> {
+        process.env.FORCE_COLOR = '1';
+        try {
+            return await run();
+        } finally {
+            Reflect.deleteProperty(process.env, 'FORCE_COLOR');
+        }
+    }
+
+    test('under FORCE_COLOR, a covering test fails: Killed by it', async () => {
+        expect(await withForceColor(() => mutantRun('kill', [id('a1'), id('a2')]))).toMatchObject({ status: MutantRunStatus.Killed, killedBy: [id('a2')], nrOfTests: 1 });
+    }, 60_000);
+
+    test('under FORCE_COLOR, a test fails and a later one exits 0, without bail: Killed by the failing test', async () => {
+        expect(await withForceColor(() => mutantRun('failExit', [id('b2'), id('b3'), id('b title plain')], { disableBail: true })))
+            .toMatchObject({ status: MutantRunStatus.Killed, killedBy: [id('b2')] });
     }, 60_000);
 
     test('a test.failing test passes: Killed by it', async () => {

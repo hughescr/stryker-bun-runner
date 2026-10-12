@@ -1573,7 +1573,9 @@ export class BunTestRunner implements TestRunner {
    * are all unaffected; only failureMessage content is enriched.
    */
     private buildFailureMessage(testInfo: TestInfo, parsed: ParsedTestResults): string {
-        const parsedTest = parsed.tests.find(t => t.name.includes(testInfo.name));
+        // Only a failing test's line carries a failure message. Under FORCE_COLOR bun's `✓` lines
+        // parse as passing tests too, and one whose name contains this test's must not shadow it.
+        const parsedTest = parsed.tests.find(t => t.status === 'failed' && t.name.includes(testInfo.name));
         const baseFailureMessage = parsedTest?.failureMessage ?? testInfo.error?.message ?? defaultFailureMessage(testInfo);
         const stack = testInfo.error?.stack;
         return stack && !baseFailureMessage.includes(stack)

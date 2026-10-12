@@ -482,7 +482,11 @@ export function parseBunTestOutput(stdout: string, stderr: string, testFiles?: r
 
     // Combine stdout and stderr for parsing
     const output = `${stdout}\n${stderr}`;
-    const lines = output.split('\n');
+    // Every line is matched without its colour codes. Under FORCE_COLOR (which reaches the child
+    // from the environment Stryker runs in) bun colours its test lines even when piped:
+    // `ESC[0mESC[31m✗ESC[0m ESC[0mmathESC[2m >ESC[0mESC[1m adds…`, which no pattern below matches raw.
+    // Stripped line by line, so an unterminated escape sequence a test printed cannot swallow a newline.
+    const lines = output.split('\n').map(line => stripAnsi(line));
     const isHeaderFile = headerFilter(lines, testFiles);
 
     let currentTest: TestResult | null = null;

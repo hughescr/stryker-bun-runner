@@ -26,6 +26,7 @@ import * as bunfigSanitizer from '../../src/utils/bunfig-sanitizer.js';
 import * as privateTempDir from '../../src/utils/private-temp-dir.js';
 import * as syncServerModule from '../../src/utils/sync-server.js';
 import * as testFileDiscovery from '../../src/utils/test-file-discovery.js';
+import { TWO_FILES_COLOUR_ONLY_FAILURES, TWO_FILES_COLOUR_ONLY_FAILURES_BAIL, TWO_FILES_PLAIN_ONLY_FAILURES, TWO_FILES_PLAIN_ONLY_FAILURES_BAIL } from '../helpers/bun-output-fixtures.js';
 import { runUntilSettled, trackTimers } from '../helpers/fake-clock.js';
 import { mockRename, mockWriteFile, resetAllMocks, resetFsMocks } from '../test-preload.js';
 
@@ -4810,6 +4811,25 @@ tests/example.test.ts:
                 }
             });
 
+            it('COMPLETE branch: takes the console failure message from the failing test\'s line, not a passing test whose name contains it', async () => {
+                // Under FORCE_COLOR bun's `✓` lines parse as passing tests, listed before the failing one here.
+                mockProcessResult({ exitCode: 1, stdout: '\u001B[32m✓\u001B[0m my test too [0.10ms]\n\u001B[31m✗\u001B[0m my test [0.20ms]\nerror: from the console\n 1 pass\n 1 fail' });
+                const testHierarchy: TestInfo[] = [
+                    { id: 1, name: 'my test too', fullName: 'my test too', type: 'test', status: 'pass' },
+                    { id: 2, name: 'my test', fullName: 'my test', type: 'test', status: 'fail', error: { message: 'from the inspector' } },
+                ];
+                mockInspectorClient.getTests.mockReturnValue(testHierarchy);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([1, 2]);
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                const result = await runner.dryRun();
+
+                expect(result.status).toBe(DryRunStatus.Complete);
+                const failed = result.status === DryRunStatus.Complete ? result.tests.find(t => t.status === TestStatus.Failed) : undefined;
+                expect(failed?.status === TestStatus.Failed ? failed.failureMessage : undefined).toBe('error: from the console');
+            });
+
             it('COMPLETE branch: does NOT append anything when the inspector error has no stack', async () => {
                 // Distinguishes the real `stack && !baseFailureMessage.includes(stack)` guard
                 // from a mutant that forces this to always-true: with no `stack` at all,
@@ -7107,6 +7127,61 @@ tests/example.test.ts:
                 const result = await run(['a.test.ts > a1', 'a.test.ts > a2', 'a.test.ts > a3']);
 
                 expect(result.status).toBe(MutantRunStatus.Survived);
+                expect((mockLogger.warn as ReturnType<typeof mock>).mock.calls.filter(call => String(call[0]).includes('rather than Survived'))).toEqual([]);
+            });
+        });
+
+        describe('real bun 1.4.2 output, with and without FORCE_COLOR (tests/helpers/bun-output-fixtures.ts)', () => {
+            // Under FORCE_COLOR bun colours its `(fail)` lines (as `✗ …`) even when piped. Read raw, no
+            // failing test was found in them: every kill had an empty killedBy (so Stryker's incremental
+            // mode could not reuse it), and an early exit 0 after a failing test scored Error.
+            const SUBTRACTS = 'tests/a.test.ts > math > subtracts wrong';
+            const THROWS = 'tests/a.test.ts > math > throws';
+            const B_FAILS = 'tests/b.test.ts > b fails';
+            const COVERING = [SUBTRACTS, THROWS, B_FAILS, 'tests/a.test.ts > math > adds', 'tests/b.test.ts > b passes'];
+
+            const run = async (disableBail: boolean) => {
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                return runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '1' } as any,
+                    testFilter:      COVERING,
+                    sandboxFileName: 'sandbox',
+                    disableBail,
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+            };
+            const unattributedWarns = (): unknown[] => (mockLogger.warn as ReturnType<typeof mock>).mock.calls.filter(call => String(call[0]).includes('no killing test identifiable'));
+
+            it.each([
+                ['plain', TWO_FILES_PLAIN_ONLY_FAILURES_BAIL],
+                ['FORCE_COLOR', TWO_FILES_COLOUR_ONLY_FAILURES_BAIL],
+            ])('%s, with bail: Killed by the failing test', async (_label, output) => {
+                mockRunBunTests.mockResolvedValue({ exitCode: 1, ...output, timedOut: false });
+
+                expect(await run(false)).toMatchObject({ status: MutantRunStatus.Killed, killedBy: [SUBTRACTS], nrOfTests: 1 });
+                expect(unattributedWarns()).toEqual([]);
+            });
+
+            it.each([
+                ['plain', TWO_FILES_PLAIN_ONLY_FAILURES],
+                ['FORCE_COLOR', TWO_FILES_COLOUR_ONLY_FAILURES],
+            ])('%s, without bail: Killed by every failing test', async (_label, output) => {
+                mockRunBunTests.mockResolvedValue({ exitCode: 1, ...output, timedOut: false });
+
+                expect(await run(true)).toMatchObject({ status: MutantRunStatus.Killed, killedBy: [SUBTRACTS, THROWS, B_FAILS], nrOfTests: 6 });
+                expect(unattributedWarns()).toEqual([]);
+            });
+
+            it.each([
+                ['plain', TWO_FILES_PLAIN_ONLY_FAILURES],
+                ['FORCE_COLOR', TWO_FILES_COLOUR_ONLY_FAILURES],
+            ])('%s, an exit 0 before the summary after two tests failed: Killed by them, not Error', async (_label, output) => {
+                // As if b.test.ts called process.exit(0) at load: everything up to its header, then nothing.
+                mockRunBunTests.mockResolvedValue({ exitCode: 0, stdout: output.stdout, stderr: output.stderr.slice(0, output.stderr.indexOf('tests/b.test.ts:')), timedOut: false });
+
+                expect(await run(true)).toMatchObject({ status: MutantRunStatus.Killed, killedBy: [SUBTRACTS, THROWS] });
                 expect((mockLogger.warn as ReturnType<typeof mock>).mock.calls.filter(call => String(call[0]).includes('rather than Survived'))).toEqual([]);
             });
         });
