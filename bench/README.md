@@ -98,10 +98,10 @@ A faster runner is only useful if it kills and spares exactly the same mutants. 
 run the harness reads `reports/mutation/mutation.json`, builds a map
 
 ```
-"<file>:<line>:<col>:<mutatorName>:<sha256(replacement)[0..10]>"  ->  Killed | Survived | NoCoverage | Timeout | ...
+"<file>:<line>:<col>-<endLine>:<endCol>:<mutatorName>:<sha256(replacement)[0..10]>"  ->  Killed | Survived | NoCoverage | Timeout | ...
 ```
 
-and compares it with `bench/baseline-statuses.json`. The key is location + mutator +
+and compares it with `bench/baseline-statuses.json`. The key is full location (start and end) + mutator +
 replacement, which is how Stryker's own incremental mode identifies a mutant; Stryker's
 sequential mutant ids are not used because they shift whenever any earlier source changes.
 (Two mutants identical in all four parts get `#2`, `#3`... in report order.)

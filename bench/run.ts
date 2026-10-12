@@ -285,13 +285,17 @@ interface MutantEntry {
     readonly status:      string
     readonly line:        number
     readonly column:      number
+    readonly endLine:     number
+    readonly endColumn:   number
 }
 
 function parseMutant(file: string, raw: unknown): MutantEntry {
     const start = isRecord(raw) && isRecord(raw.location) ? raw.location.start : undefined;
-    if(!isRecord(raw) || !isRecord(start)
+    const end = isRecord(raw) && isRecord(raw.location) ? raw.location.end : undefined;
+    if(!isRecord(raw) || !isRecord(start) || !isRecord(end)
       || typeof raw.status !== 'string' || typeof raw.mutatorName !== 'string'
-      || typeof start.line !== 'number' || typeof start.column !== 'number') {
+      || typeof start.line !== 'number' || typeof start.column !== 'number'
+      || typeof end.line !== 'number' || typeof end.column !== 'number') {
         throw new TypeError(`report: malformed mutant in ${file}: ${JSON.stringify(raw)}`);
     }
     return {
@@ -301,11 +305,15 @@ function parseMutant(file: string, raw: unknown): MutantEntry {
         status:      raw.status,
         line:        start.line,
         column:      start.column,
+        endLine:     end.line,
+        endColumn:   end.column,
     };
 }
 
 /**
- * Stable key of a mutant: `<file>:<line>:<col>:<mutatorName>:<sha256(replacement)[0..10]>`.
+ * Stable key of a mutant: `<file>:<line>:<col>-<endLine>:<endCol>:<mutatorName>:<sha256(replacement)[0..10]>`.
+ * The end position matters: Stryker can emit two mutants with the same start, mutator and replacement
+ * that differ only in extent (`a || b` vs `a`, both replaced by `false`).
  * Stryker's own incremental mode identifies a mutant by file, location, mutator and replacement
  * (core incremental-differ.js), because its sequential numeric ids shift whenever earlier source changes.
  * A report with no `replacement` falls back to `id=<id>`.
@@ -314,10 +322,11 @@ function mutantKey(file: string, mutant: MutantEntry): string {
     const tail = mutant.replacement === undefined
         ? `id=${mutant.id}`
         : createHash('sha256').update(mutant.replacement).digest('hex').slice(0, 10);
-    return `${file}:${String(mutant.line)}:${String(mutant.column)}:${mutant.mutatorName}:${tail}`;
+    const span = `${String(mutant.line)}:${String(mutant.column)}-${String(mutant.endLine)}:${String(mutant.endColumn)}`;
+    return `${file}:${span}:${mutant.mutatorName}:${tail}`;
 }
 
-/** Mutants identical in file, location, mutator and replacement (rare) get `#2`, `#3`... in report order. */
+/** Mutants identical in file, extent, mutator and replacement (should not happen) get `#2`, `#3`... in the order given. */
 function uniqueKey(base: string, statuses: StatusMap): string {
     let key = base;
     let n = 2;
@@ -338,8 +347,10 @@ async function buildStatusMap(reportPath: string): Promise<StatusMap> {
         if(!isRecord(value) || !Array.isArray(value.mutants)) {
             throw new TypeError(`report: no mutants array for ${file}`);
         }
-        for(const raw of value.mutants as unknown[]) {
-            const mutant = parseMutant(file, raw);
+        // The report lists mutants in completion order, which varies between runs; number any collisions in id order.
+        const mutants = (value.mutants as unknown[]).map(raw => parseMutant(file, raw))
+            .toSorted((a, b) => Number(a.id) - Number(b.id));
+        for(const mutant of mutants) {
             statuses[uniqueKey(mutantKey(file, mutant), statuses)] = mutant.status;
         }
     }
