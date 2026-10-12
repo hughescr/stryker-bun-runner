@@ -855,10 +855,12 @@ export class BunTestRunner implements TestRunner {
    *
    * `--test-name-pattern` filters at the TEST level, not the file level: bun
    * still loads every test file it was given in order to discover which names
-   * match. On a suite of 31 spec files that costs ~330ms per run of which only
-   * ~54ms is process startup — and a run that ends up executing two tests pays
-   * it in full, on every mutant. Handing bun only the files that can contain a
-   * covering test drops the same measurement to ~66ms.
+   * match, and a run that ends up executing two tests pays that in full, on
+   * every mutant. Measured on bun 1.4.2 (4-CPU Linux, the benchmark fixture's
+   * 160 instrumented test files), a run selecting two tests takes ~180ms when
+   * handed every file and ~18ms when handed only the covering file. Of those
+   * ~18ms, ~15ms is the child's startup through the coverage preload (bun itself
+   * ~2ms, `bun test`'s own setup ~6ms, our argv and preload ~6ms).
    *
    * Test ids are `<projectFile> > <fullName>` (see buildProjectFileTestName), so
    * the file is already the id's prefix and no extra bookkeeping is needed.

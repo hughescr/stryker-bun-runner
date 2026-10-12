@@ -593,14 +593,25 @@ live child's group, and re-raises the signal so the default behaviour is preserv
   the fake-timer queue, where it never fires again on its own, so a polling check would be lost in
   any suite that uses fake timers. No native addon or `prctl(PR_SET_PDEATHSIG)` is involved, and
   the processes a suite spawns do not inherit the pipe.
-- **Fallback.** If the lifeline is unavailable (the descriptor cannot be opened, or reading it
-  fails with an error such as `EBADF` or `ENOTSUP` before end-of-file), the child falls back to
-  polling its own `process.ppid` once a second on an unref'd interval: the operating system
-  reparents an orphan as soon as its parent exits, so a changed `ppid` means the parent is gone.
-  That covers every suite that does not use fake timers. The fallback is silent unless the
-  environment variable `STRYKER_BUN_RUNNER_DEBUG` is set to anything other than empty, `0` or
-  `false` (in the environment Stryker runs in, or in `bun.env`); the child then writes one line to
-  its stderr giving the reason.
+- **How the pipe is read.** The preload reads the lifeline through Bun's own file stream,
+  `Bun.file(fd).stream()`, not Node's `fs.createReadStream`. On Bun 1.4.2 a Node read stream on
+  the pipe costs every `bun test` child about 18 ms of CPU before its first test. That is more than
+  a small mutant run's own work, and it is paid on every run: a trivial test file took 29.3 ms with
+  it and 11.6 ms with Bun's stream, against 11.3 ms with no lifeline at all. On the benchmark
+  fixture, switching readers took a whole Stryker run from 28.7 s to 22.8 s.
+- **Fallback.** If the lifeline is unavailable, the child falls back to polling its own
+  `process.ppid` once a second on an unref'd interval. Unavailable means the descriptor cannot be
+  opened (`EBADF`, `EISDIR`), or a read fails before end-of-file. The operating system reparents an
+  orphan as soon as its parent exits, so a changed `ppid` means the parent is gone.
+  - Bun 1.4.2 does not turn every unreadable descriptor into a failed read. A read on a write-only
+    descriptor, or on one that something in the process closed underneath the reader, waits
+    forever instead. It never reports the parent gone; the parent just goes unwatched.
+  - The runner's lifeline is always the readable end of a pipe (a socketpair when Stryker runs on
+    Node), so this only happens when the suite tampers with descriptor 3.
+  - The fallback covers every suite that does not use fake timers. It is silent unless the
+    environment variable `STRYKER_BUN_RUNNER_DEBUG` is set to anything other than empty, `0` or
+    `false` (in the environment Stryker runs in, or in `bun.env`); the child then writes one line
+    to its stderr giving the reason.
 
 To check the lifeline on a given machine, run `bun scripts/verify-orphan-lifeline.ts` from a clone
 of this repository (see [CONTRIBUTING.md](../CONTRIBUTING.md#checking-orphan-prevention-on-a-machine)).
