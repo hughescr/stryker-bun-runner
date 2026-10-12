@@ -10,10 +10,12 @@
  */
 
 /* eslint-disable no-console, n/no-process-exit, unicorn/no-process-exit -- a command-line script: its output is the point, and its exit code is the verdict */
+/* eslint-disable n/no-sync -- the contamination sampler reads /proc synchronously so one sample is an atomic, millisecond-scale snapshot */
 
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { access, appendFile, copyFile, mkdir, open, readFile, rm, writeFile } from 'node:fs/promises';
+import { readdirSync, readFileSync } from 'node:fs';
+import { access, appendFile, copyFile, mkdir, open, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
@@ -38,6 +40,9 @@ const SHOWN_MISMATCHES = 20;
 /** Start-of-run system-wide CPU busy percentage above which timings are flagged as unreliable. */
 const BUSY_WARN_PCT = 25;
 
+/** A run is CONTAMINATED if CPU used by processes outside the bench process tree exceeds this share of wall x CPUs. */
+const CONTAMINATED_PCT = 2;
+
 /** Mutation status by stable mutant key. */
 type StatusMap = Record<string, string>;
 
@@ -54,6 +59,64 @@ interface MutantDetail {
     readonly killedBy?:       unknown
 }
 
+/** One command's share of the CPU used by processes outside the bench process tree. */
+interface ForeignCommand {
+    readonly command:    string
+    readonly cpuSeconds: number
+    readonly processes:  number
+}
+
+/** What the monitor saw while one Stryker run executed (see ContaminationMonitor). */
+interface Contamination {
+    readonly contaminated:           boolean
+    /** CPU used by processes outside the bench tree, minus the allowlist (claude) and kernel threads. */
+    readonly foreignCpuSeconds:      number
+    readonly foreignPct:             number
+    readonly thresholdPct:           number
+    readonly topForeign:             readonly ForeignCommand[]
+    /** Allowlisted `claude` processes: reported, never hidden, not counted as foreign. */
+    readonly claudeCpuSeconds:       number
+    readonly kernelCpuSeconds:       number
+    /** Bench process plus every descendant that was reaped (cutime/cstime), sampler included. */
+    readonly treeCpuSeconds:         number
+    /** user+nice+system from /proc/stat, all CPUs. */
+    readonly systemBusyCpuSeconds:   number
+    /** busy - tree - foreign - claude - kernel: short-lived processes the sampler missed, plus unattributable kernel time. */
+    readonly unattributedCpuSeconds: number
+    readonly stealPct:               number | undefined
+    readonly iowaitPct:              number | undefined
+    readonly stealPeakPct:           number | undefined
+    readonly samples:                number
+    readonly samplerMs:              number
+}
+
+/** A process left behind by a run: a descendant of the stryker run, or a `bun test` that is still alive. */
+interface Orphan {
+    readonly pid:     number
+    readonly command: string
+    readonly kind:    'run' | 'bun-test'
+}
+
+interface Leftovers {
+    /** Orphans still alive after the grace period (the run's own are then SIGKILLed). */
+    readonly orphans:       readonly Orphan[]
+    /** Run descendants still alive the instant stryker exited. */
+    readonly orphansAtExit: number
+    readonly killed:        number
+}
+
+interface TmpSnapshot {
+    readonly names: ReadonlySet<string>
+    readonly bytes: number | undefined
+}
+
+/** Growth of os.tmpdir() since the previous snapshot (previous run's end, or the start of the batch). */
+interface TmpGrowth {
+    readonly entries: number
+    readonly bytes:   number | undefined
+    readonly added:   readonly string[]
+}
+
 interface RunResult {
     readonly index:         number
     readonly wallSeconds:   number
@@ -63,6 +126,9 @@ interface RunResult {
     readonly load1:         number
     readonly cpuBusyPct:    number | undefined
     readonly contention:    boolean
+    readonly contamination: Contamination
+    readonly leftovers:     Leftovers
+    readonly tmpGrowth:     TmpGrowth
     readonly log:           string
     readonly statuses:      StatusMap
     readonly details:       Record<string, MutantDetail>
@@ -275,6 +341,433 @@ async function sampleCpuBusyPct(): Promise<number | undefined> {
     return 100 * (1 - (after.idle - before.idle) / (after.total - before.total));
 }
 
+// -- contamination monitor ----------------------------------------------------
+
+/** USER_HZ, the unit of the CPU times in /proc/<pid>/stat: 100 on every mainstream Linux build. */
+const CLK_TCK = 100;
+/** How often the monitor walks /proc while Stryker runs. One walk is a few milliseconds. */
+const SAMPLE_INTERVAL_MS = 250;
+/** Smallest /proc/stat slice (all-CPU ticks) the peak steal is computed over: half a sample interval on 4 CPUs. */
+const MIN_STEAL_SLICE_TICKS = 50;
+/** `comm` names reported separately instead of counted as foreign (never hidden: the RUN line prints them). */
+const ALLOWLIST_COMM: ReadonlySet<string> = new Set(['claude']);
+/** PF_KTHREAD (bit 21 of the task flags): kernel threads such as kworker, which our own I/O makes busy. */
+const PF_KTHREAD = 2 ** 21;
+/** How long after stryker exits its descendants get to disappear before they count as orphans. */
+const ORPHAN_GRACE_MS = 1500;
+const ORPHAN_POLL_MS = 100;
+const TOP_FOREIGN = 3;
+const SHOWN_TMP_ENTRIES = 10;
+
+interface ProcEntry {
+    readonly pid:        number
+    readonly ppid:       number
+    readonly pgrp:       number
+    readonly sid:        number
+    readonly state:      string
+    readonly comm:       string
+    readonly kernel:     boolean
+    /** utime + stime, in clock ticks, of the whole thread group. */
+    readonly ticks:      number
+    /** cutime + cstime: CPU of children this process has reaped. */
+    readonly childTicks: number
+    /** Start time in ticks since boot; with the pid it identifies a process even after pid reuse. */
+    readonly start:      number
+}
+
+/** Parse /proc/<pid>/stat: `pid (comm) state ppid pgrp session tty tpgid flags ... utime stime cutime cstime ... starttime`. */
+function parseProcStat(text: string): ProcEntry | undefined {
+    const parenOpen = text.indexOf('(');
+    const close = text.lastIndexOf(')');
+    if(parenOpen < 1 || close < parenOpen) {
+        return undefined;
+    }
+    const rest = text.slice(close + 2).split(' ');
+    const field = (index: number): number => Number(rest[index]);
+    const entry = {
+        pid:        Number(text.slice(0, parenOpen - 1)),
+        ppid:       field(1),
+        pgrp:       field(2),
+        sid:        field(3),
+        state:      rest[0],
+        comm:       text.slice(parenOpen + 1, close),
+        kernel:     Math.floor(field(6) / PF_KTHREAD) % 2 === 1,
+        ticks:      field(11) + field(12),
+        childTicks: field(13) + field(14),
+        start:      field(19),
+    };
+    return Object.values(entry).some(value => typeof value === 'number' && Number.isNaN(value)) ? undefined : entry;
+}
+
+/** Every live process, from /proc/<pid>/stat (one small read each; processes that exit mid-walk are skipped). */
+function readProcTable(): Map<number, ProcEntry> {
+    const table = new Map<number, ProcEntry>();
+    for(const name of readdirSync('/proc')) {
+        if(!/^\d+$/.test(name)) {
+            continue;
+        }
+        let text: string;
+        try {
+            text = readFileSync(`/proc/${name}/stat`, 'utf8');
+        } catch{
+            continue;
+        }
+        const entry = parseProcStat(text);
+        if(entry) {
+            table.set(entry.pid, entry);
+        }
+    }
+    return table;
+}
+
+interface SystemCpu {
+    /** user + nice + system, in ticks, all CPUs: the time processes (and kernel threads) are charged. irq/softirq are not charged to any process, so they are left out. */
+    readonly busy:   number
+    readonly iowait: number
+    readonly steal:  number
+    readonly total:  number
+}
+
+function readSystemCpu(): SystemCpu | undefined {
+    let text: string;
+    try {
+        text = readFileSync('/proc/stat', 'utf8');
+    } catch{
+        return undefined;
+    }
+    const fields = text.split('\n', 1)[0].trim().split(/\s+/).slice(1, 9).map(Number);
+    if(fields.length < 8 || fields.some(value => Number.isNaN(value))) {
+        return undefined;
+    }
+    const [user, nice, system, idle, iowait, irq, softirq, steal] = fields;
+    return { busy: user + nice + system, iowait, steal, total: user + nice + system + idle + iowait + irq + softirq + steal };
+}
+
+/** A short label for aggregating CPU by command: `node child-process.js`, `bun test`, `claude`. */
+function commandLabel(pid: number, comm: string): string {
+    let raw = '';
+    try {
+        raw = readFileSync(`/proc/${String(pid)}/cmdline`, 'utf8');
+    } catch{
+        // exited since the stat read
+    }
+    const argv = raw.split('\0').filter(arg => arg.length > 0);
+    if(argv.length === 0) {
+        return comm;
+    }
+    const exe = path.basename(argv[0]);
+    const sub = argv.slice(1).find(arg => !arg.startsWith('-'));
+    if(sub === undefined) {
+        return exe.slice(0, 48);
+    }
+    return `${exe} ${sub.includes('/') && !/\s/.test(sub) ? path.basename(sub) : sub}`.slice(0, 48);
+}
+
+function percent(part: number, whole: number): number | undefined {
+    return whole > 0 ? 100 * part / whole : undefined;
+}
+
+function toSeconds(ticks: number): number {
+    return ticks / CLK_TCK;
+}
+
+/**
+ * Watches /proc while one Stryker run executes and accounts for CPU that is not ours.
+ *
+ * Every 250 ms it reads /proc/<pid>/stat for all processes. A process belongs to the bench tree if it descends
+ * from this process (ppid walk), shares the detached stryker run's session or process group (so workers that
+ * were reparented to init are still ours), or was classified as ours in an earlier sample (sticky). Everything
+ * else is foreign: its CPU is the growth of utime+stime between samples, aggregated by command. `claude`
+ * (ALLOWLIST_COMM) and kernel threads are tallied separately and do not count toward the CONTAMINATED flag.
+ *
+ * Limits: CPU of a process that starts and exits between two samples (or the last slice before it exits) is
+ * invisible here; `unattributedCpuSeconds` (system busy time from /proc/stat minus everything attributed)
+ * is the cross-check for that. The sampler runs in this process, so its own cost is in the bench tree, and
+ * `samplerMs` reports how long it spent walking /proc.
+ */
+class ContaminationMonitor {
+    private readonly treeKeys = new Set<string>();
+    private readonly lastTicks = new Map<string, number>();
+    private readonly kinds = new Map<string, { label: string, kind: 'foreign' | 'claude' | 'kernel' }>();
+    private readonly byCommand = new Map<string, { ticks: number, pids: Set<number> }>();
+    private foreignTicks = 0;
+    private claudeTicks = 0;
+    private kernelTicks = 0;
+    private anchor:    number | undefined;
+    private timer:     ReturnType<typeof setInterval> | undefined;
+    private samples = 0;
+    private samplerMs = 0;
+    private baselined = false;
+    private startCpu:  SystemCpu | undefined;
+    private lastCpu:   SystemCpu | undefined;
+    private stealPeak: number | undefined;
+    private selfStart = 0;
+
+    /** Take the baseline (everything alive now is not charged to the run) and start sampling. */
+    start(): void {
+        this.selfStart = this.selfTicks();
+        this.startCpu = readSystemCpu();
+        this.lastCpu = this.startCpu;
+        this.sample();
+        this.baselined = true;
+        this.timer = setInterval(() => {
+            this.sample();
+        }, SAMPLE_INTERVAL_MS);
+    }
+
+    /** The detached stryker child: its session and process group identify its whole tree. */
+    setAnchor(pid: number | undefined): void {
+        this.anchor = pid;
+    }
+
+    private selfTicks(): number {
+        try {
+            const self = parseProcStat(readFileSync('/proc/self/stat', 'utf8'));
+            return self ? self.ticks + self.childTicks : 0;
+        } catch{
+            return 0;
+        }
+    }
+
+    private static keyOf(entry: ProcEntry): string {
+        return `${String(entry.pid)}:${String(entry.start)}`;
+    }
+
+    private descendsFromBench(entry: ProcEntry, table: ReadonlyMap<number, ProcEntry>): boolean {
+        let current: ProcEntry | undefined = entry;
+        for(let depth = 0; current && depth < 64; depth++) {
+            if(current.pid === process.pid) {
+                return true;
+            }
+            current = table.get(current.ppid);
+        }
+        return false;
+    }
+
+    private inTree(entry: ProcEntry, table: ReadonlyMap<number, ProcEntry>): boolean {
+        const key = ContaminationMonitor.keyOf(entry);
+        if(this.treeKeys.has(key)) {
+            return true;
+        }
+        const sharesAnchor = this.anchor !== undefined && (entry.sid === this.anchor || entry.pgrp === this.anchor);
+        const ours = sharesAnchor || this.descendsFromBench(entry, table);
+        if(ours) {
+            this.treeKeys.add(key);
+        }
+        return ours;
+    }
+
+    private charge(entry: ProcEntry, key: string, delta: number): void {
+        let known = this.kinds.get(key);
+        if(!known) {
+            if(entry.kernel) {
+                known = { label: entry.comm, kind: 'kernel' };
+            } else if(ALLOWLIST_COMM.has(entry.comm)) {
+                known = { label: entry.comm, kind: 'claude' };
+            } else {
+                known = { label: commandLabel(entry.pid, entry.comm), kind: 'foreign' };
+            }
+            this.kinds.set(key, known);
+        }
+        if(known.kind === 'kernel') {
+            this.kernelTicks += delta;
+        } else if(known.kind === 'claude') {
+            this.claudeTicks += delta;
+        } else {
+            this.foreignTicks += delta;
+            const slot = this.byCommand.get(known.label) ?? { ticks: 0, pids: new Set<number>() };
+            slot.ticks += delta;
+            slot.pids.add(entry.pid);
+            this.byCommand.set(known.label, slot);
+        }
+    }
+
+    private sample(): void {
+        const began = performance.now();
+        const table = readProcTable();
+        const live = new Set<string>();
+        for(const entry of table.values()) {
+            if(this.inTree(entry, table)) {
+                continue;
+            }
+            const key = ContaminationMonitor.keyOf(entry);
+            live.add(key);
+            const previous = this.lastTicks.get(key);
+            this.lastTicks.set(key, entry.ticks);
+            // Unseen after the baseline: it started since the last sample, so all its CPU is the run's.
+            const delta = entry.ticks - (previous ?? 0);
+            if(this.baselined && delta > 0) {
+                this.charge(entry, key, delta);
+            }
+        }
+        for(const key of this.lastTicks.keys()) {
+            if(!live.has(key)) {
+                this.lastTicks.delete(key);
+            }
+        }
+        const cpu = readSystemCpu();
+        // Only judge slices of at least half an interval: a slice of a few ticks (the baseline and final samples) is all noise.
+        if(cpu && this.lastCpu && cpu.total - this.lastCpu.total >= MIN_STEAL_SLICE_TICKS) {
+            const peak = percent(cpu.steal - this.lastCpu.steal, cpu.total - this.lastCpu.total);
+            if(peak !== undefined && peak > (this.stealPeak ?? 0)) {
+                this.stealPeak = peak;
+            }
+            this.lastCpu = cpu;
+        }
+        this.samples++;
+        this.samplerMs += performance.now() - began;
+    }
+
+    /** Stop the sampling timer (idempotent). */
+    halt(): void {
+        if(this.timer) {
+            clearInterval(this.timer);
+            this.timer = undefined;
+        }
+    }
+
+    /** Stop sampling and summarise. Call right after stryker exits. */
+    stop(wallSeconds: number): Contamination {
+        this.halt();
+        this.sample();
+        const end = readSystemCpu();
+        const foreignCpuSeconds = toSeconds(this.foreignTicks);
+        const claudeCpuSeconds = toSeconds(this.claudeTicks);
+        const kernelCpuSeconds = toSeconds(this.kernelTicks);
+        const treeCpuSeconds = toSeconds(this.selfTicks() - this.selfStart);
+        const systemBusyCpuSeconds = this.startCpu && end ? toSeconds(end.busy - this.startCpu.busy) : Number.NaN;
+        const capacity = wallSeconds * os.availableParallelism();
+        const foreignPct = capacity > 0 ? 100 * foreignCpuSeconds / capacity : 0;
+        const topForeign = [...this.byCommand.entries()]
+            .toSorted(([, a], [, b]) => b.ticks - a.ticks)
+            .slice(0, TOP_FOREIGN)
+            .map(([command, slot]) => ({ command, cpuSeconds: toSeconds(slot.ticks), processes: slot.pids.size }));
+        return {
+            contaminated:           foreignPct > CONTAMINATED_PCT,
+            foreignCpuSeconds,
+            foreignPct,
+            thresholdPct:           CONTAMINATED_PCT,
+            topForeign,
+            claudeCpuSeconds,
+            kernelCpuSeconds,
+            treeCpuSeconds,
+            systemBusyCpuSeconds,
+            unattributedCpuSeconds: systemBusyCpuSeconds - treeCpuSeconds - foreignCpuSeconds - claudeCpuSeconds - kernelCpuSeconds,
+            stealPct:               this.startCpu && end ? percent(end.steal - this.startCpu.steal, end.total - this.startCpu.total) : undefined,
+            iowaitPct:              this.startCpu && end ? percent(end.iowait - this.startCpu.iowait, end.total - this.startCpu.total) : undefined,
+            stealPeakPct:           this.stealPeak,
+            samples:                this.samples,
+            samplerMs:              this.samplerMs,
+        };
+    }
+
+    /**
+     * Processes left over from the run: anything of the bench tree still alive (sticky set, session, process
+     * group), and any `bun test` still alive that is not an ancestor of this process.
+     */
+    leftovers(): Orphan[] {
+        const table = readProcTable();
+        const ancestors = new Set<number>();
+        for(let current = table.get(process.pid)?.ppid; current !== undefined && current > 0 && !ancestors.has(current); current = table.get(current)?.ppid) {
+            ancestors.add(current);
+        }
+        const found: Orphan[] = [];
+        for(const entry of table.values()) {
+            if(entry.pid === process.pid || entry.state === 'Z' || entry.kernel) {
+                continue;
+            }
+            if(this.inTree(entry, table)) {
+                found.push({ pid: entry.pid, command: commandLabel(entry.pid, entry.comm), kind: 'run' });
+            } else if(entry.comm === 'bun' && !ancestors.has(entry.pid)) {
+                const command = commandLabel(entry.pid, entry.comm);
+                if(command === 'bun test') {
+                    found.push({ pid: entry.pid, command, kind: 'bun-test' });
+                }
+            }
+        }
+        return found;
+    }
+}
+
+/**
+ * After stryker exits: give its descendants a moment to go, report whatever survives, and SIGKILL the run's own
+ * survivors so they cannot steal CPU from the next run. (`bun test` processes that are not ours are only reported.)
+ */
+async function reapLeftovers(monitor: ContaminationMonitor): Promise<Leftovers> {
+    let orphans = monitor.leftovers();
+    const orphansAtExit = orphans.filter(orphan => orphan.kind === 'run').length;
+    const deadline = performance.now() + ORPHAN_GRACE_MS;
+    while(orphans.some(orphan => orphan.kind === 'run') && performance.now() < deadline) {
+        // eslint-disable-next-line no-await-in-loop -- polling until the process table settles
+        await Bun.sleep(ORPHAN_POLL_MS);
+        orphans = monitor.leftovers();
+    }
+    let killed = 0;
+    for(const orphan of orphans.filter(item => item.kind === 'run')) {
+        try {
+            process.kill(orphan.pid, 'SIGKILL');
+            killed++;
+        } catch{
+            // gone already
+        }
+    }
+    return { orphans, orphansAtExit, killed };
+}
+
+async function snapshotTmp(): Promise<TmpSnapshot> {
+    const dir = os.tmpdir();
+    const names = new Set(await readdir(dir).catch(() => [] as string[]));
+    const du = Bun.which('du');
+    let bytes: number | undefined;
+    if(du) {
+        // Exit code 1 just means some subdirectory was unreadable; the total is still printed.
+        const { output } = await capture(du, ['-sb', '--one-file-system', dir]);
+        const match = /^(\d+)\t/m.exec(output);
+        bytes = match ? Number(match[1]) : undefined;
+    }
+    return { names, bytes };
+}
+
+function tmpGrowth(before: TmpSnapshot, after: TmpSnapshot): TmpGrowth {
+    return {
+        entries: after.names.size - before.names.size,
+        bytes:   before.bytes === undefined || after.bytes === undefined ? undefined : after.bytes - before.bytes,
+        added:   [...after.names].filter(name => !before.names.has(name)).toSorted((a, b) => a.localeCompare(b)).slice(0, SHOWN_TMP_ENTRIES),
+    };
+}
+
+function formatBytes(bytes: number | undefined): string {
+    if(bytes === undefined) {
+        return 'n/a';
+    }
+    const sign = bytes < 0 ? '-' : '+';
+    const size = Math.abs(bytes);
+    if(size >= 2 ** 20) {
+        return `${sign}${(size / 2 ** 20).toFixed(1)}MB`;
+    }
+    return `${sign}${(size / 2 ** 10).toFixed(0)}KB`;
+}
+
+const signedInt = (value: number): string => `${value >= 0 ? '+' : ''}${String(value)}`;
+function pctText(value: number | undefined): string {
+    return value === undefined ? 'n/a' : `${value.toFixed(1)}%`;
+}
+
+/** The fields appended to the RUN line. */
+function contaminationFields(run: RunResult): string {
+    const { contamination: c, leftovers, tmpGrowth: tmp } = run;
+    return [
+        `foreign=${c.foreignCpuSeconds.toFixed(1)}s`,
+        `foreign_pct=${c.foreignPct.toFixed(1)}%`,
+        `claude=${c.claudeCpuSeconds.toFixed(1)}s`,
+        `steal=${pctText(c.stealPct)}`,
+        `iowait=${pctText(c.iowaitPct)}`,
+        `orphans=${String(leftovers.orphans.length)}`,
+        `tmp=${signedInt(tmp.entries)}/${formatBytes(tmp.bytes)}`,
+        ...c.contaminated ? ['CONTAMINATED'] : [],
+    ].join(' ');
+}
+
 // -- Stryker log and report parsing -------------------------------------------
 
 const ANSI = /\u001B\[[0-9;]*[A-Z]/gi;
@@ -459,9 +952,10 @@ for(const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
     });
 }
 
-async function runStryker(fixture: string, logPath: string): Promise<{ code: number | null, seconds: number }> {
+async function runStryker(fixture: string, logPath: string, monitor: ContaminationMonitor): Promise<{ code: number | null, seconds: number, contamination: Contamination }> {
     const log = await open(logPath, 'a');
     try {
+        monitor.start();
         const started = performance.now();
         const child = spawn(strykerBin, ['run'], {
             cwd:      fixture,
@@ -470,18 +964,21 @@ async function runStryker(fixture: string, logPath: string): Promise<{ code: num
             env:      { ...process.env, BENCH_PLUGIN: pluginPath },
         });
         activeChild = child;
+        monitor.setAnchor(child.pid);
         const code = await new Promise<number | null>((resolve, reject) => {
             child.on('error', reject);
             child.on('close', resolve);
         });
-        return { code, seconds: (performance.now() - started) / 1000 };
+        const seconds = (performance.now() - started) / 1000;
+        return { code, seconds, contamination: monitor.stop(seconds) };
     } finally {
+        monitor.halt();
         activeChild = undefined;
         await log.close();
     }
 }
 
-async function benchOnce(options: Options, stamp: string, index: number): Promise<RunResult> {
+async function benchOnce(options: Options, stamp: string, index: number, batch: { tmp: TmpSnapshot }): Promise<RunResult> {
     const label = `${String(index + 1)}/${String(options.runs)}`;
     await Promise.all(['.stryker-tmp', 'reports'].map(dir => rm(path.join(options.fixture, dir), { recursive: true, force: true })));
 
@@ -496,7 +993,12 @@ async function benchOnce(options: Options, stamp: string, index: number): Promis
 
     const logPath = path.join(outDir, `${stamp}-run${String(index + 1)}.log`);
     const logRel = path.relative(repoRoot, logPath);
-    const { code, seconds } = await runStryker(options.fixture, logPath);
+    const monitor = new ContaminationMonitor();
+    const { code, seconds, contamination } = await runStryker(options.fixture, logPath, monitor);
+    const leftovers = await reapLeftovers(monitor);
+    const tmpAfter = await snapshotTmp();
+    const growth = tmpGrowth(batch.tmp, tmpAfter);
+    batch.tmp = tmpAfter;
     const log = await readFile(logPath, 'utf8');
     if(code !== 0) {
         console.error(log.split('\n').slice(-40).join('\n'));
@@ -524,11 +1026,22 @@ async function benchOnce(options: Options, stamp: string, index: number): Promis
         load1,
         cpuBusyPct,
         contention,
+        contamination,
+        leftovers,
+        tmpGrowth:     growth,
         log:           logRel,
         statuses,
         details,
     };
-    say(`RUN ${label} wall=${seconds.toFixed(1)}s dryrun=${dry.seconds?.toFixed(1) ?? 'n/a'}s tests=${String(dry.tests ?? 'n/a')} mutants=${String(result.mutants)} load1=${load1.toFixed(2)}${contention ? ' LOAD-WARNING' : ''} log=${logRel}`);
+    say(`RUN ${label} wall=${seconds.toFixed(1)}s dryrun=${dry.seconds?.toFixed(1) ?? 'n/a'}s tests=${String(dry.tests ?? 'n/a')} mutants=${String(result.mutants)} load1=${load1.toFixed(2)}${contention ? ' LOAD-WARNING' : ''} log=${logRel} ${contaminationFields(result)}`);
+    const { topForeign } = contamination;
+    if(topForeign.length > 0) {
+        const shown = topForeign.map(item => `${item.command} ${item.cpuSeconds.toFixed(2)}s (${String(item.processes)} proc)`);
+        say(`  foreign top ${String(TOP_FOREIGN)}: ${shown.join(', ')}`);
+    }
+    for(const orphan of leftovers.orphans) {
+        say(`  ORPHAN pid=${String(orphan.pid)} ${orphan.kind} ${orphan.command}${orphan.kind === 'run' ? ' (killed)' : ''}`);
+    }
     return result;
 }
 
@@ -538,6 +1051,39 @@ function median(values: readonly number[]): number {
     const sorted = values.toSorted((a, b) => a - b);
     const mid = Math.floor(sorted.length / 2);
     return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+interface BatchHealth {
+    readonly contaminatedRuns:   number
+    readonly orphans:            number
+    readonly tmpEntries:         number
+    readonly tmpBytes:           number | undefined
+    readonly stealMaxPct:        number | undefined
+    readonly foreignMaxPct:      number
+    /** Least-squares slope of wall time against run number, in seconds per run (the drift within the batch). */
+    readonly trendSecondsPerRun: number
+    readonly samplerPct:         number
+}
+
+function batchHealth(results: readonly RunResult[]): BatchHealth {
+    const n = results.length;
+    const meanIndex = (n - 1) / 2;
+    const meanWall = results.reduce((sum, run) => sum + run.wallSeconds, 0) / n;
+    const covariance = results.reduce((sum, run, i) => sum + (i - meanIndex) * (run.wallSeconds - meanWall), 0);
+    const variance = results.reduce((sum, _run, i) => sum + (i - meanIndex) ** 2, 0);
+    const bytes = results.map(run => run.tmpGrowth.bytes);
+    const steals = results.map(run => run.contamination.stealPct).filter((value): value is number => value !== undefined);
+    const wall = results.reduce((sum, run) => sum + run.wallSeconds, 0);
+    return {
+        contaminatedRuns:   results.filter(run => run.contamination.contaminated).length,
+        orphans:            results.reduce((sum, run) => sum + run.leftovers.orphans.length, 0),
+        tmpEntries:         results.reduce((sum, run) => sum + run.tmpGrowth.entries, 0),
+        tmpBytes:           bytes.every((value): value is number => value !== undefined) ? bytes.reduce((sum, value) => sum + value, 0) : undefined,
+        stealMaxPct:        steals.length > 0 ? Math.max(...steals) : undefined,
+        foreignMaxPct:      Math.max(...results.map(run => run.contamination.foreignPct)),
+        trendSecondsPerRun: variance > 0 ? covariance / variance : 0,
+        samplerPct:         wall > 0 ? 100 * results.reduce((sum, run) => sum + run.contamination.samplerMs, 0) / 1000 / wall : 0,
+    };
 }
 
 function computeStats(results: readonly RunResult[]): Stats {
@@ -582,7 +1128,20 @@ async function analyse(results: readonly RunResult[]): Promise<Analysis> {
     };
 }
 
-function printReport(sha: string, results: readonly RunResult[], analysis: Analysis): void {
+/** The drift line and the contamination warnings that follow the BENCH summary line. */
+function printHealth(health: BatchHealth): void {
+    const slope = signed(health.trendSecondsPerRun, 2, 's/run');
+    const foreignMax = `${health.foreignMaxPct.toFixed(1)}% (flag above ${String(CONTAMINATED_PCT)}%)`;
+    say(`  drift: wall ${slope}; steal max ${pctText(health.stealMaxPct)}; foreign max ${foreignMax}; sampler cost ${health.samplerPct.toFixed(2)}% of one CPU`);
+    if(health.contaminatedRuns > 0) {
+        say(`BENCH-WARNING ${String(health.contaminatedRuns)} run(s) CONTAMINATED: processes outside the bench tree used more than ${String(CONTAMINATED_PCT)}% of wall x CPUs while Stryker ran; see the "foreign top" lines and re-run.`);
+    }
+    if(health.orphans > 0) {
+        say(`BENCH-WARNING ${String(health.orphans)} process(es) outlived a run (orphans); the run's own were killed after the report. Find out what leaves them behind.`);
+    }
+}
+
+function printReport(sha: string, results: readonly RunResult[], analysis: Analysis, health: BatchHealth): void {
     const { stats, counts, runsAgree } = analysis;
     say();
     for(const run of results) {
@@ -602,7 +1161,11 @@ function printReport(sha: string, results: readonly RunResult[], analysis: Analy
         `mutants=${String(results[0].mutants)}`,
         `runs_agree=${runsAgree ? 'yes' : 'NO'}`,
         `status_diff=${analysis.statusDiff}`,
+        `contaminated_runs=${String(health.contaminatedRuns)}`,
+        `orphans=${String(health.orphans)}`,
+        `tmp_growth=${signedInt(health.tmpEntries)}/${formatBytes(health.tmpBytes)}`,
     ].join(' '));
+    printHealth(health);
     if(results.some(run => run.contention)) {
         say('BENCH-WARNING the machine was not idle at the start of at least one run; timings are unreliable (check for other CPU-heavy work).');
     }
@@ -683,7 +1246,7 @@ async function writeBaseline(sha: string, results: readonly RunResult[], stats: 
     }
 }
 
-async function appendResult(label: string, sha: string, runs: number, analysis: Analysis): Promise<void> {
+async function appendResult(label: string, sha: string, runs: number, analysis: Analysis, contaminatedRuns: number): Promise<void> {
     if(!await exists(resultsMdPath)) {
         await writeFile(resultsMdPath, [
             '# Benchmark results',
@@ -707,7 +1270,7 @@ async function appendResult(label: string, sha: string, runs: number, analysis: 
         `${stats.median.toFixed(1)}s`,
         `${stats.min.toFixed(1)}–${stats.max.toFixed(1)}s`,
         delta,
-        analysis.runsAgree ? analysis.statusDiff : `${analysis.statusDiff}; RUNS DISAGREE`,
+        [analysis.statusDiff, ...analysis.runsAgree ? [] : ['RUNS DISAGREE'], ...contaminatedRuns > 0 ? [`${String(contaminatedRuns)} CONTAMINATED`] : []].join('; '),
     ].map(cell => cell.replaceAll('|', String.raw`\|`).replaceAll('\n', ' '));
     await appendFile(resultsMdPath, `| ${cells.join(' | ')} |\n`);
     say(`bench: recorded in ${path.relative(repoRoot, resultsMdPath)}`);
@@ -741,16 +1304,18 @@ async function main(): Promise<void> {
     say(`bench: sha=${sha} fixture=${options.fixture} runs=${String(options.runs)} plugin=${pluginPath}`);
 
     const results: RunResult[] = [];
+    const batch = { tmp: await snapshotTmp() };
     for(let i = 0; i < options.runs; i++) {
         // eslint-disable-next-line no-await-in-loop -- benchmark runs must be strictly sequential
-        results.push(await benchOnce(options, stamp, i));
+        results.push(await benchOnce(options, stamp, i, batch));
     }
 
     const analysis = await analyse(results);
-    printReport(sha, results, analysis);
+    const health = batchHealth(results);
+    printReport(sha, results, analysis, health);
 
     if(options.record !== undefined) {
-        await appendResult(options.record, sha, results.length, analysis);
+        await appendResult(options.record, sha, results.length, analysis, health.contaminatedRuns);
     }
     if(options.writeBaseline) {
         if(analysis.runsAgree) {
@@ -776,6 +1341,8 @@ async function main(): Promise<void> {
         mismatches:           analysis.baselineMismatches.slice(0, SHOWN_MISMATCHES),
         runDisagreements:     analysis.runDisagreements.slice(0, SHOWN_MISMATCHES),
         runDisagreementCount: analysis.runDisagreements.length,
+        contaminatedRuns:     health.contaminatedRuns,
+        health,
         runDetails:           results.map(({ statuses: _statuses, details: _details, ...rest }) => rest),
     };
     await writeFile(path.join(outDir, `${stamp}-summary.json`), `${JSON.stringify(summary, null, 2)}\n`);

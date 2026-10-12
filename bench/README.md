@@ -70,13 +70,15 @@ benchmark inside a shared lock (it would deadlock against itself and `lock.sh` r
 Per run, while it executes:
 
 ```
-RUN 2/3 wall=118.4s dryrun=6.1s tests=412 mutants=2210 load1=0.31 log=bench/out/20261012T182701-run2.log
+RUN 2/3 wall=118.4s dryrun=6.1s tests=412 mutants=2210 load1=0.31 log=bench/out/20261012T182701-run2.log foreign=0.3s foreign_pct=0.1% claude=0.2s steal=0.1% iowait=0.0% orphans=0 tmp=+2/+1.3MB
 ```
+
+(The trailing contamination fields are described under "Contamination monitor" below.)
 
 Then one greppable summary line:
 
 ```
-BENCH sha=3589d9f runs=3 median=118.4s min=117.9s max=121.0s spread=2.6% dryrun_median=6.1s mutants=2210 runs_agree=yes status_diff=OK
+BENCH sha=3589d9f runs=3 median=118.4s min=117.9s max=121.0s spread=2.6% dryrun_median=6.1s mutants=2210 runs_agree=yes status_diff=OK contaminated_runs=0 orphans=0 tmp_growth=+2/+3.9MB
 ```
 
 - `sha` — `git rev-parse --short HEAD`, plus `+dirty` if tracked files outside `bench/` differ from HEAD.
@@ -86,7 +88,57 @@ BENCH sha=3589d9f runs=3 median=118.4s min=117.9s max=121.0s spread=2.6% dryrun_
 - `mutants` — number of mutants in `reports/mutation/mutation.json`.
 - `runs_agree` — `NO` if the runs' per-mutant statuses differ from each other.
 - `status_diff` — `OK`, `NO_BASELINE`, or `<k> mismatches vs baseline`; mismatches are listed below the summary (first 20).
+- `contaminated_runs`, `orphans`, `tmp_growth` — how many runs were flagged CONTAMINATED, how many processes outlived a run, and the net change in `os.tmpdir()` over the batch (see below). A batch with `contaminated_runs` above 0 is not trustworthy; `--record` marks the row `n CONTAMINATED`.
 - `load1` — 1-minute load average at the start of a run, for information. It lags (it is high right after another benchmark or the previous run on an idle machine), so the warning is decided by a live reading instead: the harness samples system-wide CPU busy % for 1 s before each run and prints `WARNING: machine not idle` (and `BENCH-WARNING` after the summary) if it is above 25 %. (Only if `/proc/stat` is unreadable does run 1 fall back to warning on load1 > 1.0.) **A warned benchmark is not trustworthy; find the other CPU user and re-run.**
+
+### Contamination monitor
+
+The lock only helps if everybody uses it, and a VM can lose CPU to its host. So the harness
+also watches the machine **while each run executes** and reports what it saw. All of it is
+Linux `/proc`; the sampler runs in the bench process (its CPU is counted in the bench tree,
+not as foreign), wakes every 250 ms and costs about 3-5 ms per wake-up (`drift:` line:
+`sampler cost`, typically well under 2% of one CPU).
+
+Appended to every `RUN` line:
+
+```
+RUN 2/5 wall=27.8s ... log=bench/out/20261012T182701-run2.log foreign=0.3s foreign_pct=0.3% claude=0.2s steal=0.1% iowait=0.0% orphans=0 tmp=+2/+1.3MB
+  foreign top 3: node child-process-proxy-worker.js 0.20s (2 proc), bun test 0.09s (3 proc)
+```
+
+- `foreign` / `foreign_pct` — CPU-seconds used by processes that are **not** in the bench tree, and that as a
+  share of `wall × CPUs`. Sampled from `/proc/<pid>/stat` (utime+stime growth between samples). A process is
+  "ours" if it descends from the bench process (ppid walk), shares the detached stryker run's session or
+  process group (so workers reparented to init still count as ours), or was seen as ours earlier. The run is
+  flagged `CONTAMINATED` (and counted in `contaminated_runs`) if `foreign_pct` exceeds 2%. The `foreign top 3`
+  line names the three commands (grouped like `node child-process.js`, `bun test`) that used the most.
+- `claude` — CPU of `claude` processes (the allowlist). Reported, **not** counted as foreign, never hidden.
+  Kernel threads (`kworker`, ...) are likewise tallied apart (`kernelCpuSeconds` in the JSON), since our own I/O
+  keeps them busy.
+- `steal` / `iowait` — share of all CPU time `/proc/stat` attributes to hypervisor steal and I/O wait between
+  spawn and exit. JSON also has the peak steal over any 250 ms slice (`stealPeakPct`). Steal above about 1% means
+  the host took CPU from the VM and the run is not comparable with a low-steal run.
+- `orphans` — processes alive after stryker exited (checked up to 1.5 s later, to allow a graceful exit): any
+  descendant of the run, and any `bun test` that is not an ancestor of the bench. The run's own are SIGKILLed
+  right after the report so they cannot disturb the next run (`ORPHAN` lines name them); a foreign `bun test`
+  is only reported. JSON `leftovers.orphansAtExit` counts the descendants still alive the instant stryker exited.
+- `tmp` — change in `os.tmpdir()` since the previous run (since the start of the batch for run 1):
+  top-level entry count and total bytes (`du -sb`, taken between runs, outside the timed window). Other users
+  of `/tmp` show up here too; `tmpGrowth.added` in the JSON lists the new entry names.
+
+Limits: a process that starts and exits between two samples is invisible to the per-command accounting.
+The JSON therefore also carries `treeCpuSeconds` (the bench process plus every reaped descendant, from
+`cutime`/`cstime`), `systemBusyCpuSeconds` (user+nice+system from `/proc/stat`) and `unattributedCpuSeconds`
+(busy minus tree, foreign, claude and kernel). On an idle machine it is within about +-1 s (tick rounding); a
+clearly positive value means short-lived foreign processes (or tree processes that died after being
+reparented) used CPU the sampler did not see, so treat the run with suspicion even if `foreign_pct` is low.
+
+The summary line gains `contaminated_runs=<k> orphans=<n> tmp_growth=<entries>/<bytes>`, followed by a
+`drift:` line with the least-squares slope of wall time over the batch (seconds per run; a clearly positive
+slope with no steal/foreign/orphan explanation points at something the runs themselves accumulate), the
+maximum steal and foreign share, and the sampler cost. A `BENCH-WARNING` line is printed for contaminated
+runs and for orphans. The summary JSON holds all of it per run (`runDetails[].contamination`, `.leftovers`,
+`.tmpGrowth`) and for the batch (`contaminatedRuns`, `health`).
 
 Exit codes: `0` ok; `1` Stryker or build failed (log tail printed, nothing recorded); `2` usage or missing lock; `3` per-mutant statuses differ from the baseline or between runs.
 
