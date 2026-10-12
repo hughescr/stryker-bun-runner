@@ -922,9 +922,10 @@ export class BunTestRunner implements TestRunner {
    * all — go last in their old order. `files` itself is not modified.
    */
     private orderCheapestFirst(files: readonly string[] | undefined): string[] | undefined {
-        const cost = (file: string): number => this.testFileDurations?.get(normalizeTestFilePath(file) ?? file) ?? Number.POSITIVE_INFINITY;
+        // Each file's cost is looked up once, not on every comparison (which would normalize its path again each time).
+        const costed = files?.map(file => ({ file, cost: this.testFileDurations?.get(normalizeTestFilePath(file) ?? file) ?? Number.POSITIVE_INFINITY }));
         // Infinity - Infinity is NaN, which a sort comparator treats as "equal".
-        return files?.toSorted((a, b) => cost(a) - cost(b));
+        return costed?.toSorted((a, b) => a.cost - b.cost).map(entry => entry.file);
     }
 
     /**
@@ -1336,6 +1337,13 @@ export class BunTestRunner implements TestRunner {
         // The resolution is relative to process.cwd(), so if cwd changes between
         // init() calls (Stryker sandbox rotation) we must re-resolve from the new cwd.
         const eagerCwd = process.cwd();
+        // Start the test-file discovery now so it overlaps the eager-module glob below (both are
+        // read-only directory walks that need nothing from each other) instead of following it:
+        // the worker that runs the dry run waits for all of init() first. Awaited at the end.
+        const testFilesPending = this.getOrDiscoverTestFiles();
+        // If something below throws first, nobody awaits this promise, and its own rejection must not go unhandled.
+        // Stryker disable next-line ArrowFunction: equivalent mutant — any handler that returns silences the rejection just as this one does
+        testFilesPending.catch(() => undefined);
         // Stryker disable next-line ConditionalExpression,EqualityOperator,BlockStatement: cache hit — cwd match verified by tests; mutations caught by 're-resolves eager modules when cwd changes'
         if(this.cachedEagerModules === undefined || this.cachedEagerModulesCwd !== eagerCwd) {
             this.cachedEagerModules    = await resolveEagerModulesFromGlobs(this.mutateGlobs);
@@ -1362,7 +1370,7 @@ export class BunTestRunner implements TestRunner {
         // hot path.  If cwd changes between init and dryRun (Stryker sandbox rotation),
         // getOrDiscoverTestFiles() will detect the stale cachedTestFilesCwd key and
         // re-glob from the new cwd before returning.
-        const testFiles = await this.getOrDiscoverTestFiles();
+        const testFiles = await testFilesPending;
         this.logStartSummary(testFiles);
     }
 

@@ -124,14 +124,19 @@ function headerFilter(lines: readonly string[], testFiles: readonly string[] | u
     if(testFiles === undefined) {
         return () => true;
     }
-    const roots = testFiles.map(file => path.resolve(file));
+    const roots = new Set(testFiles.map(file => path.resolve(file)));
+    // A header is in the run when it IS a listed entry or lies below one (a directory entry): that is, when it or one of
+    // its parent directories is in the set. A walk up its few parents replaces comparing it with every entry.
     const isRunFile = (file: string): boolean => {
-        const resolved = path.resolve(file);
-        return roots.some((root) => {
-            const relative = path.relative(root, resolved);
-            // '' is the entry itself; anything starting '..' is outside it.
-            return relative !== '..' && !relative.startsWith(`..${path.sep}`);
-        });
+        let candidate = path.resolve(file);
+        while(!roots.has(candidate)) {
+            const parent = path.dirname(candidate);
+            if(parent === candidate) {
+                return false;
+            }
+            candidate = parent;
+        }
+        return true;
     };
     const namesRunFile = lines.some((line) => {
         const file = parseFilePath(line);
