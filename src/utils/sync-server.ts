@@ -4,9 +4,17 @@
  */
 
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { createServer, type IncomingMessage, type Server as HTTPServer } from 'node:http';
+import type * as Http from 'node:http';
+import type { IncomingMessage, Server as HTTPServer } from 'node:http';
+import { createRequire } from 'node:module';
 import type { AddressInfo } from 'node:net';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
+
+// node:http is loaded with require, not import: Node's ESM view of a builtin reads every export,
+// and http.WebSocket is a lazy getter that loads Node's bundled undici and http2 — about 40 ms of
+// every Stryker worker's plugin load, for modules the runner never uses (see
+// tests/00-integration/plugin-load-integration.test.ts).
+const { createServer } = createRequire(import.meta.url)('node:http') as typeof Http;
 
 /**
  * Whether an upgrade request's URL is exactly `expected` (`/sync/<token>`),
