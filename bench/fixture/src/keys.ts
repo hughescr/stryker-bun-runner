@@ -1,0 +1,84 @@
+import type { IsNever } from "type-fest";
+import type { EnumerableStringKeyOf } from "./internal/types/EnumerableStringKeyOf";
+import type { IterableContainer } from "./internal/types/IterableContainer";
+import type { ToString } from "./internal/types/ToString";
+import { purry } from "./purry";
+
+type Keys<T> = T extends IterableContainer ? ArrayKeys<T> : ObjectKeys<T>;
+
+// The keys output can mirror the input when it is an array/tuple. We do this by
+// "mapping" each item "key" (which is actually an index) as its own value. This
+// would maintain the shape, even including labels.
+type ArrayKeys<T extends IterableContainer> = {
+  -readonly [Index in keyof T]: Index extends number | string
+    ? // Notice that we coalesce the values as strings, this is because in JS,
+      // Object.keys always returns strings, even for arrays.
+      ToString<IsIndexAfterSpread<T, Index> extends true ? number : Index>
+    : // Index is typed as a symbol, this can't happen, but we need to guard
+      // against it for typescript.
+      never;
+};
+
+type IsIndexAfterSpread<
+  T extends IterableContainer,
+  Index extends number | string,
+> =
+  IsNever<IndicesAfterSpread<T>> extends true
+    ? false
+    : Index extends `${IndicesAfterSpread<T>}`
+      ? true
+      : false;
+
+// Find the index of the tuple where a spread item is located, and return all
+// indices in the tuple which are located after it. The tuple could be prefixed
+// by any number of literal items. If the input is a simple array it would
+// return 0 (as expected), and if the tuple doesn't contain a spread element it
+// would return never.
+type IndicesAfterSpread<
+  T extends readonly unknown[] | [],
+  // We use this type to count how many items we consumed, it's just a pseudo-
+  // element that is used for its length.
+  Iterations extends readonly unknown[] = [],
+> =
+  IsNever<T[number]> extends true
+    ? never
+    : T extends readonly [unknown, ...infer Tail]
+      ? IndicesAfterSpread<Tail, [unknown, ...Iterations]>
+      : T extends readonly [...infer Head, unknown]
+        ? | IndicesAfterSpread<Head, [unknown, ...Iterations]>
+          | Iterations["length"]
+        : Iterations["length"];
+
+type ObjectKeys<T> =
+  T extends Record<PropertyKey, never> ? [] : EnumerableStringKeyOf<T>[];
+
+/**
+ * Returns a new array containing the keys of the array or object.
+ *
+ * @param data - Either an array or an object.
+ * @signature
+ *    keys(source)
+ * @example
+ *    keys(['x', 'y', 'z']); // => ['0', '1', '2']
+ *    keys({ a: 'x', b: 'y', 5: 'z' }); // => ['a', 'b', '5']
+ * @dataFirst
+ * @category Object
+ */
+export function keys<T extends object>(data: T): Keys<T>;
+
+/**
+ * Returns a new array containing the keys of the array or object.
+ *
+ * @signature
+ *    keys()(source)
+ * @example
+ *    pipe(['x', 'y', 'z'], keys()); // => ['0', '1', '2']
+ *    pipe({ a: 'x', b: 'y', 5: 'z' } as const, keys()) // => ['a', 'b', '5']
+ * @dataLast
+ * @category Object
+ */
+export function keys(): <T extends object>(data: T) => Keys<T>;
+
+export function keys(...args: readonly unknown[]): unknown {
+  return purry(Object.keys, args);
+}

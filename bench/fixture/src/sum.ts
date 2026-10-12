@@ -1,0 +1,83 @@
+import type { IterableContainer } from "./internal/types/IterableContainer";
+import { purry } from "./purry";
+
+type Sum<T extends IterableContainer<bigint> | IterableContainer<number>> =
+  // Empty arrays would always result in a sum of (a non-bigint) 0.
+  T extends readonly []
+    ? 0
+    : // Non-empty bigint arrays will always result in a bigint sum.
+      T extends readonly [bigint, ...(readonly unknown[])]
+      ? bigint
+      : // But an empty bigint array would result in a non-bigint 0.
+        T[number] extends bigint
+        ? bigint | 0
+        : // Non-bigint arrays are always handled correctly.
+          number;
+
+/**
+ * Sums the numbers in the array, or return 0 for an empty array.
+ *
+ * Works for both `number` and `bigint` arrays, but not arrays that contain both
+ * types.
+ *
+ * IMPORTANT: The result for empty arrays would be 0 (`number`) regardless of
+ * the type of the array; to avoid adding this to the return type for cases
+ * where the array is known to be non-empty you can use `hasAtLeast` or
+ * `isEmpty` to guard against this case.
+ *
+ * @param data - The array of numbers.
+ * @signature
+ *   sum(data);
+ * @example
+ *   sum([1, 2, 3]); // => 6
+ *   sum([1n, 2n, 3n]); // => 6n
+ *   sum([]); // => 0
+ * @dataFirst
+ * @category Number
+ */
+export function sum<
+  T extends IterableContainer<bigint> | IterableContainer<number>,
+>(data: T): Sum<T>;
+
+/**
+ * Sums the numbers in the array, or return 0 for an empty array.
+ *
+ * Works for both `number` and `bigint` arrays, but not arrays that contain both
+ * types.
+ *
+ * IMPORTANT: The result for empty arrays would be 0 (`number`) regardless of
+ * the type of the array; to avoid adding this to the return type for cases
+ * where the array is known to be non-empty you can use `hasAtLeast` or
+ * `isEmpty`to guard against this case.
+ *
+ * @signature
+ *   sum()(data);
+ * @example
+ *   pipe([1, 2, 3], sum()); // => 6
+ *   pipe([1n, 2n, 3n], sum()); // => 6n
+ *   pipe([], sum()); // => 0
+ * @dataLast
+ * @category Number
+ */
+export function sum(): <
+  T extends IterableContainer<bigint> | IterableContainer<number>,
+>(
+  data: T,
+) => Sum<T>;
+
+export function sum(...args: readonly unknown[]): unknown {
+  return purry(sumImplementation, args);
+}
+
+function sumImplementation<
+  T extends IterableContainer<bigint> | IterableContainer<number>,
+>(data: T): T[number] {
+  // eslint-disable-next-line @typescript-eslint/no-magic-numbers -- The rule differentiates 0 and 0n :(
+  let out = typeof data[0] === "bigint" ? 0n : 0;
+  for (const value of data) {
+    // @ts-expect-error [ts2365] -- Typescript can't infer that all elements will be a number of the same type.
+    // eslint-disable-next-line @typescript-eslint/restrict-plus-operands
+    out += value;
+  }
+  return out;
+}

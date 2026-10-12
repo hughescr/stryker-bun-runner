@@ -1,0 +1,72 @@
+import { purryFromLazy } from "./internal/purryFromLazy";
+import type { BrandedReturn } from "./internal/types/BrandedReturn";
+import type { Deduped } from "./internal/types/Deduped";
+import type { IterableContainer } from "./internal/types/IterableContainer";
+import type { LazyCallback } from "./internal/types/LazyCallback";
+import type { LazyEvaluator } from "./internal/types/LazyEvaluator";
+import { SKIP_ITEM } from "./internal/utilityEvaluators";
+
+/**
+ * Returns a new array containing only one copy of each element in the original
+ * list transformed by a function. Elements are compared by reference using Set.
+ *
+ * @param data - The array to filter.
+ * @param keyFunction - Extracts a value that would be used to compare elements.
+ * @signature
+ *    uniqueBy(data, keyFunction)
+ * @example
+ *    uniqueBy(
+ *     [{ n: 1 }, { n: 2 }, { n: 2 }, { n: 5 }, { n: 1 }, { n: 6 }, { n: 7 }],
+ *     (obj) => obj.n,
+ *    ) // => [{n: 1}, {n: 2}, {n: 5}, {n: 6}, {n: 7}]
+ * @dataFirst
+ * @lazy
+ * @category Array
+ */
+export function uniqueBy<T extends IterableContainer>(
+  data: T,
+  keyFunction: LazyCallback<T, unknown>,
+): Deduped<T>;
+
+/**
+ * Returns a new array containing only one copy of each element in the original
+ * list transformed by a function. Elements are compared by reference using Set.
+ *
+ * @param keyFunction - Extracts a value that would be used to compare elements.
+ * @signature
+ *    uniqueBy(keyFunction)(data)
+ * @example
+ *    pipe(
+ *      [{n: 1}, {n: 2}, {n: 2}, {n: 5}, {n: 1}, {n: 6}, {n: 7}], // only 4 iterations
+ *      uniqueBy(obj => obj.n),
+ *      take(3)
+ *    ) // => [{n: 1}, {n: 2}, {n: 5}]
+ * @dataLast
+ * @lazy
+ * @category Array
+ */
+export function uniqueBy<T extends IterableContainer>(
+  keyFunction: LazyCallback<T, unknown>,
+): (data: T) => Deduped<T>;
+
+export function uniqueBy(...args: readonly unknown[]): unknown {
+  return purryFromLazy(lazyImplementation, args);
+}
+
+function lazyImplementation<T>(
+  keyFunction: (item: T, index: number, data: readonly T[]) => unknown,
+): LazyEvaluator<T> {
+  // @see https://github.com/typescript-eslint/typescript-eslint/issues/9885
+  const brandedKeyFunction = keyFunction as BrandedReturn<typeof keyFunction>;
+
+  const set = new Set<ReturnType<typeof brandedKeyFunction>>();
+  return (value, index, data) => {
+    const key = brandedKeyFunction(value, index, data);
+    if (set.has(key)) {
+      return SKIP_ITEM;
+    }
+
+    set.add(key);
+    return { done: false, hasNext: true, next: value };
+  };
+}

@@ -1,0 +1,47 @@
+import type { IterableContainer } from "./internal/types/IterableContainer";
+import type { ReorderedArray } from "./internal/types/ReorderedArray";
+import { purry } from "./purry";
+
+/**
+ * Shuffles the input array, returning a new array with the same elements in a random order.
+ *
+ * @param items - The array to shuffle.
+ * @signature
+ *    shuffle(array)
+ * @example
+ *    shuffle([4, 2, 7, 5]) // => [7, 5, 4, 2]
+ * @dataFirst
+ * @category Array
+ */
+export function shuffle<T extends IterableContainer>(
+  items: T,
+): ReorderedArray<T>;
+
+/**
+ * Shuffles the input array, returning a new array with the same elements in a random order.
+ *
+ * @signature
+ *    shuffle()(array)
+ * @example
+ *    pipe([4, 2, 7, 5], shuffle()) // => [7, 5, 4, 2]
+ * @dataLast
+ * @category Array
+ */
+export function shuffle(): <T extends IterableContainer>(
+  items: T,
+) => ReorderedArray<T>;
+
+export function shuffle(...args: readonly unknown[]): unknown {
+  return purry(shuffleImplementation, args);
+}
+
+function shuffleImplementation<T>(items: readonly T[]): T[] {
+  const result = [...items];
+  for (let index = 0; index < items.length; index++) {
+    const rand = index + Math.floor(Math.random() * (items.length - index));
+    const value = result[rand]!;
+    result[rand] = result[index]!;
+    result[index] = value;
+  }
+  return result;
+}

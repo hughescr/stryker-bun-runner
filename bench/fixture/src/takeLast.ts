@@ -1,0 +1,53 @@
+import type { IterableContainer } from "./internal/types/IterableContainer";
+import { purry } from "./purry";
+
+/**
+ * Takes the last `n` elements from the `array`.
+ *
+ * Related operations:
+ * - `dropLast` - to skip past the last `n` instead.
+ * - `splice` - to remove or insert at an arbitrary index.
+ * - `take` - same, but from the start of the array.
+ *
+ * @param array - The target array.
+ * @param n - The number of elements to take.
+ * @signature
+ *    takeLast(array, n)
+ * @example
+ *    takeLast([1, 2, 3, 4, 5], 2) // => [4, 5]
+ * @dataFirst
+ * @category Array
+ */
+export function takeLast<T extends IterableContainer>(
+  array: T,
+  n: number,
+): T[number][];
+
+/**
+ * Take the last `n` elements from the `array`.
+ *
+ * Related operations:
+ * - `dropLast` - to skip past the last `n` instead.
+ * - `splice` - to remove or insert at an arbitrary index.
+ * - `take` - same, but from the start of the array.
+ *
+ * @param n - The number of elements to take.
+ * @signature
+ *    takeLast(n)(array)
+ * @example
+ *    takeLast(2)([1, 2, 3, 4, 5]) // => [4, 5]
+ * @dataLast
+ * @category Array
+ */
+export function takeLast<T extends IterableContainer>(
+  n: number,
+): (array: T) => T[number][];
+
+export function takeLast(...args: readonly unknown[]): unknown {
+  return purry(takeLastImplementation, args);
+}
+
+const takeLastImplementation = <T extends IterableContainer>(
+  array: T,
+  n: number,
+): T[number][] => (n > 0 ? array.slice(Math.max(0, array.length - n)) : []);

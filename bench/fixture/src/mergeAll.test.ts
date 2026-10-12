@@ -1,0 +1,21 @@
+import { expect, test } from "vitest";
+import { mergeAll } from "./mergeAll";
+
+test("merge objects", () => {
+  expect(
+    mergeAll([{ a: 1, b: 1 }, { b: 2, c: 3 }, { d: 10 }] as const),
+  ).toStrictEqual({
+    a: 1,
+    b: 2,
+    c: 3,
+    d: 10,
+  });
+});
+
+test("should return an empty object when the input is an empty array", () => {
+  const input: readonly object[] = [];
+
+  const result = mergeAll(input);
+
+  expect(result).toStrictEqual({});
+});

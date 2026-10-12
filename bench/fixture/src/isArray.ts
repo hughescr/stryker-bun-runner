@@ -1,0 +1,20 @@
+import type { NarrowedTo } from "./internal/types/NarrowedTo";
+
+/**
+ * A function that checks if the passed parameter is an Array and narrows its type accordingly.
+ *
+ * @param data - The variable to check.
+ * @returns True if the passed input is an Array, false otherwise.
+ * @signature
+ *    isArray(data)
+ * @example
+ *    isArray([5]) //=> true
+ *    isArray([]) //=> true
+ *    isArray('somethingElse') //=> false
+ * @category Guard
+ */
+export function isArray<T>(
+  data: ArrayLike<unknown> | T,
+): data is NarrowedTo<T, readonly unknown[]> {
+  return Array.isArray(data);
+}

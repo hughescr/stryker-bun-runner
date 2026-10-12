@@ -1,0 +1,69 @@
+import type { IterableContainer } from "./internal/types/IterableContainer";
+import type { LazyEvaluator } from "./internal/types/LazyEvaluator";
+import { lazyEmptyEvaluator } from "./internal/utilityEvaluators";
+import { purry } from "./purry";
+
+/**
+ * Returns the first `n` elements of `array`.
+ *
+ * Related operations:
+ * - `drop` - to skip past the first `n` instead.
+ * - `splice` - to remove or insert at an arbitrary index.
+ * - `takeLast` - same, but from the end of the array.
+ *
+ * @param array - The array.
+ * @param n - The number of elements to take.
+ * @signature
+ *    take(array, n)
+ * @example
+ *    take([1, 2, 3, 4, 3, 2, 1], 3) // => [1, 2, 3]
+ * @dataFirst
+ * @lazy
+ * @category Array
+ */
+export function take<T extends IterableContainer>(
+  array: T,
+  n: number,
+): T[number][];
+
+/**
+ * Returns the first `n` elements of `array`.
+ *
+ * Related operations:
+ * - `drop` - to skip past the first `n` instead.
+ * - `splice` - to remove or insert at an arbitrary index.
+ * - `takeLast` - same, but from the end of the array.
+ *
+ * @param n - The number of elements to take.
+ * @signature
+ *    take(n)(array)
+ * @example
+ *    pipe([1, 2, 3, 4, 3, 2, 1], take(3)) // => [1, 2, 3]
+ * @dataLast
+ * @lazy
+ * @category Array
+ */
+export function take(
+  n: number,
+): <T extends IterableContainer>(array: T) => T[number][];
+
+export function take(...args: readonly unknown[]): unknown {
+  return purry(takeImplementation, args, lazyImplementation);
+}
+
+const takeImplementation = <T extends IterableContainer>(
+  array: T,
+  n: number,
+): T[number][] => (n < 0 ? [] : array.slice(0, n));
+
+function lazyImplementation<T>(n: number): LazyEvaluator<T> {
+  if (n <= 0) {
+    return lazyEmptyEvaluator;
+  }
+
+  let remaining = n;
+  return (value) => {
+    remaining -= 1;
+    return { done: remaining <= 0, hasNext: true, next: value };
+  };
+}

@@ -1,0 +1,74 @@
+import type { Simplify } from "type-fest";
+import type { EnumerableStringKeyOf } from "./internal/types/EnumerableStringKeyOf";
+import type { EnumerableStringKeyedValueOf } from "./internal/types/EnumerableStringKeyedValueOf";
+import { purry } from "./purry";
+
+type MappedValues<T extends object, Value> = Simplify<{
+  -readonly [P in keyof T as P extends number | string ? P : never]: Value;
+}>;
+
+/**
+ * Maps values of `object` and keeps the same keys. Symbol keys are not passed
+ * to the mapper and will be removed from the output object.
+ *
+ * To also copy the symbol keys to the output use merge:
+ * `merge(data, mapValues(data, mapper))`).
+ *
+ * @param data - The object to map.
+ * @param valueMapper - The mapping function.
+ * @signature
+ *    mapValues(data, mapper)
+ * @example
+ *    mapValues({a: 1, b: 2}, (value, key) => value + key) // => {a: '1a', b: '2b'}
+ * @dataFirst
+ * @category Object
+ */
+export function mapValues<T extends object, Value>(
+  data: T,
+  valueMapper: (
+    value: EnumerableStringKeyedValueOf<T>,
+    key: EnumerableStringKeyOf<T>,
+    data: T,
+  ) => Value,
+): MappedValues<T, Value>;
+
+/**
+ * Maps values of `object` and keeps the same keys. Symbol keys are not passed
+ * to the mapper and will be removed from the output object.
+ *
+ * To also copy the symbol keys to the output use merge:
+ * `merge(data, mapValues(data, mapper))`).
+ *
+ * @param valueMapper - The mapping function.
+ * @signature
+ *    mapValues(mapper)(data)
+ * @example
+ *    pipe({a: 1, b: 2}, mapValues((value, key) => value + key)) // => {a: '1a', b: '2b'}
+ * @dataLast
+ * @category Object
+ */
+export function mapValues<T extends object, Value>(
+  valueMapper: (
+    value: EnumerableStringKeyedValueOf<T>,
+    key: EnumerableStringKeyOf<T>,
+    data: T,
+  ) => Value,
+): (data: T) => MappedValues<T, Value>;
+
+export function mapValues(...args: readonly unknown[]): unknown {
+  return purry(mapValuesImplementation, args);
+}
+
+function mapValuesImplementation<T extends object, Value>(
+  data: T,
+  valueMapper: (value: unknown, key: string, data: T) => Value,
+): Record<string, Value> {
+  const out: Record<string, Value> = {};
+
+  for (const [key, value] of Object.entries(data)) {
+    const mappedValue = valueMapper(value, key, data);
+    out[key] = mappedValue;
+  }
+
+  return out;
+}

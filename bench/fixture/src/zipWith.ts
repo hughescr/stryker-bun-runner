@@ -1,0 +1,136 @@
+import { lazyDataLastImpl } from "./internal/lazyDataLastImpl";
+import type { IterableContainer } from "./internal/types/IterableContainer";
+import type { LazyEvaluator } from "./internal/types/LazyEvaluator";
+import type { NonEmptyPrefix } from "./internal/types/NonEmptyPrefix";
+import { lazyEmptyEvaluator } from "./internal/utilityEvaluators";
+
+type ZippingFunction<
+  T1 extends IterableContainer = IterableContainer,
+  T2 extends IterableContainer = IterableContainer,
+  Value = unknown,
+> = (
+  first: T1[number],
+  second: T2[number],
+  index: number,
+  data: readonly [first: T1, second: T2],
+) => Value;
+
+// Inside `pipe` the first list flows through lazily, so the callback only sees
+// the items processed so far, while the second list is provided upfront and is
+// always complete.
+type LazyZippingFunction<
+  T1 extends IterableContainer = IterableContainer,
+  T2 extends IterableContainer = IterableContainer,
+  Value = unknown,
+> = (
+  first: T1[number],
+  second: T2[number],
+  index: number,
+  data: readonly [first: Readonly<NonEmptyPrefix<T1>>, second: T2],
+) => Value;
+
+/**
+ * Creates a new list from two supplied lists by calling the supplied function
+ * with the same-positioned element from each list.
+ *
+ * @param fn - The function applied to each position of the list.
+ * @signature
+ *   zipWith(fn)(first, second)
+ * @example
+ *   zipWith((a: string, b: string) => a + b)(['1', '2', '3'], ['a', 'b', 'c']) // => ['1a', '2b', '3c']
+ * @category Array
+ */
+export function zipWith<TItem1, TItem2, Value>(
+  fn: ZippingFunction<readonly TItem1[], readonly TItem2[], Value>,
+): (first: readonly TItem1[], second: readonly TItem2[]) => Value[];
+
+/**
+ * Creates a new list from two supplied lists by calling the supplied function
+ * with the same-positioned element from each list.
+ *
+ * @param second - The second input list.
+ * @param fn - The function applied to each position of the list.
+ * @signature
+ *   zipWith(second, fn)(first)
+ * @example
+ *   pipe(['1', '2', '3'], zipWith(['a', 'b', 'c'], (a, b) => a + b)) // => ['1a', '2b', '3c']
+ * @dataLast
+ * @lazy
+ * @category Array
+ */
+export function zipWith<
+  T1 extends IterableContainer,
+  T2 extends IterableContainer,
+  Value,
+>(second: T2, fn: LazyZippingFunction<T1, T2, Value>): (first: T1) => Value[];
+
+/**
+ * Creates a new list from two supplied lists by calling the supplied function
+ * with the same-positioned element from each list.
+ *
+ * @param first - The first input list.
+ * @param second - The second input list.
+ * @param fn - The function applied to each position of the list.
+ * @signature
+ *   zipWith(first, second, fn)
+ * @example
+ *   zipWith(['1', '2', '3'], ['a', 'b', 'c'], (a, b) => a + b) // => ['1a', '2b', '3c']
+ * @dataFirst
+ * @lazy
+ * @category Array
+ */
+export function zipWith<
+  T1 extends IterableContainer,
+  T2 extends IterableContainer,
+  Value,
+>(first: T1, second: T2, fn: ZippingFunction<T1, T2, Value>): Value[];
+
+export function zipWith(
+  arg0: IterableContainer | ZippingFunction,
+  arg1?: IterableContainer | LazyZippingFunction | ZippingFunction,
+  arg2?: ZippingFunction,
+): unknown {
+  if (typeof arg0 === "function") {
+    // Both datum's last
+    return (data1: IterableContainer, data2: IterableContainer) =>
+      zipWithImplementation(data1, data2, arg0);
+  }
+
+  if (typeof arg1 === "function") {
+    // dataLast
+    return lazyDataLastImpl(
+      zipWithImplementation,
+      [arg0, arg1],
+      lazyImplementation,
+    );
+  }
+
+  // dataFirst. Notice that we assert that the arguments are defined to reduce
+  // the number of runtime checks that would otherwise be needed to make
+  // TypeScript happy here. Because this is an internal implementation and we
+  // are protected by the function typing itself this is fine!
+  return zipWithImplementation(arg0, arg1!, arg2!);
+}
+
+function zipWithImplementation<
+  T1 extends IterableContainer,
+  T2 extends IterableContainer,
+  Value,
+>(first: T1, second: T2, fn: ZippingFunction<T1, T2, Value>): Value[] {
+  const datum = [first, second] as const;
+  return first.length < second.length
+    ? first.map((item, index) => fn(item, second[index], index, datum))
+    : second.map((item, index) => fn(first[index], item, index, datum));
+}
+
+const lazyImplementation = <T1, T2 extends IterableContainer, Value>(
+  second: T2,
+  fn: ZippingFunction<readonly T1[], T2, Value>,
+): LazyEvaluator<T1, Value> =>
+  second.length === 0
+    ? lazyEmptyEvaluator
+    : (value, index, data) => ({
+        next: fn(value, second[index], index, [data, second]),
+        hasNext: true,
+        done: index >= second.length - 1,
+      });
