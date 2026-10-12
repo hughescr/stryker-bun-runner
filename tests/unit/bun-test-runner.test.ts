@@ -1110,6 +1110,72 @@ describe('BunTestRunner', () => {
             }
         });
 
+        describe('overlapping test-file discovery with the eager-module glob', () => {
+            const nextMacrotask = async (): Promise<void> => new Promise<void>(setImmediate);
+            /** A promise settled from outside. */
+            const deferred = <T>(): { promise: Promise<T>, resolve: (value: T) => void, reject: (error: Error) => void } => Promise.withResolvers<T>();
+            /** Let init() run until `spy` has been called: waits on the event, not on the clock. */
+            const untilCalled = async (spy: { mock: { calls: unknown[] } }): Promise<void> => {
+                while(spy.mock.calls.length === 0) {
+                    // eslint-disable-next-line no-await-in-loop -- each turn gives init() the chance to reach the call
+                    await nextMacrotask();
+                }
+            };
+
+            it('starts discovering test files while the eager-module glob is still running', async () => {
+                mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+                const glob = deferred<string[]>();
+                resolveEagerModulesFromGlobsSpy.mockImplementation(async () => glob.promise);
+                const runner = new BunTestRunner(mockLogger, { mutate: ['src/**/*.ts'] } as unknown as StrykerOptions);
+
+                const initDone = runner.init();
+                await untilCalled(resolveEagerModulesFromGlobsSpy);
+                // Discovery was started before the glob settled; the preload waits for the glob.
+                expect(discoverTestFilesSpy).toHaveBeenCalledTimes(1);
+                expect(mockGeneratePreloadScript).not.toHaveBeenCalled();
+
+                glob.resolve(['/abs/src/a.ts']);
+                await initDone;
+
+                expect(mockGeneratePreloadScript).toHaveBeenCalledWith(expect.objectContaining({ eagerModules: ['/abs/src/a.ts'] }));
+                // One discovery serves init's pre-warm and the later runs: still a single glob.
+                expect(discoverTestFilesSpy).toHaveBeenCalledTimes(1);
+            });
+
+            it('logs the start summary with the discovered files, as before the overlap', async () => {
+                mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+
+                await runner.init();
+
+                expect(mockLogger.debug).toHaveBeenCalledWith('%s', expect.stringContaining('2 test file(s) from auto-discovery'));
+            });
+
+            it('fails with the preload error, and leaves no unhandled rejection, when discovery also fails afterwards', async () => {
+                mockGeneratePreloadScript.mockRejectedValue(new Error('unsafe temp dir'));
+                const discovery = deferred<string[]>();
+                discoverTestFilesSpy.mockImplementation(async () => discovery.promise);
+                const unhandled: unknown[] = [];
+                const onUnhandled = (reason: unknown): void => {
+                    unhandled.push(reason);
+                };
+                process.on('unhandledRejection', onUnhandled);
+                try {
+                    const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+
+                    const err = await runner.init().catch((e: unknown) => e);
+                    expect((err as Error).message).toBe('unsafe temp dir');
+
+                    discovery.reject(new Error('discovery failed late'));
+                    await nextMacrotask();
+                    await nextMacrotask();
+                    expect(unhandled).toEqual([]);
+                } finally {
+                    process.off('unhandledRejection', onUnhandled);
+                }
+            });
+        });
+
         it('cleans up previous preload script when init() is called again (Fix 6: no preload leak on re-init)', async () => {
             // Stryker sandbox rotation calls init() multiple times on the same runner instance.
             // The old preload script must be cleaned up before generating the new one.

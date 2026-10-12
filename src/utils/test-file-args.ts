@@ -51,14 +51,7 @@ function shortestSpelling(absolute: string, cwd: string): string {
     return spelled.length < absolute.length ? spelled : absolute;
 }
 
-/**
- * Spell `files` as `bun test` path arguments, resolved against `cwd`.
- *
- * @param files - Test files or directories, absolute or relative to `cwd`
- * @param cwd - The directory the child runs in
- * @param budget - Bytes the entries may take
- */
-export function buildTestFileArgs(files: readonly string[], cwd: string = process.cwd(), budget: number = MAX_TEST_FILE_ARGS_BYTES): TestFileArgs {
+function computeTestFileArgs(files: readonly string[], cwd: string, budget: number): TestFileArgs {
     const absolute = files.map(file => path.resolve(cwd, file));
     const absoluteBytes = bytesOf(absolute);
     if(absoluteBytes <= budget) {
@@ -67,4 +60,38 @@ export function buildTestFileArgs(files: readonly string[], cwd: string = proces
     const relative = absolute.map(file => shortestSpelling(file, cwd));
     const relativeBytes = bytesOf(relative);
     return { args: relative, form: 'relative', bytes: relativeBytes, fits: relativeBytes <= budget };
+}
+
+function sameEntries(a: readonly string[], b: readonly string[]): boolean {
+    return a.length === b.length && a.every((entry, index) => entry === b[index]);
+}
+
+/**
+ * The previous {@link buildTestFileArgs} call. A mutant run builds its list twice in a row (once to
+ * fit it to the budget, then again to spawn bun with it), so remembering the last call halves the
+ * path work, which on a full-suite run is one `path.resolve` per test file.
+ */
+let lastBuild: { files: readonly string[], cwd: string, budget: number, result: TestFileArgs } | undefined;
+
+/**
+ * Spell `files` as `bun test` path arguments, resolved against `cwd`.
+ *
+ * @param files - Test files or directories, absolute or relative to `cwd`
+ * @param cwd - The directory the child runs in
+ * @param budget - Bytes the entries may take
+ */
+export function buildTestFileArgs(files: readonly string[], cwd: string = process.cwd(), budget: number = MAX_TEST_FILE_ARGS_BYTES): TestFileArgs {
+    // The memo key is (files, cwd, budget). A relative cwd would resolve against process.cwd(), which is not in the key,
+    // so only an absolute cwd is remembered (and reused).
+    if(!path.isAbsolute(cwd)) {
+        return computeTestFileArgs(files, cwd, budget);
+    }
+    const cached = lastBuild;
+    if(cached?.cwd === cwd && cached.budget === budget && sameEntries(cached.files, files)) {
+        return { ...cached.result, args: [...cached.result.args] };
+    }
+    const result = computeTestFileArgs(files, cwd, budget);
+    // Own copies of both lists, so neither a caller changing `files` nor one changing `result.args` can alter what is remembered.
+    lastBuild = { files: [...files], cwd, budget, result: { ...result, args: [...result.args] } };
+    return result;
 }

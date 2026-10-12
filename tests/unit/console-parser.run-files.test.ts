@@ -160,6 +160,32 @@ describe('parseBunTestOutput with the run\'s test files', () => {
         });
     });
 
+    describe('how a header is matched against the list', () => {
+        it('believes a header that reaches a listed file through .. segments', () => {
+            const out = 'tests/unit/../other/x.test.ts:\n(fail) x [1ms]\n';
+
+            expect(failedNames(out, ['tests/other/x.test.ts'])).toEqual(['tests/unit/../other/x.test.ts > x']);
+        });
+
+        it('believes every header when the list holds the filesystem root', () => {
+            const out = '/elsewhere/s.test.ts:\n(fail) s [1ms]\ntests/a.test.ts:\n(fail) a [1ms]\n';
+
+            expect(failedNames(out, ['/'])).toEqual(['/elsewhere/s.test.ts > s', 'tests/a.test.ts > a']);
+        });
+
+        it('credits each failure to its own file for a run of thousands of files, ignoring a stray header', () => {
+            const files = Array.from({ length: 3000 }, (_unused, index) => `tests/unit/file-${index}.test.ts`);
+            const out = [...files.map((file, index) => (index % 1000 === 7 ? `${file}:\n(fail) t${index} [1ms]\n` : `${file}:\n(pass) t${index} [1ms]\n`)), '+ tests/stray.test.ts:\n(fail) w [1ms]'].join('\n');
+
+            expect(failedNames(out, files)).toEqual([
+                'tests/unit/file-7.test.ts > t7',
+                'tests/unit/file-1007.test.ts > t1007',
+                'tests/unit/file-2007.test.ts > t2007',
+                'tests/unit/file-2999.test.ts > w',
+            ]);
+        });
+    });
+
     it('finds a run file\'s header in stdout too', () => {
         const result = parseBunTestOutput('tests/a.test.ts:\n(fail) one [1ms]\n', 'tests/x.test.ts:\n', ['tests/a.test.ts']);
 

@@ -11,7 +11,7 @@
  */
 
 import path from 'node:path';
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import { buildTestFileArgs, MAX_TEST_FILE_ARGS_BYTES } from '../../src/utils/test-file-args.js';
 
 /** One argv entry costs its UTF-8 bytes, a NUL terminator and a 64-bit pointer. */
@@ -150,5 +150,85 @@ describe('buildTestFileArgs', () => {
         it('keeps the order', () => {
             expect(buildTestFileArgs(['tests/z.test.ts', 'tests/a.test.ts'], CWD, OVER).args).toEqual(['./tests/z.test.ts', './tests/a.test.ts']);
         });
+    });
+});
+
+describe('buildTestFileArgs remembering the previous call', () => {
+    const FILES = ['tests/a.test.ts', 'tests/b.test.ts', 'tests/c.test.ts'];
+    const ABSOLUTE = FILES.map(file => path.resolve(CWD, file));
+    let resolveSpy: ReturnType<typeof spyOn<typeof path, 'resolve'>>;
+
+    beforeEach(() => {
+        // A call with other inputs first, so each test starts from a remembered call that cannot match its own.
+        buildTestFileArgs(['tests/never-matches.test.ts'], '/unrelated', 1);
+        resolveSpy = spyOn(path, 'resolve');
+    });
+
+    afterEach(() => {
+        resolveSpy.mockRestore();
+    });
+
+    it('does the path work once for two calls in a row with the same list', () => {
+        const first = buildTestFileArgs(FILES, CWD);
+        resolveSpy.mockClear();
+
+        const second = buildTestFileArgs(FILES, CWD);
+
+        expect(resolveSpy).not.toHaveBeenCalled();
+        expect(second).toEqual(first);
+    });
+
+    it('recognises the same list in a different array', () => {
+        const first = buildTestFileArgs(FILES, CWD);
+        resolveSpy.mockClear();
+
+        expect(buildTestFileArgs([...FILES], CWD)).toEqual(first);
+        expect(resolveSpy).not.toHaveBeenCalled();
+    });
+
+    it('neither remembers nor reuses a call with a relative cwd, which resolves against the process cwd', () => {
+        const relativeCwd = 'rel/cwd';
+        const first = buildTestFileArgs(FILES, relativeCwd);
+        resolveSpy.mockClear();
+
+        expect(buildTestFileArgs(FILES, relativeCwd)).toEqual(first);
+        expect(resolveSpy).toHaveBeenCalled();
+        // And it left the remembered call alone: this one was already remembered before.
+        buildTestFileArgs(FILES, CWD);
+        buildTestFileArgs(FILES, relativeCwd);
+        resolveSpy.mockClear();
+        buildTestFileArgs(FILES, CWD);
+        expect(resolveSpy).not.toHaveBeenCalled();
+    });
+
+    it('gives each caller its own args array', () => {
+        const first = buildTestFileArgs(FILES, CWD);
+        first.args.push('/mutated-by-caller');
+        const second = buildTestFileArgs(FILES, CWD);
+        second.args.pop();
+
+        expect(buildTestFileArgs(FILES, CWD).args).toEqual(ABSOLUTE);
+    });
+
+    it('does not let a caller changing its input list change what is remembered', () => {
+        const list = [...FILES];
+        buildTestFileArgs(list, CWD);
+        list[0] = 'tests/changed.test.ts';
+
+        expect(buildTestFileArgs(list, CWD).args[0]).toBe('/work/project/tests/changed.test.ts');
+        expect(buildTestFileArgs(FILES, CWD).args).toEqual(ABSOLUTE);
+    });
+
+    it.each([
+        ['a different cwd', FILES, '/other/project', MAX_TEST_FILE_ARGS_BYTES, FILES.map(file => path.resolve('/other/project', file))],
+        ['a different budget', FILES, CWD, 1, FILES.map(file => `./${file}`)],
+        ['a longer list', [...FILES, 'tests/d.test.ts'], CWD, MAX_TEST_FILE_ARGS_BYTES, [...ABSOLUTE, '/work/project/tests/d.test.ts']],
+        ['a shorter list', FILES.slice(0, 2), CWD, MAX_TEST_FILE_ARGS_BYTES, ABSOLUTE.slice(0, 2)],
+        ['a list differing in its last entry', [...FILES.slice(0, 2), 'tests/z.test.ts'], CWD, MAX_TEST_FILE_ARGS_BYTES, [...ABSOLUTE.slice(0, 2), '/work/project/tests/z.test.ts']],
+        ['a list differing in its first entry', ['tests/z.test.ts', ...FILES.slice(1)], CWD, MAX_TEST_FILE_ARGS_BYTES, ['/work/project/tests/z.test.ts', ...ABSOLUTE.slice(1)]],
+    ])('does the work again for %s', (_label, files, cwd, budget, expectedArgs) => {
+        buildTestFileArgs(FILES, CWD);
+
+        expect(buildTestFileArgs(files, cwd, budget).args).toEqual(expectedArgs);
     });
 });
