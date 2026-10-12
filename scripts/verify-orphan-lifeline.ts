@@ -21,7 +21,7 @@
 
 /* eslint-disable no-console, n/no-process-exit, unicorn/no-process-exit -- a command-line script: its output is the point, and its exit code is the verdict */
 
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import { createServer, type AddressInfo, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -31,6 +31,10 @@ import { LIFELINE_FD_ENV } from '../src/coverage/preload-logic.js';
 const ALIVE_WINDOW_MS = 1500;
 /** How long the child may take to start and report in. */
 const STARTUP_CAP_MS = 30_000;
+/** How much of the host's stderr to keep for the failure report. */
+const STDERR_TAIL_CHARS = 4000;
+/** How long to wait, after the host exits, for the rest of its stderr. */
+const STDERR_DRAIN_MS = 1000;
 /** How long the child may take to exit once its host is killed. */
 const EXIT_CAP_MS = 5000;
 
@@ -119,6 +123,25 @@ function lineReader(socket: Socket): () => Promise<string> {
     };
 }
 
+/**
+ * Echoes `stream` to this process's stderr and keeps its last
+ * STDERR_TAIL_CHARS characters, for the report if the host dies. `done`
+ * settles once the stream ends.
+ */
+function teeTail(stream: AsyncIterable<Uint8Array>): { tail: () => string, done: Promise<void> } {
+    const decoder = new TextDecoder();
+    let tail = '';
+    const done = (async () => {
+        for await (const chunk of stream) {
+            process.stderr.write(chunk);
+            tail = (tail + decoder.decode(chunk, { stream: true })).slice(-STDERR_TAIL_CHARS);
+        }
+    })().catch(() => {
+        // The stream closing abnormally just ends the capture; the tail so far stands.
+    });
+    return { tail: () => tail, done };
+}
+
 function isRunning(pid: number): boolean {
     try {
         process.kill(pid, 0);
@@ -130,7 +153,9 @@ function isRunning(pid: number): boolean {
 
 async function main(): Promise<boolean> {
     console.log(`verify-orphan-lifeline: bun ${Bun.version} on ${process.platform} ${process.arch}`);
-    const fixture = await mkdtemp(path.join(tmpdir(), 'stryker-bun-verify-orphan-'));
+    // Resolve symlinks (macOS: /var -> /private/var): the preload's private temp
+    // directory check rejects any path with a symlinked ancestor.
+    const fixture = await realpath(await mkdtemp(path.join(tmpdir(), 'stryker-bun-verify-orphan-')));
     const server = createServer();
     let host: ReturnType<typeof Bun.spawn> | undefined;
     let childPid: number | undefined;
@@ -144,13 +169,31 @@ async function main(): Promise<boolean> {
         });
         const { port } = server.address() as AddressInfo;
 
-        host = Bun.spawn([process.execPath, '--eval', hostScript(fixture, port)], { cwd: fixture, stdout: 'ignore', stderr: 'inherit' });
-        const socket = await within(connected, STARTUP_CAP_MS, `the child did not report in within ${STARTUP_CAP_MS} ms`);
+        const spawned = Bun.spawn([process.execPath, '--eval', hostScript(fixture, port)], { cwd: fixture, stdout: 'ignore', stderr: 'pipe' });
+        host = spawned;
+        const hostStderr = teeTail(spawned.stderr);
+        // Resolves (never rejects) with a description of the host's exit; used to
+        // fail fast when the host dies before the child has reported in.
+        const hostFailed = spawned.exited.then(async () => {
+            await Promise.race([hostStderr.done, Bun.sleep(STDERR_DRAIN_MS)]);
+            const how = spawned.signalCode === null ? `exit code ${spawned.exitCode}` : `signal ${spawned.signalCode}`;
+            const tail = hostStderr.tail().trim();
+            const stderrNote = tail === '' ? 'It wrote nothing to stderr.' : ['Its stderr ended with:', tail].join('\n');
+            return new Error(`the host process exited (${how}) before the child reported in. ${stderrNote}`);
+        });
+        const unlessHostExits = async <T>(promise: Promise<T>): Promise<T> => Promise.race([
+            promise,
+            hostFailed.then((error) => {
+                throw error;
+            }),
+        ]);
+
+        const socket = await within(unlessHostExits(connected), STARTUP_CAP_MS, `the child did not report in within ${STARTUP_CAP_MS} ms`);
         const closed = new Promise<void>((resolve) => {
             socket.once('close', () => resolve());
         });
         const nextLine = lineReader(socket);
-        const report = await within(nextLine(), STARTUP_CAP_MS, 'the child did not send its pid');
+        const report = await within(unlessHostExits(nextLine()), STARTUP_CAP_MS, 'the child did not send its pid');
         const [pidText, ...lifeline] = report.split(' ');
         childPid = Number(pidText);
         console.log(`host pid ${host.pid}, child pid ${childPid}; child's lifeline: ${lifeline.join(' ')}`);
