@@ -5,6 +5,7 @@
 
 import { type ChildProcess, type SpawnOptions, spawn } from 'node:child_process';
 import { LIFELINE_FD_ENV, SYNC_TOKEN_ENV } from './coverage/preload-logic.js';
+import type { RunProfile } from './run-profile.js';
 import { killProcessGroup } from './utils/process-group.js';
 import { getProcessRssBytes } from './utils/process-rss.js';
 import { buildTestFileArgs } from './utils/test-file-args.js';
@@ -49,6 +50,13 @@ export const SPAWN_DEPTH_ENV = '__STRYKER_BUN_RUNNER_DEPTH__';
  * {@link BunTestRunOptions.maxSpawnDepth}.
  */
 export const DEFAULT_MAX_SPAWN_DEPTH = 1;
+
+/**
+ * Environment variable naming the file the opt-in run profile appends to (see
+ * src/run-profile.ts). A profiled run removes it from its child's environment,
+ * so a runner the suite itself drives does not append to the same file.
+ */
+export const PROFILE_ENV = 'STRYKER_BUN_PROFILE';
 
 /**
  * Read the current process's spawn depth from an environment value.
@@ -244,6 +252,13 @@ export interface BunTestRunOptions {
    * @default 1
    */
     maxSpawnDepth?: number
+
+    /**
+     * The run's timing profile, set only when profiling is on (see
+     * src/run-profile.ts). The child's spawn, stderr, exit and close are
+     * reported to it; when undefined nothing is timed or read for it.
+     */
+    profile?: RunProfile
 }
 
 export interface BunProcessResult {
@@ -515,6 +530,9 @@ function buildChildEnv(options: BunTestRunOptions, spawnDepth: number): Record<s
     // around and drives this runner again, that nested call can see how deep it
     // already is — see maxSpawnDepth.
     env[SPAWN_DEPTH_ENV] = String(spawnDepth + 1);
+    if(options.profile) {
+        delete env[PROFILE_ENV];
+    }
     return env;
 }
 
@@ -523,6 +541,8 @@ function buildChildEnv(options: BunTestRunOptions, spawnDepth: number): Record<s
  * recursion ceiling is decided before any of this work happens.
  */
 async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Promise<BunProcessResult> {
+    const profile = options.profile;
+    profile?.beginSpawn(options.bail === true, options.testFiles, options.testNamePattern);
     // Stryker disable next-line StringLiteral: mutating 'test' removes the bun test subcommand → bun exits immediately with no tests run → Timeout
     const args = ['test'];
 
@@ -653,6 +673,7 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
             detached: true,
         };
         const childProcess = spawn(options.bunPath, args, spawnOpts);
+        profile?.mark('spawned');
 
         // Track the child so a signal arriving here takes it down too — being
         // detached, it no longer dies with this process on its own.
@@ -757,6 +778,7 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
         if(childProcess.stderr) {
             childProcess.stderr.on('data', (data: Buffer) => {
                 stderrChunks.push(data);
+                profile?.onStderr(data);
 
                 // If inspector is enabled, parse stderr for WebSocket URL
                 if(options.inspect && !inspectorUrlExtracted && options.onInspectorReady) {
@@ -809,6 +831,7 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
         // the run ends at close, or STDIO_CLOSE_GRACE_MS after exit with the
         // output read by then, whichever comes first.
         childProcess.on('exit', (code, signal) => {
+            profile?.mark('exit');
             onLeaderExitDuringTermination?.();
             stdioCloseHandle = setTimeout(() => {
                 release();
@@ -827,6 +850,7 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
         // Handle process exit
         // Stryker disable next-line BlockStatement,StringLiteral: Promise.resolve never called without 'close' handler → Timeout
         childProcess.on('close', (code, signal) => {
+            profile?.mark('close');
             hasClosed = true;
             onLeaderExitDuringTermination?.();
             release();
@@ -845,6 +869,7 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
         // Handle process errors
         // Stryker disable next-line BlockStatement: emptying this handler means resolve() is never called on a spawn/child error → Timeout — expected, mirrors the 'close' handler's disable comment above
         childProcess.on('error', (error) => {
+            profile?.mark('close');
             hasClosed = true;
             onLeaderExitDuringTermination?.();
             release();
