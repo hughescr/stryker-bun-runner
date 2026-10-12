@@ -497,12 +497,18 @@ export type LifelineFile = (fd: number) => { stream: () => { getReader: () => { 
  *
  * The reader is created before this returns, so a descriptor bun cannot open
  * (EBADF, EISDIR) throws here, and watchParentLifeline reports that as
- * unavailable. A read that fails later emits 'error'. bun 1.4.2 does not fail
- * every unreadable descriptor that way, though: a read on a write-only
- * descriptor, or on one closed underneath the reader, stays pending instead.
- * That never reports the parent gone; it only leaves the parent unwatched. The
- * runner's lifeline is always the readable end of a pipe or socketpair, so
- * that case needs something else in the process to tamper with it.
+ * unavailable. A read that fails later emits 'error'.
+ *
+ * Creating the reader duplicates `fd` (close-on-exec), and the reader reads the
+ * duplicate (bun 1.4.2). Closing `fd` itself afterwards is therefore harmless,
+ * and the processes a suite spawns do not inherit the duplicate. What would
+ * break the watch is something in the process closing the duplicate's number,
+ * such as a helper that closes every descriptor from 3 up, or a double close.
+ * The pending read then hangs, so the parent goes unwatched (failing open). If
+ * the number is then reused, the reader can see another descriptor's
+ * end-of-file and exit as if orphaned, or swallow its bytes. Either needs a bug
+ * in the suite: the runner hands every child a socketpair (Node and bun hosts
+ * alike) and never touches it again.
  *
  * @param file - `Bun.file`; tests pass a stand-in
  */

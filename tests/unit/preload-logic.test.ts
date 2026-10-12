@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { PassThrough, type Readable } from 'node:stream';
 import type { MutantCoverage } from '@stryker-mutator/api/core';
+import { dlopen, FFIType, ptr } from 'bun:ffi';
 import { describe, it, expect, spyOn, beforeEach, afterEach, test, mock, jest } from 'bun:test';
 import {
     getPreloadConfig,
@@ -52,6 +53,34 @@ function lifelineFileReading(read: () => Promise<{ done: boolean }>): LifelineFi
     const reader = { read };
     const stream = { getReader: () => reader };
     return () => ({ stream: () => stream });
+}
+
+/**
+ * A connected AF_UNIX stream socketpair, made with socketpair(2) through bun:ffi:
+ * neither node:fs nor Bun.spawn hands the calling process both ends of one.
+ */
+function unixSocketPair(): [number, number] {
+    const libc = dlopen(process.platform === 'darwin' ? 'libc.dylib' : 'libc.so.6', {
+        socketpair: { args: [FFIType.i32, FFIType.i32, FFIType.i32, FFIType.ptr], returns: FFIType.i32 },
+    });
+    try {
+        const fds = new Int32Array(2);
+        // AF_UNIX and SOCK_STREAM are both 1 on Linux and macOS.
+        expect(libc.symbols.socketpair(1, 1, 0, ptr(fds))).toBe(0);
+        return [fds[0], fds[1]];
+    } finally {
+        libc.close();
+    }
+}
+
+/** Yields `count` macrotask turns (setImmediate: no clock wait, and real under fake timers). */
+async function macrotaskTurns(count: number): Promise<void> {
+    for(let turn = 0; turn < count; turn++) {
+        // eslint-disable-next-line no-await-in-loop -- one turn after another is the point
+        await new Promise<void>((resolve) => {
+            setImmediate(resolve);
+        });
+    }
 }
 
 describe('preload-logic', () => {
@@ -1081,12 +1110,13 @@ describe('preload-logic', () => {
         });
 
         /**
-         * The default reader (openLifelineReader, through Bun.file) on a real pipe.
-         * A FIFO this process holds both ends of stands in for the runner's pipe:
-         * closing its write end is exactly what the parent's death looks like to
-         * the child, since the kernel closes a dead process's descriptors.
+         * The default reader (openLifelineReader, through Bun.file) on real descriptors.
+         * The test holds both ends, so closing the parent's end is exactly what the
+         * parent's death looks like to the child: the kernel closes every descriptor
+         * of a process that dies. The runner always hands the child a socketpair (on
+         * Node and bun hosts alike); bun reads a FIFO differently, so both are covered.
          */
-        describe('default reader on a real pipe', () => {
+        describe('default reader on real descriptors', () => {
             let dir: string;
             let openFds: number[];
 
@@ -1105,27 +1135,45 @@ describe('preload-logic', () => {
                 /* eslint-enable n/no-sync -- end of fixture teardown */
             });
 
-            /** A FIFO opened at both ends: the lifeline's read end and the parent's write end. */
-            function lifelinePipe(): { readFd: number, closeParentEnd: () => void, parentWrites: (text: string) => void } {
+            /** The lifeline's end and the parent's end of one connection, both closed in afterEach unless a test closed the parent's. */
+            interface Lifeline {
+                readFd:         number
+                closeParentEnd: () => void
+                parentWrites:   (text: string) => void
+            }
+
+            function lifeline(readFd: number, parentFd: number): Lifeline {
+                openFds.push(readFd, parentFd);
+                /* eslint-disable n/no-sync -- the parent's end of the descriptor under test */
+                return {
+                    readFd,
+                    closeParentEnd: () => {
+                        openFds.splice(openFds.indexOf(parentFd), 1);
+                        fs.closeSync(parentFd);
+                    },
+                    parentWrites: (text) => {
+                        fs.writeSync(parentFd, text);
+                    },
+                };
+                /* eslint-enable n/no-sync -- end of the parent's end */
+            }
+
+            /** A FIFO opened at both ends. */
+            function fifoLifeline(): Lifeline {
                 const fifo = path.join(dir, 'lifeline');
                 /* eslint-disable n/no-sync -- fixture setup; descriptor numbers are the input under test */
                 expect(Bun.spawnSync(['mkfifo', fifo]).exitCode).toBe(0);
                 // Non-blocking, or opening the read end would wait for a writer.
                 // eslint-disable-next-line no-bitwise -- open(2) flags are a bitmask
                 const readFd = fs.openSync(fifo, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
-                const writeFd = fs.openSync(fifo, fs.constants.O_WRONLY);
-                openFds.push(readFd, writeFd);
-                return {
-                    readFd,
-                    closeParentEnd: () => {
-                        openFds.splice(openFds.indexOf(writeFd), 1);
-                        fs.closeSync(writeFd);
-                    },
-                    parentWrites: (text) => {
-                        fs.writeSync(writeFd, text);
-                    },
-                };
+                return lifeline(readFd, fs.openSync(fifo, fs.constants.O_WRONLY));
                 /* eslint-enable n/no-sync -- end of descriptor setup */
+            }
+
+            /** A connected AF_UNIX stream socketpair: what the runner's spawn gives the child. */
+            function socketpairLifeline(): Lifeline {
+                const [readFd, parentFd] = unixSocketPair();
+                return lifeline(readFd, parentFd);
             }
 
             /**
@@ -1144,60 +1192,74 @@ describe('preload-logic', () => {
                 };
             }
 
-            it('reports the parent gone when the parent end of the pipe closes', async () => {
-                const { readFd, closeParentEnd } = lifelinePipe();
-                const { onOrphaned, orphaned } = orphanedSignal();
-                const onUnavailable = mock();
-                watchParentLifeline({ fdValue: String(readFd), onOrphaned, onUnavailable });
+            // Each test collects garbage just before the parent's end closes: a reader
+            // whose stream or pending read the GC could reclaim would never see EOF.
+            describe.each([
+                ['FIFO', fifoLifeline],
+                ['socketpair', socketpairLifeline],
+            ])('on a %s', (_kind, openLifeline) => {
+                it('reports the parent gone when, and only when, the parent end closes', async () => {
+                    const { readFd, closeParentEnd } = openLifeline();
+                    const { onOrphaned, orphaned } = orphanedSignal();
+                    const onUnavailable = mock();
+                    watchParentLifeline({ fdValue: String(readFd), onOrphaned, onUnavailable });
 
-                closeParentEnd();
-                await orphaned;
-
-                expect(onOrphaned).toHaveBeenCalledTimes(1);
-                expect(onUnavailable).not.toHaveBeenCalled();
-            });
-
-            it('drains what the parent writes without reporting the parent gone', async () => {
-                const { readFd, closeParentEnd, parentWrites } = lifelinePipe();
-                const { onOrphaned, orphaned } = orphanedSignal();
-                const onUnavailable = mock();
-                let dataRead!: () => void;
-                const firstDataRead = new Promise<void>((resolve) => {
-                    dataRead = resolve;
-                });
-                const file = observedBunFile((done) => {
-                    if(!done) {
-                        dataRead();
-                    }
-                });
-                watchParentLifeline({ fdValue: String(readFd), onOrphaned, onUnavailable, open: fd => openLifelineReader(fd, file) });
-
-                parentWrites('x');
-                await firstDataRead;
-                expect(onOrphaned).not.toHaveBeenCalled();
-
-                closeParentEnd();
-                await orphaned;
-                expect(onOrphaned).toHaveBeenCalledTimes(1);
-                expect(onUnavailable).not.toHaveBeenCalled();
-            });
-
-            it('arms no timer, and reports the parent gone while fake timers are installed', async () => {
-                const { readFd, closeParentEnd } = lifelinePipe();
-                const { onOrphaned, orphaned } = orphanedSignal();
-                jest.useFakeTimers();
-                const timers = trackTimers();
-                try {
-                    watchParentLifeline({ fdValue: String(readFd), onOrphaned, onUnavailable: mock() });
-                    expect(timers.delays).toEqual([]);
+                    // Give a read that wrongly ends early the chance to report first.
+                    await macrotaskTurns(3);
+                    Bun.gc(true);
+                    expect(onOrphaned).not.toHaveBeenCalled();
 
                     closeParentEnd();
                     await orphaned;
-                } finally {
-                    timers.restore();
-                }
 
-                expect(onOrphaned).toHaveBeenCalledTimes(1);
+                    expect(onOrphaned).toHaveBeenCalledTimes(1);
+                    expect(onUnavailable).not.toHaveBeenCalled();
+                });
+
+                it('drains what the parent writes without reporting the parent gone', async () => {
+                    const { readFd, closeParentEnd, parentWrites } = openLifeline();
+                    const { onOrphaned, orphaned } = orphanedSignal();
+                    const onUnavailable = mock();
+                    let dataRead!: () => void;
+                    const firstDataRead = new Promise<void>((resolve) => {
+                        dataRead = resolve;
+                    });
+                    const file = observedBunFile((done) => {
+                        if(!done) {
+                            dataRead();
+                        }
+                    });
+                    watchParentLifeline({ fdValue: String(readFd), onOrphaned, onUnavailable, open: fd => openLifelineReader(fd, file) });
+
+                    parentWrites('x');
+                    await firstDataRead;
+                    expect(onOrphaned).not.toHaveBeenCalled();
+
+                    Bun.gc(true);
+                    closeParentEnd();
+                    await orphaned;
+                    expect(onOrphaned).toHaveBeenCalledTimes(1);
+                    expect(onUnavailable).not.toHaveBeenCalled();
+                });
+
+                it('arms no timer, and reports the parent gone while fake timers are installed', async () => {
+                    const { readFd, closeParentEnd } = openLifeline();
+                    const { onOrphaned, orphaned } = orphanedSignal();
+                    jest.useFakeTimers();
+                    const timers = trackTimers();
+                    try {
+                        watchParentLifeline({ fdValue: String(readFd), onOrphaned, onUnavailable: mock() });
+                        expect(timers.delays).toEqual([]);
+
+                        Bun.gc(true);
+                        closeParentEnd();
+                        await orphaned;
+                    } finally {
+                        timers.restore();
+                    }
+
+                    expect(onOrphaned).toHaveBeenCalledTimes(1);
+                });
             });
 
             it.each([
