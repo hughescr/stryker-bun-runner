@@ -1,0 +1,54 @@
+import { purry } from "./purry";
+
+/**
+ * Calls the given function with the given value, then returns the given value.
+ * The return value of the provided function is ignored.
+ *
+ * This allows "tapping into" a function sequence in a pipe, to perform side
+ * effects on intermediate results.
+ *
+ * @param value - The value to pass into the function.
+ * @param fn - The function to call.
+ * @signature
+ *    tap(value, fn)
+ * @example
+ *    tap("foo", console.log) // => "foo"
+ * @dataFirst
+ * @category Other
+ */
+export function tap<T>(value: T, fn: (value: T) => void): T;
+
+/**
+ * Calls the given function with the given value, then returns the given value.
+ * The return value of the provided function is ignored.
+ *
+ * This allows "tapping into" a function sequence in a pipe, to perform side
+ * effects on intermediate results.
+ *
+ * @param fn - The function to call.
+ * @signature
+ *    tap(fn)(value)
+ * @example
+ *    pipe(
+ *      [-5, -1, 2, 3],
+ *      filter(n => n > 0),
+ *      tap(console.log), // prints [2, 3]
+ *      map(n => n * 2)
+ *    ) // => [4, 6]
+ * @dataLast
+ * @category Other
+ */
+export function tap<
+  T,
+  // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters -- TODO [>2]: This is solvable by inlining F and wrapping the T parameter with `NoInfer` (e.g. `(value: NoInfer<T>) => unknown`); to prevent typescript from inferring it as `unknown`. This is only available in TS 5.4, which is above what we currently support (5.1).
+  F extends (value: T) => unknown,
+>(fn: F): (value: T) => T;
+
+export function tap(...args: readonly unknown[]): unknown {
+  return purry(tapImplementation, args);
+}
+
+function tapImplementation<T>(value: T, fn: (value: T) => void): T {
+  fn(value);
+  return value;
+}

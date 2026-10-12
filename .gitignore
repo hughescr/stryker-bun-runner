@@ -42,6 +42,9 @@ yarn-error.log*
 .claude/settings.local.json
 .eslintcache
 .claude/scheduled_tasks.lock
+.claude/worktrees/
 
 # Benchmark harness output
 /bench/out/
+/bench/fixture/reports/
+/bench/fixture/.stryker-tmp/

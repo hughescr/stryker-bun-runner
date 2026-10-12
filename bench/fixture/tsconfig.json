@@ -1,0 +1,50 @@
+{
+  "$schema": "http://json.schemastore.org/tsconfig",
+
+  "include": ["src", "test", "*.config.js", "*.config.ts"],
+
+  "compilerOptions": {
+    // TYPE CHECKING
+    "strict": true,
+    "allowUnreachableCode": false,
+    "allowUnusedLabels": false,
+    "exactOptionalPropertyTypes": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitOverride": true,
+    "noImplicitReturns": true,
+    "noPropertyAccessFromIndexSignature": true,
+    "noUncheckedIndexedAccess": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+
+    // MODULES
+    "module": "Preserve",
+    "moduleResolution": "Bundler",
+    // Allow us to import utilities directly from "remeda" so we can write copy-
+    // pasteable reference implementations in our test files (e.g., like the
+    // ones for mimicking lodash-like `debounce` and `throttle` functions).
+    // @see https://github.com/remeda/remeda/pull/1419
+    "paths": { "remeda": ["./src/index.ts"] },
+
+    // EMIT
+    "noEmit": true,
+
+    // JAVASCRIPT SUPPORT
+    "checkJs": true,
+
+    // INTEROP CONSTRAINTS
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "isolatedModules": true,
+
+    // LANGUAGE and ENVIRONMENT
+    // TODO [>2]: These are defined by the minimum still-supported Node.JS version, which is currently 18.
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "moduleDetection": "force",
+
+    // COMPLETENESS
+    "skipLibCheck": true
+  }
+}

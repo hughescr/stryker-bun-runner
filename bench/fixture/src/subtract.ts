@@ -1,0 +1,44 @@
+import { purry } from "./purry";
+
+/**
+ * Subtracts two numbers.
+ *
+ * @param value - The number.
+ * @param subtrahend - The number to subtract from the value.
+ * @signature
+ *    subtract(value, subtrahend);
+ * @example
+ *    subtract(10, 5) // => 5
+ *    subtract(10, -5) // => 15
+ *    reduce([1, 2, 3, 4], subtract, 20) // => 10
+ * @dataFirst
+ * @category Number
+ */
+export function subtract(value: bigint, subtrahend: bigint): bigint;
+export function subtract(value: number, subtrahend: number): number;
+
+/**
+ * Subtracts two numbers.
+ *
+ * @param subtrahend - The number to subtract from the value.
+ * @signature
+ *    subtract(subtrahend)(value);
+ * @example
+ *    subtract(5)(10) // => 5
+ *    subtract(-5)(10) // => 15
+ *    map([1, 2, 3, 4], subtract(1)) // => [0, 1, 2, 3]
+ * @dataLast
+ * @category Number
+ */
+export function subtract(subtrahend: bigint): (value: bigint) => bigint;
+export function subtract(subtrahend: number): (value: number) => number;
+
+export function subtract(...args: readonly unknown[]): unknown {
+  return purry(subtractImplementation, args);
+}
+
+// The implementation only uses `number` types, but that's just because it's
+// hard to tell typescript that both value and subtrahend would be of the same
+// type.
+const subtractImplementation = (value: number, subtrahend: number): number =>
+  value - subtrahend;
