@@ -1,5 +1,6 @@
 import { once } from 'node:events';
 import * as fs from 'node:fs';
+import fsDefault from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { PassThrough, type Readable } from 'node:stream';
@@ -14,6 +15,7 @@ import {
     detectGapWindowBleed,
     writeCoverageToFile,
     watchParentLifeline,
+    openLifelineReader,
     startOrphanWatchdog,
     guardAgainstOrphaning,
     orphanDebugLog,
@@ -29,6 +31,7 @@ import {
     awaitRunnerReady,
     SYNC_TOKEN_ENV,
     type SyncReadySocket,
+    type LifelineFile,
     type PreloadConfig,
     type StrykerNamespace
 } from '../../src/coverage/preload-logic';
@@ -43,6 +46,13 @@ const COVERAGE_OPEN_FLAGS = fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.c
 const COVERAGE_FILE_MODE = 0o600;
 /** The descriptor the mocked openSync hands out. */
 const FAKE_FD = 4242;
+
+/** A stand-in for Bun.file whose stream's reader answers every read with `read()`. */
+function lifelineFileReading(read: () => Promise<{ done: boolean }>): LifelineFile {
+    const reader = { read };
+    const stream = { getReader: () => reader };
+    return () => ({ stream: () => stream });
+}
 
 describe('preload-logic', () => {
     describe('getPreloadConfig', () => {
@@ -765,6 +775,30 @@ describe('preload-logic', () => {
 
                 expect(await fs.promises.readFile(file, 'utf8')).toBe('{"perTest":{"a":{"1":1}},"static":{}}\n');
             });
+
+            it('still writes the real file while a test has the default node:fs export (require("node:fs")) spied on', async () => {
+                // A spy on the default export patches the module object that
+                // require('node:fs') and process.getBuiltinModule('node:fs') return.
+                // A preload that looked node:fs up when it wrote, instead of capturing
+                // it at load (to save loading it in runs that never write), would call
+                // the spy (measured, bun 1.4.2), losing the coverage write and the
+                // hit-limit sentinel alike.
+                const spies = [
+                    spyOn(fsDefault, 'openSync').mockImplementation(() => FAKE_FD),
+                    spyOn(fsDefault, 'appendFileSync').mockImplementation(() => {}),
+                    spyOn(fsDefault, 'closeSync').mockImplementation(() => {}),
+                ];
+                const file = path.join(dir, 'coverage.json');
+                try {
+                    writeCoverageToFile(file, { perTest: { a: { '1': 1 } }, 'static': {} });
+                } finally {
+                    for(const spy of spies) {
+                        spy.mockRestore();
+                    }
+                }
+
+                expect(await fs.promises.readFile(file, 'utf8')).toBe('{"perTest":{"a":{"1":1}},"static":{}}\n');
+            });
         });
     });
 
@@ -1028,17 +1062,185 @@ describe('preload-logic', () => {
 
         it('reads a real descriptor by default', async () => {
             // /dev/null reads as immediate end-of-file: exactly what a lifeline
-            // whose parent has died looks like. The stream closes the descriptor.
+            // whose parent has died looks like. The reader leaves the descriptor open.
             // eslint-disable-next-line n/no-sync -- a descriptor number is the input under test
             const fd = fs.openSync('/dev/null', 'r');
             const { onOrphaned, orphaned } = orphanedSignal();
 
             const onUnavailable = mock();
-            watchParentLifeline({ fdValue: String(fd), onOrphaned, onUnavailable });
-            await orphaned;
+            try {
+                watchParentLifeline({ fdValue: String(fd), onOrphaned, onUnavailable });
+                await orphaned;
+            } finally {
+                // eslint-disable-next-line n/no-sync -- closing the descriptor the test opened
+                fs.closeSync(fd);
+            }
 
             expect(onOrphaned).toHaveBeenCalledTimes(1);
             expect(onUnavailable).not.toHaveBeenCalled();
+        });
+
+        /**
+         * The default reader (openLifelineReader, through Bun.file) on a real pipe.
+         * A FIFO this process holds both ends of stands in for the runner's pipe:
+         * closing its write end is exactly what the parent's death looks like to
+         * the child, since the kernel closes a dead process's descriptors.
+         */
+        describe('default reader on a real pipe', () => {
+            let dir: string;
+            let openFds: number[];
+
+            beforeEach(() => {
+                // eslint-disable-next-line n/no-sync -- fixture setup
+                dir = fs.mkdtempSync(path.join(tmpdir(), 'stryker-lifeline-'));
+                openFds = [];
+            });
+
+            afterEach(() => {
+                /* eslint-disable n/no-sync -- fixture teardown */
+                for(const fd of openFds) {
+                    fs.closeSync(fd);
+                }
+                fs.rmSync(dir, { recursive: true, force: true });
+                /* eslint-enable n/no-sync -- end of fixture teardown */
+            });
+
+            /** A FIFO opened at both ends: the lifeline's read end and the parent's write end. */
+            function lifelinePipe(): { readFd: number, closeParentEnd: () => void, parentWrites: (text: string) => void } {
+                const fifo = path.join(dir, 'lifeline');
+                /* eslint-disable n/no-sync -- fixture setup; descriptor numbers are the input under test */
+                expect(Bun.spawnSync(['mkfifo', fifo]).exitCode).toBe(0);
+                // Non-blocking, or opening the read end would wait for a writer.
+                // eslint-disable-next-line no-bitwise -- open(2) flags are a bitmask
+                const readFd = fs.openSync(fifo, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+                const writeFd = fs.openSync(fifo, fs.constants.O_WRONLY);
+                openFds.push(readFd, writeFd);
+                return {
+                    readFd,
+                    closeParentEnd: () => {
+                        openFds.splice(openFds.indexOf(writeFd), 1);
+                        fs.closeSync(writeFd);
+                    },
+                    parentWrites: (text) => {
+                        fs.writeSync(writeFd, text);
+                    },
+                };
+                /* eslint-enable n/no-sync -- end of descriptor setup */
+            }
+
+            /**
+             * Bun.file, with every read's result reported to `onRead`, so a test
+             * can wait until the reader has consumed what the parent wrote.
+             */
+            function observedBunFile(onRead: (done: boolean) => void): LifelineFile {
+                return (fd) => {
+                    const reader = Bun.file(fd).stream().getReader();
+                    const observedRead = async (): Promise<{ done: boolean }> => {
+                        const result = await reader.read();
+                        onRead(result.done);
+                        return result;
+                    };
+                    return lifelineFileReading(observedRead)(fd);
+                };
+            }
+
+            it('reports the parent gone when the parent end of the pipe closes', async () => {
+                const { readFd, closeParentEnd } = lifelinePipe();
+                const { onOrphaned, orphaned } = orphanedSignal();
+                const onUnavailable = mock();
+                watchParentLifeline({ fdValue: String(readFd), onOrphaned, onUnavailable });
+
+                closeParentEnd();
+                await orphaned;
+
+                expect(onOrphaned).toHaveBeenCalledTimes(1);
+                expect(onUnavailable).not.toHaveBeenCalled();
+            });
+
+            it('drains what the parent writes without reporting the parent gone', async () => {
+                const { readFd, closeParentEnd, parentWrites } = lifelinePipe();
+                const { onOrphaned, orphaned } = orphanedSignal();
+                const onUnavailable = mock();
+                let dataRead!: () => void;
+                const firstDataRead = new Promise<void>((resolve) => {
+                    dataRead = resolve;
+                });
+                const file = observedBunFile((done) => {
+                    if(!done) {
+                        dataRead();
+                    }
+                });
+                watchParentLifeline({ fdValue: String(readFd), onOrphaned, onUnavailable, open: fd => openLifelineReader(fd, file) });
+
+                parentWrites('x');
+                await firstDataRead;
+                expect(onOrphaned).not.toHaveBeenCalled();
+
+                closeParentEnd();
+                await orphaned;
+                expect(onOrphaned).toHaveBeenCalledTimes(1);
+                expect(onUnavailable).not.toHaveBeenCalled();
+            });
+
+            it('arms no timer, and reports the parent gone while fake timers are installed', async () => {
+                const { readFd, closeParentEnd } = lifelinePipe();
+                const { onOrphaned, orphaned } = orphanedSignal();
+                jest.useFakeTimers();
+                const timers = trackTimers();
+                try {
+                    watchParentLifeline({ fdValue: String(readFd), onOrphaned, onUnavailable: mock() });
+                    expect(timers.delays).toEqual([]);
+
+                    closeParentEnd();
+                    await orphaned;
+                } finally {
+                    timers.restore();
+                }
+
+                expect(onOrphaned).toHaveBeenCalledTimes(1);
+            });
+
+            it.each([
+                ['not open', 'EBADF', (): number => {
+                    /* eslint-disable n/no-sync -- a descriptor number is the input under test */
+                    const fd = fs.openSync('/dev/null', 'r');
+                    fs.closeSync(fd);
+                    /* eslint-enable n/no-sync -- end of descriptor setup */
+                    return fd;
+                }],
+                ['a directory', 'EISDIR', (): number => {
+                    // eslint-disable-next-line n/no-sync -- a descriptor number is the input under test
+                    const fd = fs.openSync(dir, 'r');
+                    openFds.push(fd);
+                    return fd;
+                }],
+            ])('reports a descriptor that is %s as the lifeline unavailable, never the parent gone', (_label, code, descriptor) => {
+                const fd = descriptor();
+                const onOrphaned = mock();
+                const onUnavailable = mock();
+
+                watchParentLifeline({ fdValue: String(fd), onOrphaned, onUnavailable });
+
+                expect(onUnavailable).toHaveBeenCalledTimes(1);
+                expect(onUnavailable).toHaveBeenCalledWith(`opening fd ${fd} failed: ${code}`);
+                expect(onOrphaned).not.toHaveBeenCalled();
+            });
+
+            it('reports a read that fails before end-of-file as the lifeline unavailable, never the parent gone', async () => {
+                let reported!: (reason: string) => void;
+                const unavailable = new Promise<string>((resolve) => {
+                    reported = resolve;
+                });
+                const onOrphaned = mock();
+                const failingFile = lifelineFileReading(async () => {
+                    throw Object.assign(new Error('input/output error'), { code: 'EIO' });
+                });
+
+                watchParentLifeline({ fdValue: '3', onOrphaned, onUnavailable: reason => reported(reason), open: fd => openLifelineReader(fd, failingFile) });
+
+                expect(await unavailable).toBe('reading fd 3 failed: EIO');
+                expect(onOrphaned).not.toHaveBeenCalled();
+            });
         });
     });
 
