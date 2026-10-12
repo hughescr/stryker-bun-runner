@@ -6984,6 +6984,108 @@ tests/example.test.ts:
             }
         });
 
+        describe('exit 0 before bun printed its summary (a test, hook or module called process.exit(0))', () => {
+            // Byte shapes from bun 1.4.2 with the mutant-run bunfig (onlyFailures, bail): bun prints its
+            // summary only after every file has run, so a process.exit(0) anywhere before that (in a test,
+            // a hook, or a module at load) leaves only the banner and what was printed before the exit.
+            const EARLY_EXIT_REASON = 'bun exited 0 before running every selected test';
+
+            const run = async (testFilter: string[], extra: Record<string, unknown> = {}) => {
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                return runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '1' } as any,
+                    testFilter,
+                    sandboxFileName: 'sandbox',
+                    ...extra,
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+            };
+
+            it('scores a static run that printed nothing but the banner as Error, not Survived, and warns once', async () => {
+                mockRunBunTests.mockResolvedValue({ exitCode: 0, stdout: '\u001B[1mbun test v1.4.2 (744846f84)\u001B[0m\n', stderr: '', timedOut: false });
+
+                const result = await run([]);
+
+                const errorMessage = `${EARLY_EXIT_REASON}: it printed no test summary, so a test, hook or module most likely called process.exit(0) `
+                  + 'and the tests after it never ran; the mutant changed what the suite does, but no test reported a failure: '
+                  + 'bun test v1.4.2 (744846f84)';
+                expect(result).toEqual({ status: MutantRunStatus.Error, errorMessage });
+                const warns = (mockLogger.warn as ReturnType<typeof mock>).mock.calls.filter(call => String(call[0]).includes('scoring as Error rather than Survived'));
+                expect(warns).toHaveLength(1);
+                expect(warns[0]).toEqual(['Mutant %s: %s — scoring as Error rather than Survived', '1', errorMessage]);
+            });
+
+            it('scores a targeted run whose last test exited 0 after printing as Error, quoting stderr first', async () => {
+                mockRunBunTests.mockResolvedValue({
+                    exitCode: 0,
+                    stdout:   'bun test v1.4.2 (744846f84)\nhello from e2\n',
+                    stderr:   '\ne.test.ts:\n',
+                    timedOut: false,
+                });
+
+                const result = await run(['e.test.ts > e1', 'e.test.ts > e2 last exits']);
+
+                expect(result).toEqual({
+                    status:       MutantRunStatus.Error,
+                    errorMessage: expect.stringMatching(new RegExp(String.raw`^${EARLY_EXIT_REASON}: .*: e\.test\.ts:$`, 's')),
+                });
+            });
+
+            it('quotes at most 500 characters of the output, without colour codes', async () => {
+                mockRunBunTests.mockResolvedValue({ exitCode: 0, stdout: 'on stdout', stderr: `\u001B[31m${'y'.repeat(600)}\u001B[0m`, timedOut: false });
+
+                const result = await run([]);
+
+                expect(result.status).toBe(MutantRunStatus.Error);
+                if(result.status === MutantRunStatus.Error) {
+                    expect(result.errorMessage).toEndWith(`failure: ${'y'.repeat(500)}`);
+                }
+            });
+
+            it('says when the output may have been cut short', async () => {
+                mockRunBunTests.mockResolvedValue({ exitCode: 0, stdout: '', stderr: '', timedOut: false, outputIncomplete: true });
+
+                const result = await run([]);
+
+                expect(result.status).toBe(MutantRunStatus.Error);
+                if(result.status === MutantRunStatus.Error) {
+                    expect(result.errorMessage).toContain('still held open');
+                    expect(result.errorMessage).toEndWith(': (no output)');
+                }
+            });
+
+            it('scores it Killed by the failing test when one failed before the exit (without bail, bun still exits 0)', async () => {
+                mockRunBunTests.mockResolvedValue({
+                    exitCode: 0,
+                    stdout:   'bun test v1.4.2 (744846f84)\n',
+                    stderr:   '\nf.test.ts:\nerror: expect(received).toBe(expected)\n\nExpected: 2\nReceived: 1\n\n(fail) f1 fails [0.41ms]\n',
+                    timedOut: false,
+                });
+
+                const result = await run(['f.test.ts > f1 fails', 'f.test.ts > f2 exits', 'f.test.ts > f3'], { disableBail: true });
+
+                expect(result).toMatchObject({ status: MutantRunStatus.Killed, killedBy: ['f.test.ts > f1 fails'] });
+            });
+
+            it.each([
+                ['the full summary', ' 1 pass\n 0 fail\n 1 expect() calls\nRan 1 test across 1 file. [4.00ms]\n'],
+                // `-t` counts only the tests it matched, and skipped, pending and .only-filtered tests are
+                // not passes: a summary with fewer tests than the covering set is still a complete run.
+                ['a summary counting fewer tests than were selected', ' 1 pass\n 2 skip\n 0 fail\nRan 3 tests across 1 file. [4.00ms]\n'],
+                ['a summary of zero passes', ' 0 pass\n 0 fail\nRan 0 tests across 1 file. [1.00ms]\n'],
+                ['--dots output, which drops the leading space', '.\n\n1 pass\n0 fail\nRan 1 test across 1 file. [4.00ms]\n'],
+            ])('keeps a run that printed %s Survived', async (_label, stderr) => {
+                mockRunBunTests.mockResolvedValue({ exitCode: 0, stdout: 'bun test v1.4.2 (744846f84)\n', stderr, timedOut: false });
+
+                const result = await run(['a.test.ts > a1', 'a.test.ts > a2', 'a.test.ts > a3']);
+
+                expect(result.status).toBe(MutantRunStatus.Survived);
+                expect((mockLogger.warn as ReturnType<typeof mock>).mock.calls.filter(call => String(call[0]).includes('rather than Survived'))).toEqual([]);
+            });
+        });
+
         it('should log exact mutantRun debug messages', async () => {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock implementation
             mockRunBunTests.mockImplementation((options: any) => {
@@ -12379,6 +12481,13 @@ error: Third failure message
                     marker: 'reported no failing test and no fail/error count',
                     filter: [],
                     child:  () => ({ exitCode: 1, stdout: 'bun test v1\n', stderr: 'crash', timedOut: false }),
+                },
+                {
+                    name:   'exit 0 before bun printed its summary',
+                    kind:   'bun test exited 0 before printing its summary, scoring as Error rather than Survived',
+                    marker: 'bun exited 0 before running every selected test',
+                    filter: [],
+                    child:  () => ({ exitCode: 0, stdout: 'bun test v1\n', stderr: '', timedOut: false }),
                 },
                 {
                     name:    'inconclusive full-suite fallback timeout',

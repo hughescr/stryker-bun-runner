@@ -63,15 +63,18 @@ const FILES: Record<string, string> = {
         ACTIVE,
         // A passing test that prints a line shaped like the header of another file of the run.
         "test('b1', () => { if(active() === 'noise') { console.error('a.test.ts:'); } expect(1).toBe(1); });",
-        "test('b2', () => { expect(['two', 'noise'].includes(active()) ? 2 : 1).toBe(1); });",
-        "test('b3', () => { if(active() === 'exit0') { process.exit(0); } if(active() === 'exit1') { process.exit(1); } });",
+        "test('b2', () => { expect(['two', 'noise', 'failExit'].includes(active()) ? 2 : 1).toBe(1); });",
+        // Exits with tests of its own file still to run.
+        "test('b3', () => { if(['exit0', 'failExit'].includes(active())) { process.exit(0); } if(active() === 'exit1') { process.exit(1); } });",
         "test('b title ' + (active() === 'rename' ? 'renamed' : 'plain'), () => { expect(active() === 'rename' ? 2 : 1).toBe(1); });",
-        "test('b hangs', async () => { if(active() === 'hang') { await new Promise(() => {}); } });",
+        // The file's last test.
+        "test('b hangs', async () => { if(active() === 'exitLast') { process.exit(0); } if(active() === 'hang') { await new Promise(() => {}); } });",
     ].join('\n'),
     'c.test.ts': [
         "import { expect, test } from 'bun:test';",
         ACTIVE,
         "if(active() === 'load') { throw new TypeError('boom at load'); }",
+        "if(active() === 'exitLoad') { process.exit(0); }",
         "test('c1', () => { expect(1).toBe(1); });",
     ].join('\n'),
     'd.test.ts': [
@@ -87,7 +90,7 @@ const FILES: Record<string, string> = {
         ACTIVE,
         "describe('E', () => {",
         "    beforeAll(() => { if(active() === 'beforeAll') { throw new Error('beforeAll threw'); } });",
-        "    afterEach(() => { if(active() === 'afterEach') { throw new Error('afterEach threw'); } });",
+        "    afterEach(() => { if(active() === 'afterEach') { throw new Error('afterEach threw'); } if(active() === 'exitHook') { process.exit(0); } });",
         "    test('e1', () => { expect(1).toBe(1); });",
         // Expected to throw; it fails when the mutant makes it pass.
         "    test.failing('e failing', () => { if(active() !== 'failing') { throw new Error('expected'); } });",
@@ -162,7 +165,13 @@ describe('the mutant-run bunfig in a real bun test child', () => {
         [{ name: 'a beforeAll hook throws, without bail', active: 'beforeAll', bail: false }, { exitCode: 1 }],
         [{ name: 'an afterEach hook throws, with bail', active: 'afterEach', bail: true }, { exitCode: 1, failedTests: 1, bailLine: 'Bailed out after 1 failure' }],
         [{ name: 'an afterEach hook throws, without bail', active: 'afterEach', bail: false }, { exitCode: 1 }],
+        // Bun prints its summary only after the last file, so an exit 0 anywhere before that leaves none.
         [{ name: 'a test exits 0', active: 'exit0', bail: true }, { exitCode: 0, summaryPrinted: false }],
+        [{ name: 'a file\'s last test exits 0', active: 'exitLast', bail: true }, { exitCode: 0, failedTests: 0, summaryPrinted: false }],
+        [{ name: 'a test file exits 0 at load', active: 'exitLoad', bail: true }, { exitCode: 0, failedTests: 0, summaryPrinted: false }],
+        [{ name: 'an afterEach hook exits 0', active: 'exitHook', bail: true }, { exitCode: 0, failedTests: 0, summaryPrinted: false }],
+        // Without bail a failed test does not stop the run, and the exit 0 after it is still bun's exit code.
+        [{ name: 'a test fails, then a later one exits 0, without bail', active: 'failExit', bail: false }, { exitCode: 0, failedTests: 1, summaryPrinted: false }],
         [{ name: 'a test exits 1', active: 'exit1', bail: true }, { exitCode: 1, summaryPrinted: false }],
         [{ name: 'the name pattern matches no test', active: 'rename', bail: true, pattern: '^b title plain$' }, { exitCode: 1, zeroMatch: true }],
         [{ name: 'the name pattern matches some tests', active: 'kill', bail: true, pattern: 'a2|nothing' }, { exitCode: 1, failedTests: 1, zeroMatch: false }],
@@ -349,8 +358,32 @@ describe('mutant-run verdicts through a real BunTestRunner', () => {
         expect(await mutantRun('describe', undefined)).toMatchObject({ status: MutantRunStatus.Killed, killedBy: [], nrOfTests: 11 });
     }, 60_000);
 
-    test('a test exits 0 before bun\'s summary: Survived', async () => {
-        expect(await mutantRun('exit0', undefined)).toEqual({ status: MutantRunStatus.Survived, nrOfTests: 0 });
+    /** The verdict for a run that exited 0 before bun printed its summary: caught, but by no failing test. */
+    const earlyExit = { status: MutantRunStatus.Error, errorMessage: expect.stringMatching(/^bun exited 0 before running every selected test: /) as string } as const;
+
+    test('a test exits 0 in a static run, with files left to run: Error, not Survived', async () => {
+        expect(await mutantRun('exit0', undefined)).toEqual(earlyExit);
+    }, 60_000);
+
+    test('a covering test exits 0 mid-file, with covering tests after it: Error, not Survived', async () => {
+        expect(await mutantRun('exit0', [id('b2'), id('b3'), id('b title plain'), id('b hangs')])).toEqual(earlyExit);
+    }, 60_000);
+
+    test('the last covering test exits 0, after every other one passed: Error, not Survived', async () => {
+        expect(await mutantRun('exitLast', [id('b1'), id('b2'), id('b hangs')])).toEqual(earlyExit);
+    }, 60_000);
+
+    test('a test file exits 0 at load: Error, not Survived', async () => {
+        expect(await mutantRun('exitLoad', undefined)).toEqual(earlyExit);
+    }, 60_000);
+
+    test('an afterEach hook exits 0: Error, not Survived', async () => {
+        expect(await mutantRun('exitHook', [id('e1'), id('e failing')])).toEqual(earlyExit);
+    }, 60_000);
+
+    test('a test fails and a later one exits 0, without bail: Killed by the failing test', async () => {
+        expect(await mutantRun('failExit', [id('b2'), id('b3'), id('b title plain')], { disableBail: true }))
+            .toMatchObject({ status: MutantRunStatus.Killed, killedBy: [id('b2')] });
     }, 60_000);
 
     test('a test exits 1 with no failing test: Error', async () => {

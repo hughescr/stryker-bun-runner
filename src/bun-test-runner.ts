@@ -550,6 +550,7 @@ const MUTANT_WARN_KIND = {
     spawnError:          'could not start bun test, scoring as Error rather than Killed',
     signalError:         'bun test terminated by a signal, scoring as Error rather than Killed',
     noEvidence:          'bun test exited non-zero with no failing test and no fail/error count, scoring as Error rather than Killed',
+    earlyExit:           'bun test exited 0 before printing its summary, scoring as Error rather than Survived',
     inconclusiveTimeout: 'inconclusive timeout, scoring as Error rather than Timeout',
     registryVersion:     'dryRun registry file has an unexpected version (skipped)',
     registryMalformed:   'dryRun registry file is malformed (treated as absent)',
@@ -2802,7 +2803,10 @@ export class BunTestRunner implements TestRunner {
             return this.buildMutantKilledResult(result, parsed, localRegistry, localBaseIndex, options.activeMutant.id);
         }
 
-        // Exit code 0 means all tests passed, mutant survived
+        // Exit code 0 means every selected test passed, provided bun got as far as its summary.
+        if(!parsed.summaryPrinted) {
+            return this.classifyEarlyCleanExit(result, parsed, localRegistry, localBaseIndex, options.activeMutant.id);
+        }
         return {
             status:    MutantRunStatus.Survived,
             nrOfTests: parsed.totalTests,
@@ -3073,6 +3077,46 @@ export class BunTestRunner implements TestRunner {
             status:       MutantRunStatus.Error,
             errorMessage: `bun test exited with code ${result.exitCode} but reported no failing test and no fail/error count, so there is no evidence a test detected this mutant: ${output}`,
         };
+    }
+
+    /**
+   * Classify a mutant run that exited 0 without bun's summary.
+   *
+   * Bun prints its summary (` N pass` … `Ran N tests across M files`) only once
+   * every file has run, on every run that gets that far: with every reporter,
+   * `onlyFailures`, `--dots`, junit, the AI-agent reporter, and a `-t` pattern
+   * (verified on bun 1.4.2). So an exit with code 0 and no summary means the
+   * process left early: a test, a hook or a module at load called
+   * `process.exit(0)` (bun 1.4.2 then prints nothing more, not even the
+   * summary of the tests that already passed), and every selected test after
+   * that point never ran. The mutant changed what the suite does, so the run
+   * is never Survived. It is scored as the other early terminations are
+   * (a non-zero exit with no failing test, a signal death): Killed when a
+   * failing test was reported before the exit (without bail, bun still exits 0
+   * after one), and otherwise Error, since no test reported a failure.
+   *
+   * The signal is the summary's absence, not its count: a `-t` pattern counts
+   * only the tests it matched (a partial miss is legitimate), and skipped,
+   * pending, retried and `.only`-filtered tests change the count on healthy
+   * runs, so a count lower than the selected tests proves nothing.
+   */
+    private classifyEarlyCleanExit(
+        result:         { exitCode: number | null, signal?: NodeJS.Signals | null, stdout: string, stderr: string, outputIncomplete?: true },
+        parsed:         Pick<ParsedTestResults, 'tests' | 'totalTests' | 'failed' | 'summaryErrors'>,
+        localRegistry:  Set<string>,
+        localBaseIndex: Map<string, string[]>,
+        mutantId:       string
+    ): MutantRunResult {
+        if(parsed.tests.some(test => test.status === 'failed')) {
+            return this.buildMutantKilledResult(result, parsed, localRegistry, localBaseIndex, mutantId);
+        }
+        const output = (stripAnsi(result.stderr).trim() || stripAnsi(result.stdout).trim()).slice(0, 500) || '(no output)';
+        const incomplete = result.outputIncomplete
+            ? ' (its output was still held open by a process it started, so the summary may also have been cut off)'
+            : '';
+        const errorMessage = `bun exited 0 before running every selected test: it printed no test summary${incomplete}, so a test, hook or module most likely called process.exit(0) and the tests after it never ran; the mutant changed what the suite does, but no test reported a failure: ${output}`;
+        this.mutantWarnings.warn(MUTANT_WARN_KIND.earlyExit, mutantId, 'Mutant %s: %s — scoring as Error rather than Survived', mutantId, errorMessage);
+        return { status: MutantRunStatus.Error, errorMessage };
     }
 
     /**
