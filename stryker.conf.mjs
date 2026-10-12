@@ -22,7 +22,8 @@ const config = {
     // src/templates/**/*.ts and src/coverage/preload-logic.ts are excluded because both
     // execute LIVE inside every spawned `bun test` child (as the coverage-preload script
     // and the pure-logic module it imports via __PRELOAD_LOGIC_PATH__ — see
-    // src/templates/coverage-preload.ts). Instrumenting preload-logic.ts causes a
+    // src/templates/coverage-preload.ts; the built package ships both pre-bundled
+    // into one JS file by scripts/build-preload.ts). Instrumenting preload-logic.ts causes a
     // self-referential false positive: detectGapWindowBleed's own instrumented body
     // increments globalThis.__stryker__.mutantCoverage.static for ITS OWN mutant IDs as a
     // side effect of merely being called, and since it reads that same `static` object

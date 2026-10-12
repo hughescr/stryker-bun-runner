@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, it, expect, beforeEach, afterEach, spyOn, type Mock } from 'bun:test';
 import * as tinyglobby from 'tinyglobby';
-import { generatePreloadScript, cleanupPreloadScript, resolveEagerModulesFromGlobs } from '../../src/coverage/preload-generator.js';
+import { generatePreloadScript, cleanupPreloadScript, resolveEagerModulesFromGlobs, resolvePreloadTemplate } from '../../src/coverage/preload-generator.js';
 import { UnsafeTempDirError } from '../../src/utils/private-temp-dir.js';
 import { mockMkdir, mockReadFile, mockWriteFile, mockUnlink, resetFsMocks } from '../test-preload.js';
 
@@ -285,6 +285,55 @@ describe('generatePreloadScript', () => {
             expect(() => JSON.parse(writtenContent)).not.toThrow();
             expect(JSON.parse(writtenContent)).toEqual(paths);
         });
+    });
+});
+
+describe('resolvePreloadTemplate', () => {
+    it('points a source checkout at the TypeScript template and logic module, generating a .ts preload', () => {
+        expect(resolvePreloadTemplate('/work/repo/src/coverage')).toEqual({
+            templatePath:     '/work/repo/src/templates/coverage-preload.ts',
+            preloadLogicPath: '/work/repo/src/coverage/preload-logic.ts',
+            extension:        'ts',
+        });
+    });
+
+    it.each(['/work/repo/dist', '/usr/lib/node_modules/@hughescr/stryker-bun-runner/dist', '/work/repo/dist/coverage'])(
+        'points a built package (%s) at the prebuilt single-file JavaScript template with no separate logic module',
+        (moduleDir) => {
+            expect(resolvePreloadTemplate(moduleDir)).toEqual({
+                templatePath:     path.join(moduleDir, 'templates/coverage-preload.js'),
+                preloadLogicPath: undefined,
+                extension:        'js',
+            });
+        }
+    );
+});
+
+describe('generatePreloadScript from a built package layout', () => {
+    let root: string;
+    let tempDir: string;
+
+    beforeEach(async () => {
+        root = await realpath(await mkdtemp(path.join(tmpdir(), 'stryker-preload-dist-test-')));
+        tempDir = path.join(root, 'run');
+        mockWriteFile.mockResolvedValue(undefined);
+    });
+
+    afterEach(async () => {
+        resetFsMocks();
+        await rm(root, { recursive: true, force: true });
+    });
+
+    it('reads the prebuilt bundle, substitutes only the eager module list, and writes a .js preload', async () => {
+        mockReadFile.mockResolvedValue('import "bun:test";\nvar EAGER_MODULES = __EAGER_MODULES__;\n// __PRELOAD_LOGIC_PATH__ stays: nothing to fill in');
+
+        const result = await generatePreloadScript({ tempDir, coverageFile: path.join(tempDir, 'c.json'), eagerModules: ['/abs/a.ts'] }, '/pkg/dist');
+
+        expect(result).toBe(path.join(tempDir, `stryker-coverage-preload-${process.pid}.js`));
+        expect(mockReadFile.mock.calls[0][0]).toBe('/pkg/dist/templates/coverage-preload.js');
+        const [target, content] = mockWriteFile.mock.calls[0] as [string, string];
+        expect(target).toBe(result);
+        expect(content).toBe('import "bun:test";\nvar EAGER_MODULES = ["/abs/a.ts"];\n// __PRELOAD_LOGIC_PATH__ stays: nothing to fill in');
     });
 });
 
