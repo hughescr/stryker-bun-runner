@@ -20,7 +20,8 @@ export default {
     // real timers and are not vendored); src/randomBigInt.ts (its test is not vendored: too slow
     // when instrumented, and its mutants hit wall-clock timeouts); and six files with hit-limit
     // Timeout mutants covered by more than one test file (or static), whose status flapped
-    // between Killed and Timeout across runs. See UPSTREAM.md.
+    // between Killed and Timeout across runs; and the four other sources that call Math.random,
+    // whose mutants' statuses depend on the random draws. See UPSTREAM.md.
     mutate:           [
         'src/**/*.ts',
         '!src/**/*.test.ts',
@@ -35,5 +36,9 @@ export default {
         '!src/pipe.ts',
         '!src/stringToPath.ts',
         '!src/times.ts',
+        '!src/randomInteger.ts',
+        '!src/randomString.ts',
+        '!src/sample.ts',
+        '!src/shuffle.ts',
     ],
 };

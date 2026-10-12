@@ -42,10 +42,13 @@ files instead, and accepted a run of about 30 s.
 | neverthrow @ `5ef3a01` | 5 / 2 | 1 failure, needs `testdouble` | — | — | Only 2 test files |
 | fast-equals @ `39bb9e2` | 5 / 4 | 2 failures, needs react/lodash | — | — | Only 4 test files |
 | colord @ `1404cfe` | 41 / 4 | Fails to load (`export { Plugin }` type re-export) | — | — | Only 4 test files |
-| **remeda @ `8e6e78f`** | 226 / 165 | 2085 pass after the edits below | 1830 | about 29 s | Pure TypeScript with no runtime deps, one colocated test file per function, every mutant got the same status in each of 12 runs |
+| **remeda @ `8e6e78f`** | 226 / 165 | 2085 pass after the edits below | 1766 | about 29 s | Pure TypeScript with no runtime deps, one colocated test file per function, every mutant got the same status in all 15 runs of the final config (a 10-run batch, then the 5 baseline runs) |
 
 remeda gives one small test file per function, so perTest coverage narrows each mutant to a single file.
-That is the targeting the runner optimises. 113 static mutants also exercise full-suite runs.
+That is the targeting the runner optimises. 112 static mutants also exercise full-suite runs.
+
+Final status breakdown: Killed 1604, Survived 146, Timeout 16 (all from the hit limit), NoCoverage 0. See
+`bench/BASELINE.md` for the baseline timings.
 
 ## Modifications to upstream
 
@@ -85,8 +88,19 @@ Killed and Timeout across three identical runs (binarySearchCutoffIndex #513/#51
 Cause: the runner orders a mutant's test files by their dry-run wall-clock duration
 (`orderCheapestFirst` in `src/bun-test-runner.ts`), and bun bails on the first failure. Durations vary
 between runs, so the file order varies too. For a looping mutant, whether a failing test or the hit
-limit comes first then depends on that order. The remaining Timeouts (21, all hit-limit) are each
+limit comes first then depends on that order. The remaining Timeouts (16, all hit-limit) are each
 covered by a single test file and none is static, so the order cannot change them.
+
+`src/randomInteger.ts`, `src/randomString.ts`, `src/sample.ts`, `src/shuffle.ts` (64 mutants) are
+excluded because they call `Math.random`, so whether a test kills a mutant, and how many hits count
+towards the hit limit, depends on the random draws. Evidence: across about 32 baseline-attempt runs,
+`src/shuffle.ts:41` ArithmeticOperator (id 1398) was Killed 15 times in 16 and Survived once, and about
+2 statuses flapped in total. The hit-limit Timeouts in `sample.ts`, `shuffle.ts` and `randomString.ts`
+were random-dependent too. These, with `randomBigInt.ts` (already excluded), are the only sources that
+use `Math.random` or `crypto`. Nothing else imports them except `src/index.ts`. Their tests still run,
+unmodified and unseeded; seeding would change what the upstream tests mean. They also cover
+`difference`, `unique` and `times`, whose mutants have deterministic killers in their own test files.
+After this exclusion, a 10-run batch and the 5 baseline runs all agreed for every mutant.
 
 Also excluded, as upstream's coverage config does: `src/index.ts` (re-exports only) and
 `src/internal/types/**` (type-only).
