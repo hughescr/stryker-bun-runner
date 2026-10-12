@@ -98,8 +98,8 @@ describe('dry-run completeness gate (real bun children)', () => {
     let originalForceColor: string | undefined;
     const spies: { mockRestore: () => void }[] = [];
 
-    async function dryRun(testFiles: string[]): Promise<DryRunResult> {
-        const runner = new BunTestRunner(silentLogger, {
+    async function dryRun(testFiles: string[], logger: Logger = silentLogger): Promise<DryRunResult> {
+        const runner = new BunTestRunner(logger, {
             bun: {
                 bunPath:          'bun',
                 timeout:          60_000,
@@ -282,20 +282,27 @@ describe('dry-run completeness gate (real bun children)', () => {
         ].join('\n'));
         const staticB = path.join(tempDir, 'static-b.test.ts');
         await fsPromises.writeFile(staticB, [
-            "import { test } from 'bun:test';",
+            "import { test, afterAll } from 'bun:test';",
             "import { cover } from './cover.js';",
             "cover('loadB');",
             "test('third', () => { cover('loadB'); cover('ownC'); });",
+            "afterAll(() => { cover('tailB'); });",
         ].join('\n'));
+        const warnings: string[] = [];
+        const logger = { ...silentLogger, warn: (...args: unknown[]) => warnings.push(args.map(String).join(' ')) } as unknown as Logger;
 
-        const result = await dryRun([staticA, staticB]);
+        const result = await dryRun([staticA, staticB], logger);
 
         expect(result.status).toBe(DryRunStatus.Complete);
         if(result.status !== DryRunStatus.Complete) {
             return;
         }
+        // The last file's afterAll runs after its last test with no beforeEach after it: only
+        // the preload's own final afterAll closes that gap, puts its hits into static and
+        // reports them as trailing bleed. Whichever file bun runs last, its tail is that hit.
+        expect(warnings.some(line => line.includes('mutant coverage was recorded between tests') && /tail[AB]/.test(line))).toBe(true);
         expect(result.mutantCoverage).toEqual({
-            'static': { loadA: 3, gapA: 2, tailA: 1, loadB: 2 },
+            'static': { loadA: 3, gapA: 2, tailA: 1, loadB: 2, tailB: 1 },
             perTest:  {
                 'static-a.test.ts > first':          { ownA: 1 },
                 'static-a.test.ts > group > second': { ownB: 2 },

@@ -24,7 +24,7 @@ import * as dryRunCompleteness from '../../src/dry-run-completeness.js';
 import * as inspectorModule from '../../src/inspector/inspector-client.js';
 import type { TestInfo } from '../../src/inspector/types.js';
 import * as processRunner from '../../src/process-runner.js';
-import { RunProfile, type RunRecord, type WorkerSummary } from '../../src/run-profile.js';
+import { RunProfile, WorkerProfiler, type RunRecord, type WorkerSummary } from '../../src/run-profile.js';
 import * as bunVersion from '../../src/utils/bun-version.js';
 import * as bunfigSanitizer from '../../src/utils/bunfig-sanitizer.js';
 import * as privateTempDir from '../../src/utils/private-temp-dir.js';
@@ -208,6 +208,39 @@ describe('BunTestRunner run profile', () => {
         expect(mutant.patternBytes).toBeUndefined();
         expect(summary.runs).toBe(2);
         expect(Object.keys(summary.groups)).toEqual(['all', 'dry', 'dry/complete', 'mutant', 'mutant/*/static', 'mutant/survived', 'mutant/survived/static']);
+    });
+
+    it('still stops the in-flight child and cleans up at dispose when the profile summary throws', async () => {
+        process.env[processRunner.PROFILE_ENV] = file;
+        spyOn(WorkerProfiler.prototype, 'writeSummary').mockImplementation(() => {
+            throw new RangeError('Maximum call stack size exceeded.');
+        });
+        // A dry run whose child only ends when it is aborted.
+        let aborted = false;
+        let spawned!: () => void;
+        const childStarted = new Promise<void>((resolve) => {
+            spawned = resolve;
+        });
+        mockRunBunTests.mockImplementation((options: SpawnOptions & { signal?: AbortSignal }) => new Promise((resolve) => {
+            spawned();
+            options.onInspectorReady?.('ws://127.0.0.1:6499/inspector');
+            options.signal?.addEventListener('abort', () => {
+                aborted = true;
+                resolve({ exitCode: null, stdout: '', stderr: '', timedOut: true });
+            });
+        }));
+        const cleanupSpy = spyOn(preloadGenerator, 'cleanupPreloadScript').mockResolvedValue(undefined);
+        const runner = new BunTestRunner(mockLogger, {} as StrykerOptions);
+        await runner.init();
+        const dryRun = runner.dryRun();
+        await childStarted;
+
+        await runner.dispose();
+        await dryRun;
+
+        expect(aborted).toBe(true);
+        expect(cleanupSpy).toHaveBeenCalledWith('/tmp/preload.ts');
+        expect((mockLogger.warn as ReturnType<typeof mock>).mock.calls.some(call => String(call[0]).includes('run profile\'s summary'))).toBe(true);
     });
 
     it('adds the dry run\'s finer timings: the preload\'s, from its stderr line, and the runner\'s own steps after the child', async () => {

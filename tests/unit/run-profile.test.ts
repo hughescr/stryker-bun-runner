@@ -546,6 +546,25 @@ describe('WorkerProfiler and RunProfile', () => {
         expect(run.marks[0].firstFile).toBe(7);
     });
 
+    it('summarises a worker with more runs than a call can take arguments (no spread of every run)', async () => {
+        // A million runs: spread into one call, their start times overflow the stack
+        // (bun 1.4.2; node already fails at ~120k). Pushed straight into the record list,
+        // since appending a million lines is not what this test is about.
+        const RUNS = 1_000_000;
+        const records = (profiler as unknown as { records: RunRecord[] }).records;
+        const template = record({ startEpochMs: 0, totalMs: 1 });
+        for(let i = 0; i < RUNS; i++) {
+            records.push({ ...template, startEpochMs: 1_000_000 + RUNS - i });
+        }
+        clock.at(RUNS + 10);
+
+        profiler.writeSummary();
+
+        const [summary] = await lines() as [WorkerSummary];
+        expect(summary.runs).toBe(RUNS);
+        expect(summary.firstRunEpochMs).toBe(1_000_001);
+    }, 30_000);
+
     it('writes no summary for a worker that ran nothing', async () => {
         profiler.writeSummary();
         expect(await fsp.readdir(dir)).toEqual([]);

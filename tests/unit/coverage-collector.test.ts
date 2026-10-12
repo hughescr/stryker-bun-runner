@@ -224,6 +224,31 @@ describe('collectCoverage', () => {
             expect(result).toBeUndefined();
         });
 
+        it('should return undefined for a single line whose per-test record is not an object, as for several lines', async () => {
+            // The single-line fast path must not hand such a record on: the merge fails on it, and
+            // no coverage is the loud outcome the dry run reports.
+            const malformed = JSON.stringify({ perTest: { 'f@@test-1': null }, 'static': {} });
+            mockReadFile.mockResolvedValue(`${malformed}\n`);
+            expect(await collectCoverage(tempCoverageFile)).toBeUndefined();
+
+            mockReadFile.mockResolvedValue(`${malformed}\n${malformed}\n`);
+            expect(await collectCoverage(tempCoverageFile)).toBeUndefined();
+        });
+
+        it('should read the file once when the coverage and the bleed observations are asked for together', async () => {
+            mockReadFile.mockResolvedValue(`${line({ perTest: { 'f@@test-1': { '1': 1 } }, 'static': {}, lateHits: [{ testId: 'f@@test-1', mutantIds: ['2'] }] })}\n`);
+
+            const [coverage, lateHits] = await Promise.all([collectCoverage(tempCoverageFile), collectLateHits(tempCoverageFile)]);
+
+            expect(coverage).toEqual({ perTest: { 'f@@test-1': { '1': 1 } }, 'static': {} });
+            expect(lateHits).toEqual([{ testId: 'f@@test-1', mutantIds: ['2'] }]);
+            expect(mockReadFile).toHaveBeenCalledTimes(1);
+
+            // A later call reads the file again: nothing is cached past the read in progress.
+            await collectCoverage(tempCoverageFile);
+            expect(mockReadFile).toHaveBeenCalledTimes(2);
+        });
+
         it('should return undefined on read permission error', async () => {
             mockReadFile.mockRejectedValue(new Error('EACCES: permission denied'));
 

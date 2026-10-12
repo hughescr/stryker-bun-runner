@@ -3417,6 +3417,19 @@ export class BunTestRunner implements TestRunner {
    * still find the registry (with concurrency 1, the disposing worker IS the
    * only one, so a "last one out" check would delete it from under its successor).
    */
+    /**
+     * Append the worker's profile summary, if profiling. Profiling is diagnostic
+     * only: a summary that throws is warned about, never allowed to stop
+     * dispose() from stopping the child and cleaning up.
+     */
+    private writeProfileSummary(): void {
+        try {
+            this.profiler?.writeSummary();
+        } catch (error) {
+            this.logger.warn('Could not write the run profile\'s summary: %s', error instanceof Error ? error.message : String(error));
+        }
+    }
+
     public async dispose(): Promise<void> {
         // Stryker disable next-line StringLiteral: logging message only
         this.logger.debug('Disposing BunTestRunner');
@@ -3424,7 +3437,7 @@ export class BunTestRunner implements TestRunner {
         // Summaries first: a cleanup failure below must not swallow them.
         this.logMutantRunSummary();
         this.mutantWarnings.flush();
-        this.profiler?.writeSummary();
+        this.writeProfileSummary();
 
         // If a dryRun/mutantRun child is still in flight when Stryker disposes
         // this runner (e.g. a hung worker being torn down), kill it rather than

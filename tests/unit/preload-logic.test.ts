@@ -558,6 +558,23 @@ describe('preload-logic', () => {
             expect(result.perTest).toEqual({ 'test-1': { '2': 1 } });
         });
 
+        it('closes a gap the tracker has open first, so it writes the real static bucket with the gap\'s hits', () => {
+            const coverage: MutantCoverage = { 'static': { '1': 1 }, perTest: {} };
+            const tracker = new StaticGapTracker(coverage);
+            tracker.open();
+            coverage.static['2'] = 1; // a hit during the gap, the way the instrumenter records one
+
+            const result = JSON.parse(serializeCoverageData(coverage, [], tracker)) as CoverageFileData;
+
+            expect(result.static).toEqual({ '1': 1, '2': 1 });
+            expect(tracker.close()).toEqual([]);
+        });
+
+        it('is handed the preload\'s gap tracker by the template\'s coverage write', async () => {
+            const template = await Bun.file(new URL('../../src/templates/coverage-preload.ts', import.meta.url)).text();
+            expect(template).toMatch(/serializeCoverageData\([^)]*, gapTracker\)/);
+        });
+
         it('does not modify the coverage it serializes', () => {
             const coverage: MutantCoverage = { 'static': { '1': 1 }, perTest: { 'test-1': { '2': 1 } } };
             serializeCoverageData(coverage, [{ testId: 'test-1', mutantIds: ['1'] }]);

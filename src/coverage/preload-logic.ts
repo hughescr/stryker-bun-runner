@@ -393,6 +393,16 @@ interface PartialMutantCoverage {
  * 2,000-test suite).
  *
  * A mutant hit again in a later gap is reported again: each gap starts empty.
+ *
+ * The swap is only safe under two conditions:
+ *
+ * 1. The coverage is read (written out) only with no gap open: while one is,
+ *    `mutantCoverage.static` is the gap bucket, not the real one. So
+ *    {@link serializeCoverageData} takes the tracker and closes any open gap first.
+ * 2. Nothing may hold the gap bucket past {@link close} and write to it later:
+ *    hits made to it after the close are lost. The instrumenter never holds it
+ *    (it reads `cov.static` on every hit); code that grabs
+ *    `__stryker__.mutantCoverage.static` itself and keeps it would.
  */
 export class StaticGapTracker {
     /** The real static bucket while a gap bucket is installed in its place. */
@@ -438,11 +448,18 @@ export class StaticGapTracker {
  * Serialised straight from the live objects, with no copy: the string is the
  * snapshot, so hits recorded afterwards cannot change it. (Copying every
  * per-test record first cost about 30 ms on a 2,000-test suite.)
+ *
+ * `gapTracker`, when given, is the tracker swapping `mutantCoverage.static`:
+ * any gap it has open is closed first, so the real static bucket is written.
  */
 export function serializeCoverageData(
     mutantCoverage: PartialMutantCoverage | undefined,
-    lateHits: readonly LateHitEntry[] = []
+    lateHits: readonly LateHitEntry[] = [],
+    gapTracker?: StaticGapTracker
 ): string {
+    // An open gap has the gap bucket in place of the static one: put the real one
+    // back, with the gap's hits, before reading it (see StaticGapTracker).
+    gapTracker?.close();
     const data: CoverageFileData = {
         perTest:  mutantCoverage?.perTest ?? {},
         'static': mutantCoverage?.static ?? {},

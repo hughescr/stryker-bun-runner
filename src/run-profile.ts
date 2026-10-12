@@ -543,7 +543,12 @@ export class WorkerProfiler {
             return;
         }
         const end = round3(this.clock.origin + this.clock.now());
-        const firstRun = Math.min(...this.records.map(record => record.startEpochMs));
+        // A loop, not Math.min(...starts): spreading one argument per run overflows the
+        // stack (RangeError) for a worker with ~100k runs or more.
+        let firstRun = Number.POSITIVE_INFINITY;
+        for(const record of this.records) {
+            firstRun = Math.min(firstRun, record.startEpochMs);
+        }
         const busyMs = this.records.reduce((total, record) => total + record.totalMs, 0);
         const dryRunMs = this.records.reduce((total, record) => total + (record.kind === 'dry' ? record.totalMs : 0), 0);
         const wallMs = end - firstRun;

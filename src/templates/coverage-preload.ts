@@ -279,7 +279,7 @@ const writeCoverageData = () => {
 
     // Test names are resolved by coverage-mapper from the inspector data, not here.
     // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-member-access -- Placeholder import replaced at runtime
-    const data: string = serializeCoverageData(strykerGlobal.mutantCoverage, lateHits);
+    const data: string = serializeCoverageData(strykerGlobal.mutantCoverage, lateHits, gapTracker);
     if(timings) {
         timings['at.coverageFormatted'] = nowEpoch();
         timings['bytes.coverage'] = data.length;

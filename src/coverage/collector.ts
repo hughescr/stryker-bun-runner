@@ -23,6 +23,19 @@ function isRecordObject(value: unknown): boolean {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/** Whether a parsed coverage line has a `static` object and a `perTest` object whose every record is an object. */
+function isWellFormedLine(data: CoverageFileData): boolean {
+    if(!isRecordObject(data.perTest) || !isRecordObject(data.static)) {
+        return false;
+    }
+    for(const counts of Object.values(data.perTest)) {
+        if(!isRecordObject(counts)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /**
  * Merge the coverage lines of one run into Stryker's MutantCoverage.
  *
@@ -35,7 +48,9 @@ function isRecordObject(value: unknown): boolean {
 function mergeCoverageData(dataList: CoverageFileData[]): MutantCoverage {
     // The dry run writes one line: its records are freshly parsed and ours, so they are
     // taken as they are rather than copied hit by hit (tens of milliseconds on a large suite).
-    if(dataList.length === 1 && isRecordObject(dataList[0].perTest) && isRecordObject(dataList[0].static)) {
+    // Only a well-formed line, though: anything else takes the merge below, which fails
+    // (no coverage) on a record that is not an object exactly as it always has.
+    if(dataList.length === 1 && isWellFormedLine(dataList[0])) {
         return { perTest: dataList[0].perTest, 'static': dataList[0].static };
     }
     const merged: MutantCoverage = { perTest: {}, 'static': {} };
