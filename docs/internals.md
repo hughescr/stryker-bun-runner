@@ -117,32 +117,60 @@ For each mutant, Stryker tells the runner which tests covered it in the dry run.
    (from the dry-run registry), and passes bun only the files those tests live in. A pattern over
    100,000 UTF-8 bytes would risk the operating system's argument limits, so the runner runs the
    full suite instead.
-2. **Orders the files: likeliest killers first, then cheapest first.** The dry run records how
-   long each test file took (the sum of its tests' durations as bun reports them; time spent
-   loading the file or in `beforeAll` hooks is not counted) and shares it through the registry.
-   Every mutant run hands bun its files in ascending order of that time: the covering files for a
-   targeted run, every file for a full-suite run. With bail, a fast unit test usually kills the
-   mutant before a slow integration file even loads. Files with the same time keep their
-   alphabetical order; files with no recorded time go last.
+2. **Orders the files: cheapest first, and a static mutant's likeliest killers before that.** The
+   dry run records how long each test file took (the sum of its tests' durations as bun reports
+   them; time spent loading the file or in `beforeAll` hooks is not counted) and shares it through
+   the registry. Every mutant run hands bun its files in ascending order of that time: the
+   covering files for a targeted run, every file for a full-suite run. With bail, a fast unit test
+   usually kills the mutant before a slow integration file even loads. Files with the same time
+   keep their alphabetical order; files with no recorded time go last.
 
-   A run that bails then moves the files likeliest to kill its mutant to the front, ranked by, in
-   this order (files that rank the same stay cheapest first):
-   - **Dry-run coverage**, which only a full-suite run can use: the files whose tests executed this
-     mutant, then those whose tests executed another mutant of the same source file, then the rest.
-     The dry run records which mutants each test file's tests executed (a static mutant's per-test
-     hits included) and shares it through the registry. The runner reads a source file's mutants
-     from its instrumented copy in the sandbox, once per worker. Most files of a full suite never
-     call into the mutated module, so a static mutant that dies usually dies in the first file.
-   - **Kills**: the files that killed the source file's earlier mutants in this worker, most kills
-     first. Each worker learns on its own and starts from nothing.
-   - **Name**: the test file named after the source file (`src/foo.ts`, `foo.test.ts`).
+   A planned full-suite run (a static mutant, a mutant with no coverage, or a run scoped to
+   Stryker's `testFiles`) that bails then moves the files likeliest to kill its mutant to the
+   front. Most files of a full suite never call into the mutated module, and under cheapest first
+   a killed static mutant typically ran a third of the suite before the file that killed it. The
+   ranks, in this order (files that rank the same stay cheapest first):
+   - **The mutant's own coverage**: the files whose tests executed this mutant in the dry run. The
+     dry run records which mutants each test file's tests executed, from the raw per-test coverage,
+     so a static mutant's per-test hits count even though the coverage handed to Stryker drops
+     them. The registry holds it as a table of test files plus, per mutant, the indices of its
+     files.
+   - **The source file's coverage**: then the files whose tests executed more of the mutated source
+     file's other mutants, usually the module's own unit tests. The runner reads a source file's
+     mutant ids from its instrumented copy in the sandbox, once per worker.
+   - **Name**: then the test file named after the source file (`src/foo.ts`, `foo.test.ts`).
 
-   **The safety rule.** The order can change a mutant's result, not just which test `killedBy`
-   names. A mutant can fail a test in one file and hang, trip the hit limit or crash bun in
-   another, and then whichever file runs first decides between Killed and Timeout (or Error). So
-   once a mutant of a source file ends in Timeout or Error, its worker runs that source file's
-   later mutants cheapest first, whatever the ranks say. With `disableBail` every file runs anyway,
-   so the order stays cheapest first.
+   Everything else keeps cheapest first: targeted runs (their files all executed the mutant, and
+   on the benchmark fixture fewer than 3% of killed targeted mutants needed a second file), the
+   full-suite fallbacks below (Stryker sized their deadline for the covering tests only, so moving
+   a slower file ahead of the killer could turn a kill into an inconclusive Error), and runs with
+   `disableBail` (every file runs whatever the order).
+
+   **What the order can and cannot change.** The runner assumes an order-independent suite: each
+   test file passes or fails under a mutant whatever ran before it in the same process. (A suite
+   that leaks state between files, such as a `mock.module()` that is never restored, is a bug in
+   the suite; see below.) Under that assumption:
+   - *A mutant that every file survives stays Survived.* Only a failure (bail), a hang (the
+     deadline) or the hit limit stops a run early. If no file fails, every file runs in any order,
+     the same tests pass, and the run takes the same total time against the same deadline. A
+     reorder never runs fewer files when nothing fails.
+   - *A detected mutant stays detected, as Killed or Timeout.* When some file fails, hangs or trips
+     the hit limit, every order stops at the first such file it reaches, and which one that is can
+     change the verdict between Killed and Timeout:
+     - one file fails a test and another hangs or loops: whichever runs first decides;
+     - files that pass but run slowly: the deadline is for the whole run, so reaching the killer
+       later can let the deadline fire first (Timeout), and earlier the reverse;
+     - the hit counter is cumulative over the run: passing files that execute the mutant add to
+       it, so a different set of them before the killer can trip the limit sooner or later;
+     - bun's per-test timeout (`[test].timeout`) against the runner's deadline: an awaited hang
+       is a failing test (Killed) if bun's timeout fires first and a Timeout if the deadline does,
+       so when the hanging test starts matters.
+   - *The exception: a mutant that crashes bun or exits the process.* If the mutant makes one file
+     crash bun (a signal) or call `process.exit()`, and another file kills it, the order decides
+     which ends the run. A crash, or a non-zero exit with no failing test, is Error; an exit with
+     code 0 reads as Survived. Any order has this exposure, cheapest first included: it needs a
+     mutant that drives the code under test into a crash or an exit, which a normal test never
+     reaches.
 3. **Turns randomized order off.** `[test].randomize` (and `[test].seed`, or `--randomize` and
    `--seed` in `bun.bunArgs`) shuffles both the file order and the test order within each file.
    The dry run keeps your setting, so order-dependent tests still show up there. Mutant runs turn
@@ -161,7 +189,8 @@ and two mutants' runs may order the same files differently, a suite whose test f
 each other's order may behave differently in mutant runs. The usual cause is a
 `mock.module()` (or another global change) in one file that leaks into the files bun runs after
 it in the same process. Fix such leaks (restore the mock in `afterAll`, or avoid module mocks in
-files that share a process) rather than relying on file order.
+files that share a process) rather than relying on file order. With bail, `killedBy` names the
+first failing test, so which test it names depends on the order too.
 
 **Zero-match retry.** A `--test-name-pattern` can match no test at all, usually because the mutant
 changed a value interpolated into an `it.each` title. Bun then exits with an error. The runner

@@ -8,7 +8,7 @@ coverage so that each mutant runs only the tests that reach it.
 [![npm version](https://img.shields.io/npm/v/@hughescr/stryker-bun-runner)](https://www.npmjs.com/package/@hughescr/stryker-bun-runner) [![LICENSE](https://img.shields.io/badge/LICENSE-Apache--2.0-blue)](LICENSE.md) [![Bun](https://img.shields.io/badge/Bun-%3E%3D1.4.0-f9f1e1?logo=bun)](https://bun.sh) [![Stryker](https://img.shields.io/badge/Stryker-9%20%7C%2010-e74c3c?logo=stryker)](https://stryker-mutator.io) [![Mutation testing badge](https://img.shields.io/endpoint?url=https%3A%2F%2Fbadge-api.stryker-mutator.io%2Fgithub.com%2Fhughescr%2Fstryker-bun-runner%2Fmain)](https://dashboard.stryker-mutator.io/reports/github.com/hughescr/stryker-bun-runner/main)
 
 - **Per-test coverage**, so each mutant runs only its covering tests, in only their files,
-  likeliest killer first, then cheapest first.
+  cheapest file first; a static mutant's whole-suite run starts with the files likeliest to kill it.
 - **Honest scoring**: a crash or a run that proves nothing is an Error, not a kill; a test file
   that a mutant stops from loading is a kill; an infinite loop is stopped early and scored Timeout.
 - **A strict dry run** that fails loudly rather than hand Stryker incomplete coverage.
@@ -173,8 +173,8 @@ Most projects need no config change, but these differ from 1.4:
   small margin ([Timeouts](#timeouts)). If you raised `bun.timeout` so slow mutant runs would not
   time out, raise `timeoutMS` or `timeoutFactor` instead. `bun.timeout` can now be generous: the
   runner warns above 80% use, and only a hung dry run takes that long to fail.
-- **Mutant runs never randomize.** Files run likeliest killer first, then cheapest first (by
-  dry-run time), tests in source order. The dry run still follows your bunfig `randomize` and `seed`.
+- **Mutant runs never randomize.** Files run cheapest first (by dry-run time; a static mutant's
+  likeliest killers before that), tests in source order. The dry run still follows your bunfig `randomize` and `seed`.
 - **Some verdicts change, toward correctness** ([How results are scored](#how-results-are-scored)).
   A hang that a fast test catches is Killed. An infinite loop stops at Stryker's hit limit and is
   Timeout, reason `Hit limit reached`. A bun crash or failed start with no failing test is Error
@@ -347,7 +347,7 @@ runner's own [preload](#terms). Details:
    the coverage records must agree exactly, or the dry run fails
    ([the completeness gate](docs/internals.md#the-completeness-gate)).
 3. **Mutant runs.** A fresh `bun test` process per mutant, with the mutant switched on. It runs only
-   the covering tests (`--test-name-pattern`), only in their files, likeliest killer first, and bails at
+   the covering tests (`--test-name-pattern`), only in their files, cheapest file first, and bails at
    the first failure unless `disableBail` is set. The hit limit stops infinite loops early.
 
 More: [Mutant runs](docs/internals.md#mutant-runs), [the dry run in detail](docs/internals.md#the-dry-run-in-detail).
