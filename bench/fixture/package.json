@@ -1,0 +1,11 @@
+{
+  "name": "remeda-bench-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Vendored remeda (pinned) used as a mutation-testing performance benchmark fixture. See UPSTREAM.md.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "test": "bun test"
+  }
+}

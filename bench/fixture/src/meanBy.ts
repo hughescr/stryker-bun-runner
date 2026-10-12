@@ -1,0 +1,62 @@
+import { purry } from "./purry";
+
+/**
+ * Returns the mean of the elements of an array using the provided predicate.
+ *
+ * @param fn - Predicate function.
+ * @signature
+ *   meanBy(fn)(array)
+ * @example
+ *    pipe(
+ *      [{a: 5}, {a: 1}, {a: 3}],
+ *      meanBy(x => x.a)
+ *    ) // 3
+ * @dataLast
+ * @category Array
+ */
+
+export function meanBy<T>(
+  fn: (value: T, index: number, data: readonly T[]) => number,
+): (items: readonly T[]) => number;
+
+/**
+ * Returns the mean of the elements of an array using the provided predicate.
+ *
+ * @param items - The array.
+ * @param fn - Predicate function.
+ * @signature
+ *   meanBy(array, fn)
+ * @example
+ *    meanBy(
+ *      [{a: 5}, {a: 1}, {a: 3}],
+ *      x => x.a
+ *    ) // 3
+ * @dataFirst
+ * @category Array
+ */
+
+export function meanBy<T>(
+  items: readonly T[],
+  fn: (value: T, index: number, data: readonly T[]) => number,
+): number;
+
+export function meanBy(...args: readonly unknown[]): unknown {
+  return purry(meanByImplementation, args);
+}
+
+const meanByImplementation = <T>(
+  array: readonly T[],
+  fn: (value: T, index: number, data: readonly T[]) => number,
+): number => {
+  if (array.length === 0) {
+    return NaN;
+  }
+
+  let sum = 0;
+
+  for (const [index, item] of array.entries()) {
+    sum += fn(item, index, array);
+  }
+
+  return sum / array.length;
+};

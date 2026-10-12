@@ -1,0 +1,78 @@
+import type { LazyCallback } from "./internal/types/LazyCallback";
+import type { LazyEvaluator } from "./internal/types/LazyEvaluator";
+import { purry } from "./purry";
+
+/**
+ * Returns a new array formed by applying a given callback function to each
+ * element of the array, and then flattening the result by one level. It is
+ * identical to a `map` followed by a `flat` of depth 1
+ * (`flat(map(data, ...args))`), but slightly more efficient than calling those
+ * two methods separately. Equivalent to `Array.prototype.flatMap`.
+ *
+ * @param data - The items to map and flatten.
+ * @param callbackfn - A function to execute for each element in the array. It
+ * should return an array containing new elements of the new array, or a single
+ * non-array value to be added to the new array.
+ * @returns A new array with each element being the result of the callback
+ * function and flattened by a depth of 1.
+ * @signature
+ *    flatMap(data, callbackfn)
+ * @example
+ *    flatMap([1, 2, 3], x => [x, x * 10]) // => [1, 10, 2, 20, 3, 30]
+ * @dataFirst
+ * @lazy
+ * @category Array
+ */
+export function flatMap<T, U>(
+  data: readonly T[],
+  callbackfn: (input: T, index: number, data: readonly T[]) => readonly U[] | U,
+): U[];
+
+/**
+ * Returns a new array formed by applying a given callback function to each
+ * element of the array, and then flattening the result by one level. It is
+ * identical to a `map` followed by a `flat` of depth 1
+ * (`flat(map(data, ...args))`), but slightly more efficient than calling those
+ * two methods separately. Equivalent to `Array.prototype.flatMap`.
+ *
+ * @param callbackfn - A function to execute for each element in the array. It
+ * should return an array containing new elements of the new array, or a single
+ * non-array value to be added to the new array.
+ * @returns A new array with each element being the result of the callback
+ * function and flattened by a depth of 1.
+ * @signature
+ *    flatMap(callbackfn)(data)
+ * @example
+ *    pipe([1, 2, 3], flatMap(x => [x, x * 10])) // => [1, 10, 2, 20, 3, 30]
+ * @dataLast
+ * @lazy
+ * @category Array
+ */
+export function flatMap<T, U>(
+  callbackfn: LazyCallback<readonly T[], readonly U[] | U>,
+): (data: readonly T[]) => U[];
+
+export function flatMap(...args: readonly unknown[]): unknown {
+  return purry(flatMapImplementation, args, lazyImplementation);
+}
+
+const flatMapImplementation = <T, U>(
+  data: readonly T[],
+  callbackfn: (value: T, index: number, data: readonly T[]) => readonly U[] | U,
+): U[] => data.flatMap(callbackfn);
+
+const lazyImplementation =
+  <T, K>(
+    callbackfn: (
+      input: T,
+      index: number,
+      data: readonly T[],
+    ) => K | readonly K[],
+  ): LazyEvaluator<T, K> =>
+  // @ts-expect-error [ts2322] - We need to make LazyMany better so it accommodate the typing here...
+  (value, index, data) => {
+    const next = callbackfn(value, index, data);
+    return Array.isArray(next)
+      ? { done: false, hasNext: true, hasMany: true, next }
+      : { done: false, hasNext: true, next };
+  };
