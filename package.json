@@ -35,7 +35,7 @@
     "dist"
   ],
   "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target node --format esm --packages external && bun scripts/build-preload.ts dist/templates && dts-bundle-generator --config dts-bundle-generator.config.json",
+    "build": "rm -rf dist && bun build src/index.ts --outdir dist --target node --format esm --packages external && bun scripts/build-preload.ts dist/templates && dts-bundle-generator --config dts-bundle-generator.config.json",
     "lint": "eslint --cache --format unix .",
     "mutate": "stryker run",
     "prepublishOnly": "bun run build",

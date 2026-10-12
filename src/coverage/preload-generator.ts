@@ -187,8 +187,9 @@ export async function generatePreloadScript(
     // Replace placeholders with runtime values.
     // JSON.stringify produces a valid TS/JS array literal and handles path escaping.
     // The prebuilt bundle has the logic inlined, so only the source template has a logic path to fill in.
-    const withLogic = preloadLogicPath === undefined ? template : template.replace('__PRELOAD_LOGIC_PATH__', preloadLogicPath);
-    const content = withLogic.replace('__EAGER_MODULES__', JSON.stringify(eagerModules));
+    // Replacer functions, not replacement strings: a path holding `$&`, `` $` `` or `$'` would otherwise be expanded as a pattern.
+    const withLogic = preloadLogicPath === undefined ? template : template.replace('__PRELOAD_LOGIC_PATH__', () => preloadLogicPath);
+    const content = withLogic.replace('__EAGER_MODULES__', () => JSON.stringify(eagerModules));
 
     // Write the template to the temp location
     await writePrivateFile(preloadPath, content);

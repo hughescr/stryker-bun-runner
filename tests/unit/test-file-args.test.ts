@@ -186,6 +186,21 @@ describe('buildTestFileArgs remembering the previous call', () => {
         expect(resolveSpy).not.toHaveBeenCalled();
     });
 
+    it('neither remembers nor reuses a call with a relative cwd, which resolves against the process cwd', () => {
+        const relativeCwd = 'rel/cwd';
+        const first = buildTestFileArgs(FILES, relativeCwd);
+        resolveSpy.mockClear();
+
+        expect(buildTestFileArgs(FILES, relativeCwd)).toEqual(first);
+        expect(resolveSpy).toHaveBeenCalled();
+        // And it left the remembered call alone: this one was already remembered before.
+        buildTestFileArgs(FILES, CWD);
+        buildTestFileArgs(FILES, relativeCwd);
+        resolveSpy.mockClear();
+        buildTestFileArgs(FILES, CWD);
+        expect(resolveSpy).not.toHaveBeenCalled();
+    });
+
     it('gives each caller its own args array', () => {
         const first = buildTestFileArgs(FILES, CWD);
         first.args.push('/mutated-by-caller');

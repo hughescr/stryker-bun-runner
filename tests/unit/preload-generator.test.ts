@@ -272,6 +272,16 @@ describe('generatePreloadScript', () => {
             expect(writtenContent).toContain(JSON.stringify(paths));
         });
 
+        it.each(['$&', '$`', '$\'', '$$', '$1'])('should insert a path containing %s literally, not as a replacement pattern', async (pattern) => {
+            mockReadFile.mockResolvedValue('before __EAGER_MODULES__ after');
+            const paths = [`/abs/we${pattern}ird/a.ts`];
+
+            await generatePreloadScript({ tempDir, coverageFile, eagerModules: paths });
+
+            const [, writtenContent] = mockWriteFile.mock.calls[0] as [string, string];
+            expect(writtenContent).toBe(`before ${JSON.stringify(paths)} after`);
+        });
+
         it('should produce valid JSON array literal for paths with backslashes', async () => {
             const templateContent = '__EAGER_MODULES__';
             mockReadFile.mockResolvedValue(templateContent);

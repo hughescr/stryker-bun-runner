@@ -72,6 +72,8 @@ describe('prebuilt single-file preload (real bun child)', () => {
         const coverageFile = path.join(work, 'coverage.json');
         await mkdir(work);
         // The generator reads dist/templates/coverage-preload.js relative to the module directory it is given.
+        // None of a surrounding Stryker run's settings (sync port, active mutant, ...) may reach the child.
+        const plainEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('__STRYKER')));
         const preloadPath = await generatePreloadScript(
             { tempDir: path.join(work, 'preload'), coverageFile, eagerModules: [eagerPath] },
             path.join(root, 'dist')
@@ -81,7 +83,7 @@ describe('prebuilt single-file preload (real bun child)', () => {
 
         const child = Bun.spawn([process.execPath, 'test', '--preload', preloadPath, 'preload-bundle.test.ts'], {
             cwd:    work,
-            env:    { ...process.env, __STRYKER_COVERAGE_FILE__: coverageFile, [HIT_LIMIT_TOKEN_ENV]: 'secret-token' },
+            env:    { ...plainEnv, __STRYKER_COVERAGE_FILE__: coverageFile, [HIT_LIMIT_TOKEN_ENV]: 'secret-token' },
             stdout: 'pipe',
             stderr: 'pipe',
         });

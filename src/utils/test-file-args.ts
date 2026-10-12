@@ -81,6 +81,11 @@ let lastBuild: { files: readonly string[], cwd: string, budget: number, result: 
  * @param budget - Bytes the entries may take
  */
 export function buildTestFileArgs(files: readonly string[], cwd: string = process.cwd(), budget: number = MAX_TEST_FILE_ARGS_BYTES): TestFileArgs {
+    // The memo key is (files, cwd, budget). A relative cwd would resolve against process.cwd(), which is not in the key,
+    // so only an absolute cwd is remembered (and reused).
+    if(!path.isAbsolute(cwd)) {
+        return computeTestFileArgs(files, cwd, budget);
+    }
     const cached = lastBuild;
     if(cached?.cwd === cwd && cached.budget === budget && sameEntries(cached.files, files)) {
         return { ...cached.result, args: [...cached.result.args] };

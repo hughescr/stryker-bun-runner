@@ -37,7 +37,7 @@ const config = {
     mutate:           ['src/**/*.ts', '!src/templates/**/*.ts', '!src/coverage/preload-logic.ts'],
     // Only copy into the sandbox what the tests and checker need: sources, tests, their configs, and
     // package.json (tests/unit/bun-version.test.ts reads it to check MIN_BUN_VERSION against engines.bun).
-    ignorePatterns:   ['**', '!src/**/*.ts', '!tests/**/*.ts', '!bunfig.toml', '!tsconfig.json', '!*.mjs', '!package.json'],
+    ignorePatterns:   ['**', '!src/**/*.ts', '!tests/**/*.ts', '!scripts/**/*.ts', '!bunfig.toml', '!tsconfig.json', '!*.mjs', '!package.json'],
     thresholds:       { high: 100, low: 100, 'break': 100 },
     coverageAnalysis: 'perTest',
     concurrency:      isCI ? 4 : 12,
