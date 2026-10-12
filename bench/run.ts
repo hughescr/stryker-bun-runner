@@ -3,6 +3,7 @@
  *
  *     bun run bench -- [--runs N] [--quick] [--fixture <dir>] [--no-build]
  *                      [--write-baseline] [--record "<label>"] [--json]
+ *                      [--compare <git-ref-or-worktree-path> [--keep-ref]]
  *
  * Do not run this file directly: `bun run bench` takes the exclusive machine-wide
  * bench lock first (bench/lock.sh), and this script refuses to run without it.
@@ -15,7 +16,7 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync } from 'node:fs';
-import { access, appendFile, copyFile, mkdir, open, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, appendFile, copyFile, mkdir, open, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
@@ -45,6 +46,28 @@ const CONTAMINATED_PCT = 2;
 
 /** Mutation status by stable mutant key. */
 type StatusMap = Record<string, string>;
+
+/**
+ * The gate: a mutant whose baseline status is in this group must still be in it in every run. Anything else
+ * (Survived, NoCoverage, Ignored, or missing from the report) is a lost detection. Moves within the group
+ * (Killed <-> Timeout ...) and Survived -> caught are informational swaps.
+ */
+const CAUGHT: ReadonlySet<string> = new Set(['Killed', 'Timeout', 'RuntimeError', 'CompileError']);
+const STATUS_ABBREVIATION: Readonly<Record<string, string>> = {
+    Killed:       'K',
+    Timeout:      'T',
+    Survived:     'S',
+    NoCoverage:   'N',
+    RuntimeError: 'R',
+    CompileError: 'C',
+    Ignored:      'I',
+    Pending:      'P',
+    '<absent>':   '-',
+};
+/** Distinct transitions listed in the `swaps:` line. */
+const SHOWN_SWAP_KINDS = 8;
+/** Resamples for the bootstrap interval of the median paired delta. */
+const BOOTSTRAP_RESAMPLES = 10_000;
 
 /** What the report says about one mutant; saved per run to make disagreements diagnosable. */
 interface MutantDetail {
@@ -126,6 +149,8 @@ interface RunResult {
     readonly load1:         number
     readonly cpuBusyPct:    number | undefined
     readonly contention:    boolean
+    /** Compare mode only: which side this run measured. */
+    readonly side?:         'ref' | 'cand'
     readonly contamination: Contamination
     readonly leftovers:     Leftovers
     readonly tmpGrowth:     TmpGrowth
@@ -140,11 +165,13 @@ interface Disagreement {
     readonly runs: readonly MutantDetail[]
 }
 
-interface Mismatch {
+/** One mutant whose status in one run differs from the baseline. `lost` is the gate failure. */
+interface StatusChange {
     readonly key:      string
     readonly expected: string
     readonly actual:   string
     readonly run:      number
+    readonly lost:     boolean
 }
 
 interface BaselineJson {
@@ -166,6 +193,8 @@ interface Options {
     readonly writeBaseline: boolean
     readonly record:        string | undefined
     readonly json:          boolean
+    readonly compare:       string | undefined
+    readonly keepRef:       boolean
 }
 
 interface Stats {
@@ -177,14 +206,36 @@ interface Stats {
 }
 
 interface Analysis {
-    readonly stats:              Stats
-    readonly counts:             Record<string, number>
-    readonly runsAgree:          boolean
-    readonly runDisagreements:   readonly Disagreement[]
-    readonly baselineMismatches: readonly Mismatch[]
-    readonly mismatchedKeys:     number
-    readonly statusDiff:         string
-    readonly baseline:           BaselineJson | undefined
+    readonly stats:            Stats
+    readonly counts:           Record<string, number>
+    /** False if some mutant is caught in one run and not caught in another. */
+    readonly runsAgree:        boolean
+    readonly runDisagreements: readonly Disagreement[]
+    /** Mutants whose status differs between runs but stays on one side of the caught line (informational). */
+    readonly runSwapCount:     number
+    /** Every difference from the baseline, in run order. */
+    readonly changes:          readonly StatusChange[]
+    readonly lost:             readonly StatusChange[]
+    readonly swaps:            readonly StatusChange[]
+    readonly lostKeys:         number
+    readonly swapSummary:      string
+    /** `OK`, `NO_BASELINE` or `<n> lost`: the gate. */
+    readonly detectDiff:       string
+    readonly baseline:         BaselineJson | undefined
+}
+
+/** One side's wall times against the other's, run in alternation. */
+interface Pairing {
+    readonly pairs:       number
+    /** cand - ref, seconds, per pair (negative: the candidate was faster). */
+    readonly deltas:      readonly number[]
+    readonly deltaMedian: number
+    readonly deltaPct:    number
+    readonly wins:        number
+    readonly losses:      number
+    /** Two-sided exact sign-test p-value (ties dropped). */
+    readonly pValue:      number
+    readonly ci95:        readonly [number, number]
 }
 
 let jsonMode = false;
@@ -198,8 +249,18 @@ function say(line = ''): void {
     }
 }
 
+/** Undoes what `--compare` set up (the temporary reference worktree). Synchronous: it also runs from die() and signal handlers. */
+let pendingCleanup: (() => void) | undefined;
+
+function runCleanup(): void {
+    const cleanup = pendingCleanup;
+    pendingCleanup = undefined;
+    cleanup?.();
+}
+
 function die(message: string, code = EXIT_FAIL): never {
     console.error(`bench: ${message}`);
+    runCleanup();
     process.exit(code);
 }
 
@@ -239,6 +300,8 @@ function parseOptions(): Options {
                 'write-baseline': { type: 'boolean', 'default': false },
                 record:           { type: 'string' },
                 json:             { type: 'boolean', 'default': false },
+                compare:          { type: 'string' },
+                'keep-ref':       { type: 'boolean', 'default': false },
             },
             allowPositionals: false,
         });
@@ -250,6 +313,9 @@ function parseOptions(): Options {
     if(!Number.isInteger(runs) || runs < 1) {
         die(`--runs must be a positive integer (got ${String(values.runs)})`, EXIT_USAGE);
     }
+    if(values.compare !== undefined && values['write-baseline']) {
+        die('--write-baseline cannot be combined with --compare', EXIT_USAGE);
+    }
     return {
         runs,
         fixture:       path.resolve(process.cwd(), values.fixture ?? path.join(benchDir, 'fixture')),
@@ -257,6 +323,8 @@ function parseOptions(): Options {
         writeBaseline: values['write-baseline'],
         record:        values.record,
         json:          values.json,
+        compare:       values.compare,
+        keepRef:       values['keep-ref'],
     };
 }
 
@@ -276,8 +344,8 @@ async function assertExclusiveLock(): Promise<void> {
     }
 }
 
-async function capture(command: string, args: readonly string[]): Promise<{ code: number | null, output: string }> {
-    const child = spawn(command, args, { cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'] });
+async function capture(command: string, args: readonly string[], cwd = repoRoot): Promise<{ code: number | null, output: string }> {
+    const child = spawn(command, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
     const chunks: string[] = [];
     const collect = (chunk: Buffer): void => {
         chunks.push(chunk.toString());
@@ -291,24 +359,24 @@ async function capture(command: string, args: readonly string[]): Promise<{ code
 }
 
 /** Short sha, with `+dirty` if tracked files outside bench/ differ from HEAD. */
-async function gitSha(): Promise<string> {
+async function gitSha(cwd = repoRoot): Promise<string> {
     const git = Bun.which('git');
     if(!git) {
         return 'unknown';
     }
-    const head = await capture(git, ['rev-parse', '--short', 'HEAD']);
-    const status = await capture(git, ['status', '--porcelain', '--untracked-files=no', '--', '.', ':!bench']);
+    const head = await capture(git, ['rev-parse', '--short', 'HEAD'], cwd);
+    const status = await capture(git, ['status', '--porcelain', '--untracked-files=no', '--', '.', ':!bench'], cwd);
     const sha = head.code === 0 ? head.output.trim() : 'unknown';
     return status.code === 0 && status.output.trim().length > 0 ? `${sha}+dirty` : sha;
 }
 
-async function build(): Promise<void> {
-    say('bench: building (bun run build) so dist/ matches the source...');
+async function build(dir = repoRoot, what = 'so dist/ matches the source'): Promise<void> {
+    say(`bench: building (bun run build) ${what}...`);
     const started = performance.now();
-    const { code, output } = await capture(process.execPath, ['run', 'build']);
+    const { code, output } = await capture(process.execPath, ['run', 'build'], dir);
     if(code !== 0) {
         console.error(output);
-        die(`bun run build failed (exit ${String(code)})`);
+        die(`bun run build failed in ${dir} (exit ${String(code)})`);
     }
     say(`bench: build ok in ${((performance.now() - started) / 1000).toFixed(1)}s`);
 }
@@ -321,8 +389,8 @@ interface CpuTimes {
 }
 
 async function readCpuTimes(): Promise<CpuTimes | undefined> {
-    const stat = await readFile('/proc/stat', 'utf8').catch(() => '');
-    const fields = stat.split('\n', 1)[0].trim().split(/\s+/).slice(1).map(Number);
+    const procStat = await readFile('/proc/stat', 'utf8').catch(() => '');
+    const fields = procStat.split('\n', 1)[0].trim().split(/\s+/).slice(1).map(Number);
     if(fields.length < 5 || fields.some(value => Number.isNaN(value))) {
         return undefined;
     }
@@ -892,17 +960,25 @@ function absent(key: string): MutantDetail {
     return { status: '<absent>', id: '', mutatorName: '', file: key, location: '' };
 }
 
-/** Mutants whose status is not the same in every run (a key present in only some runs counts, as `<absent>`). */
-function findDisagreements(results: readonly RunResult[]): Disagreement[] {
+const isCaught = (status: string): boolean => CAUGHT.has(status);
+
+/**
+ * Mutants caught in some runs and not in others (a key present in only some runs counts, as `<absent>`) are
+ * disagreements. Mutants whose status differs between runs but stays on one side of the caught line are only counted.
+ */
+function findDisagreements(results: readonly RunResult[]): { disagreements: Disagreement[], swapped: number } {
     const keys = new Set(results.flatMap(run => Object.keys(run.details)));
     const found: Disagreement[] = [];
+    let swapped = 0;
     for(const key of keys) {
         const runs = results.map(run => run.details[key] ?? absent(key));
-        if(new Set(runs.map(detail => detail.status)).size > 1) {
+        if(new Set(runs.map(detail => isCaught(detail.status))).size > 1) {
             found.push({ key, runs });
+        } else if(new Set(runs.map(detail => detail.status)).size > 1) {
+            swapped++;
         }
     }
-    return found.toSorted((a, b) => a.key.localeCompare(b.key));
+    return { disagreements: found.toSorted((a, b) => a.key.localeCompare(b.key)), swapped };
 }
 
 function sortedEntries(map: StatusMap): [string, string][] {
@@ -917,16 +993,33 @@ function countStatuses(statuses: StatusMap): Record<string, number> {
     return Object.fromEntries(Object.entries(counts).toSorted(([a], [b]) => a.localeCompare(b)));
 }
 
-function diffStatuses(expected: StatusMap, actual: StatusMap, run: number): Mismatch[] {
-    const mismatches: Mismatch[] = [];
+function diffStatuses(expected: StatusMap, actual: StatusMap, run: number): StatusChange[] {
+    const changes: StatusChange[] = [];
     for(const key of new Set([...Object.keys(expected), ...Object.keys(actual)])) {
         const want = expected[key] ?? '<absent>';
         const got = actual[key] ?? '<absent>';
         if(want !== got) {
-            mismatches.push({ key, expected: want, actual: got, run });
+            changes.push({ key, expected: want, actual: got, run, lost: isCaught(want) && !isCaught(got) });
         }
     }
-    return mismatches.toSorted((a, b) => a.key.localeCompare(b.key));
+    return changes.toSorted((a, b) => a.key.localeCompare(b.key));
+}
+
+const abbreviate = (status: string): string => STATUS_ABBREVIATION[status] ?? status.slice(0, 1);
+
+/** `K→T:3,S→K:1`: the informational swaps by kind, most frequent first. */
+function summariseSwaps(swaps: readonly StatusChange[]): string {
+    const kinds = new Map<string, number>();
+    for(const swap of swaps) {
+        const kind = `${abbreviate(swap.expected)}→${abbreviate(swap.actual)}`;
+        kinds.set(kind, (kinds.get(kind) ?? 0) + 1);
+    }
+    const sorted = [...kinds.entries()].toSorted(([nameA, a], [nameB, b]) => b - a || nameA.localeCompare(nameB));
+    if(sorted.length === 0) {
+        return 'none';
+    }
+    const shown = sorted.slice(0, SHOWN_SWAP_KINDS).map(([kind, count]) => `${kind}:${String(count)}`);
+    return sorted.length > SHOWN_SWAP_KINDS ? `${shown.join(',')},…` : shown.join(',');
 }
 
 // -- running Stryker ----------------------------------------------------------
@@ -948,11 +1041,12 @@ function killActive(): void {
 for(const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
     process.on(signal, () => {
         killActive();
+        runCleanup();
         process.exit(128 + os.constants.signals[signal]);
     });
 }
 
-async function runStryker(fixture: string, logPath: string, monitor: ContaminationMonitor): Promise<{ code: number | null, seconds: number, contamination: Contamination }> {
+async function runStryker(fixture: string, logPath: string, plugin: string, monitor: ContaminationMonitor): Promise<{ code: number | null, seconds: number, contamination: Contamination }> {
     const log = await open(logPath, 'a');
     try {
         monitor.start();
@@ -961,7 +1055,7 @@ async function runStryker(fixture: string, logPath: string, monitor: Contaminati
             cwd:      fixture,
             stdio:    ['ignore', log.fd, log.fd],
             detached: true,
-            env:      { ...process.env, BENCH_PLUGIN: pluginPath },
+            env:      { ...process.env, BENCH_PLUGIN: plugin },
         });
         activeChild = child;
         monitor.setAnchor(child.pid);
@@ -978,23 +1072,51 @@ async function runStryker(fixture: string, logPath: string, monitor: Contaminati
     }
 }
 
-async function benchOnce(options: Options, stamp: string, index: number, batch: { tmp: TmpSnapshot }): Promise<RunResult> {
-    const label = `${String(index + 1)}/${String(options.runs)}`;
+/** The RUN line, then the top foreign commands and any orphans. */
+function printRun(result: RunResult, label: string): void {
+    const { contamination, leftovers, wallSeconds, dryRunSeconds, tests, load1, contention, log } = result;
+    say(`RUN ${label} wall=${wallSeconds.toFixed(1)}s dryrun=${dryRunSeconds?.toFixed(1) ?? 'n/a'}s tests=${String(tests ?? 'n/a')} mutants=${String(result.mutants)} load1=${load1.toFixed(2)}${contention ? ' LOAD-WARNING' : ''} log=${log} ${contaminationFields(result)}`);
+    const { topForeign } = contamination;
+    if(topForeign.length > 0) {
+        const shown = topForeign.map(item => `${item.command} ${item.cpuSeconds.toFixed(2)}s (${String(item.processes)} proc)`);
+        say(`  foreign top ${String(TOP_FOREIGN)}: ${shown.join(', ')}`);
+    }
+    for(const orphan of leftovers.orphans) {
+        say(`  ORPHAN pid=${String(orphan.pid)} ${orphan.kind} ${orphan.command}${orphan.kind === 'run' ? ' (killed)' : ''}`);
+    }
+}
+
+/** One Stryker run to measure: which plugin build, and how it is named in output and files. */
+interface Step {
+    /** 0-based position in the batch. */
+    readonly sequence: number
+    /** Run number (or pair number in compare mode), 1-based. */
+    readonly number:   number
+    /** `2/3` or `pair 2/3 ref`. */
+    readonly label:    string
+    /** File stem under bench/out/: `run2` or `pair2-ref`. */
+    readonly stem:     string
+    readonly plugin:   string
+    readonly side?:    'ref' | 'cand'
+}
+
+async function benchOnce(options: Options, stamp: string, step: Step, batch: { tmp: TmpSnapshot }): Promise<RunResult> {
+    const { label, sequence } = step;
     await Promise.all(['.stryker-tmp', 'reports'].map(dir => rm(path.join(options.fixture, dir), { recursive: true, force: true })));
 
     const load1 = os.loadavg()[0];
     const cpuBusyPct = await sampleCpuBusyPct();
     // The 1-minute load average lags: right after another benchmark (or this run's predecessor) it is high on an idle machine.
     // So the live CPU sample decides; the load average only decides when /proc/stat is unavailable, and only for run 1.
-    const contention = cpuBusyPct === undefined ? index === 0 && load1 > 1 : cpuBusyPct > BUSY_WARN_PCT;
+    const contention = cpuBusyPct === undefined ? sequence === 0 && load1 > 1 : cpuBusyPct > BUSY_WARN_PCT;
     const busy = cpuBusyPct === undefined ? 'n/a' : `${cpuBusyPct.toFixed(0)}%`;
     const warning = contention ? '  WARNING: machine not idle, timing is unreliable' : '';
     say(`bench: run ${label} starting (load1=${load1.toFixed(2)}, cpu_busy=${busy})${warning}`);
 
-    const logPath = path.join(outDir, `${stamp}-run${String(index + 1)}.log`);
+    const logPath = path.join(outDir, `${stamp}-${step.stem}.log`);
     const logRel = path.relative(repoRoot, logPath);
     const monitor = new ContaminationMonitor();
-    const { code, seconds, contamination } = await runStryker(options.fixture, logPath, monitor);
+    const { code, seconds, contamination } = await runStryker(options.fixture, logPath, step.plugin, monitor);
     const leftovers = await reapLeftovers(monitor);
     const tmpAfter = await snapshotTmp();
     const growth = tmpGrowth(batch.tmp, tmpAfter);
@@ -1010,7 +1132,7 @@ async function benchOnce(options: Options, stamp: string, index: number, batch: 
     }
     const details = await buildMutantDetails(reportPath);
     const statuses = statusesOf(details);
-    const runPrefix = path.join(outDir, `${stamp}-run${String(index + 1)}`);
+    const runPrefix = path.join(outDir, `${stamp}-${step.stem}`);
     await writeFile(`${runPrefix}-statuses.json`, `${JSON.stringify(Object.fromEntries(Object.entries(details).toSorted(([a], [b]) => a.localeCompare(b))), null, 1)}\n`);
     await copyFile(reportPath, `${runPrefix}-mutation.json`);
     const dry = parseDryRun(log);
@@ -1018,7 +1140,8 @@ async function benchOnce(options: Options, stamp: string, index: number, batch: 
         console.error(`bench: warning: no "Initial test run succeeded" line in ${logRel}`);
     }
     const result: RunResult = {
-        index:         index + 1,
+        index:         step.number,
+        ...step.side === undefined ? {} : { side: step.side },
         wallSeconds:   seconds,
         dryRunSeconds: dry.seconds,
         tests:         dry.tests,
@@ -1033,15 +1156,7 @@ async function benchOnce(options: Options, stamp: string, index: number, batch: 
         statuses,
         details,
     };
-    say(`RUN ${label} wall=${seconds.toFixed(1)}s dryrun=${dry.seconds?.toFixed(1) ?? 'n/a'}s tests=${String(dry.tests ?? 'n/a')} mutants=${String(result.mutants)} load1=${load1.toFixed(2)}${contention ? ' LOAD-WARNING' : ''} log=${logRel} ${contaminationFields(result)}`);
-    const { topForeign } = contamination;
-    if(topForeign.length > 0) {
-        const shown = topForeign.map(item => `${item.command} ${item.cpuSeconds.toFixed(2)}s (${String(item.processes)} proc)`);
-        say(`  foreign top ${String(TOP_FOREIGN)}: ${shown.join(', ')}`);
-    }
-    for(const orphan of leftovers.orphans) {
-        say(`  ORPHAN pid=${String(orphan.pid)} ${orphan.kind} ${orphan.command}${orphan.kind === 'run' ? ' (killed)' : ''}`);
-    }
+    printRun(result, label);
     return result;
 }
 
@@ -1103,27 +1218,33 @@ function computeStats(results: readonly RunResult[]): Stats {
 
 async function analyse(results: readonly RunResult[]): Promise<Analysis> {
     const [first] = results;
-    const runDisagreements = findDisagreements(results);
+    const { disagreements, swapped } = findDisagreements(results);
     const baselineStatuses = await readJson(baselineStatusesPath) as StatusMap | undefined;
     const baseline = await readJson(baselineJsonPath) as BaselineJson | undefined;
-    const baselineMismatches = baselineStatuses
+    const changes = baselineStatuses
         ? results.flatMap(run => diffStatuses(baselineStatuses, run.statuses, run.index))
         : [];
-    const mismatchedKeys = new Set(baselineMismatches.map(m => m.key)).size;
-    let statusDiff = `${String(mismatchedKeys)} mismatches vs baseline`;
+    const lost = changes.filter(change => change.lost);
+    const swaps = changes.filter(change => !change.lost);
+    const lostKeys = new Set(lost.map(change => change.key)).size;
+    let detectDiff = `${String(lostKeys)} lost`;
     if(!baselineStatuses) {
-        statusDiff = 'NO_BASELINE';
-    } else if(mismatchedKeys === 0) {
-        statusDiff = 'OK';
+        detectDiff = 'NO_BASELINE';
+    } else if(lostKeys === 0) {
+        detectDiff = 'OK';
     }
     return {
-        stats:     computeStats(results),
-        counts:    countStatuses(first.statuses),
-        runsAgree: runDisagreements.length === 0,
-        runDisagreements,
-        baselineMismatches,
-        mismatchedKeys,
-        statusDiff,
+        stats:            computeStats(results),
+        counts:           countStatuses(first.statuses),
+        runsAgree:        disagreements.length === 0,
+        runDisagreements: disagreements,
+        runSwapCount:     swapped,
+        changes,
+        lost,
+        swaps,
+        lostKeys,
+        swapSummary:      summariseSwaps(swaps),
+        detectDiff,
         baseline,
     };
 }
@@ -1138,6 +1259,26 @@ function printHealth(health: BatchHealth): void {
     }
     if(health.orphans > 0) {
         say(`BENCH-WARNING ${String(health.orphans)} process(es) outlived a run (orphans); the run's own were killed after the report. Find out what leaves them behind.`);
+    }
+}
+
+/** Which mutants lost detection (the gate), disagree between runs, or merely swapped status (info). */
+function printDetection(analysis: Analysis): void {
+    if(analysis.swaps.length > 0 || analysis.runSwapCount > 0) {
+        say(`  swaps (info): ${analysis.swapSummary} vs baseline (${String(analysis.swaps.length)} across runs); ${String(analysis.runSwapCount)} mutants changed status between runs without crossing the caught line`);
+    }
+    if(!analysis.runsAgree) {
+        say(`\nRuns disagree on ${String(analysis.runDisagreements.length)} mutants: caught in some runs, not in others (up to ${String(SHOWN_MISMATCHES)} shown; per-run maps in bench/out/<stamp>-<run>-statuses.json):`);
+        for(const d of analysis.runDisagreements.slice(0, SHOWN_MISMATCHES)) {
+            const perRun = d.runs.map((detail, i) => `run${String(i + 1)}=${detail.status}(id ${detail.id || '-'})`).join(' ');
+            say(`  ${d.key}\n    ${d.runs[0].mutatorName} at ${d.runs[0].file}:${d.runs[0].location}  ${perRun}`);
+        }
+    }
+    if(analysis.lost.length > 0) {
+        say(`\nLOST DETECTION vs baseline (${String(analysis.lost.length)} across runs, ${String(analysis.lostKeys)} distinct mutants; up to ${String(SHOWN_MISMATCHES)} shown):`);
+        for(const m of analysis.lost.slice(0, SHOWN_MISMATCHES)) {
+            say(`  run ${String(m.run)}: ${m.key}: baseline ${m.expected}, got ${m.actual}`);
+        }
     }
 }
 
@@ -1160,7 +1301,8 @@ function printReport(sha: string, results: readonly RunResult[], analysis: Analy
         `dryrun_median=${stats.dryRunMedian?.toFixed(1) ?? 'n/a'}s`,
         `mutants=${String(results[0].mutants)}`,
         `runs_agree=${runsAgree ? 'yes' : 'NO'}`,
-        `status_diff=${analysis.statusDiff}`,
+        `detect_diff=${analysis.detectDiff}`,
+        `status_swaps=${String(analysis.swaps.length)}`,
         `contaminated_runs=${String(health.contaminatedRuns)}`,
         `orphans=${String(health.orphans)}`,
         `tmp_growth=${signedInt(health.tmpEntries)}/${formatBytes(health.tmpBytes)}`,
@@ -1169,19 +1311,7 @@ function printReport(sha: string, results: readonly RunResult[], analysis: Analy
     if(results.some(run => run.contention)) {
         say('BENCH-WARNING the machine was not idle at the start of at least one run; timings are unreliable (check for other CPU-heavy work).');
     }
-    if(!runsAgree) {
-        say(`\nRuns disagree on ${String(analysis.runDisagreements.length)} mutants (up to ${String(SHOWN_MISMATCHES)} shown; per-run maps in bench/out/<stamp>-run<i>-statuses.json):`);
-        for(const d of analysis.runDisagreements.slice(0, SHOWN_MISMATCHES)) {
-            const perRun = d.runs.map((detail, i) => `run${String(i + 1)}=${detail.status}(id ${detail.id || '-'})`).join(' ');
-            say(`  ${d.key}\n    ${d.runs[0].mutatorName} at ${d.runs[0].file}:${d.runs[0].location}  ${perRun}`);
-        }
-    }
-    if(analysis.baselineMismatches.length > 0) {
-        say(`\nStatus mismatches vs baseline (${String(analysis.baselineMismatches.length)} across runs, ${String(analysis.mismatchedKeys)} distinct mutants; up to ${String(SHOWN_MISMATCHES)} shown):`);
-        for(const m of analysis.baselineMismatches.slice(0, SHOWN_MISMATCHES)) {
-            say(`  run ${String(m.run)}: ${m.key}: baseline ${m.expected}, got ${m.actual}`);
-        }
-    }
+    printDetection(analysis);
 }
 
 // -- baseline and results files -----------------------------------------------
@@ -1246,23 +1376,44 @@ async function writeBaseline(sha: string, results: readonly RunResult[], stats: 
     }
 }
 
-async function appendResult(label: string, sha: string, runs: number, analysis: Analysis, contaminatedRuns: number): Promise<void> {
+/** Append one row to RESULTS.md (created with its header on first use). */
+async function appendRow(cells: readonly string[]): Promise<void> {
     if(!await exists(resultsMdPath)) {
         await writeFile(resultsMdPath, [
             '# Benchmark results',
             '',
-            'One row per `bun run bench -- --record "<label>"`. Delta is the median wall time versus the median in `baseline.json`.',
+            'One row per `bun run bench -- --record "<label>"`. Delta is the median wall time versus the median in `baseline.json`; a `--compare` row\'s delta is the paired median versus the reference build, and its sha cell reads `<candidate> vs <reference>`.',
             '',
-            '| date | sha | label | runs | median | min–max | delta vs baseline | status_diff |',
+            '| date | sha | label | runs | median | min–max | delta vs baseline | detect_diff |',
             '| --- | --- | --- | ---: | ---: | --- | --- | --- |',
             '',
         ].join('\n'));
     }
+    const escaped = cells.map(cell => cell.replaceAll('|', String.raw`\|`).replaceAll('\n', ' '));
+    await appendFile(resultsMdPath, `| ${escaped.join(' | ')} |\n`);
+    say(`bench: recorded in ${path.relative(repoRoot, resultsMdPath)}`);
+}
+
+function detectCell(analysis: Analysis, contaminatedRuns: number): string {
+    const parts = [analysis.detectDiff];
+    if(analysis.swaps.length > 0) {
+        parts.push(`swaps ${analysis.swapSummary}`);
+    }
+    if(!analysis.runsAgree) {
+        parts.push('RUNS DISAGREE');
+    }
+    if(contaminatedRuns > 0) {
+        parts.push(`${String(contaminatedRuns)} CONTAMINATED`);
+    }
+    return parts.join('; ');
+}
+
+async function appendResult(label: string, sha: string, runs: number, analysis: Analysis, contaminatedRuns: number): Promise<void> {
     const { stats, baseline } = analysis;
     const delta = baseline
         ? `${signed(100 * (stats.median - baseline.medianSeconds) / baseline.medianSeconds, 1, '%')} (${signed(stats.median - baseline.medianSeconds, 1, 's')})`
         : 'n/a';
-    const cells = [
+    await appendRow([
         new Date().toISOString().slice(0, 16).replace('T', ' '),
         sha,
         label,
@@ -1270,10 +1421,8 @@ async function appendResult(label: string, sha: string, runs: number, analysis: 
         `${stats.median.toFixed(1)}s`,
         `${stats.min.toFixed(1)}–${stats.max.toFixed(1)}s`,
         delta,
-        [analysis.statusDiff, ...analysis.runsAgree ? [] : ['RUNS DISAGREE'], ...contaminatedRuns > 0 ? [`${String(contaminatedRuns)} CONTAMINATED`] : []].join('; '),
-    ].map(cell => cell.replaceAll('|', String.raw`\|`).replaceAll('\n', ' '));
-    await appendFile(resultsMdPath, `| ${cells.join(' | ')} |\n`);
-    say(`bench: recorded in ${path.relative(repoRoot, resultsMdPath)}`);
+        detectCell(analysis, contaminatedRuns),
+    ]);
 }
 
 // -- main ---------------------------------------------------------------------
@@ -1293,6 +1442,262 @@ async function checkPreconditions(options: Options): Promise<void> {
     }
 }
 
+/** The gate and the informational swaps, as they go into a summary JSON. The per-mutant lists are complete. */
+function detectionJson(analysis: Analysis): Record<string, unknown> {
+    return {
+        runsAgree:            analysis.runsAgree,
+        detectDiff:           analysis.detectDiff,
+        lostMutants:          analysis.lostKeys,
+        statusSwaps:          analysis.swaps.length,
+        swapSummary:          analysis.swapSummary,
+        runSwapCount:         analysis.runSwapCount,
+        lost:                 analysis.lost,
+        swaps:                analysis.swaps,
+        runDisagreements:     analysis.runDisagreements.slice(0, SHOWN_MISMATCHES),
+        runDisagreementCount: analysis.runDisagreements.length,
+    };
+}
+
+function stripMaps(results: readonly RunResult[]): Record<string, unknown>[] {
+    return results.map(({ statuses: _statuses, details: _details, ...rest }) => rest);
+}
+
+async function writeSummary(options: Options, stamp: string, summary: Record<string, unknown>): Promise<void> {
+    await writeFile(path.join(outDir, `${stamp}-summary.json`), `${JSON.stringify(summary, null, 2)}\n`);
+    if(options.json) {
+        console.log(JSON.stringify(summary));
+    }
+}
+
+// -- --compare: interleaved reference vs candidate ------------------------------
+
+interface RefBuild {
+    readonly sha:    string
+    readonly plugin: string
+}
+
+async function isDirectory(file: string): Promise<boolean> {
+    const info = await stat(file).catch(() => undefined);
+    return info?.isDirectory() ?? false;
+}
+
+/** Resolve a git ref and check it out as a detached worktree in bench/out/ref-<sha> (removed at exit unless kept). */
+async function checkoutRef(git: string, spec: string, keep: boolean): Promise<{ sha: string, dir: string }> {
+    const rev = await capture(git, ['rev-parse', '--verify', '--short', `${spec}^{commit}`]);
+    if(rev.code !== 0) {
+        return die(`--compare: ${spec} is neither a directory nor a git ref (${rev.output.trim()})`, EXIT_USAGE);
+    }
+    const sha = rev.output.trim();
+    const dir = path.join(outDir, `ref-${sha}`);
+    if(!await exists(dir)) {
+        const added = await capture(git, ['worktree', 'add', '--detach', dir, sha]);
+        if(added.code !== 0) {
+            return die(`git worktree add ${dir} failed: ${added.output.trim()}`);
+        }
+    }
+    if(!keep) {
+        pendingCleanup = (): void => {
+            Bun.spawnSync([git, 'worktree', 'remove', '--force', dir], { cwd: repoRoot });
+            Bun.spawnSync([git, 'worktree', 'prune'], { cwd: repoRoot });
+        };
+    }
+    return { sha, dir };
+}
+
+/**
+ * Make the reference build: a directory given as `--compare` is used as is; a git ref gets a temporary
+ * `git worktree add --detach` in bench/out/ref-<sha> (removed at exit unless --keep-ref). Each side is installed and
+ * built once, in its own directory, so its dist/ resolves its own node_modules.
+ */
+async function prepareRef(options: Options): Promise<RefBuild> {
+    const spec = options.compare ?? '';
+    const git = Bun.which('git');
+    if(!git) {
+        return die('--compare needs git on PATH');
+    }
+    const asPath = path.resolve(process.cwd(), spec);
+    let dir = asPath;
+    let sha: string;
+    if(await isDirectory(asPath)) {
+        sha = await gitSha(asPath);
+    } else {
+        ({ sha, dir } = await checkoutRef(git, spec, options.keepRef));
+    }
+    if(!await exists(path.join(dir, 'node_modules'))) {
+        say(`bench: bun install in reference ${sha} (${path.relative(repoRoot, dir)})...`);
+        const installed = await capture(process.execPath, ['install'], dir);
+        if(installed.code !== 0) {
+            console.error(installed.output);
+            return die(`bun install failed in ${dir}`);
+        }
+    }
+    const plugin = path.join(dir, 'dist', 'index.js');
+    if(options.build || !await exists(plugin)) {
+        await build(dir, `the reference ${sha}`);
+    }
+    return { sha, plugin };
+}
+
+/** Two-sided exact sign test: probability, if wins and losses were equally likely, of a split at least this lopsided. Ties are dropped. */
+function signTestP(wins: number, losses: number): number {
+    const n = wins + losses;
+    if(n === 0) {
+        return 1;
+    }
+    let term = 1;
+    let tail = 0;
+    for(let i = 0; i <= Math.min(wins, losses); i++) {
+        tail += term;
+        term = term * (n - i) / (i + 1);
+    }
+    return Math.min(1, 2 * tail / 2 ** n);
+}
+
+/** 95% percentile-bootstrap interval of the median, with a fixed-seed LCG so the same data gives the same interval. */
+function bootstrapMedianCi(values: readonly number[]): [number, number] {
+    let state = 12_345;
+    const next = (): number => {
+        state = (state * 1_664_525 + 1_013_904_223) % 2 ** 32;
+        return state / 2 ** 32;
+    };
+    const medians: number[] = [];
+    for(let i = 0; i < BOOTSTRAP_RESAMPLES; i++) {
+        medians.push(median(values.map(() => values[Math.floor(next() * values.length)])));
+    }
+    medians.sort((a, b) => a - b);
+    return [medians[Math.floor(0.025 * BOOTSTRAP_RESAMPLES)], medians[Math.floor(0.975 * BOOTSTRAP_RESAMPLES)]];
+}
+
+function pairUp(ref: readonly RunResult[], cand: readonly RunResult[], refMedian: number): Pairing {
+    const deltas = cand.map(run => run.wallSeconds - (ref.find(other => other.index === run.index)?.wallSeconds ?? Number.NaN));
+    const wins = deltas.filter(delta => delta < 0).length;
+    const losses = deltas.filter(delta => delta > 0).length;
+    const deltaMedian = median(deltas);
+    return {
+        pairs:    deltas.length,
+        deltas,
+        deltaMedian,
+        deltaPct: refMedian > 0 ? 100 * deltaMedian / refMedian : 0,
+        wins,
+        losses,
+        pValue:   signTestP(wins, losses),
+        ci95:     bootstrapMedianCi(deltas),
+    };
+}
+
+function formatP(p: number): string {
+    return p < 0.001 ? '<0.001' : p.toFixed(3);
+}
+
+function printComparison(refSha: string, candSha: string, results: readonly RunResult[], refStats: Stats, candStats: Stats, pairing: Pairing): void {
+    say();
+    for(const [i, delta] of pairing.deltas.entries()) {
+        const pair = i + 1;
+        const ref = results.find(run => run.index === pair && run.side === 'ref');
+        const cand = results.find(run => run.index === pair && run.side === 'cand');
+        const first = pair % 2 === 1 ? 'ref' : 'cand';
+        const dirty = (ref?.contamination.contaminated ?? false) || (cand?.contamination.contaminated ?? false) ? ' CONTAMINATED' : '';
+        say(`  pair ${String(pair)} (${first} first): ref=${ref?.wallSeconds.toFixed(1) ?? 'n/a'}s cand=${cand?.wallSeconds.toFixed(1) ?? 'n/a'}s delta=${signed(delta, 2, 's')}${dirty}`);
+    }
+    const describe = (name: string, stats: Stats): string => `  ${name}: median=${stats.median.toFixed(1)}s min=${stats.min.toFixed(1)}s max=${stats.max.toFixed(1)}s spread=${stats.spreadPct.toFixed(1)}%`;
+    say(describe('ref ', refStats));
+    say(describe('cand', candStats));
+    const [low, high] = pairing.ci95;
+    say(`  paired delta (cand - ref): median ${signed(pairing.deltaMedian, 2, 's')} (${signed(pairing.deltaPct, 1, '%')}), 95% bootstrap CI [${signed(low, 2, '')}, ${signed(high, 2, '')}]s, candidate faster in ${String(pairing.wins)}/${String(pairing.pairs)} pairs (slower in ${String(pairing.losses)}), sign-test p=${formatP(pairing.pValue)}`);
+    say(`  ref=${refSha} cand=${candSha}; a small p with a delta beyond the CI of an A/A run means a real difference, a large p means noise`);
+}
+
+async function runCompare(options: Options, stamp: string, candSha: string): Promise<void> {
+    const ref = await prepareRef(options);
+    say(`bench: compare ref=${ref.sha} cand=${candSha} pairs=${String(options.runs)} fixture=${options.fixture} (ref plugin ${ref.plugin}, cand plugin ${pluginPath})`);
+    const results: RunResult[] = [];
+    const batch = { tmp: await snapshotTmp() };
+    const total = options.runs * 2;
+    for(let pair = 1; pair <= options.runs; pair++) {
+        // The order alternates per pair (ref first, then cand first, ...), so a drift cannot favour one side.
+        const order: readonly ('ref' | 'cand')[] = pair % 2 === 1 ? ['ref', 'cand'] : ['cand', 'ref'];
+        for(const side of order) {
+            const step: Step = {
+                sequence: results.length,
+                number:   pair,
+                label:    `pair ${String(pair)}/${String(options.runs)} ${side}`,
+                stem:     `pair${String(pair)}-${side}`,
+                plugin:   side === 'ref' ? ref.plugin : pluginPath,
+                side,
+            };
+            // eslint-disable-next-line no-await-in-loop -- benchmark runs must be strictly sequential
+            results.push(await benchOnce(options, stamp, step, batch));
+        }
+    }
+    runCleanup();
+    if(results.length !== total) {
+        die('internal error: missing runs');
+    }
+
+    const refRuns = results.filter(run => run.side === 'ref');
+    const candRuns = results.filter(run => run.side === 'cand');
+    const refAnalysis = await analyse(refRuns);
+    const candAnalysis = await analyse(candRuns);
+    const health = batchHealth(results);
+    const pairing = pairUp(refRuns, candRuns, refAnalysis.stats.median);
+    printComparison(ref.sha, candSha, results, refAnalysis.stats, candAnalysis.stats, pairing);
+    const breakdown = Object.entries(candAnalysis.counts).map(([status, count]) => `${status}=${String(count)}`);
+    say(`  statuses (cand): ${breakdown.join(' ')}`);
+    printHealth(health);
+    if(results.some(run => run.contention)) {
+        say('BENCH-WARNING the machine was not idle at the start of at least one run; timings are unreliable (check for other CPU-heavy work).');
+    }
+    say(`  reference gate: detect_diff=${refAnalysis.detectDiff} status_swaps=${String(refAnalysis.swaps.length)} runs_agree=${refAnalysis.runsAgree ? 'yes' : 'NO'}`);
+    printDetection(candAnalysis);
+    const { stats: refStats } = refAnalysis;
+    const { stats: candStats } = candAnalysis;
+    say([
+        `COMPARE ref=${ref.sha}`,
+        `cand=${candSha}`,
+        `pairs=${String(pairing.pairs)}`,
+        `ref_median=${refStats.median.toFixed(1)}s`,
+        `cand_median=${candStats.median.toFixed(1)}s`,
+        `delta_median=${signed(pairing.deltaMedian, 2, 's')} (${signed(pairing.deltaPct, 1, '%')})`,
+        `wins=${String(pairing.wins)}/${String(pairing.pairs)}`,
+        `p=${formatP(pairing.pValue)}`,
+        `detect_diff=${candAnalysis.detectDiff}`,
+        `status_swaps=${String(candAnalysis.swaps.length)}`,
+        `runs_agree=${candAnalysis.runsAgree ? 'yes' : 'NO'}`,
+        `contaminated_runs=${String(health.contaminatedRuns)}`,
+    ].join(' '));
+
+    if(options.record !== undefined) {
+        const note = `${options.record} (compare ref=${ref.sha})`;
+        await appendRow([
+            new Date().toISOString().slice(0, 16).replace('T', ' '),
+            `${candSha} vs ${ref.sha}`,
+            note,
+            String(pairing.pairs),
+            `${candStats.median.toFixed(1)}s`,
+            `${candStats.min.toFixed(1)}–${candStats.max.toFixed(1)}s`,
+            `${signed(pairing.deltaPct, 1, '%')} (${signed(pairing.deltaMedian, 2, 's')}) vs ref, wins ${String(pairing.wins)}/${String(pairing.pairs)}, p=${formatP(pairing.pValue)}`,
+            detectCell(candAnalysis, health.contaminatedRuns),
+        ]);
+    }
+    await writeSummary(options, stamp, {
+        mode:             'compare',
+        refSha:           ref.sha,
+        candSha,
+        pairs:            pairing.pairs,
+        ref:              refStats,
+        cand:             candStats,
+        pairing,
+        contaminatedRuns: health.contaminatedRuns,
+        health,
+        ...detectionJson(candAnalysis),
+        refDetection:     detectionJson(refAnalysis),
+        runDetails:       stripMaps(results),
+    });
+    if(candAnalysis.lostKeys > 0) {
+        process.exit(EXIT_MISMATCH);
+    }
+}
+
 async function main(): Promise<void> {
     const options = parseOptions();
     jsonMode = options.json;
@@ -1303,11 +1708,17 @@ async function main(): Promise<void> {
     await mkdir(outDir, { recursive: true });
     say(`bench: sha=${sha} fixture=${options.fixture} runs=${String(options.runs)} plugin=${pluginPath}`);
 
+    if(options.compare !== undefined) {
+        await runCompare(options, stamp, sha);
+        return;
+    }
+
     const results: RunResult[] = [];
     const batch = { tmp: await snapshotTmp() };
     for(let i = 0; i < options.runs; i++) {
+        const step: Step = { sequence: i, number: i + 1, label: `${String(i + 1)}/${String(options.runs)}`, stem: `run${String(i + 1)}`, plugin: pluginPath };
         // eslint-disable-next-line no-await-in-loop -- benchmark runs must be strictly sequential
-        results.push(await benchOnce(options, stamp, i, batch));
+        results.push(await benchOnce(options, stamp, step, batch));
     }
 
     const analysis = await analyse(results);
@@ -1321,35 +1732,27 @@ async function main(): Promise<void> {
         if(analysis.runsAgree) {
             await writeBaseline(sha, results, analysis.stats);
         } else {
-            console.error('bench: NOT writing baseline: the runs disagree with each other.');
+            console.error('bench: NOT writing baseline: the runs disagree with each other (a mutant is caught in some runs and not in others).');
         }
     }
 
     const { stats } = analysis;
-    const summary = {
+    await writeSummary(options, stamp, {
         sha,
-        runs:                 results.length,
-        medianSeconds:        stats.median,
-        minSeconds:           stats.min,
-        maxSeconds:           stats.max,
-        spreadPct:            stats.spreadPct,
-        dryRunMedianSeconds:  stats.dryRunMedian ?? null,
-        mutants:              results[0].mutants,
-        statusCounts:         analysis.counts,
-        runsAgree:            analysis.runsAgree,
-        statusDiff:           analysis.statusDiff,
-        mismatches:           analysis.baselineMismatches.slice(0, SHOWN_MISMATCHES),
-        runDisagreements:     analysis.runDisagreements.slice(0, SHOWN_MISMATCHES),
-        runDisagreementCount: analysis.runDisagreements.length,
-        contaminatedRuns:     health.contaminatedRuns,
+        runs:                results.length,
+        medianSeconds:       stats.median,
+        minSeconds:          stats.min,
+        maxSeconds:          stats.max,
+        spreadPct:           stats.spreadPct,
+        dryRunMedianSeconds: stats.dryRunMedian ?? null,
+        mutants:             results[0].mutants,
+        statusCounts:        analysis.counts,
+        ...detectionJson(analysis),
+        contaminatedRuns:    health.contaminatedRuns,
         health,
-        runDetails:           results.map(({ statuses: _statuses, details: _details, ...rest }) => rest),
-    };
-    await writeFile(path.join(outDir, `${stamp}-summary.json`), `${JSON.stringify(summary, null, 2)}\n`);
-    if(options.json) {
-        console.log(JSON.stringify(summary));
-    }
-    if(!analysis.runsAgree || analysis.mismatchedKeys > 0) {
+        runDetails:          stripMaps(results),
+    });
+    if(analysis.lostKeys > 0) {
         process.exit(EXIT_MISMATCH);
     }
 }
