@@ -40,6 +40,7 @@ import * as privateTempDir from '../../src/utils/private-temp-dir.js';
 import * as syncServerModule from '../../src/utils/sync-server.js';
 import { buildTestFileArgs, MAX_TEST_FILE_ARGS_BYTES } from '../../src/utils/test-file-args.js';
 import * as testFileDiscovery from '../../src/utils/test-file-discovery.js';
+import * as testName from '../../src/utils/test-name.js';
 import { mockReadFile, mockRename, mockWriteFile, resetAllMocks } from '../test-preload.js';
 
 /** The run's private temp directory, derived independently (see survivors-a's copy of this helper). */
@@ -400,6 +401,21 @@ describe('BunTestRunner cheapest-first file order and fixed test order in mutant
             await mutantRun(runner, []);
 
             expect(lastMutantSpawn().testFiles).toEqual([ALPHA, 'tests/a-untimed.test.ts']);
+        });
+
+        it('normalizes each file\'s path once for the order, not once per comparison', async () => {
+            const files = Array.from({ length: 64 }, (_unused, index) => `tests/f${String(index).padStart(2, '0')}.test.ts`);
+            discoverTestFilesSpy.mockResolvedValue(files);
+            dryRunSees([inspectorTest(1, 'tests/f40.test.ts', 'x', 3), inspectorTest(2, 'tests/f07.test.ts', 'y', 1)]);
+            const runner = await dryRunWorker();
+            const normalizeSpy = spyOn(testName, 'normalizeTestFilePath');
+
+            await mutantRun(runner, []);
+
+            const normalizedForOrder = normalizeSpy.mock.calls.filter(([file]) => files.includes(file!));
+            expect(normalizedForOrder.length).toBeLessThanOrEqual(files.length);
+            // The two timed files first, cheapest first, then the rest in their old order.
+            expect(lastMutantSpawn().testFiles).toEqual(['tests/f07.test.ts', 'tests/f40.test.ts', ...files.filter(file => file !== 'tests/f07.test.ts' && file !== 'tests/f40.test.ts')]);
         });
 
         it('leaves bun to find the files when there is no list to order', async () => {

@@ -894,9 +894,10 @@ export class BunTestRunner implements TestRunner {
    * all — go last in their old order. `files` itself is not modified.
    */
     private orderCheapestFirst(files: readonly string[] | undefined): string[] | undefined {
-        const cost = (file: string): number => this.testFileDurations?.get(normalizeTestFilePath(file) ?? file) ?? Number.POSITIVE_INFINITY;
+        // Each file's cost is looked up once, not on every comparison (which would normalize its path again each time).
+        const costed = files?.map(file => ({ file, cost: this.testFileDurations?.get(normalizeTestFilePath(file) ?? file) ?? Number.POSITIVE_INFINITY }));
         // Infinity - Infinity is NaN, which a sort comparator treats as "equal".
-        return files?.toSorted((a, b) => cost(a) - cost(b));
+        return costed?.toSorted((a, b) => a.cost - b.cost).map(entry => entry.file);
     }
 
     /**
