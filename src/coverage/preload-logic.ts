@@ -6,7 +6,7 @@
  * uses these functions.
  */
 
-import { appendFileSync, closeSync, constants, createReadStream, openSync, writeSync } from 'node:fs';
+import { appendFileSync, closeSync, constants, openSync, writeSync } from 'node:fs';
 import type { Readable } from 'node:stream';
 import type { MutantCoverage } from '@stryker-mutator/api/core';
 import type { CoverageFileData, LateHitEntry } from './types.js';
@@ -462,6 +462,62 @@ function parseLifelineFd(value: string | undefined): number | undefined {
 }
 
 /**
+ * SPIKE PROTOTYPE (from the warm-worker spike, spike-warm-worker.md): the
+ * default lifeline reader. `fs.createReadStream` on the lifeline pipe costs
+ * every `bun test` child about 18 ms before its first test (bun 1.4.2, a
+ * trivial test file spawned like process-runner does: 29.3 ms with it, 11.6 ms
+ * with this reader, 11.3 ms with no lifeline at all), more than a small mutant
+ * run's own work; the benchmark fixture ran 28.7 s -> 22.8 s (median of 3).
+ * `Bun.file(fd).stream()` still sees end-of-file the moment the parent's end
+ * closes, with or without fake timers.
+ * It is wrapped in the three members of a Readable that
+ * {@link watchParentLifeline} uses. The reader is created here, so a descriptor
+ * that cannot be opened throws inside `open` and is reported as unavailable.
+ */
+function openNativeLifeline(fd: number): Readable {
+    // Through globalThis: the declaration bundle is compiled without bun's types.
+    const { Bun: bun } = globalThis as unknown as { Bun: { file: (fd: number) => { stream: () => { getReader: () => { read: () => Promise<{ done: boolean }> } } } } };
+    const reader = bun.file(fd).stream().getReader();
+    const endListeners: (() => void)[] = [];
+    const errorListeners: ((error: unknown) => void)[] = [];
+    const pump = async (): Promise<void> => {
+        for(;;) {
+            // eslint-disable-next-line no-await-in-loop -- reads are sequential by nature
+            const { done } = await reader.read();
+            if(done) {
+                for(const listener of endListeners) {
+                    listener();
+                }
+                return;
+            }
+        }
+    };
+    const lifeline = {
+        once(event: string, listener: () => void) {
+            if(event === 'end') {
+                endListeners.push(listener);
+            }
+            return lifeline;
+        },
+        on(event: string, listener: (error: unknown) => void) {
+            if(event === 'error') {
+                errorListeners.push(listener);
+            }
+            return lifeline;
+        },
+        resume() {
+            pump().catch((error: unknown) => {
+                for(const listener of errorListeners) {
+                    listener(error);
+                }
+            });
+            return lifeline;
+        },
+    };
+    return lifeline as unknown as Readable;
+}
+
+/**
  * Calls `onOrphaned` when the process that spawned this one dies, so a
  * `bun test` child never outlives the Stryker worker that started it — even
  * when that worker is killed with SIGKILL, which gives it no chance to run any
@@ -496,7 +552,7 @@ export function watchParentLifeline(deps: ParentLifelineDeps): void {
         unavailable(`${LIFELINE_FD_ENV}=${deps.fdValue ?? '(unset)'} names no lifeline descriptor`);
         return;
     }
-    const open = deps.open ?? ((lifelineFd: number) => createReadStream('', { fd: lifelineFd }));
+    const open = deps.open ?? openNativeLifeline;
     let lifeline: Readable;
     try {
         lifeline = open(fd);
