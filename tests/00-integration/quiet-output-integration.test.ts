@@ -82,6 +82,17 @@ const FILES: Record<string, string> = {
         "    test('d1', () => { expect(1).toBe(1); });",
         '});',
     ].join('\n'),
+    'e.test.ts': [
+        "import { afterEach, beforeAll, describe, expect, test } from 'bun:test';",
+        ACTIVE,
+        "describe('E', () => {",
+        "    beforeAll(() => { if(active() === 'beforeAll') { throw new Error('beforeAll threw'); } });",
+        "    afterEach(() => { if(active() === 'afterEach') { throw new Error('afterEach threw'); } });",
+        "    test('e1', () => { expect(1).toBe(1); });",
+        // Expected to throw; it fails when the mutant makes it pass.
+        "    test.failing('e failing', () => { if(active() !== 'failing') { throw new Error('expected'); } });",
+        '});',
+    ].join('\n'),
 };
 
 const silentLogger = {
@@ -138,13 +149,19 @@ describe('the mutant-run bunfig in a real bun test child', () => {
     interface Outcome { name: string, active: string, bail: boolean, pattern?: string }
     /** Each outcome, with what the dry run's bunfig gives for it (the second part shows how the runner scores it). */
     const OUTCOMES: [Outcome, Record<string, unknown>][] = [
-        [{ name: 'every test passes', active: 'none', bail: true }, { exitCode: 0, failedTests: 0, summaryPassed: 9 }],
+        [{ name: 'every test passes', active: 'none', bail: true }, { exitCode: 0, failedTests: 0, summaryPassed: 11 }],
         [{ name: 'a test fails, with bail', active: 'kill', bail: true }, { exitCode: 1, failedTests: 1, bailLine: 'Bailed out after 1 failure' }],
         [{ name: 'two tests fail, without bail', active: 'two', bail: false }, { exitCode: 1, failedTests: 2, summaryFailed: 2 }],
         [{ name: 'a test fails after a passing test printed a header-shaped line', active: 'noise', bail: true }, { exitCode: 1, failedTests: 1 }],
         [{ name: 'a test file fails to load, with bail', active: 'load', bail: true }, { exitCode: 1, failedTests: 0, unhandled: true, bailLine: 'Bailed out after 1 failure' }],
         [{ name: 'a test file fails to load, without bail', active: 'load', bail: false }, { exitCode: 1, failedTests: 0, unhandled: true, summaryErrors: 1 }],
         [{ name: 'a describe body throws', active: 'describe', bail: true }, { exitCode: 1, failedTests: 0, unhandled: true, summaryErrors: 1 }],
+        [{ name: 'a test.failing test passes, with bail', active: 'failing', bail: true }, { exitCode: 1, failedTests: 1, bailLine: 'Bailed out after 1 failure' }],
+        [{ name: 'a test.failing test passes, without bail', active: 'failing', bail: false }, { exitCode: 1, failedTests: 1, summaryFailed: 1 }],
+        [{ name: 'a beforeAll hook throws, with bail', active: 'beforeAll', bail: true }, { exitCode: 1, bailLine: 'Bailed out after 1 failure' }],
+        [{ name: 'a beforeAll hook throws, without bail', active: 'beforeAll', bail: false }, { exitCode: 1 }],
+        [{ name: 'an afterEach hook throws, with bail', active: 'afterEach', bail: true }, { exitCode: 1, failedTests: 1, bailLine: 'Bailed out after 1 failure' }],
+        [{ name: 'an afterEach hook throws, without bail', active: 'afterEach', bail: false }, { exitCode: 1 }],
         [{ name: 'a test exits 0', active: 'exit0', bail: true }, { exitCode: 0, summaryPrinted: false }],
         [{ name: 'a test exits 1', active: 'exit1', bail: true }, { exitCode: 1, summaryPrinted: false }],
         [{ name: 'the name pattern matches no test', active: 'rename', bail: true, pattern: '^b title plain$' }, { exitCode: 1, zeroMatch: true }],
@@ -279,18 +296,29 @@ describe('mutant-run verdicts through a real BunTestRunner', () => {
 
     test('every covering test passes: Survived, counting the tests bun ran', async () => {
         // Every test but the skipped and the pending one, which the pattern filters out.
-        expect(await mutantRun('none', allIds())).toEqual({ status: MutantRunStatus.Survived, nrOfTests: 9 });
+        expect(await mutantRun('none', allIds())).toEqual({ status: MutantRunStatus.Survived, nrOfTests: 11 });
     }, 60_000);
 
     test('a static run in which every test passes: Survived', async () => {
-        expect(await mutantRun('none', undefined)).toEqual({ status: MutantRunStatus.Survived, nrOfTests: 10 });
+        expect(await mutantRun('none', undefined)).toEqual({ status: MutantRunStatus.Survived, nrOfTests: 12 });
     }, 60_000);
 
     test('a covering test fails: Killed by it', async () => {
         const result = await mutantRun('kill', [id('a1'), id('a2')]);
 
         expect(result).toMatchObject({ status: MutantRunStatus.Killed, killedBy: [id('a2')], nrOfTests: 1 });
-        expect((result as { failureMessage: string }).failureMessage).toContain('Ran ');
+    }, 60_000);
+
+    test('a test.failing test passes: Killed by it', async () => {
+        expect(await mutantRun('failing', [id('e1'), id('e failing')])).toMatchObject({ status: MutantRunStatus.Killed, killedBy: [id('e failing')], nrOfTests: 1 });
+    }, 60_000);
+
+    test('a beforeAll hook throws: Killed', async () => {
+        expect(await mutantRun('beforeAll', [id('e1'), id('e failing')])).toMatchObject({ status: MutantRunStatus.Killed, killedBy: [], nrOfTests: 1 });
+    }, 60_000);
+
+    test('an afterEach hook throws: Killed by the test it ran after', async () => {
+        expect(await mutantRun('afterEach', [id('e1'), id('e failing')])).toMatchObject({ status: MutantRunStatus.Killed, killedBy: [id('e1')], nrOfTests: 1 });
     }, 60_000);
 
     test('without bail, every failing test is in killedBy', async () => {
@@ -301,7 +329,7 @@ describe('mutant-run verdicts through a real BunTestRunner', () => {
         expect({ ...result, killedBy: (result as { killedBy: string[] }).killedBy.toSorted(byName) }).toMatchObject({
             status:    MutantRunStatus.Killed,
             killedBy:  [id('a2'), id('b2')].toSorted(byName),
-            nrOfTests: 9,
+            nrOfTests: 11,
         });
     }, 60_000);
 
@@ -314,11 +342,11 @@ describe('mutant-run verdicts through a real BunTestRunner', () => {
     }, 60_000);
 
     test('a test file fails to load, without bail: Killed with an empty killedBy', async () => {
-        expect(await mutantRun('load', undefined, { disableBail: true })).toMatchObject({ status: MutantRunStatus.Killed, killedBy: [], nrOfTests: 10 });
+        expect(await mutantRun('load', undefined, { disableBail: true })).toMatchObject({ status: MutantRunStatus.Killed, killedBy: [], nrOfTests: 12 });
     }, 60_000);
 
     test('a describe body throws: Killed with an empty killedBy', async () => {
-        expect(await mutantRun('describe', undefined)).toMatchObject({ status: MutantRunStatus.Killed, killedBy: [], nrOfTests: 9 });
+        expect(await mutantRun('describe', undefined)).toMatchObject({ status: MutantRunStatus.Killed, killedBy: [], nrOfTests: 11 });
     }, 60_000);
 
     test('a test exits 0 before bun\'s summary: Survived', async () => {

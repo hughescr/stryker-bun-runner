@@ -526,8 +526,8 @@ affected more than one mutant:
 | `dryRun registry file has an unexpected version (skipped)`, `dryRun registry file is malformed (treated as absent)`, `failed to load the dryRun registry file` | a worker that never ran the dry run could not use the shared registry; it retries on every mutant |
 
 The signal and no-evidence warnings include the first 600 (signal) or 500 (no evidence) characters
-of bun's output, which in a mutant run lists no passing test (see [Mutant runs](#mutant-runs)). Run Stryker with `logLevel: 'debug'` (or `--logLevel debug`) to see every
-occurrence.
+of bun's output, which in a mutant run lists no passing test (see [Mutant runs](#mutant-runs)).
+Run Stryker with `logLevel: 'debug'` (or `--logLevel debug`) to see every occurrence.
 
 ## Temporary files
 
