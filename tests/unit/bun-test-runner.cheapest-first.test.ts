@@ -8,10 +8,10 @@
  *   (ties and files with no recorded time keep their old relative order, files
  *   with no recorded time last), so with bail a fast unit test can kill the
  *   mutant before a slow integration file even loads.
- * - A bailing run then moves its likeliest killers to the front: by dry-run
- *   coverage (the mutant's own, then its source file's), by this worker's kills
- *   of the source file's mutants, and by name. A source file whose mutant ended
- *   in Timeout or Error keeps cheapest first, as does a run without bail.
+ * - A bailing static (full-suite, no covering ids) run then moves its likeliest
+ *   killers to the front: by dry-run coverage (the mutant's own, then how many of
+ *   its source file's mutants), then by name. Targeted runs, full-suite
+ *   fallbacks and runs without bail stay cheapest first.
  * - Mutant runs never randomize: they use the sanitizer's mutant-run copy of
  *   the bunfig when the project's randomizes, and drop --randomize/--seed from
  *   bun.bunArgs. The dry run keeps both.
@@ -466,7 +466,7 @@ describe('BunTestRunner cheapest-first file order and fixed test order in mutant
     // Likely killers first
     // ---------------------------------------------------------------------
 
-    describe('a bailing mutant run hands bun its likeliest killers first', () => {
+    describe('a bailing static (full-suite) mutant run hands bun its likeliest killers first', () => {
         const LIB = '/project/src/lib.ts';
         const OTHER = '/project/src/other.ts';
         const SANDBOX_LIB = '/sandbox/src/lib.ts';
@@ -474,11 +474,23 @@ describe('BunTestRunner cheapest-first file order and fixed test order in mutant
         const CHEAPEST = [BETA, GAMMA, ALPHA];
         const durations: [string, number][] = [[ALPHA, 30], [BETA, 5], [GAMMA, 12]];
         const ALL_TESTS = [id(ALPHA, 'a1'), id(BETA, 'b1'), id(GAMMA, 'g1')];
-        /** lib.ts instrumented: mutants 7 and 8. */
-        const LIB_CODE = 'export const f = () => stryMutAct_9fa48("7") ? 0 : (stryCov_9fa48("7"), stryMutAct_9fa48("8") ? 1 : 2);';
+        /** lib.ts instrumented: mutants 7, 8 and 9. */
+        const LIB_CODE = 'export const f = () => stryMutAct_9fa48("7") ? 0 : (stryCov_9fa48("7", "8"), stryMutAct_9fa48("8") ? 1 : stryMutAct_9fa48("9") ? 2 : 3);';
 
         const killedIn = (file: string, test: string): typeof mutantOutcome => ({ exitCode: 1, stdout: '', stderr: `${file}:\n(fail) ${test} [1.00ms]\nBailed out after 1 failure\n`, timedOut: false });
-        const survived = (): typeof mutantOutcome => ({ exitCode: 0, stdout: ' 1 pass\n', stderr: '', timedOut: false });
+        const survived = (): typeof mutantOutcome => ({ exitCode: 0, stdout: ' 3 pass\n', stderr: '', timedOut: false });
+
+        /** The registry's mutantTestFiles for these per-file mutant lists. */
+        function coverageOf(byFile: Record<string, string[]>): { files: string[], mutants: Record<string, number[]> } {
+            const files = Object.keys(byFile);
+            const mutants: Record<string, number[]> = {};
+            for(const [index, file] of files.entries()) {
+                for(const mutantId of byFile[file]) {
+                    mutants[mutantId] = [...(mutants[mutantId] ?? []), index];
+                }
+            }
+            return { files, mutants };
+        }
 
         /** A worker that loads `registry` (with the standard durations) and can read these instrumented sources. */
         const LIB_SOURCES: Record<string, string> = { [SANDBOX_LIB]: LIB_CODE };
@@ -531,7 +543,7 @@ describe('BunTestRunner cheapest-first file order and fixed test order in mutant
 
                 await dryRunWorker();
 
-                expect(writtenRegistry().testFileMutants).toEqual([[ALPHA, ['7', '8']], [GAMMA, ['9']]]);
+                expect(writtenRegistry().mutantTestFiles).toEqual({ files: [ALPHA, GAMMA], mutants: { '7': [0], '8': [0], '9': [1] } });
             });
 
             it('leaves the field out without per-test coverage', async () => {
@@ -539,7 +551,7 @@ describe('BunTestRunner cheapest-first file order and fixed test order in mutant
 
                 await dryRunWorker();
 
-                expect(writtenRegistry()).not.toHaveProperty('testFileMutants');
+                expect(writtenRegistry()).not.toHaveProperty('mutantTestFiles');
             });
 
             it('uses them in its own mutant runs', async () => {
@@ -553,9 +565,17 @@ describe('BunTestRunner cheapest-first file order and fixed test order in mutant
             });
         });
 
-        describe('a full-suite (static) run', () => {
+        describe('the order', () => {
             it('runs the files that executed the mutant first, then those that executed its source file\'s other mutants, then the rest', async () => {
-                const runner = await worker({ testFileMutants: [[ALPHA, ['7']], [GAMMA, ['8']], [BETA, ['99']]] });
+                const runner = await worker({ mutantTestFiles: coverageOf({ [ALPHA]: ['7'], [GAMMA]: ['8'], [BETA]: ['99'] }) });
+
+                await runMutant(runner, '7', LIB, []);
+
+                expect(lastMutantSpawn().testFiles).toEqual([ALPHA, GAMMA, BETA]);
+            });
+
+            it('runs the file that executed more of the source file\'s mutants first', async () => {
+                const runner = await worker({ mutantTestFiles: coverageOf({ [ALPHA]: ['8', '9'], [GAMMA]: ['8'] }) });
 
                 await runMutant(runner, '7', LIB, []);
 
@@ -563,23 +583,50 @@ describe('BunTestRunner cheapest-first file order and fixed test order in mutant
             });
 
             it('keeps cheapest first within each rank', async () => {
-                const runner = await worker({ testFileMutants: [[ALPHA, ['8']], [GAMMA, ['8']]] });
+                const runner = await worker({ mutantTestFiles: coverageOf({ [ALPHA]: ['8'], [GAMMA]: ['8'] }) });
 
                 await runMutant(runner, '7', LIB, []);
 
                 expect(lastMutantSpawn().testFiles).toEqual([GAMMA, ALPHA, BETA]);
             });
 
+            it('runs the test file named after the source file first among files that rank the same', async () => {
+                const runner = await worker();
+
+                await runMutant(runner, '1', '/project/src/gamma.ts', []);
+
+                expect(lastMutantSpawn().testFiles).toEqual([GAMMA, BETA, ALPHA]);
+            });
+
             it('ranks by the mutant\'s own coverage alone when its source file cannot be read', async () => {
-                const runner = await worker({ testFileMutants: [[ALPHA, ['7']], [GAMMA, ['8']]] }, {});
+                const runner = await worker({ mutantTestFiles: coverageOf({ [ALPHA]: ['7'], [GAMMA]: ['8'] }) }, {});
 
                 await runMutant(runner, '7', LIB, []);
 
                 expect(lastMutantSpawn().testFiles).toEqual([ALPHA, BETA, GAMMA]);
             });
 
+            it('ranks by coverage when Stryker names no source file', async () => {
+                const runner = await worker({ mutantTestFiles: coverageOf({ [ALPHA]: ['7'] }) });
+
+                await mutantRun(runner, []);
+
+                expect(lastMutantSpawn().testFiles).toEqual([ALPHA, BETA, GAMMA]);
+            });
+
+            it('orders a run scoped to Stryker\'s testFiles selection (absolute sandbox paths)', async () => {
+                const cwd = process.cwd();
+                const [alpha, beta, gamma] = [ALPHA, BETA, GAMMA].map(file => path.join(cwd, file));
+                const runner = await worker({ mutantTestFiles: coverageOf({ [ALPHA]: ['7'] }), testFiles: [alpha, beta, gamma] });
+                spyOn(fsPromises, 'stat').mockResolvedValue({ isFile: () => true } as Awaited<ReturnType<typeof fsPromises.stat>>);
+
+                await runMutant(runner, '7', '/project/src/gamma.ts', [alpha, gamma, beta]);
+
+                expect(lastMutantSpawn().testFiles).toEqual([alpha, gamma, beta]);
+            });
+
             it('reads each instrumented source file once per worker', async () => {
-                const runner = await worker({ testFileMutants: [[GAMMA, ['8']]] });
+                const runner = await worker({ mutantTestFiles: coverageOf({ [GAMMA]: ['8'] }) });
 
                 await runMutant(runner, '7', LIB, []);
                 await runMutant(runner, '8', LIB, []);
@@ -589,22 +636,22 @@ describe('BunTestRunner cheapest-first file order and fixed test order in mutant
                 expect(lastMutantSpawn().testFiles).toEqual([GAMMA, BETA, ALPHA]);
             });
 
-            it('logs the change of first file at debug', async () => {
-                const runner = await worker({ testFileMutants: [[ALPHA, ['7']]] });
+            it('logs the change of first file at debug, and nothing when the first file stays', async () => {
+                const runner = await worker({ mutantTestFiles: coverageOf({ [ALPHA]: ['7'], [BETA]: ['8'] }) });
 
-                await runMutant(runner, '7', LIB, []);
+                await runMutant(runner, '8', OTHER, []);
+                expect(debugCalls('likeliest killer')).toEqual([]);
+                await runMutant(runner, '7', OTHER, []);
 
                 expect(debugCalls('likeliest killer')).toEqual([[expect.any(String), '7', ALPHA, BETA]]);
             });
 
             it.each([
-                ['not an array', { [ALPHA]: ['7'] }],
-                ['an entry that is not a pair', [[ALPHA]]],
-                ['a non-string file', [[7, ['7']]]],
-                ['ids that are not an array', [[ALPHA, '7']]],
-                ['a non-string id', [[ALPHA, [7]]]],
-            ])('ignores registry coverage that is %s, and still loads the rest of the registry', async (_label, testFileMutants) => {
-                const runner = await worker({ testFileMutants });
+                ['an array of pairs', [[ALPHA, ['7']]]],
+                ['missing its file table', { mutants: { '7': [0] } }],
+                ['an index past the file table', { files: [ALPHA], mutants: { '7': [1] } }],
+            ])('ignores registry coverage that is %s, and still loads the rest of the registry', async (_label, mutantTestFiles) => {
+                const runner = await worker({ mutantTestFiles });
 
                 await runMutant(runner, '7', LIB, []);
 
@@ -613,122 +660,55 @@ describe('BunTestRunner cheapest-first file order and fixed test order in mutant
             });
         });
 
-        describe('a targeted run', () => {
-            it('runs first the file that killed this source file\'s earlier mutants in this worker', async () => {
-                const runner = await worker();
-                await runMutant(runner, '1', LIB, ALL_TESTS, killedIn(GAMMA, 'g1'));
-                expect(lastMutantSpawn().testFiles).toEqual(CHEAPEST);
+        describe('the verdict does not depend on the order', () => {
+            it('runs every file, so a mutant every file survives is Survived', async () => {
+                const runner = await worker({ mutantTestFiles: coverageOf({ [ALPHA]: ['7'] }) });
 
-                await runMutant(runner, '2', LIB, ALL_TESTS);
+                const result = await runMutant(runner, '7', LIB, [], survived());
 
-                expect(lastMutantSpawn().testFiles).toEqual([GAMMA, BETA, ALPHA]);
+                expect(lastMutantSpawn().testFiles).toEqual([ALPHA, BETA, GAMMA]);
+                expect(new Set(lastMutantSpawn().testFiles)).toEqual(new Set(CHEAPEST));
+                expect(result).toEqual({ status: MutantRunStatus.Survived, nrOfTests: 3 });
             });
 
-            it('ranks the file with more kills first', async () => {
-                const runner = await worker();
-                await runMutant(runner, '1', LIB, ALL_TESTS, killedIn(ALPHA, 'a1'));
-                await runMutant(runner, '2', LIB, ALL_TESTS, killedIn(GAMMA, 'g1'));
-                await runMutant(runner, '3', LIB, ALL_TESTS, killedIn(ALPHA, 'a1'));
+            it('scores a kill in any file Killed', async () => {
+                const runner = await worker({ mutantTestFiles: coverageOf({ [ALPHA]: ['7'] }) });
 
-                await runMutant(runner, '4', LIB, ALL_TESTS);
+                const result = await runMutant(runner, '7', LIB, [], killedIn(BETA, 'b1'));
 
-                expect(lastMutantSpawn().testFiles).toEqual([ALPHA, GAMMA, BETA]);
-            });
-
-            it('keeps kills per source file', async () => {
-                const runner = await worker();
-                await runMutant(runner, '1', LIB, ALL_TESTS, killedIn(GAMMA, 'g1'));
-
-                await runMutant(runner, '2', OTHER, ALL_TESTS);
-
-                expect(lastMutantSpawn().testFiles).toEqual(CHEAPEST);
-            });
-
-            it('runs the test file named after the source file first when there are no kills yet', async () => {
-                const runner = await worker();
-
-                await runMutant(runner, '1', '/project/src/gamma.ts', ALL_TESTS);
-
-                expect(lastMutantSpawn().testFiles).toEqual([GAMMA, BETA, ALPHA]);
-            });
-
-            it('reorders a run of just two files', async () => {
-                const runner = await worker();
-
-                await runMutant(runner, '1', '/project/src/gamma.ts', [id(BETA, 'b1'), id(GAMMA, 'g1')]);
-
-                expect(lastMutantSpawn().testFiles).toEqual([GAMMA, BETA]);
-            });
-
-            it('ranks kills above the name', async () => {
-                const runner = await worker();
-                await runMutant(runner, '1', '/project/src/gamma.ts', ALL_TESTS, killedIn(ALPHA, 'a1'));
-
-                await runMutant(runner, '2', '/project/src/gamma.ts', ALL_TESTS);
-
-                expect(lastMutantSpawn().testFiles).toEqual([ALPHA, GAMMA, BETA]);
-            });
-
-            it('does not read the source file: every covering file executed the mutant', async () => {
-                const runner = await worker({ testFileMutants: [[GAMMA, ['8']]] });
-
-                await runMutant(runner, '7', LIB, [id(ALPHA, 'a1'), id(GAMMA, 'g1')]);
-
-                expect((mockReadFile.mock.calls as unknown[][]).filter(([file]) => file === SANDBOX_LIB)).toEqual([]);
+                expect(result).toMatchObject({ status: MutantRunStatus.Killed, killedBy: [id(BETA, 'b1')] });
             });
         });
 
-        describe('the safety rule: the baseline order wherever a reorder could change a status', () => {
-            it.each([
-                ['Timeout', { exitCode: null as unknown as number, stdout: '', stderr: '', timedOut: true }, MutantRunStatus.Timeout],
-                ['Error', { exitCode: 1, stdout: '', stderr: '', timedOut: false }, MutantRunStatus.Error],
-            ])('keeps cheapest first for a source file once one of its mutants ended in %s, kills and coverage notwithstanding', async (_label, outcome, status) => {
-                const runner = await worker({ testFileMutants: [[ALPHA, ['7', '8']], [GAMMA, ['8']]] });
-                await runMutant(runner, '1', LIB, ALL_TESTS, killedIn(GAMMA, 'g1'));
-                const unsettling = await runMutant(runner, '2', LIB, ALL_TESTS, outcome);
-                expect(unsettling.status).toBe(status);
+        describe('runs that stay cheapest first', () => {
+            it('a targeted run, without reading the source file', async () => {
+                const runner = await worker({ mutantTestFiles: coverageOf({ [ALPHA]: ['7'], [GAMMA]: ['8'] }) });
 
-                await runMutant(runner, '3', LIB, ALL_TESTS, killedIn(ALPHA, 'a1'));
+                await runMutant(runner, '7', '/project/src/alpha.ts', ALL_TESTS);
+
                 expect(lastMutantSpawn().testFiles).toEqual(CHEAPEST);
-                await runMutant(runner, '7', LIB, []);
-                expect(lastMutantSpawn().testFiles).toEqual(CHEAPEST);
+                expect((mockReadFile.mock.calls as unknown[][]).filter(([file]) => file === '/sandbox/alpha.ts')).toEqual([]);
             });
 
-            it('keeps reordering the other source files', async () => {
-                const runner = await worker();
-                await runMutant(runner, '1', LIB, ALL_TESTS, { exitCode: 1, stdout: '', stderr: '', timedOut: true });
+            it('the full-suite retry after a pattern that matched no test, sized for the covering tests only', async () => {
+                const runner = await worker({ mutantTestFiles: coverageOf({ [ALPHA]: ['7'] }) });
+                mockRunBunTests.mockClear();
 
-                await runMutant(runner, '2', '/project/src/gamma.ts', ALL_TESTS);
+                await runMutant(runner, '7', '/project/src/alpha.ts', [id(ALPHA, 'a1')], { exitCode: 1, stdout: '', stderr: 'error: regex "x" matched 0 tests. Searched 3 files', timedOut: false });
 
-                expect(lastMutantSpawn().testFiles).toEqual([GAMMA, BETA, ALPHA]);
+                const spawns = (mockRunBunTests.mock.calls as [{ testFiles?: string[], testNamePattern?: string }][]).map(([o]) => o);
+                expect(spawns).toHaveLength(2);
+                expect(spawns[1].testNamePattern).toBeUndefined();
+                expect(spawns[1].testFiles).toEqual(CHEAPEST);
             });
 
-            it('does not read an unsettled source file', async () => {
-                const runner = await worker({ testFileMutants: [[GAMMA, ['8']]] });
-                await runMutant(runner, '1', LIB, ALL_TESTS, { exitCode: 1, stdout: '', stderr: '', timedOut: true });
+            it('a run without bail: every file runs whatever the order', async () => {
+                const runner = await worker({ mutantTestFiles: coverageOf({ [ALPHA]: ['7'] }) });
 
-                await runMutant(runner, '7', LIB, []);
-
-                expect((mockReadFile.mock.calls as unknown[][]).filter(([file]) => file === SANDBOX_LIB)).toEqual([]);
-            });
-
-            it('keeps cheapest first when bail is off: every file runs whatever the order', async () => {
-                const runner = await worker({ testFileMutants: [[ALPHA, ['7']], [GAMMA, ['8']]] });
-                await runMutant(runner, '1', LIB, ALL_TESTS, killedIn(GAMMA, 'g1'), { disableBail: true });
-
-                await runMutant(runner, '7', LIB, [], survived(), { disableBail: true });
-                expect(lastMutantSpawn().testFiles).toEqual(CHEAPEST);
-                await runMutant(runner, '2', '/project/src/gamma.ts', ALL_TESTS, survived(), { disableBail: true });
-                expect(lastMutantSpawn().testFiles).toEqual(CHEAPEST);
-            });
-
-            it('keeps cheapest first when Stryker names no source file', async () => {
-                const runner = await worker({ testFileMutants: [[ALPHA, ['7']]] });
-
-                await mutantRun(runner, []);
+                await runMutant(runner, '7', '/project/src/alpha.ts', [], survived(), { disableBail: true });
 
                 expect(lastMutantSpawn().testFiles).toEqual(CHEAPEST);
-                expect(debugCalls('likeliest killer')).toEqual([]);
+                expect((mockReadFile.mock.calls as unknown[][]).filter(([file]) => file === '/sandbox/alpha.ts')).toEqual([]);
             });
         });
     });
