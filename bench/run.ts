@@ -42,13 +42,17 @@ const SHOWN_MISMATCHES = 20;
 const BUSY_WARN_PCT = 25;
 
 /**
- * Variables removed from the environment Stryker (and so every bun test worker) runs in. Agent sessions set
- * some of them, and bun then changes its output: with bun 1.4.2, AGENT, CLAUDECODE and REPL_ID switch `bun test`
- * to the quiet "AI agent" reporter that hides passing tests, and GITHUB_ACTIONS adds ::group:: annotations. A user
- * running Stryker by hand has none of them, so a benchmark taken with them set is not representative. The
- * rest are the other agent and CI markers bun's binary carries (CI_APP_ID, EAS_BUILD, TF_BUILD, ...) and the
- * usual agent and CI markers of other tools (found by probing: none of those changes bun test output, but they
- * are removed all the same). Removing a variable that was never set is a no-op.
+ * Variables removed from the environment Stryker (and so every node worker and bun test child) runs in. A user
+ * running Stryker by hand has none of them, so a benchmark taken with them set is not representative.
+ *
+ * Agent and CI markers: sessions set some, and bun then changes its output. With bun 1.4.2, AGENT, CLAUDECODE and
+ * REPL_ID switch `bun test` to the quiet "AI agent" reporter that hides passing tests, and GITHUB_ACTIONS adds
+ * ::group:: annotations. The rest are the other markers bun's binary carries (CI_APP_ID, EAS_BUILD, TF_BUILD, ...)
+ * and the usual ones of other tools (found by probing: none of those changes bun test output, but they go too).
+ *
+ * Runtime switches: the agent harness exports BUN_OPTIONS=--smol (a smaller-heap bun), NODE_OPTIONS with a heap
+ * limit, NODE_PATH and BUN_FEATURE_FLAG_*, which change how bun and node run. Removing a variable that was never set
+ * is a no-op.
  */
 const STRIPPED_ENV: ReadonlySet<string> = new Set([
     // agents
@@ -60,22 +64,43 @@ const STRIPPED_ENV: ReadonlySet<string> = new Set([
     'CI_APP_ID', 'CI_BUILD_ID', 'CI_BUILD_NUMBER', 'CI_NAME', 'BUDDY_WORKSPACE_ID', 'HARNESS_BUILD_ID',
     'APPCENTER_BUILD_ID', 'CM_BUILD_ID', 'CF_BUILD_ID', 'RELEASE_BUILD_ID', 'PROW_JOB_ID', 'CODEBUILD_BUILD_ARN',
     'BITBUCKET_BUILD_NUMBER', 'DRONE', 'NETLIFY', 'VERCEL', 'NOW_BUILDER', 'SEMAPHORE',
+    // runtime behaviour
+    'BUN_OPTIONS', 'NODE_OPTIONS', 'NODE_PATH', 'UV_THREADPOOL_SIZE', 'BUN_RUNTIME_TRANSPILER_CACHE_PATH',
 ]);
-/** Everything the Claude Code sessions set (CLAUDECODE, CLAUDE_CODE_*, ...) and the agents' own prefixes. */
-const STRIPPED_ENV_PREFIXES: readonly string[] = ['CLAUDE', 'CURSOR_', 'CODEX_', 'OPENCODE_', 'AUGMENT_', 'GEMINI_CLI'];
+/** Everything the Claude Code sessions set (CLAUDECODE, CLAUDE_CODE_*, ...), the agents' own prefixes, and bun/JSC/allocator tuning families. */
+const STRIPPED_ENV_PREFIXES: readonly string[] = [
+    'CLAUDE', 'CURSOR_', 'CODEX_', 'OPENCODE_', 'AUGMENT_', 'GEMINI_CLI',
+    'BUN_CONFIG_', 'BUN_JSC_', 'BUN_FEATURE_FLAG_', 'BUN_GC_', 'BUN_DEBUG', 'JSC_', 'MALLOC_', 'MIMALLOC_',
+];
+/**
+ * Other runtime-looking variables that are left alone because they only affect networking or where tools live;
+ * any BUN_*, NODE_*, UV_*, LD_* or DYLD_* variable that is set and neither stripped nor listed here is reported loudly.
+ */
+const BENIGN_RUNTIME_ENV: ReadonlySet<string> = new Set(['BUN_INSTALL', 'NODE_EXTRA_CA_CERTS', 'UV_NATIVE_TLS']);
+const WATCHED_ENV_PREFIXES: readonly string[] = ['BUN_', 'NODE_', 'UV_', 'LD_', 'DYLD_'];
 
-/** This process's environment minus the agent and CI markers, and the names that were removed (never the values). */
-function cleanStrykerEnv(): { env: Record<string, string | undefined>, removed: string[] } {
+function isStrippedName(name: string): boolean {
+    return STRIPPED_ENV.has(name) || STRIPPED_ENV_PREFIXES.some(prefix => name.startsWith(prefix));
+}
+
+const sortedNames = (names: readonly string[]): string[] => names.toSorted((a, b) => a.localeCompare(b));
+
+/** This process's environment minus the markers above; the names removed, and runtime-looking names left in place (never values). */
+function cleanStrykerEnv(): { env: Record<string, string | undefined>, removed: string[], left: string[] } {
     const env: Record<string, string | undefined> = {};
     const removed: string[] = [];
+    const left: string[] = [];
     for(const [name, value] of Object.entries(process.env)) {
-        if(STRIPPED_ENV.has(name) || STRIPPED_ENV_PREFIXES.some(prefix => name.startsWith(prefix))) {
+        if(isStrippedName(name)) {
             removed.push(name);
-        } else {
-            env[name] = value;
+            continue;
+        }
+        env[name] = value;
+        if(WATCHED_ENV_PREFIXES.some(prefix => name.startsWith(prefix)) && !BENIGN_RUNTIME_ENV.has(name)) {
+            left.push(name);
         }
     }
-    return { env, removed: removed.toSorted((a, b) => a.localeCompare(b)) };
+    return { env, removed: sortedNames(removed), left: sortedNames(left) };
 }
 
 const strykerEnv = cleanStrykerEnv();
@@ -158,6 +183,14 @@ interface Contamination {
     readonly stealPeakPct:           number | undefined
     readonly samples:                number
     readonly samplerMs:              number
+    /** Which processes of the run had their /proc/<pid>/environ read, and which stripped variables were found in them. */
+    readonly envCheck:               EnvCheck
+}
+
+/** Self-check of the stripped environment: `observed` lists the kinds of process inspected, `leaked` is `kind:NAME` for each stripped variable found. */
+interface EnvCheck {
+    readonly observed: readonly string[]
+    readonly leaked:   readonly string[]
 }
 
 /** A process left behind by a run: a descendant of the stryker run, or a `bun test` that is still alive. */
@@ -472,6 +505,8 @@ const PF_KTHREAD = 2 ** 21;
 const ORPHAN_GRACE_MS = 1500;
 const ORPHAN_POLL_MS = 100;
 const TOP_FOREIGN = 3;
+/** Kinds of process whose environment is inspected: stryker, a node worker, a bun test child. */
+const ENV_CHECK_KINDS = 3;
 const SHOWN_TMP_ENTRIES = 10;
 
 interface ProcEntry {
@@ -617,6 +652,7 @@ class ContaminationMonitor {
     private lastCpu:   SystemCpu | undefined;
     private stealPeak: number | undefined;
     private selfStart = 0;
+    private readonly envObserved = new Map<string, string[]>();
 
     /** Take the baseline (everything alive now is not charged to the run) and start sampling. */
     start(): void {
@@ -697,12 +733,56 @@ class ContaminationMonitor {
         }
     }
 
+    private envKind(entry: ProcEntry): string | undefined {
+        if(entry.pid === this.anchor) {
+            return 'stryker';
+        }
+        if(entry.comm === 'node') {
+            return 'node worker';
+        }
+        return entry.comm === 'bun' && commandLabel(entry.pid, entry.comm) === 'bun test' ? 'bun test' : undefined;
+    }
+
+    /**
+     * Self-check: read /proc/<pid>/environ of the stryker process, one node worker and one `bun test` child (once
+     * each per run) and record which of the variables this harness strips are in there anyway.
+     */
+    private checkEnvironment(entry: ProcEntry): void {
+        if(this.envObserved.size >= ENV_CHECK_KINDS) {
+            return;
+        }
+        const kind = this.envKind(entry);
+        if(kind === undefined || this.envObserved.has(kind)) {
+            return;
+        }
+        let text: string;
+        try {
+            text = readFileSync(`/proc/${String(entry.pid)}/environ`, 'utf8');
+        } catch{
+            return;
+        }
+        const present = new Set(text.split('\0').map(item => item.split('=', 1)[0]));
+        // An exiting process reads back as empty; every real environment here has PATH. Anything else is not an observation.
+        if(!present.has('PATH')) {
+            return;
+        }
+        this.envObserved.set(kind, strykerEnv.removed.filter(name => present.has(name)));
+    }
+
+    private envCheck(): EnvCheck {
+        return {
+            observed: [...this.envObserved.keys()],
+            leaked:   [...this.envObserved.entries()].flatMap(([kind, names]) => names.map(name => `${kind}:${name}`)),
+        };
+    }
+
     private sample(): void {
         const began = performance.now();
         const table = readProcTable();
         const live = new Set<string>();
         for(const entry of table.values()) {
             if(this.inTree(entry, table)) {
+                this.checkEnvironment(entry);
                 continue;
             }
             const key = ContaminationMonitor.keyOf(entry);
@@ -773,6 +853,7 @@ class ContaminationMonitor {
             stealPeakPct:           this.stealPeak,
             samples:                this.samples,
             samplerMs:              this.samplerMs,
+            envCheck:               this.envCheck(),
         };
     }
 
@@ -868,6 +949,14 @@ function pctText(value: number | undefined): string {
     return value === undefined ? 'n/a' : `${value.toFixed(1)}%`;
 }
 
+function envCheckField(check: EnvCheck): string {
+    if(check.leaked.length > 0) {
+        return `ENV-LEAK(${check.leaked.join(',')})`;
+    }
+    const missing = ['stryker', 'node worker', 'bun test'].filter(kind => !check.observed.includes(kind));
+    return missing.length === 0 ? 'env=clean' : `env=clean(not seen: ${missing.join(', ')})`;
+}
+
 /** The fields appended to the RUN line. */
 function contaminationFields(run: RunResult): string {
     const { contamination: c, leftovers, tmpGrowth: tmp } = run;
@@ -879,6 +968,7 @@ function contaminationFields(run: RunResult): string {
         `iowait=${pctText(c.iowaitPct)}`,
         `orphans=${String(leftovers.orphans.length)}`,
         `tmp=${signedInt(tmp.entries)}/${formatBytes(tmp.bytes)}`,
+        envCheckField(c.envCheck),
         ...c.contaminated ? ['CONTAMINATED'] : [],
     ].join(' ');
 }
@@ -1204,6 +1294,9 @@ async function benchOnce(options: Options, stamp: string, step: Step, batch: { t
         details,
     };
     printRun(result, label);
+    if(contamination.envCheck.leaked.length > 0) {
+        die(`run ${label}: variables the harness strips were found in the environment of a process of the run (${contamination.envCheck.leaked.join(', ')}); the benchmark is not running in the environment it reports.`);
+    }
     return result;
 }
 
@@ -1510,7 +1603,7 @@ function stripMaps(results: readonly RunResult[]): Record<string, unknown>[] {
 }
 
 async function writeSummary(options: Options, stamp: string, summary: Record<string, unknown>): Promise<void> {
-    const full = { ...summary, strippedEnv: strykerEnv.removed };
+    const full = { ...summary, strippedEnv: strykerEnv.removed, leftRuntimeEnv: strykerEnv.left };
     await writeFile(path.join(outDir, `${stamp}-summary.json`), `${JSON.stringify(full, null, 2)}\n`);
     if(options.json) {
         console.log(JSON.stringify(full));
@@ -1755,7 +1848,10 @@ async function main(): Promise<void> {
     const stamp = new Date().toISOString().replaceAll(/[-:]/g, '').slice(0, 15);
     await mkdir(outDir, { recursive: true });
     say(`bench: sha=${sha} fixture=${options.fixture} runs=${String(options.runs)} plugin=${pluginPath}`);
-    say(`bench: removed from the Stryker environment (agent/CI markers that change bun's output): ${describeStrippedEnv(strykerEnv.removed)}`);
+    say(`bench: removed from the Stryker environment (agent/CI markers and runtime switches): ${describeStrippedEnv(strykerEnv.removed)}`);
+    if(strykerEnv.left.length > 0) {
+        say(`bench: WARNING: runtime-looking variables are still set in the Stryker environment and may skew timings: ${strykerEnv.left.join(', ')}`);
+    }
 
     if(options.compare !== undefined) {
         await runCompare(options, stamp, sha);

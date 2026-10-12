@@ -33,17 +33,32 @@ usage for 1 s before starting it.
 
 ## The environment Stryker runs in
 
-Agent sessions set variables such as `CLAUDECODE` and `AI_AGENT`, and bun reacts to some of them: with bun 1.4.2,
-`AGENT`, `CLAUDECODE` and `REPL_ID` switch `bun test` to a quiet "AI agent" reporter that hides passing tests, and
-`GITHUB_ACTIONS` adds `::group::` annotations. A person running Stryker by hand has none of these, so the harness
-**removes agent and CI markers from the environment of the Stryker child** (and so of every `bun test` worker), on
-both sides of `--compare`: the exact names in `STRIPPED_ENV` in `run.ts` (`AGENT`, `AI_AGENT`, `CLAUDECODE`,
-`REPL_ID`, `CURSOR_TRACE_ID`, `GITHUB_ACTIONS`, `CI`, `TF_BUILD`, `EAS_BUILD`, and the other markers bun's binary
-carries for CI detection) and every variable starting with `CLAUDE`, `CURSOR_`, `CODEX_`, `OPENCODE_`, `AUGMENT_` or
-`GEMINI_CLI`. Each invocation prints the names that were actually set and removed once, right after the first
-`bench: sha=` line, and the summary JSON lists them in `strippedEnv` (names only, never values). Everything else,
-including `TMPDIR` and `PATH`, is passed through. To find out which variables change bun's output on a newer bun,
-run `bun test` on a trivial test with each candidate set and compare the output.
+Agent sessions export variables that a person running Stryker by hand does not have, and they change how the
+benchmark runs. The harness therefore **removes them from the environment of the Stryker child** (and so of every
+node worker and `bun test` child), on both sides of `--compare`:
+
+- **Agent and CI markers**, because bun reacts to some of them. With bun 1.4.2, `AGENT`, `CLAUDECODE` and `REPL_ID`
+  switch `bun test` to a quiet "AI agent" reporter that hides passing tests, and `GITHUB_ACTIONS` adds `::group::`
+  annotations. Also `AI_AGENT`, `CURSOR_TRACE_ID`, `CI`, `TF_BUILD`, `EAS_BUILD` and the other markers bun's binary
+  carries for CI detection, and every variable starting with `CLAUDE`, `CURSOR_`, `CODEX_`, `OPENCODE_`,
+  `AUGMENT_` or `GEMINI_CLI`.
+- **Runtime switches**: `BUN_OPTIONS` (the agent harness exports `--smol`, a smaller-heap bun), `NODE_OPTIONS`
+  (a heap limit), `NODE_PATH`, `UV_THREADPOOL_SIZE`, `BUN_RUNTIME_TRANSPILER_CACHE_PATH`, and the `BUN_CONFIG_*`,
+  `BUN_JSC_*`, `BUN_FEATURE_FLAG_*`, `BUN_GC_*`, `BUN_DEBUG*`, `JSC_*`, `MALLOC_*` and `MIMALLOC_*` families.
+
+The exact lists are `STRIPPED_ENV` and `STRIPPED_ENV_PREFIXES` in `run.ts`. Each invocation prints the names that
+were actually set and removed once, right after the first `bench: sha=` line, and the summary JSON lists them in
+`strippedEnv` (names only, never values). Any other `BUN_*`, `NODE_*`, `UV_*`, `LD_*` or `DYLD_*` variable that is set
+and not on the short harmless list (`BUN_INSTALL`, `NODE_EXTRA_CA_CERTS`, `UV_NATIVE_TLS`) is left alone but reported
+with `bench: WARNING: runtime-looking variables are still set ...` (and as `leftRuntimeEnv` in the JSON). Everything else
+(`PATH`, `HOME`, proxy and certificate variables, `TMPDIR`) is passed through.
+
+**Self-check.** During every run the sampler reads `/proc/<pid>/environ` of the stryker process, of one node
+worker and of one `bun test` child, and looks for any variable the harness removed. The RUN line ends in
+`env=clean` (or `env=clean(not seen: bun test)` if a kind of process never showed up while the sampler looked); if a removed variable
+is present anywhere, the line says `ENV-LEAK(bun test:BUN_OPTIONS,...)` and the harness exits 1 instead of reporting
+a number measured in a different environment than it claims. To find out which variables change bun's output on a newer
+bun, run `bun test` on a trivial test with each candidate set and compare the output.
 
 ## The lock
 
