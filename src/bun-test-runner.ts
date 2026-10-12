@@ -43,6 +43,7 @@ import type { TestInfo } from './inspector/types.js';
 import type { StrykerBunOptions } from './options.js';
 import { parseBunTestOutput, type ParsedTestResults } from './parsers/console-parser.js';
 import { runBunTests, stripAnsi, STDIO_CLOSE_GRACE_MS, type BunProcessResult } from './process-runner.js';
+import { createWorkerProfiler, mutantRunScope, profileInspectorHandlers, type RunProfile, type WorkerProfiler } from './run-profile.js';
 import { type DroppedBunfigKey, assertSupportedBunArgs, splitBunConfigArg, stripRandomizeArgs, checkBunVersion, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, mutantRunBunfigPath, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, TEST_FILE_SUFFIX_RE, discoverTestFiles, findBuildOutputTestFiles, buildTestFileArgs, MAX_TEST_FILE_ARGS_BYTES, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery, resolveRunTempDir, writePrivateFile, MutantWarnAggregator } from './utils/index.js';
 
 /**
@@ -596,6 +597,8 @@ interface MutantRunContext {
      * --test-name-pattern. See {@link BunTestRunner.resolveTestFileFilter}.
      */
     testFileScope?:    string[]
+    /** The run's timing profile; set only when profiling is on (see src/run-profile.ts). */
+    profile?:          RunProfile
 }
 
 /**
@@ -686,6 +689,8 @@ export class BunTestRunner implements TestRunner {
     private mutantRunsByStatus = emptyMutantRunCounts();
     /** Mutant runs that had covering tests but ran the full suite anyway (pattern too long, or zero-match retry). Reset with {@link mutantRunsByStatus}. */
     private fullSuiteFallbacks = 0;
+    /** Times every run when STRYKER_BUN_PROFILE names a file; undefined otherwise (see src/run-profile.ts). */
+    private readonly profiler?:           WorkerProfiler;
 
     /**
    * AbortController for whichever `dryRun`/`mutantRun` child process is
@@ -733,6 +738,7 @@ export class BunTestRunner implements TestRunner {
         // Likewise declared non-optional (Stryker defaults it to false) but absent in partial options.
         this.disableBail = (options as { disableBail?: boolean }).disableBail;
         this.mutantWarnings = new MutantWarnAggregator(logger);
+        this.profiler = createWorkerProfiler(logger);
 
         // Stryker disable next-line StringLiteral: logging message only
         this.logger.debug('BunTestRunner initialized with options: %o', {
@@ -1612,6 +1618,14 @@ export class BunTestRunner implements TestRunner {
    * not `options.timeout` (dryRunTimeoutMinutes), bounds the child.
    */
     public async dryRun(options?: DryRunOptions): Promise<DryRunResult> {
+        const profile = this.profiler?.startRun('dry');
+        const result = await this.executeDryRun(options, profile);
+        profile?.finish(result.status);
+        return result;
+    }
+
+    /** The dry run itself; split from {@link dryRun} so its many returns all reach the profile. */
+    private async executeDryRun(options: DryRunOptions | undefined, profile: RunProfile | undefined): Promise<DryRunResult> {
         const coverageAnalysis = this.resolveCoverageAnalysis(options);
         // Stryker's own `testFiles` option, when set, decides which files this dry run (and the
         // "run everything" fallbacks of later mutant runs) cover; see applyDryRunTestFiles.
@@ -1715,6 +1729,7 @@ export class BunTestRunner implements TestRunner {
                     );
                 },
                 onInspectorReady: inspectorUrlWaiter.onReady,
+                profile,
             });
 
             // 4. Wait for inspector URL with timeout (or until the child is gone)
@@ -1802,6 +1817,7 @@ export class BunTestRunner implements TestRunner {
                             info.msUnanswered, info.msSinceLastFrame, info.method, info.id
                         );
                     },
+                    ...profileInspectorHandlers(profile),
                 },
             });
 
@@ -1809,6 +1825,7 @@ export class BunTestRunner implements TestRunner {
             try {
                 await inspector.connect();
                 await inspector.send('TestReporter.enable', {});
+                profile?.mark('inspector');
                 // Stryker disable next-line StringLiteral: logging message only
                 this.logger.debug('Inspector connected and TestReporter enabled');
             } catch (error) {
@@ -2350,6 +2367,7 @@ export class BunTestRunner implements TestRunner {
         // The time budget starts now, not at spawn: Stryker's own timer is already
         // running, and the registry load / bunfig / discovery below spend from it.
         const startedAt = Date.now();
+        const profile = this.profiler?.startRun('mutant', options.activeMutant.id);
         // Stryker disable next-line StringLiteral: logging message only
         this.logger.debug('Running mutant run for mutant %s', options.activeMutant.id);
 
@@ -2439,8 +2457,10 @@ export class BunTestRunner implements TestRunner {
             deadline:          startedAt + limitMs,
             strykerTimeoutMs,
             testFileScope,
+            profile,
         }, testNamePattern, this.resolveCoveringTestFiles(filterIds));
         this.mutantRunsByStatus[result.status]++;
+        profile?.finish(result.status);
         return result;
     }
 
@@ -2517,6 +2537,7 @@ export class BunTestRunner implements TestRunner {
         // Then kept within the argv budget: see fitTestFiles.
         const ordered = this.orderCheapestFirst(ctx.testFileScope ?? (testNamePattern === undefined ? this.effectiveTestFiles : (coveringTestFiles ?? this.effectiveTestFiles)));
         const testFiles = this.fitTestFiles(ordered, ctx.testFileScope === undefined ? this.explicitTestFilesSource(process.cwd()) : 'Stryker\'s testFiles option');
+        ctx.profile?.setScope(mutantRunScope(ctx.testFileScope !== undefined, testNamePattern, ctx.coveringTestCount));
         let result;
         try {
             result = await runBunTests({
@@ -2548,6 +2569,7 @@ export class BunTestRunner implements TestRunner {
                         options.activeMutant.id
                     );
                 },
+                profile: ctx.profile,
             });
         } finally {
             // Stryker disable next-line ConditionalExpression,EqualityOperator,BlockStatement: clears the in-flight tracking so dispose() doesn't abort a stale/already-finished controller; covered by 'clears currentAbortController after mutantRun completes'
@@ -3368,6 +3390,7 @@ export class BunTestRunner implements TestRunner {
         // Summaries first: a cleanup failure below must not swallow them.
         this.logMutantRunSummary();
         this.mutantWarnings.flush();
+        this.profiler?.writeSummary();
 
         // If a dryRun/mutantRun child is still in flight when Stryker disposes
         // this runner (e.g. a hung worker being torn down), kill it rather than

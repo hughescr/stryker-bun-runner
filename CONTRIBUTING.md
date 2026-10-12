@@ -49,6 +49,23 @@ Each rule below comes from a test that failed only some of the time.
 - **Stress a new test before landing it.** Run it many times with different `--seed` values and
   under CPU load (`yes > /dev/null` a few times over). When it breaks, keep the seed.
 
+## Profiling a run
+
+To see where the wall-clock of a `stryker run` goes, set `STRYKER_BUN_PROFILE` to the absolute
+path of a file in the environment Stryker runs in, then summarise it:
+
+```bash
+STRYKER_BUN_PROFILE=/tmp/profile.jsonl bun run mutate
+bun bench/profile-summary.ts /tmp/profile.jsonl
+```
+
+Every worker appends one JSON line per dry or mutant run (its phases: `prep`, `spawn`, `startup`,
+`inspector`, `load`, `tests`, `teardown`, `stdio`, `finish`, with the marks between them) and one
+summary line when it is disposed. The script prints each phase's share of the time and its count,
+mean, p50, p95 and total by run status and scope (targeted, static, fallback, files). Unset, empty,
+`0` or `false` means off, and a value that is not an absolute path is warned about and also means
+off. Off, the runner does no timing at all. See `src/run-profile.ts` for the line formats.
+
 ## Checking orphan prevention on a machine
 
 ```bash
