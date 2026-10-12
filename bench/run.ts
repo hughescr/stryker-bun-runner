@@ -41,6 +41,53 @@ const SHOWN_MISMATCHES = 20;
 /** Start-of-run system-wide CPU busy percentage above which timings are flagged as unreliable. */
 const BUSY_WARN_PCT = 25;
 
+/**
+ * Variables removed from the environment Stryker (and so every bun test worker) runs in. Agent sessions set
+ * some of them, and bun then changes its output: with bun 1.4.2, AGENT, CLAUDECODE and REPL_ID switch `bun test`
+ * to the quiet "AI agent" reporter that hides passing tests, and GITHUB_ACTIONS adds ::group:: annotations. A user
+ * running Stryker by hand has none of them, so a benchmark taken with them set is not representative. The
+ * rest are the other agent and CI markers bun's binary carries (CI_APP_ID, EAS_BUILD, TF_BUILD, ...) and the
+ * usual agent and CI markers of other tools (found by probing: none of those changes bun test output, but they
+ * are removed all the same). Removing a variable that was never set is a no-op.
+ */
+const STRIPPED_ENV: ReadonlySet<string> = new Set([
+    // agents
+    'AGENT', 'AI_AGENT', 'CLAUDECODE', 'REPL_ID', 'CURSOR_TRACE_ID', 'GEMINI_CLI', 'CODEX_SANDBOX', 'CODEX_CI',
+    'OPENCODE', 'OPENCODE_CLIENT', 'AUGMENT_AGENT',
+    // CI
+    'CI', 'CONTINUOUS_INTEGRATION', 'BUILD_NUMBER', 'RUN_ID', 'TASK_ID', 'GITHUB_ACTIONS', 'GITHUB_RUN_ID', 'GITLAB_CI',
+    'CIRCLECI', 'TRAVIS', 'JENKINS_URL', 'BUILDKITE', 'TEAMCITY_VERSION', 'APPVEYOR', 'TF_BUILD', 'EAS_BUILD',
+    'CI_APP_ID', 'CI_BUILD_ID', 'CI_BUILD_NUMBER', 'CI_NAME', 'BUDDY_WORKSPACE_ID', 'HARNESS_BUILD_ID',
+    'APPCENTER_BUILD_ID', 'CM_BUILD_ID', 'CF_BUILD_ID', 'RELEASE_BUILD_ID', 'PROW_JOB_ID', 'CODEBUILD_BUILD_ARN',
+    'BITBUCKET_BUILD_NUMBER', 'DRONE', 'NETLIFY', 'VERCEL', 'NOW_BUILDER', 'SEMAPHORE',
+]);
+/** Everything the Claude Code sessions set (CLAUDECODE, CLAUDE_CODE_*, ...) and the agents' own prefixes. */
+const STRIPPED_ENV_PREFIXES: readonly string[] = ['CLAUDE', 'CURSOR_', 'CODEX_', 'OPENCODE_', 'AUGMENT_', 'GEMINI_CLI'];
+
+/** This process's environment minus the agent and CI markers, and the names that were removed (never the values). */
+function cleanStrykerEnv(): { env: Record<string, string | undefined>, removed: string[] } {
+    const env: Record<string, string | undefined> = {};
+    const removed: string[] = [];
+    for(const [name, value] of Object.entries(process.env)) {
+        if(STRIPPED_ENV.has(name) || STRIPPED_ENV_PREFIXES.some(prefix => name.startsWith(prefix))) {
+            removed.push(name);
+        } else {
+            env[name] = value;
+        }
+    }
+    return { env, removed: removed.toSorted((a, b) => a.localeCompare(b)) };
+}
+
+const strykerEnv = cleanStrykerEnv();
+
+/** One line naming what was removed; the CLAUDE* family is summarised (the full list is in the summary JSON). */
+function describeStrippedEnv(removed: readonly string[]): string {
+    const claude = removed.filter(name => name.startsWith('CLAUDE'));
+    const others = removed.filter(name => !name.startsWith('CLAUDE'));
+    const shown = [...others, ...claude.length > 0 ? [`CLAUDE* (${String(claude.length)} variables, incl. ${claude.includes('CLAUDECODE') ? 'CLAUDECODE' : claude[0]})`] : []];
+    return shown.length > 0 ? shown.join(', ') : 'none were set';
+}
+
 /** A run is CONTAMINATED if CPU used by processes outside the bench process tree exceeds this share of wall x CPUs. */
 const CONTAMINATED_PCT = 2;
 
@@ -1055,7 +1102,7 @@ async function runStryker(fixture: string, logPath: string, plugin: string, moni
             cwd:      fixture,
             stdio:    ['ignore', log.fd, log.fd],
             detached: true,
-            env:      { ...process.env, BENCH_PLUGIN: plugin },
+            env:      { ...strykerEnv.env, BENCH_PLUGIN: plugin },
         });
         activeChild = child;
         monitor.setAnchor(child.pid);
@@ -1463,9 +1510,10 @@ function stripMaps(results: readonly RunResult[]): Record<string, unknown>[] {
 }
 
 async function writeSummary(options: Options, stamp: string, summary: Record<string, unknown>): Promise<void> {
-    await writeFile(path.join(outDir, `${stamp}-summary.json`), `${JSON.stringify(summary, null, 2)}\n`);
+    const full = { ...summary, strippedEnv: strykerEnv.removed };
+    await writeFile(path.join(outDir, `${stamp}-summary.json`), `${JSON.stringify(full, null, 2)}\n`);
     if(options.json) {
-        console.log(JSON.stringify(summary));
+        console.log(JSON.stringify(full));
     }
 }
 
@@ -1707,6 +1755,7 @@ async function main(): Promise<void> {
     const stamp = new Date().toISOString().replaceAll(/[-:]/g, '').slice(0, 15);
     await mkdir(outDir, { recursive: true });
     say(`bench: sha=${sha} fixture=${options.fixture} runs=${String(options.runs)} plugin=${pluginPath}`);
+    say(`bench: removed from the Stryker environment (agent/CI markers that change bun's output): ${describeStrippedEnv(strykerEnv.removed)}`);
 
     if(options.compare !== undefined) {
         await runCompare(options, stamp, sha);

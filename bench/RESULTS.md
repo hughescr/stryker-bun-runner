@@ -7,3 +7,4 @@ One row per `bun run bench -- --record "<label>"`. Delta is the median wall time
 | 2026-10-12 18:48 | e305c85 | baseline (e305c85) | 5 | 28.5s | 28.1–29.5s | n/a | NO_BASELINE; RUNS DISAGREE |
 | 2026-10-12 19:17 | 43efd25 | baseline | 5 | 29.4s | 27.3–31.1s | n/a | NO_BASELINE |
 | 2026-10-12 19:21 | e3e2fa9 | killer-order 9912287 | 5 | 25.9s | 24.3–26.9s | -12.0% (-3.5s) | OK |
+| 2026-10-12 20:03 | 27309b5 vs 288921a | killer-order dd4d1b8 vs 288921a (compare ref=288921a) | 6 | 28.0s | 26.2–29.7s | -9.3% (-2.88s) vs ref, wins 6/6, p=0.031 | OK; 1 CONTAMINATED |

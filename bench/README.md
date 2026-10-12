@@ -31,6 +31,20 @@ the 3-run default (or more) before you claim a speedup, since a single run says 
 noise. Each run takes about a second longer than Stryker itself: the harness samples CPU
 usage for 1 s before starting it.
 
+## The environment Stryker runs in
+
+Agent sessions set variables such as `CLAUDECODE` and `AI_AGENT`, and bun reacts to some of them: with bun 1.4.2,
+`AGENT`, `CLAUDECODE` and `REPL_ID` switch `bun test` to a quiet "AI agent" reporter that hides passing tests, and
+`GITHUB_ACTIONS` adds `::group::` annotations. A person running Stryker by hand has none of these, so the harness
+**removes agent and CI markers from the environment of the Stryker child** (and so of every `bun test` worker), on
+both sides of `--compare`: the exact names in `STRIPPED_ENV` in `run.ts` (`AGENT`, `AI_AGENT`, `CLAUDECODE`,
+`REPL_ID`, `CURSOR_TRACE_ID`, `GITHUB_ACTIONS`, `CI`, `TF_BUILD`, `EAS_BUILD`, and the other markers bun's binary
+carries for CI detection) and every variable starting with `CLAUDE`, `CURSOR_`, `CODEX_`, `OPENCODE_`, `AUGMENT_` or
+`GEMINI_CLI`. Each invocation prints the names that were actually set and removed once, right after the first
+`bench: sha=` line, and the summary JSON lists them in `strippedEnv` (names only, never values). Everything else,
+including `TMPDIR` and `PATH`, is passed through. To find out which variables change bun's output on a newer bun,
+run `bun test` on a trivial test with each candidate set and compare the output.
+
 ## The lock
 
 Benchmark timings are only meaningful if nothing else is using the CPUs, and several agents
