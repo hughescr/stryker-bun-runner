@@ -67,7 +67,7 @@ describe('eager module imports in a real bun test child', () => {
             stdout: 'pipe',
             stderr: 'pipe',
         });
-        const [exitCode, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+        const [exitCode, stderr] = await Promise.all([child.exited, child.stderr.text()]);
         expect({ exitCode, stderr }).toMatchObject({ exitCode: 0 });
         return readFile(out, 'utf8');
     }

@@ -8,7 +8,7 @@
  * the runner spawns loads the generated preload, so from a built package it must
  * not have to transpile a TypeScript template and resolve, read and transpile a
  * second module first. This bundles both into `<outdir>/coverage-preload.js`
- * (no minification, so the `__EAGER_MODULES__` placeholder the generator
+ * (no minification, so the `__EAGER_MODULES_FILE__` placeholder the generator
  * substitutes per run survives as written). `bun:test` and `node:*` stay as imports.
  *
  * The preload therefore still runs live inside every child, uninstrumented, for the
@@ -27,7 +27,7 @@ const LOGIC_SOURCE = path.join(repoRoot, 'src/coverage/preload-logic.ts');
 /** The import specifier the template uses for the logic module; the generator fills it in for the TypeScript (source) template. */
 const LOGIC_PLACEHOLDER = '__PRELOAD_LOGIC_PATH__';
 /** The per-run value the generator substitutes into the bundle. */
-const EAGER_PLACEHOLDER = '__EAGER_MODULES__';
+const EAGER_PLACEHOLDER = '__EAGER_MODULES_FILE__';
 
 /**
  * Bundle the preload into `<outdir>/coverage-preload.js`.

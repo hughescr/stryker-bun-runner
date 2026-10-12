@@ -16,6 +16,7 @@ import {
     formatCoverageData,
     detectGapWindowBleed,
     writeCoverageToFile,
+    readEagerModules,
     guardAgainstOrphaning,
     orphanDebugLog,
     awaitRunnerReady,
@@ -67,13 +68,16 @@ interface StrykerGlobal {
     }
 }
 
-// Eager modules list — placeholder replaced at generation time with a sorted JSON array of absolute
-// paths to all source files being mutated.  Importing each module here (before any test code runs,
-// while strykerGlobal.currentTestId is undefined) ensures that all module-level top-level code is
-// executed in the "static" coverage bucket rather than the "perTest" bucket of whichever test
+// Eager modules list file — placeholder replaced at generation time with the absolute path (a JSON
+// string literal) of the file holding a sorted JSON array of absolute paths to all source files
+// being mutated, or null when there are none.  Importing each module here (before any test code
+// runs, while strykerGlobal.currentTestId is undefined) ensures that all module-level top-level code
+// is executed in the "static" coverage bucket rather than the "perTest" bucket of whichever test
 // happened to trigger the first import.  This makes coverage collection deterministic across runs.
-// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- Placeholder replaced at generation time; value is always a valid JSON array literal
-const EAGER_MODULES: string[] = __EAGER_MODULES__;
+// The list is a separate file, read in Section 3 only when collecting coverage, so the mutant runs
+// (every other child) do not parse a list whose length grows with the number of mutated files.
+// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- Placeholder replaced at generation time; value is always a JSON string literal or null
+const EAGER_MODULES_FILE: string | null = __EAGER_MODULES_FILE__;
 
 // Get environment variables
 // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
@@ -226,8 +230,11 @@ if(activeMutant) {
 // `perTest` entry of whichever test happened to trigger the import first.
 //
 // This block is skipped during mutant runs (shouldCollectCoverage is false)
-// so mutant runs do not pay the startup cost of importing every source file.
+// so mutant runs do not pay the startup cost of importing every source file,
+// or of reading the list.
 if(shouldCollectCoverage) {
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-call -- Placeholder import replaced at runtime
+    const EAGER_MODULES: string[] = await readEagerModules(EAGER_MODULES_FILE);
     for(const modPath of EAGER_MODULES) {
         try {
             // eslint-disable-next-line no-await-in-loop -- Sequential eager imports are intentional; parallel import would race on module-level side effects

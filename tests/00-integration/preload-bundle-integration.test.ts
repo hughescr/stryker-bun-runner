@@ -63,7 +63,7 @@ describe('prebuilt single-file preload (real bun child)', () => {
             expect(specifier === 'bun:test' || !/^[./]/.test(specifier)).toBe(true);
         }
         expect(code).not.toContain('__PRELOAD_LOGIC_PATH__');
-        expect(code.split('__EAGER_MODULES__')).toHaveLength(2);
+        expect(code.split('__EAGER_MODULES_FILE__')).toHaveLength(2);
     });
 
     test('collects coverage in a child when generated from the built layout and loaded as JavaScript', async () => {

@@ -7,15 +7,15 @@ type: project
 ## Key Source Files
 
 - `src/bun-test-runner.ts` — `BunTestRunner` class (implements Stryker TestRunner). Injects `commonTokens.logger` and `commonTokens.options`. Stores `options.mutate` as `mutateGlobs`. In `init()`, resolves eager modules via `resolveEagerModulesFromGlobs(mutateGlobs)` (cached as `cachedEagerModules`) and passes them to `generatePreloadScript`.
-- `src/coverage/preload-generator.ts` — `generatePreloadScript` reads `src/templates/coverage-preload.ts`, replaces `__PRELOAD_LOGIC_PATH__` and `__EAGER_MODULES__` placeholders, writes to `$TMPDIR/stryker-bun-runner/stryker-coverage-preload-$PID.ts`. Also exports `resolveEagerModulesFromGlobs` which uses `tinyglobby` to resolve `StrykerOptions.mutate` glob patterns to sorted absolute paths.
-- `src/templates/coverage-preload.ts` — Bun preload template. Key placeholders: `__PRELOAD_LOGIC_PATH__` (import path), `__EAGER_MODULES__` (JSON array of absolute file paths). The eager-import block (Section 3) runs inside `if(shouldCollectCoverage)`, after `setActiveMutant`, before `beforeEach` registration.
+- `src/coverage/preload-generator.ts` — `generatePreloadScript` reads `src/templates/coverage-preload.ts`, replaces `__PRELOAD_LOGIC_PATH__` and `__EAGER_MODULES_FILE__` placeholders, writes to `$TMPDIR/stryker-bun-runner/stryker-coverage-preload-$PID.ts` and the eager module list (JSON array) beside it at `eagerModulesFileFor(preloadPath)` (`...-$PID.eager-modules.json`, only when non-empty). Also exports `resolveEagerModulesFromGlobs` which uses `tinyglobby` to resolve `StrykerOptions.mutate` glob patterns to sorted absolute paths.
+- `src/templates/coverage-preload.ts` — Bun preload template. Key placeholders: `__PRELOAD_LOGIC_PATH__` (import path), `__EAGER_MODULES_FILE__` (JSON string path of the eager module list, or null). The eager-import block (Section 3) reads the list (`readEagerModules`) and imports it only inside `if(shouldCollectCoverage)`, so mutant runs never parse it, after `setActiveMutant`, before `beforeEach` registration.
 - `src/coverage/preload-logic.ts` — The real preload logic module (imported by the generated preload script at runtime).
 
 ## Eager Module Import Pattern (bistable coverage fix)
 
 **Why:** Module-level top-level code runs when a module is first imported. With multiple workers doing work-stealing, which test imports source module M first is nondeterministic. Without eager imports, module-level mutants land in `perTest[firstTestThatImports]` — nondeterministic, causing bistable coverage maps across runs and breaking Stryker's incremental cache.
 
-**Fix:** In the preload script (before any tests run, while `strykerGlobal.currentTestId` is undefined), `await import(modPath)` each source module listed in `EAGER_MODULES`. Module-level code then records to the `static` bucket deterministically.
+**Fix:** In the preload script (before any tests run, while `strykerGlobal.currentTestId` is undefined), `await import(modPath)` each source module listed in the eager module list file. Module-level code then records to the `static` bucket deterministically.
 
 **Source of truth:** `StrykerOptions.mutate` — exactly what Stryker instruments. Resolved via `tinyglobby.glob()` with `!`-prefixed negation patterns passed to `ignore`. Mutation-range suffixes (`:1:3-2:5`) are stripped before globbing.
 

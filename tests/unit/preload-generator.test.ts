@@ -621,7 +621,8 @@ describe('eager-import determinism guard', () => {
         // a pure reformat of the template.
         expect(templateSource).toMatch(/if\s*\(shouldCollectCoverage\)\s*\{[^}]*readEagerModules\(EAGER_MODULES_FILE\)[^}]*for\s*\(const modPath of EAGER_MODULES\)/);
         expect(templateSource).toContain('await import(modPath);');
-        expect(templateSource.match(/EAGER_MODULES_FILE/g)).toHaveLength(2);
+        // Declared once and read once: nothing outside that block touches the list.
+        expect(templateSource.match(/\bEAGER_MODULES_FILE\b/g)).toHaveLength(2);
     });
 });
 

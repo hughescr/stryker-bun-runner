@@ -521,7 +521,7 @@ occurrence.
 ## Temporary files
 
 The runner's temporary files (the coverage preload script every `bun test` child executes, the
-coverage data file, the sanitized bunfig and its mutant-run copy, and the dry-run test registry)
+list of mutated modules beside it that the dry run imports before any test, the coverage data file, the sanitized bunfig and its mutant-run copy, and the dry-run test registry)
 live in one directory per Stryker run, private to the user running Stryker:
 
 ```text

@@ -31,6 +31,7 @@ import {
     formatSyncNotReadyMessage,
     awaitRunnerReady,
     SYNC_TOKEN_ENV,
+    readEagerModules,
     type SyncReadySocket,
     type LifelineFile,
     type PreloadConfig,
@@ -1875,5 +1876,49 @@ describe('preload-logic', () => {
             // before any test files execute.
             expect(true).toBe(true);
         });
+    });
+});
+
+describe('readEagerModules', () => {
+    it('reads nothing and returns no modules when there is no list file', async () => {
+        const readJson = mock(() => Promise.resolve(['/never.ts']));
+        const warn = mock((_message: string) => {});
+
+        expect(await readEagerModules(null, { readJson, warn })).toEqual([]);
+        expect(readJson).not.toHaveBeenCalled();
+        expect(warn).not.toHaveBeenCalled();
+    });
+
+    it('returns the paths the list file holds, in order', async () => {
+        const readJson = mock((_file: string) => Promise.resolve(['/abs/b.ts', '/abs/a.ts']));
+
+        expect(await readEagerModules('/run/list.json', { readJson })).toEqual(['/abs/b.ts', '/abs/a.ts']);
+        expect(readJson).toHaveBeenCalledWith('/run/list.json');
+    });
+
+    it('reads a real list file through Bun.file by default', async () => {
+        const dir = await fs.promises.mkdtemp(path.join(tmpdir(), 'stryker-eager-list-'));
+        try {
+            const file = path.join(dir, 'list.json');
+            await Bun.write(file, JSON.stringify([String.raw`C:\src\foo.ts`, '/abs/a.ts']));
+            expect(await readEagerModules(file)).toEqual([String.raw`C:\src\foo.ts`, '/abs/a.ts']);
+        } finally {
+            await fs.promises.rm(dir, { recursive: true, force: true });
+        }
+    });
+
+    it.each([
+        ['an unreadable file', () => Promise.reject(Object.assign(new Error('no such file'), { code: 'ENOENT' })), 'ENOENT'],
+        ['a non-array', () => Promise.resolve({ a: 1 }), 'not a JSON array of module paths'],
+        ['an array holding a non-string', () => Promise.resolve(['/abs/a.ts', 3]), 'not a JSON array of module paths'],
+    ])('warns on one [Stryker] line and imports nothing for %s', async (_label, readJson, reason) => {
+        const warn = mock((_message: string) => {});
+
+        expect(await readEagerModules('/run/list.json', { readJson, warn })).toEqual([]);
+        expect(warn).toHaveBeenCalledTimes(1);
+        const [message] = warn.mock.calls[0];
+        expect(message).toStartWith('[Stryker] Could not read the eager module list /run/list.json');
+        expect(message).toContain(reason);
+        expect(message).not.toContain('\n');
     });
 });

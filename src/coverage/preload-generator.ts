@@ -183,27 +183,47 @@ export async function generatePreloadScript(
     // Falls back to empty array when not provided — coverage still works, but
     // module-level mutants may record to perTest instead of static.
     const eagerModules = options.eagerModules ?? [];
+    // The list goes in a file of its own, which only the dry run reads: every
+    // `bun test` child parses the preload, and inlined as an array literal the
+    // list cost each mutant run ~1.4 µs per mutated file (bun 1.4.2; 7 ms per
+    // child at 5,000 files) for imports only the dry run makes.
+    const eagerModulesFile = eagerModules.length > 0 ? eagerModulesFileFor(preloadPath) : null;
 
     // Replace placeholders with runtime values.
-    // JSON.stringify produces a valid TS/JS array literal and handles path escaping.
+    // JSON.stringify produces a valid JS string literal (or null) and handles path escaping.
     // The prebuilt bundle has the logic inlined, so only the source template has a logic path to fill in.
     // Replacer functions, not replacement strings: a path holding `$&`, `` $` `` or `$'` would otherwise be expanded as a pattern.
     const withLogic = preloadLogicPath === undefined ? template : template.replace('__PRELOAD_LOGIC_PATH__', () => preloadLogicPath);
-    const content = withLogic.replace('__EAGER_MODULES__', () => JSON.stringify(eagerModules));
+    const content = withLogic.replace('__EAGER_MODULES_FILE__', () => JSON.stringify(eagerModulesFile));
 
     // Write the template to the temp location
     await writePrivateFile(preloadPath, content);
+    // The dry run imports every path in the list, so it is written as privately as the preload itself.
+    if(eagerModulesFile !== null) {
+        await writePrivateFile(eagerModulesFile, JSON.stringify(eagerModules));
+    }
 
     return preloadPath;
 }
 
 /**
- * Clean up generated preload script
+ * The file holding the eager module list of the preload at `preloadPath`: beside
+ * it, in the same private directory, named after it.
+ */
+export function eagerModulesFileFor(preloadPath: string): string {
+    return `${preloadPath.replace(/\.[jt]s$/, '')}.eager-modules.json`;
+}
+
+/**
+ * Clean up generated preload script, and the eager module list beside it
  */
 export async function cleanupPreloadScript(preloadPath: string): Promise<void> {
-    try {
-        await unlink(preloadPath);
-    } catch{
-    // Ignore errors - file may not exist or may have already been deleted
+    for(const file of [preloadPath, eagerModulesFileFor(preloadPath)]) {
+        try {
+            // eslint-disable-next-line no-await-in-loop -- two unlinks; order does not matter, and each failure is ignored on its own
+            await unlink(file);
+        } catch{
+            // Ignore errors - file may not exist (no list was written) or may have already been deleted
+        }
     }
 }

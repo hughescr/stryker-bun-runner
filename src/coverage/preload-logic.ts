@@ -422,6 +422,49 @@ export function writeCoverageToFile(coverageFile: string, data: CoverageFileData
 /* eslint-enable n/no-sync -- end of writeCoverageToFile */
 
 // ============================================================================
+// Eager module list
+// ============================================================================
+
+/** Dependencies of {@link readEagerModules}; tests pass stand-ins. */
+export interface EagerModulesDeps {
+    /** Reads and parses a JSON file. Defaults to `Bun.file(file).json()`. */
+    readJson?: (file: string) => Promise<unknown>
+    /** Receives the one warning line. Defaults to `console.warn`. */
+    warn?:     (message: string) => void
+}
+
+/**
+ * The modules the dry run imports before any test runs (see the preload's eager
+ * imports), from the list file the generator wrote beside the preload, or none
+ * when it wrote none (`file` null). The list is a file of its own, not part of
+ * the preload, so the mutant runs, which never import it, never parse it either.
+ *
+ * A list that cannot be read, or is not an array of paths, imports nothing and
+ * says so on one `[Stryker]` line: module-level mutants may then be attributed
+ * to the first test that loads them instead of to static coverage.
+ */
+export async function readEagerModules(file: string | null, deps: EagerModulesDeps = {}): Promise<string[]> {
+    if(file === null) {
+        return [];
+    }
+    // Through globalThis: the declaration bundle is compiled without bun's types.
+    const readJson = deps.readJson ?? ((listFile: string) => (globalThis as unknown as { Bun: { file: (path: string) => { json: () => Promise<unknown> } } }).Bun.file(listFile).json());
+    let problem: string;
+    try {
+        const list = await readJson(file);
+        if(Array.isArray(list) && list.every(entry => typeof entry === 'string')) {
+            return list;
+        }
+        problem = 'not a JSON array of module paths';
+    } catch (error) {
+        problem = describeError(error);
+    }
+    // eslint-disable-next-line no-console -- runs inside the bun test child, whose stderr is the runner's only view of the preload
+    (deps.warn ?? console.warn)(`[Stryker] Could not read the eager module list ${file} (${problem}); importing no modules ahead of the tests, so module-level mutants may be attributed to a test instead of to static coverage`);
+    return [];
+}
+
+// ============================================================================
 // Orphan prevention: the parent lifeline
 // ============================================================================
 
