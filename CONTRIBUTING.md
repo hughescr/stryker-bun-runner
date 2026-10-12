@@ -70,6 +70,12 @@ runner's steps after the child exits (coverage read, mapping, tests built, gate,
 `0` or `false` means off, and a value that is not an absolute path is warned about and also means
 off. Off, the runner does no timing at all. See `src/run-profile.ts` for the line formats.
 
+Mutant runs hide passing tests, and bun writes nothing to stderr until the first file that fails or
+prints something (its header), or its summary. So a mutant run's `startup` runs to that point and
+holds the loading and the tests before it; in a run where nothing prints before the decisive line,
+`load` and `tests` are 0 and `file headers seen` counts only the files that printed. Compare
+`startup` + `load` + `tests` across runs.
+
 ## Checking orphan prevention on a machine
 
 ```bash

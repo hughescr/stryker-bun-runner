@@ -332,8 +332,8 @@ the runner warns once when it finds any. Details, including the command-line len
 sanitized copy of yours. Everything outside `[test]` is kept. In `[test]`, `preload`, `root`,
 `pathIgnorePatterns`, `timeout`, `smol`, `randomize` and `seed` are kept; `coverage` and
 `onlyFailures` are forced off; `retry` and `rerunEach` are dropped with a warning; anything else is
-dropped. Mutant runs never randomize the test order. Your `[test].preload` files run before the
-runner's own [preload](#terms). Details:
+dropped. Mutant runs never randomize the test order, and in them bun lists only failing tests.
+Your `[test].preload` files run before the runner's own [preload](#terms). Details:
 [the sanitized config](docs/internals.md#your-bunfigtoml-the-sanitized-config).
 
 ## How it works

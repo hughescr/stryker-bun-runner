@@ -181,7 +181,15 @@ For each mutant, Stryker tells the runner which tests covered it in the dry run.
 4. **Bails on the first failing test** unless Stryker's `disableBail` is set. Dry runs never bail.
    A bail flag in `bun.bunArgs` (`--bail`, `--bail=<N>`, `--bail <N>`) is removed: bail is
    decided by `disableBail` alone.
-5. **Runs the child** with the mutant active, under the time limit described in
+5. **Hides passing tests.** The mutant-run copy of the sanitized bunfig also sets
+   `onlyFailures = true`, so bun prints no line for a passing, skipped or `todo` test. A mutant run
+   is scored only from what still prints: the failing tests with their file headers, bun's summary
+   counts, the `Ran N tests` and `Bailed out` lines, the zero-match error, `# Unhandled error
+   between tests` blocks, and whatever the tests and the coverage preload print themselves (bun
+   prints a file's header before them too). On a 165-file suite that cuts a full run's stderr from
+   126 KB to 115 bytes and makes its `bun test` about 36 ms faster (bun 1.4.2). The dry run prints
+   every test.
+6. **Runs the child** with the mutant active, under the time limit described in
    [Timeouts](#timeouts) and Stryker's hit limit.
 
 Because mutant runs order files by kill likelihood and cost rather than in the dry run's order,
@@ -316,15 +324,18 @@ layering on top of it, so:
   `smol`, `randomize` and `seed` are forwarded; any other `[test]` key is dropped and logged at
   debug with the reason. If you need another `[test]` key forwarded, please open an issue.
 - **Forced off**: `coverage = false` and `onlyFailures = false`. A `coverageThreshold` miss makes
-  bun exit 1 even when no test fails, which would be mistaken for a mutant kill, and hiding passing
-  tests would hide results the runner needs.
+  bun exit 1 even when no test fails, which would be mistaken for a mutant kill, and the dry run
+  reads every test's result. Mutant runs set `onlyFailures = true` themselves (see below).
 - **Dropped with a warning**: `retry` and `rerunEach`. Bun then runs with no retry and no rerun.
   They re-run tests, which multiplies the cost of every mutant run and repeats test names, so a
   `killedBy` test cannot be resolved to one test; neither can improve a mutation score. A per-test
   `{ retry: N }` in test code cannot be controlled by the runner and still applies.
-- **Randomization for the dry run only**: when `randomize` or `seed` turns randomization on, the
-  runner also writes a copy for mutant runs, next to the sanitized file with `.mutant-runs.toml`
-  in place of `.toml`, with `randomize = false` and no `seed` (see [Mutant runs](#mutant-runs)).
+- **A copy for mutant runs**: next to the sanitized file, with `.mutant-runs.toml` in place of
+  `.toml`, the same except `onlyFailures = true` and, when `randomize` or `seed` turns
+  randomization on, `randomize = false` and no `seed` (see [Mutant runs](#mutant-runs)).
+  Randomization applies to the dry run only. A copy is needed because the sanitized file's
+  `onlyFailures = false` wins over a `--only-failures` flag, and bun has no flag that turns
+  randomize off.
 - **Paths**: relative `preload` (top-level and `[test]`) and `[test].root` paths are made absolute,
   anchored at the project (sandbox) directory. Bun resolves relative bunfig paths against its
   working directory, not the bunfig's location, and the sanitized file lives in the temp directory.
@@ -515,7 +526,7 @@ affected more than one mutant:
 | `dryRun registry file has an unexpected version (skipped)`, `dryRun registry file is malformed (treated as absent)`, `failed to load the dryRun registry file` | a worker that never ran the dry run could not use the shared registry; it retries on every mutant |
 
 The signal and no-evidence warnings include the first 600 (signal) or 500 (no evidence) characters
-of bun's output. Run Stryker with `logLevel: 'debug'` (or `--logLevel debug`) to see every
+of bun's output, which in a mutant run lists no passing test (see [Mutant runs](#mutant-runs)). Run Stryker with `logLevel: 'debug'` (or `--logLevel debug`) to see every
 occurrence.
 
 ## Temporary files

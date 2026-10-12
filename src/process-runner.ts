@@ -577,7 +577,8 @@ async function spawnBunTests(options: BunTestRunOptions, spawnDepth: number): Pr
     }
 
     // Override the project bunfig with a sanitized copy to prevent coverage
-    // thresholds and onlyFailures from interfering with mutation testing.
+    // thresholds and onlyFailures from interfering with mutation testing
+    // (mutant runs get its copy with onlyFailures on: see mutantRunBunfigPath).
     // NOTE: bun requires the equals form here; `--config PATH` is silently
     // ignored and PATH is then consumed as a positional test-file filter.
     // Stryker disable StringLiteral: mutating --config=/--preload/--test-name-pattern/--max-concurrency removes required flags → coverage/filter broken → Timeout

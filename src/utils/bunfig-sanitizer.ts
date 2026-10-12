@@ -5,9 +5,9 @@
  * must be carried over: every top-level key and section is preserved as-is
  * (`[loader]`, `define`, `jsx*`, `[macros]`, `[install]`, `[run]`, ...) except
  * `[test]`, which is rebuilt from an allowlist with coverage and onlyFailures
- * forced off — settings that would break mutation testing. A project that
- * randomizes the test order also gets a copy for mutant runs with randomize
- * turned off (see mutantRunBunfigPath).
+ * forced off — settings that would break mutation testing. Mutant runs use a
+ * copy that hides passing tests and never randomizes the test order (see
+ * mutantRunBunfigPath).
  */
 
 import { readFile, unlink } from 'node:fs/promises';
@@ -41,7 +41,7 @@ const IGNORED_TEST_KEY_REASONS: ReadonlyMap<string, string> = new Map([
 // [test] settings the runner forces to false, with why.
 const FORCED_FALSE_TEST_KEY_REASONS: ReadonlyMap<string, string> = new Map([
     ['coverage', 'forced to false for mutation runs: a coverageThreshold miss makes bun exit 1 even when no test fails, which would be mistaken for a mutant kill'],
-    ['onlyFailures', 'forced to false for mutation runs: hiding passing tests would hide the results the runner needs'],
+    ['onlyFailures', 'forced to false for the dry run, which reads every test\'s result; mutant runs hide passing tests themselves'],
 ]);
 
 const COVERAGE_DROP_REASON = 'dropped: coverage is disabled for mutation runs (the runner collects its own per-test coverage)';
@@ -85,12 +85,19 @@ const RANDOM_ORDER_REASON = 'kept for the dry run, but mutant runs use a copy of
 
 /**
  * Where {@link generateSanitizedBunfig} writes the copy of the sanitized bunfig
- * that mutant runs use when the project's bunfig randomizes the test order: the
- * same file name with `.mutant-runs` before the `.toml` extension. The copy
- * differs only in `[test]`: `randomize = false` and no `seed`. bun has no flag
- * that turns randomize off, so a second file is the only way; an explicit
- * `randomize = false` there also wins over a `--randomize` or `--seed` flag
- * (measured on bun 1.4.2).
+ * that mutant runs use: the same file name with `.mutant-runs` before the
+ * `.toml` extension. The copy differs only in `[test]`:
+ *
+ * - `onlyFailures = true`. Bun then prints no line for a passing, skipped or
+ *   pending test, which on a whole-suite run is nearly all of its output (a
+ *   165-file suite: 126 KB of stderr down to 115 bytes, and its `bun test`
+ *   36 ms faster); everything a mutant run is scored from still prints (see
+ *   tests/00-integration/quiet-output-integration.test.ts). Measured on bun
+ *   1.4.0 and 1.4.2, the `--only-failures` flag does nothing against the
+ *   sanitized bunfig's explicit `onlyFailures = false`, hence the copy.
+ * - When the project randomizes the order: `randomize = false` and no `seed`.
+ *   bun has no flag that turns randomize off; an explicit `randomize = false`
+ *   also wins over a `--randomize` or `--seed` flag (measured on bun 1.4.2).
  *
  * @param sanitizedPath - A path generateSanitizedBunfig returned
  */
@@ -236,10 +243,10 @@ function sanitizeTestSection(sourceTest: Record<string, unknown>, projectCwd: st
  * forwarded, `retry` and `rerunEach` are dropped, and `coverage = false` and
  * `onlyFailures = false` are forced regardless of the project's settings.
  *
- * When `[test]` randomizes the test order (`randomize = true`, or a `seed`), a
- * second file is written for mutant runs at {@link mutantRunBunfigPath}, the
- * same except `randomize = false` and no `seed`, and both keys are reported
- * with `mutantRunsOnly: true`.
+ * A second file is written for mutant runs at {@link mutantRunBunfigPath}, the
+ * same except `onlyFailures = true` and, when `[test]` randomizes the test order
+ * (`randomize = true`, or a `seed`), `randomize = false` and no `seed`; those
+ * two keys are then reported with `mutantRunsOnly: true`.
  *
  * The runner's own coverage preload is passed on the command line (`--preload`),
  * which bun runs AFTER `[test].preload` — user preloads therefore still run
@@ -253,7 +260,8 @@ function sanitizeTestSection(sourceTest: Record<string, unknown>, projectCwd: st
  *          (relative to projectCwd); `<projectCwd>/bunfig.toml` when omitted
  * @param onDropped  - Called once with every setting that was dropped or
  *          overridden, and why (empty when nothing was)
- * @returns Absolute path of the written sanitized bunfig
+ * @returns Absolute path of the written sanitized bunfig (the dry run's; its
+ *          mutant-run copy is at {@link mutantRunBunfigPath} of it)
  */
 export async function generateSanitizedBunfig(
     projectCwd: string,
@@ -291,11 +299,13 @@ export async function generateSanitizedBunfig(
     const outPath = path.join(tmpDir, `stryker-bun-runner-bunfig-${process.pid}-${Date.now()}.toml`);
     await writePrivateFile(outPath, stringify(sanitized));
 
+    // The mutant-run copy: passing tests hidden, and the order not randomized.
+    const mutantRunTest: Record<string, unknown> = { ...sanitizedTest, onlyFailures: true };
     if(randomOrderKeys.length > 0) {
-        const mutantRunTest = Object.fromEntries(Object.entries(sanitizedTest).filter(([key]) => key !== 'seed'));
+        delete mutantRunTest.seed;
         mutantRunTest.randomize = false;
-        await writePrivateFile(mutantRunBunfigPath(outPath), stringify({ ...sanitized, test: mutantRunTest }));
     }
+    await writePrivateFile(mutantRunBunfigPath(outPath), stringify({ ...sanitized, test: mutantRunTest }));
 
     return outPath;
 }

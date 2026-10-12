@@ -10682,7 +10682,7 @@ error: Message 2
         });
 
         describe('bunfigPath passed to mutant runs', () => {
-            it('should pass sanitized bunfigPath to mutantRun', async () => {
+            it('should pass the mutant-run copy of the sanitized bunfig to mutantRun', async () => {
                 mockGeneratePreloadScript.mockResolvedValue('/tmp/preload.ts');
                 mockGenerateSanitizedBunfig.mockResolvedValue('/tmp/sanitized.toml');
                 mockRunBunTests.mockResolvedValue({
@@ -10703,10 +10703,10 @@ error: Message 2
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
                 } as any);
 
-                // Verify bunfigPath is the sanitized path (coverage disabled via bunfig, not --no-coverage)
+                // The sanitized bunfig's mutant-run copy (coverage disabled via bunfig, not --no-coverage; passing tests hidden)
                 expect(mockRunBunTests).toHaveBeenCalledWith(
                     expect.objectContaining({
-                        bunfigPath: '/tmp/sanitized.toml',
+                        bunfigPath: '/tmp/sanitized.mutant-runs.toml',
                     })
                 );
             });

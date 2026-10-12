@@ -44,10 +44,16 @@ type RunMark = 'requested' | SpawnMark | 'returned';
  *
  * - `prep`: the runner's work before it spawns (registry load, pattern, file list; the sync server in a dry run)
  * - `spawn`: building argv and env, and the spawn() call itself
- * - `startup`: bun's own start, up to its first byte on stderr (its `bun test` banner)
+ * - `startup`: bun's own start, up to its first byte on stderr (the dry run's inspector banner; in a
+ *   mutant run, the start of the first output of a test file: its `bun test` banner goes to stdout)
  * - `inspector`: dry run only: waiting for the inspector URL, connecting, and `TestReporter.enable`
  * - `load`: the preloads (ours and the user's) and loading the first test file
  * - `tests`: from the first test file's header (or first TestReporter event) to the decisive line
+ *
+ * A mutant run's bun hides passing tests: its first byte on stderr is the header of the first file
+ * that fails or prints something, or its summary. There `startup` runs to that point and holds the
+ * loading and the tests before it, and a run in which nothing prints before the decisive line has
+ * no `load` or `tests` time at all.
  * - `teardown`: from the decisive line (the failing test under bail, the hit-limit report, or bun's summary) to the child's exit
  * - `stdio`: from the child's exit to its stdout and stderr closing
  * - `finish`: the runner's work after that (parsing, scoring; the dry run's drain, coverage and checks)

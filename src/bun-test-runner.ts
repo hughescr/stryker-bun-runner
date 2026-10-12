@@ -654,8 +654,9 @@ export class BunTestRunner implements TestRunner {
     /** {@link bunArgs} for mutant runs: without `--randomize`/`--seed`, which only the dry run keeps (see stripRandomizeArgs). */
     private readonly mutantBunArgs?:      string[];
     /**
-     * True when the current sanitized bunfig randomizes the test order, so mutant runs use its mutant-run
-     * copy (see mutantRunBunfigPath). Set whenever the sanitized bunfig is (re)generated, which every run does first.
+     * True when the current sanitized bunfig randomizes the test order, which its mutant-run copy (see
+     * mutantRunBunfigPath) turns off; only logged (see logRandomizeOffOnce). Set whenever the sanitized bunfig is
+     * (re)generated, which every run does first.
      */
     private sanitizedBunfigRandomizes?:   boolean;
     /** True once the "randomized order is off for mutant runs" debug line has been logged; it is shown once per runner. */
@@ -1457,7 +1458,7 @@ export class BunTestRunner implements TestRunner {
         const tempDir = this.tempDir ?? await this.ensureRunTempDir();
         let randomizes = false;
         this.sanitizedBunfigPath = await generateSanitizedBunfig(cwd, tempDir, this.sourceBunfig, (drops) => {
-            // A key dropped for mutant runs only means the sanitizer wrote a mutant-run copy.
+            // A key dropped for mutant runs only means the bunfig randomizes and its mutant-run copy does not.
             randomizes = drops.some(drop => drop.mutantRunsOnly);
             this.reportDroppedBunfigKeys(drops);
         });
@@ -2597,8 +2598,8 @@ export class BunTestRunner implements TestRunner {
         const sanitizedBunfig = (this.sanitizedBunfigPath && this.sanitizedBunfigCwd === mutantCwd)
             ? this.sanitizedBunfigPath
             : await this.ensureSanitizedBunfig();
-        // Mutant runs never randomize the test order: a bunfig that does gets its mutant-run copy.
-        const bunfigPath = this.sanitizedBunfigRandomizes ? mutantRunBunfigPath(sanitizedBunfig) : sanitizedBunfig;
+        // Mutant runs use the sanitized bunfig's mutant-run copy: it hides passing tests, and never randomizes the order.
+        const bunfigPath = mutantRunBunfigPath(sanitizedBunfig);
         this.logRandomizeOffOnce();
 
         // Reuse the sorted test-file list cached during dryRun.

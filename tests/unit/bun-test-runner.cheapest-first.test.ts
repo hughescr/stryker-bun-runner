@@ -755,21 +755,23 @@ describe('BunTestRunner cheapest-first file order and fixed test order in mutant
             expect(lastMutantSpawn().bunfigPath).toBe(bunfigSanitizer.mutantRunBunfigPath(SANITIZED));
         });
 
-        it('runs mutants with the sanitized bunfig itself when it does not randomize', async () => {
+        it('runs mutants with the mutant-run copy (it hides passing tests) when the bunfig does not randomize either', async () => {
             sanitizerReports([otherDrop]);
-            const runner = await initRunner();
+            standardSuite();
+            const runner = await dryRunWorker();
 
-            await mutantRun(runner, []);
+            await mutantRun(runner, [id(ALPHA, 'a1')]);
 
-            expect(lastMutantSpawn().bunfigPath).toBe(SANITIZED);
+            expect(dryRunSpawn().bunfigPath).toBe(SANITIZED);
+            expect(lastMutantSpawn().bunfigPath).toBe(bunfigSanitizer.mutantRunBunfigPath(SANITIZED));
         });
 
-        it('runs mutants with the sanitized bunfig itself when the sanitizer reports nothing', async () => {
+        it('runs mutants with the mutant-run copy when the sanitizer reports nothing', async () => {
             const runner = await initRunner();
 
             await mutantRun(runner, []);
 
-            expect(lastMutantSpawn().bunfigPath).toBe(SANITIZED);
+            expect(lastMutantSpawn().bunfigPath).toBe(bunfigSanitizer.mutantRunBunfigPath(SANITIZED));
         });
 
         it('follows the bunfig regenerated for a new cwd', async () => {
@@ -784,7 +786,7 @@ describe('BunTestRunner cheapest-first file order and fixed test order in mutant
             sanitizerReports([otherDrop], '/tmp/second.toml');
             await mutantRun(runner, []);
 
-            expect(lastMutantSpawn().bunfigPath).toBe('/tmp/second.toml');
+            expect(lastMutantSpawn().bunfigPath).toBe('/tmp/second.mutant-runs.toml');
             cwdSpy.mockRestore();
         });
 
