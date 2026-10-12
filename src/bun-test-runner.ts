@@ -921,11 +921,16 @@ export class BunTestRunner implements TestRunner {
    * files with no recorded duration — every file, when there are no durations at
    * all — go last in their old order. `files` itself is not modified.
    */
-    private orderCheapestFirst(files: readonly string[] | undefined): string[] | undefined {
-        // Each file's cost is looked up once, not on every comparison (which would normalize its path again each time).
-        const costed = files?.map(file => ({ file, cost: this.testFileDurations?.get(normalizeTestFilePath(file) ?? file) ?? Number.POSITIVE_INFINITY }));
+    private orderCheapestFirst(files: readonly string[] | undefined, projectFiles: ReadonlyMap<string, string> = this.projectFilesOf(files)): string[] | undefined {
+        // Each file's cost is looked up once, not on every comparison.
+        const costed = files?.map(file => ({ file, cost: this.testFileDurations?.get(projectFiles.get(file)!) ?? Number.POSITIVE_INFINITY }));
         // Infinity - Infinity is NaN, which a sort comparator treats as "equal".
         return costed?.toSorted((a, b) => a.cost - b.cost).map(entry => entry.file);
+    }
+
+    /** Each of `files` mapped to its project-relative path, normalized once, for the orderings of one mutant run to share. */
+    private projectFilesOf(files: readonly string[] | undefined): Map<string, string> {
+        return new Map((files ?? []).map(file => [file, normalizeTestFilePath(file) ?? file]));
     }
 
     /**
@@ -956,7 +961,8 @@ export class BunTestRunner implements TestRunner {
    * order, so with no signal at all the order is cheapest first.
    */
     private orderForMutantRun(files: readonly string[] | undefined, ctx: MutantRunContext): string[] | undefined {
-        const cheapest = this.orderCheapestFirst(files);
+        const projectFiles = this.projectFilesOf(files);
+        const cheapest = this.orderCheapestFirst(files, projectFiles);
         if(cheapest === undefined || cheapest.length < 2 || !this.ordersLikelyKillersFirst(ctx.options, ctx.coveringTestCount)) {
             return cheapest;
         }
@@ -964,7 +970,7 @@ export class BunTestRunner implements TestRunner {
         const mutantFiles = this.testFileCoverage?.filesCovering(mutantId);
         const isNamedAfterSource = (fileName as string | undefined) === undefined ? () => false : namedAfter(fileName);
         const rankOf = (file: string): KillerRank => {
-            const projectFile = normalizeTestFilePath(file) ?? file;
+            const projectFile = projectFiles.get(file)!;
             const sourceMutants = ctx.sourceCoverage?.get(projectFile) ?? 0;
             let coverage: KillerRank['coverage'] = 2;
             if(mutantFiles?.has(projectFile)) {
