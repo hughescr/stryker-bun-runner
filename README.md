@@ -179,7 +179,8 @@ Most projects need no config change, but these differ from 1.4:
   A hang that a fast test catches is Killed. An infinite loop stops at Stryker's hit limit and is
   Timeout, reason `Hit limit reached`. A bun crash or failed start with no failing test is Error
   (left out of the score), not Killed. A mutant that stops a test file loading is Killed (1.4
-  usually scored it Error). Incremental mode keeps the old verdict of mutants it reuses; run once
+  usually scored it Error). A mutant that makes a test, hook or module call `process.exit(0)` is
+  Error, not Survived. Incremental mode keeps the old verdict of mutants it reuses; run once
   with `--force` to re-score.
 - **The dry run is stricter.** Bun's summary, the inspector's events and the coverage records must
   agree exactly (1.4 tolerated small shortfalls), and missing per-test coverage with
@@ -357,12 +358,14 @@ More: [Mutant runs](docs/internals.md#mutant-runs), [the dry run in detail](docs
 
 - **Killed** when a test fails, or when a test file fails to load because of the mutant (bun reports
   a failure count but no failing test).
-- **Survived** when every selected test passes.
+- **Survived** when every selected test passes and bun finishes the run (prints its summary).
 - **Timeout** when the hit limit is exceeded, the time limit is reached, or `bun.maxChildRss` is
   exceeded.
 - **Error** when the run proves nothing either way: the process crashed with no failing test that
   matches a known test, could not be started, exited with an error but no failing test and no failure
-  count, or a full-suite fallback ran out of the time Stryker sized for the covering tests.
+  count, exited 0 before running every selected test (a test, hook or module called
+  `process.exit(0)`) with no failing test that matches a known test, or a full-suite fallback ran out of the time Stryker sized
+  for the covering tests. An early exit is never Survived: the tests after it never ran.
 
 The full table and the reasoning: [How results are scored](docs/internals.md#how-results-are-scored).
 
@@ -598,6 +601,7 @@ also fails; see [Inspector diagnostics](docs/internals.md#inspector-diagnostics)
 | `Mutant <id>: bun test terminated by <SIGNAL>` ... `scoring as Error rather than Killed` | The process crashed (SIGSEGV, an out-of-memory kill) without a failing test. | A few can be a real crash in your suite; many mean memory pressure: lower `concurrency`, set `bun.maxChildRss`. |
 | `Mutant <id>: could not start bun test: <error>` | Bun could not be started. | Check `bun.bunPath`, `PATH` and system limits. |
 | `Mutant <id>: bun test exited with code <N> but reported no failing test and no fail/error count` | Bun failed before running tests (a missing preload, an unreadable bunfig). | Read the output in the warning. |
+| `Mutant <id>: bun exited 0 before running every selected test` ... `scoring as Error rather than Survived` | The mutant made a test, hook or module call `process.exit(0)`, so bun stopped without its summary. | Usually nothing: the mutant changed behaviour. If many mutants do this, look for a `process.exit` in the code under test. |
 | `Mutant <id>: inconclusive timeout, scoring as Error rather than Timeout` | A full-suite fallback did not finish within the time Stryker sized for the covering tests. | Raise Stryker's `timeoutMS` or `timeoutFactor`. |
 | `Mutant <id>: --test-name-pattern matched 0 tests` | The mutant changed a test's name (often an interpolated `it.each` title); the runner retries with the full suite. | Usually nothing; spot-check that the mutant changes a title. |
 | `no exact-name registry available` or `missing from exact-name registry` | A worker could not match test ids to bun's exact names; tests whose titles contain ` > ` may have been skipped in that run. | Check for an earlier registry warning; re-run. |

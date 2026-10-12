@@ -167,8 +167,8 @@ For each mutant, Stryker tells the runner which tests covered it in the dry run.
        so when the hanging test starts matters.
    - *The exception: a mutant that crashes bun or exits the process.* If the mutant makes one file
      crash bun (a signal) or call `process.exit()`, and another file kills it, the order decides
-     which ends the run. A crash, or a non-zero exit with no failing test, is Error; an exit with
-     code 0 reads as Survived. Any order has this exposure, cheapest first included: it needs a
+     which ends the run. A crash, or an exit (with any code) with no failing test, is Error; never
+     Survived. Any order has this exposure, cheapest first included: it needs a
      mutant that drives the code under test into a crash or an exit, which a normal test never
      reaches.
 3. **Turns randomized order off.** `[test].randomize` (and `[test].seed`, or `--randomize` and
@@ -223,7 +223,9 @@ run stopped at the deadline as a normal Timeout.
 | One or more tests failed and could be matched to dry-run tests | **Killed**, `killedBy` lists them |
 | A test file failed to load: bun printed `# Unhandled error between tests` and a non-zero fail or error count (` 1 fail`, ` 1 error`, `Bailed out after 1 failure`), but no failing test | **Killed**, empty `killedBy` |
 | Tests failed but none could be matched to a dry-run test | **Killed**, empty `killedBy` (warned) |
-| Every selected test passed | **Survived** |
+| Every selected test passed: exit 0 and bun printed its summary | **Survived** |
+| Exit 0 with no summary (a test, hook or module called `process.exit(0)`), after a failing test that matches a dry-run test was reported (possible without bail) | **Killed**, `killedBy` lists the failing tests |
+| Exit 0 with no summary and no failing test that matches a dry-run test | **Error**, reason `bun exited 0 before running every selected test: ...` |
 | The active mutant exceeded Stryker's hit limit | **Timeout**, reason `Hit limit reached (count/limit)` |
 | The runner killed the child at its time limit, or for exceeding `bun.maxChildRss` | **Timeout** |
 | A full-suite fallback was killed at the limit Stryker sized for the covering tests only | **Error** (`inconclusive timeout`) |
@@ -246,6 +248,22 @@ here and not in the dry run. That is a test-isolation defect, as it would be und
 
 **Why crashes are Error.** A signal death or a failed spawn is not evidence that a test caught the
 mutant, so it scores Killed only when a failing test was reported and matched to a known test.
+
+**Why an early exit 0 is Error, not Survived.** Bun prints its summary (` N pass` through
+`Ran N tests across M files`) only after the last file has run. It does so on every run that gets
+that far, with `onlyFailures`, a `-t` pattern, `--dots`, junit and the AI-agent reporter alike, and
+the dry run already fails when the summary is missing (see
+[The completeness gate](#the-completeness-gate)). When a test, a hook or a module at load calls
+`process.exit(0)`, bun 1.4.2 exits 0 and prints nothing more, not even the count of the tests that
+already passed. So exit 0 without a summary means the selected tests after that point never ran:
+the mutant changed what the suite does, and the run is not Survived. With no failing test it is
+scored as the other early terminations are (a non-zero exit with no failing test, a signal death),
+Error, since no test is known to have failed; a failing test reported before the exit makes it
+Killed, but only when it matches a dry-run test (as for a signal death, a failing-test line that a
+test printed itself is no evidence).
+The runner checks for the summary, not its count: the count legitimately falls short of the
+selected tests (a `-t` alternative that matches nothing, skipped, pending and `.only`-filtered
+tests), while a missing summary is never part of a complete run.
 
 ## Timeouts
 
@@ -519,6 +537,7 @@ affected more than one mutant:
 | `bun test terminated by a signal, scoring as Error rather than Killed` | `Mutant <id>: bun test terminated by <SIGNAL> ... — scoring as Error rather than Killed` |
 | `could not start bun test, scoring as Error rather than Killed` | `Mutant <id>: could not start bun test: <error> — scoring as Error rather than Killed` |
 | `bun test exited non-zero with no failing test and no fail/error count, scoring as Error rather than Killed` | `Mutant <id>: bun test exited with code <N> but reported no failing test and no fail/error count — scoring as Error rather than Killed` |
+| `bun test exited 0 before printing its summary, scoring as Error rather than Survived` | `Mutant <id>: bun exited 0 before running every selected test: ... — scoring as Error rather than Survived` |
 | `inconclusive timeout, scoring as Error rather than Timeout` | `Mutant <id>: inconclusive timeout, scoring as Error rather than Timeout` |
 | `failed test names could not be resolved to dry-run test ids` | `Mutant <id>: <N> failed test name(s) could not be resolved to dry-run test ids ...` |
 | `no killing test identifiable, emitting empty killedBy` | `Mutant <id>: no killing test identifiable — emitting empty killedBy` |
@@ -526,7 +545,9 @@ affected more than one mutant:
 | `dryRun registry file has an unexpected version (skipped)`, `dryRun registry file is malformed (treated as absent)`, `failed to load the dryRun registry file` | a worker that never ran the dry run could not use the shared registry; it retries on every mutant |
 
 The signal and no-evidence warnings include the first 600 (signal) or 500 (no evidence) characters
-of bun's output, which in a mutant run lists no passing test (see [Mutant runs](#mutant-runs)).
+of bun's output, which in a mutant run lists no passing test (see [Mutant runs](#mutant-runs)). The
+early-exit warning includes the last 500 characters of its output (stdout, then stderr), which show
+where the exit happened.
 Run Stryker with `logLevel: 'debug'` (or `--logLevel debug`) to see every occurrence.
 
 ## Temporary files
