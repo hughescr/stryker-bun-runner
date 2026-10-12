@@ -117,13 +117,32 @@ For each mutant, Stryker tells the runner which tests covered it in the dry run.
    (from the dry-run registry), and passes bun only the files those tests live in. A pattern over
    100,000 UTF-8 bytes would risk the operating system's argument limits, so the runner runs the
    full suite instead.
-2. **Orders the files cheapest first.** The dry run records how long each test file took (the
-   sum of its tests' durations as bun reports them; time spent loading the file or in `beforeAll`
-   hooks is not counted) and shares it through the registry. Every mutant run hands bun its files
-   in ascending order of that time: the covering files for a targeted run, every file for a
-   full-suite run. With bail, a fast unit test usually kills the mutant before a slow integration
-   file even loads. Files with the same time keep their alphabetical order; files with no
-   recorded time go last.
+2. **Orders the files: likeliest killers first, then cheapest first.** The dry run records how
+   long each test file took (the sum of its tests' durations as bun reports them; time spent
+   loading the file or in `beforeAll` hooks is not counted) and shares it through the registry.
+   Every mutant run hands bun its files in ascending order of that time: the covering files for a
+   targeted run, every file for a full-suite run. With bail, a fast unit test usually kills the
+   mutant before a slow integration file even loads. Files with the same time keep their
+   alphabetical order; files with no recorded time go last.
+
+   A run that bails then moves the files likeliest to kill its mutant to the front, ranked by, in
+   this order (files that rank the same stay cheapest first):
+   - **Dry-run coverage**, which only a full-suite run can use: the files whose tests executed this
+     mutant, then those whose tests executed another mutant of the same source file, then the rest.
+     The dry run records which mutants each test file's tests executed (a static mutant's per-test
+     hits included) and shares it through the registry. The runner reads a source file's mutants
+     from its instrumented copy in the sandbox, once per worker. Most files of a full suite never
+     call into the mutated module, so a static mutant that dies usually dies in the first file.
+   - **Kills**: the files that killed the source file's earlier mutants in this worker, most kills
+     first. Each worker learns on its own and starts from nothing.
+   - **Name**: the test file named after the source file (`src/foo.ts`, `foo.test.ts`).
+
+   **The safety rule.** The order can change a mutant's result, not just which test `killedBy`
+   names. A mutant can fail a test in one file and hang, trip the hit limit or crash bun in
+   another, and then whichever file runs first decides between Killed and Timeout (or Error). So
+   once a mutant of a source file ends in Timeout or Error, its worker runs that source file's
+   later mutants cheapest first, whatever the ranks say. With `disableBail` every file runs anyway,
+   so the order stays cheapest first.
 3. **Turns randomized order off.** `[test].randomize` (and `[test].seed`, or `--randomize` and
    `--seed` in `bun.bunArgs`) shuffles both the file order and the test order within each file.
    The dry run keeps your setting, so order-dependent tests still show up there. Mutant runs turn
@@ -137,8 +156,9 @@ For each mutant, Stryker tells the runner which tests covered it in the dry run.
 5. **Runs the child** with the mutant active, under the time limit described in
    [Timeouts](#timeouts) and Stryker's hit limit.
 
-Because mutant runs order files by cost rather than in the dry run's order, a suite whose test
-files depend on each other's order may behave differently in mutant runs. The usual cause is a
+Because mutant runs order files by kill likelihood and cost rather than in the dry run's order,
+and two mutants' runs may order the same files differently, a suite whose test files depend on
+each other's order may behave differently in mutant runs. The usual cause is a
 `mock.module()` (or another global change) in one file that leaks into the files bun runs after
 it in the same process. Fix such leaks (restore the mock in `afterAll`, or avoid module mocks in
 files that share a process) rather than relying on file order.
