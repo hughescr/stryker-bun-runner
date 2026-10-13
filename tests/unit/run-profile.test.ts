@@ -448,6 +448,45 @@ describe('WorkerProfiler and RunProfile', () => {
         expect(run.marks[0].decisive).toBe(11);
     });
 
+    it('keeps skipping through a short chunk that has no newline in it', async () => {
+        const profile = profiler.startRun('mutant', '1');
+        profile.beginSpawn(true, undefined, undefined);
+        profile.onStderr(Buffer.from('x'.repeat(5000)));
+        // Short, so it alone would not start another skip: only the skipping state can drop it.
+        profile.onStderr(Buffer.from('tests/z'));
+        // Together with the middle chunk this would be a whole header, but both are the long line's tail.
+        profile.onStderr(Buffer.from('.test.ts:\ntests/a.test.ts:\n'));
+        profile.finish('survived');
+        const run = await onlyRun();
+        expect(run.fileHeaders).toBe(1);
+    });
+
+    it('reads the line right after an over-long one when the long line ended at a chunk boundary', async () => {
+        const profile = profiler.startRun('mutant', '1');
+        profile.beginSpawn(true, undefined, undefined);
+        clock.at(10);
+        profile.onStderr(Buffer.from('x'.repeat(5000)));
+        clock.at(11);
+        // The newline that ends the long line is this chunk's first character.
+        profile.onStderr(Buffer.from('\nRan 1 test across 1 file.\n'));
+        profile.finish('survived');
+        const run = await onlyRun();
+        expect(run.decisive).toBe('summary');
+        expect(run.marks[0].decisive).toBe(11);
+    });
+
+    it('reads every later chunk normally once an over-long line has ended', async () => {
+        const profile = profiler.startRun('mutant', '1');
+        profile.beginSpawn(true, undefined, undefined);
+        profile.onStderr(Buffer.from('x'.repeat(5000)));
+        profile.onStderr(Buffer.from('tail\ntests/a.test.ts:\n'));
+        // Its first line would be dropped as the tail of a long line if the skip had not been ended.
+        profile.onStderr(Buffer.from('tests/b.test.ts:\n'));
+        profile.finish('survived');
+        const run = await onlyRun();
+        expect(run.fileHeaders).toBe(2);
+    });
+
     it('reads a header whose line has a carriage return inside it as well as at its end', async () => {
         const profile = profiler.startRun('mutant', '1');
         profile.beginSpawn(true, undefined, undefined);
