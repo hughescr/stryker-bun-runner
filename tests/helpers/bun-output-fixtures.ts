@@ -3,9 +3,10 @@
  * stdout and stderr piped, with the AI-agent variables (CLAUDECODE, AI_AGENT, …) unset.
  * Only the absolute fixture directory is replaced with `/project`.
  *
- * Each fixture comes in four forms: with and without `FORCE_COLOR=1` (`COLOUR`/`PLAIN`), and
- * with the dry run's bunfig (`ALL`, every test printed) or the mutant-run bunfig
- * (`ONLY_FAILURES`, `[test].onlyFailures = true`). Under FORCE_COLOR bun prints
+ * A fixture's name says its form: with or without `FORCE_COLOR=1` (`COLOUR`/`PLAIN`), and with
+ * the dry run's bunfig (`ALL`, every test printed) or the mutant-run bunfig (`ONLY_FAILURES`,
+ * `[test].onlyFailures = true`). EDGE_CASES comes in all four forms, TWO_FILES in all four plus
+ * two `_BAIL` forms, and HOOKS only plain with onlyFailures. Under FORCE_COLOR bun prints
  * `✓`/`✗`/`»` for `(pass)`/`(fail)`/`(skip)` (and `✎` for a pending test) and wraps most of each
  * line in colour codes; bun prints a failing test's error report BEFORE its `(fail)` line, and a per-test
  * timeout's `^ this test timed out after Nms.` line after it.

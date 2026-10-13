@@ -192,4 +192,24 @@ describe('failureMessage boundaries', () => {
 
         expect(parse(`${report}\n(fail) f [1.00ms]\n`)).toEqual([['f', report]]);
     });
+
+    it('caps the report alone, so a note after an over-long report is kept whole and the count is the report\'s', () => {
+        const report = `error: ${'x'.repeat(MAX_FAILURE_MESSAGE_LENGTH + 50)}`;
+
+        expect(parse(`${report}\n(fail) f [1.00ms]\n  ^ this test timed out after 5ms.\n  ^ and a second note\n`)).toEqual([[
+            'f',
+            `${report.slice(0, MAX_FAILURE_MESSAGE_LENGTH)}\n… (57 more characters)\n^ this test timed out after 5ms.\n^ and a second note`,
+        ]]);
+    });
+
+    it('gives a timed-out test only its note when what came before it is other tests\' output', () => {
+        // With onlyFailures, a passing test's stderr is all that precedes a timed-out test's line.
+        expect(parse('a.test.ts:\nstderr from a passing test\n\nmore of it\n(fail) slow [20.13ms]\n  ^ this test timed out after 20ms.\n'))
+            .toEqual([['a.test.ts > slow', '^ this test timed out after 20ms.']]);
+    });
+
+    it('keeps the report before a note when it has an error heading', () => {
+        expect(parse('a.test.ts:\nnoise\nerror: boom\n(fail) f [1.00ms]\n  ^ this test timed out after 5ms.\n'))
+            .toEqual([['a.test.ts > f', 'error: boom\n^ this test timed out after 5ms.']]);
+    });
 });

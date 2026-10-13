@@ -270,23 +270,43 @@ function capFailureMessage(message: string): string {
         : message;
 }
 
+/** What bun printed for a failing test before its `(fail)` line, as {@link readFailureBlock} reads it. */
+interface FailureBlock {
+    /** The block from its code frame or error heading on (the whole block without either), trimmed; undefined when empty. */
+    text:     string | undefined
+    /** Whether the block has a code frame or an error heading: whether bun reported an error in it. */
+    reported: boolean
+}
+
 /**
- * A failing test's failureMessage, from the lines between the previous file header, test line or
- * failing test's note and its own `(fail)` line, or undefined when bun printed nothing there.
+ * Read the lines between the previous file header, test line or failing test's note and a failing
+ * test's own `(fail)` line.
  *
  * Bun prints a failing test's report BEFORE its `(fail)` line: a code frame, the error heading,
  * the expected/received diff, the stack. Without `onlyFailures` it comes right after the previous
  * test's line. With it (mutant runs) no line marks where a passing test ended, so what a passing
- * test, or the failing test itself, printed on stderr can come first; the message therefore starts
- * at the first code-frame line, or without one at the first error heading, and keeps the whole
- * block only when it has neither. GitHub Actions workflow commands are left out.
+ * test, or the failing test itself, printed on stderr can come first; the text therefore starts
+ * at the first code-frame line, or without one at the first error heading, and is the whole block
+ * only when it has neither. GitHub Actions workflow commands are left out.
  */
-function failureMessageFrom(block: readonly string[]): string | undefined {
-    const report = block.filter(line => !isWorkflowCommandLine(line));
-    const frameStart = report.findIndex(line => CODE_FRAME_LINE.test(line));
-    const start = frameStart === -1 ? report.findIndex(line => ERROR_HEADING_LINE.test(line)) : frameStart;
-    const message = report.slice(Math.max(start, 0)).join('\n').trim();
-    return message === '' ? undefined : capFailureMessage(message);
+function readFailureBlock(block: readonly string[]): FailureBlock {
+    const lines = block.filter(line => !isWorkflowCommandLine(line));
+    const frameStart = lines.findIndex(line => CODE_FRAME_LINE.test(line));
+    const start = frameStart === -1 ? lines.findIndex(line => ERROR_HEADING_LINE.test(line)) : frameStart;
+    const text = lines.slice(Math.max(start, 0)).join('\n').trim();
+    return { text: text === '' ? undefined : text, reported: start !== -1 };
+}
+
+/**
+ * A failing test's failureMessage: its block, cut to {@link MAX_FAILURE_MESSAGE_LENGTH}, then the
+ * `  ^ …` notes bun printed after its `(fail)` line, whole. A block with no error in it is output
+ * of other tests (or of this one) and gives way to the notes when there are any: a timed-out test's
+ * message is then just bun's timeout note. Undefined when there is nothing to say.
+ */
+function failureMessageFrom(block: FailureBlock, notes: readonly string[]): string | undefined {
+    const report = block.text !== undefined && (block.reported || notes.length === 0) ? capFailureMessage(block.text) : undefined;
+    const parts = report === undefined ? notes : [report, ...notes];
+    return parts.length === 0 ? undefined : parts.join('\n');
 }
 
 interface TestCounters {
@@ -304,24 +324,31 @@ interface LineReader {
     currentFile:           string | undefined
     /**
      * Where the output a failing test's error report can be in starts: the line after the last
-     * file header, test line or failing test's note (see failureMessageFrom).
+     * file header, test line or failing test's note (see readFailureBlock).
      */
     blockStart:            number
     /**
-     * The failing test whose `(fail)` line (or a note after it) is the line just read: bun prints a
-     * timeout's or a passing `.failing` test's `  ^ …` note right after that line.
+     * The failing test whose `(fail)` line (or a note after it) is the line just read, with its
+     * block and the notes read so far: bun prints a timeout's or a passing `.failing` test's
+     * `  ^ …` note right after that line.
      */
-    lastFailed:            TestResult | undefined
+    lastFailed:            { test: TestResult, block: FailureBlock, notes: string[] } | undefined
+}
+
+/** Set `test`'s failure message, leaving it unset when there is none. */
+function setFailureMessage(test: TestResult, block: FailureBlock, notes: readonly string[]): void {
+    const failureMessage = failureMessageFrom(block, notes);
+    if(failureMessage !== undefined) {
+        test.failureMessage = failureMessage;
+    }
 }
 
 /** Record a test line's test, with its failure message when it failed. */
 function recordTest(reader: LineReader, test: TestResult, index: number): void {
     if(test.status === 'failed') {
-        const failureMessage = failureMessageFrom(reader.lines.slice(reader.blockStart, index));
-        if(failureMessage !== undefined) {
-            test.failureMessage = failureMessage;
-        }
-        reader.lastFailed = test;
+        const block = readFailureBlock(reader.lines.slice(reader.blockStart, index));
+        setFailureMessage(test, block, []);
+        reader.lastFailed = { test, block, notes: [] };
     }
     reader.tests.push(test);
     reader.counters[test.status]++;
@@ -347,9 +374,9 @@ function readLine(reader: LineReader, index: number): void {
     }
 
     if(reader.lastFailed && AFTER_FAIL_NOTE_LINE.test(line)) {
-        const note = line.trim();
-        const before = reader.lastFailed.failureMessage;
-        reader.lastFailed.failureMessage = capFailureMessage(before === undefined ? note : `${before}\n${note}`);
+        const { test, block, notes } = reader.lastFailed;
+        notes.push(line.trim());
+        setFailureMessage(test, block, notes);
         reader.blockStart = index + 1;
         return;
     }

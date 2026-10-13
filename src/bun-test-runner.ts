@@ -389,7 +389,7 @@ function buildTestNameIndex(
  * a partial miss, only a total one.
  */
 // Stryker disable next-line Regex: version-coupled to bun's exact wording; see the doc comment above and mutantRun/checkRuntimeError's behavioral tests
-const ZERO_MATCH_TEST_PATTERN_RE = /matched 0 tests\./;
+export const ZERO_MATCH_TEST_PATTERN_RE = /matched 0 tests\./;
 
 /** What a failed test says when neither bun's console recap nor the inspector says why. */
 function defaultFailureMessage(testInfo: TestInfo): string {

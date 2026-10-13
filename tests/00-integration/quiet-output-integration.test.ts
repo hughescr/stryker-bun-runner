@@ -26,7 +26,7 @@ import type { StrykerOptions } from '@stryker-mutator/api/core';
 import type { Logger } from '@stryker-mutator/api/logging';
 import { DryRunStatus, MutantRunStatus, type MutantRunOptions, type MutantRunResult } from '@stryker-mutator/api/test-runner';
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test';
-import { BunTestRunner } from '../../src/bun-test-runner.js';
+import { BunTestRunner, ZERO_MATCH_TEST_PATTERN_RE } from '../../src/bun-test-runner.js';
 import { parseBunTestOutput } from '../../src/parsers/console-parser.js';
 import { killAllLiveChildren, removeSignalCleanup, runBunTests, stripAnsi, type BunProcessResult } from '../../src/process-runner.js';
 import { generateSanitizedBunfig, mutantRunBunfigPath } from '../../src/utils/bunfig-sanitizer.js';
@@ -219,7 +219,8 @@ describe('the mutant-run bunfig in a real bun test child', () => {
             summaryTodo:     parsed.summaryTodo,
             summaryErrors:   parsed.summaryErrors,
             summaryPrinted:  parsed.summaryPrinted,
-            zeroMatch:       stderr.includes('matched 0 tests.'),
+            // As the runner tests it: on the raw stderr, so a coloured fragment in a later bun shows up here.
+            zeroMatch:       ZERO_MATCH_TEST_PATTERN_RE.test(result.stderr),
             unhandled:       stderr.includes('# Unhandled error between tests'),
             ranLine:         /^Ran \d+ tests? across/m.exec(stderr)?.[0],
             bailLine:        /^Bailed out after \d+ failures?$/m.exec(stderr)?.[0],
