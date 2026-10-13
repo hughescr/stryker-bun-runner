@@ -235,6 +235,17 @@ describe('collectCoverage', () => {
             expect(await collectCoverage(tempCoverageFile)).toBeUndefined();
         });
 
+        it('should return undefined for a single line whose static record is not an object, as for several lines', async () => {
+            // Both records must be objects for the single-line fast path; a null static record
+            // fails the merge instead.
+            const malformed = JSON.stringify({ perTest: {}, 'static': null });
+            mockReadFile.mockResolvedValue(`${malformed}\n`);
+            expect(await collectCoverage(tempCoverageFile)).toBeUndefined();
+
+            mockReadFile.mockResolvedValue(`${malformed}\n${malformed}\n`);
+            expect(await collectCoverage(tempCoverageFile)).toBeUndefined();
+        });
+
         it('should read the file once when the coverage and the bleed observations are asked for together', async () => {
             mockReadFile.mockResolvedValue(`${line({ perTest: { 'f@@test-1': { '1': 1 } }, 'static': {}, lateHits: [{ testId: 'f@@test-1', mutantIds: ['2'] }] })}\n`);
 
