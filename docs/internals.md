@@ -577,13 +577,16 @@ list of mutated modules beside it that the dry run imports before any test, the 
 live in one directory per Stryker run, private to the user running Stryker:
 
 ```text
-$TMPDIR/stryker-bun-runner-<uid>-<hash>-<n>/
+$TMPDIR/stryker-bun-runner-<uid>-<space>-<pid>-<hash>-<n>/
 ```
 
 `$TMPDIR` is the OS temp directory (`os.tmpdir()`, usually `/tmp`), resolved to its real path.
-`<hash>` is derived from the Stryker sandbox directory and the Stryker main process's pid, so
-every worker of one run finds the same directory, including workers recycled by
-`maxTestRunnerReuse`, while separate runs get separate directories. The directory is created with
+`<pid>` is the Stryker main process's pid, and `<hash>` is derived from the Stryker sandbox
+directory and that pid. `<space>` says which processes that pid can refer to: on Linux it is
+derived from the boot id and the pid namespace, so containers that share a temp directory get
+different values; elsewhere it is a constant. Every worker is a direct child of the main process, so every worker of one
+run finds the same directory, including workers recycled by `maxTestRunnerReuse`, while separate
+runs, also concurrent ones in the same project, get separate directories. The directory is created with
 mode `0700` and its files with mode `0600`; a file is always created fresh (a stale file or a
 symlink at its path is removed first, never written through), and the coverage file is opened with
 `O_NOFOLLOW`.
@@ -604,10 +607,43 @@ error, `stryker-bun-runner: refusing to use temporary directory ...`, names the 
 Delete it if it is a stale run directory you trust, or set `TMPDIR` to a directory that only you and
 root control.
 
-Each worker removes its own files on `dispose()`. The directory and its `registry.json` stay
-behind: Stryker gives a worker no way to tell whether it is the last one, and a worker recycled
-mid-run still needs the registry. Each run leaves one small directory, which is safe to delete once
-the run has finished.
+### When the directory is removed
+
+Each worker removes its own files on `dispose()`, but no worker removes the directory or its
+`registry.json`, because none can tell whether it is the last one. Stryker restarts a worker (for
+`maxTestRunnerReuse`, after a timeout, or after a crash) by disposing and killing it first and only
+then forking its replacement, which loads the registry. With `concurrency: 1` no worker is alive in
+between, so a "last one out" rule would delete the registry from under the next worker. Late workers
+need it too: with checkers configured, Stryker starts more workers once checking is done.
+
+The directory is needed for exactly as long as the Stryker main process lives: only that process
+forks the run's workers, and it exits only after disposing every one of them (each worker gets 2 s
+to dispose, then is killed). So the main process removes it: Stryker's plugin loader imports the
+plugin there too, and the plugin removes the run's directory when that process exits. That includes
+an exit on Ctrl-C, since Stryker turns the signal into an ordinary exit.
+
+A run killed outright (`SIGKILL`, or a crash of the main process) runs no exit code and leaves its
+directory behind. The next Stryker run to exit removes it: on exit, the plugin also removes every
+run directory of yours whose main process no longer exists. Concurrent runs, of the same project or
+others, never remove each other's directories, because their main processes are alive. Nothing is
+removed unless it passes the same checks as a directory the runner uses (a real directory, not a
+symlink, owned by you, mode `0700`, named for your uid), and nothing at all if a directory above
+`$TMPDIR` fails the checks above. If a dead run's pid has been reused by another process, its
+directory stays until that process is gone too.
+
+Some directories are never judged, because their `<pid>` says nothing to the process that would
+judge them:
+
+- A directory with another `<space>`: one from another container sharing the temp directory, or
+  one left from before a reboot, on Linux. Its own container removes it, or the OS's temp cleaning
+  does.
+- On Linux without a readable `/proc` the runner cannot tell its own `<space>`, and removes nothing.
+- Directories left by versions of the runner that did not put the main process's pid in the name
+  (`stryker-bun-runner-<uid>-<hash>-<n>`). Nothing records whose run those were. Delete them by hand
+  once no Stryker run is going.
+
+`stryker serve` keeps directories longer: one long-lived main process runs many runs, so their
+directories are removed when the server exits.
 
 ## Child processes
 
@@ -738,8 +774,8 @@ that composes with this runner.
 ## `maxTestRunnerReuse` compatibility
 
 Stryker's [`maxTestRunnerReuse`](https://stryker-mutator.io/docs/stryker-js/configuration/#maxtestrunnerreuse-number)
-disposes and recreates the test runner (and, depending on Stryker's process pooling, the worker
-process hosting it) after a set number of runs. That is the right lever for growth in the
+disposes the test runner and kills the worker process hosting it after a set number of runs, then
+forks a new worker in its place. That is the right lever for growth in the
 long-lived Stryker worker, as opposed to the per-run `bun test` children, which are already
 isolated. The runner tolerates recycling:
 
@@ -748,7 +784,7 @@ isolated. The runner tolerates recycling:
 - A fresh runner that never ran the dry run still resolves `killedBy` names and builds exact test
   name patterns: it loads the shared dry-run registry from the run's private temp directory (see
   [Temporary files](#temporary-files)). A recycled worker is still a child of the same Stryker main
-  process, so it finds the same directory.
+  process, so it finds the same directory, and the directory stays until that process exits.
 
 ```javascript
 // stryker.conf.mjs

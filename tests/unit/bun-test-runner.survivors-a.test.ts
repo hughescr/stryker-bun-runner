@@ -39,7 +39,7 @@ import { mockRename, mockWriteFile, resetAllMocks } from '../test-preload.js';
  */
 function expectedRunTempDir(cwd: string = process.cwd(), ppid: number = process.ppid, baseDir: string = tmpdir()): string {
     const hash = createHash('sha256').update(`${cwd}:${ppid}`).digest('hex').slice(0, 16);
-    return path.join(baseDir, `stryker-bun-runner-${process.getuid!()}-${hash}-0`);
+    return path.join(baseDir, `stryker-bun-runner-${process.getuid!()}-${privateTempDir.pidSpace().tag}-${ppid}-${hash}-0`);
 }
 
 /**

@@ -35,7 +35,7 @@ import { mockRename, mockWriteFile, resetAllMocks } from '../test-preload.js';
 
 function expectedRunTempDir(): string {
     const hash = createHash('sha256').update(`${process.cwd()}:${process.ppid}`).digest('hex').slice(0, 16);
-    return path.join(tmpdir(), `stryker-bun-runner-${process.getuid!()}-${hash}-0`);
+    return path.join(tmpdir(), `stryker-bun-runner-${process.getuid!()}-${privateTempDir.pidSpace().tag}-${process.ppid}-${hash}-0`);
 }
 
 const ALPHA = 'tests/alpha.test.ts';

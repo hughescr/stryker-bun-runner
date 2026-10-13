@@ -50,7 +50,7 @@ import { mockReadFile, mockRename, mockWriteFile, resetAllMocks } from '../test-
 /** The run's private temp directory, derived independently (see survivors-a's copy of this helper). */
 function expectedRunTempDir(cwd: string = process.cwd(), ppid: number = process.ppid): string {
     const hash = createHash('sha256').update(`${cwd}:${ppid}`).digest('hex').slice(0, 16);
-    return path.join(tmpdir(), `stryker-bun-runner-${process.getuid!()}-${hash}-0`);
+    return path.join(tmpdir(), `stryker-bun-runner-${process.getuid!()}-${privateTempDir.pidSpace().tag}-${ppid}-${hash}-0`);
 }
 
 const REGISTRY_PATH = (): string => path.join(expectedRunTempDir(), 'registry.json');

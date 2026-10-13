@@ -55,7 +55,7 @@ const realFindDryRunDataLoss = dryRunCompleteness.findDryRunDataLoss;
  */
 function expectedRunTempDir(cwd: string = process.cwd(), ppid: number = process.ppid, baseDir: string = tmpdir()): string {
     const hash = createHash('sha256').update(`${cwd}:${ppid}`).digest('hex').slice(0, 16);
-    return path.join(baseDir, `stryker-bun-runner-${process.getuid!()}-${hash}-0`);
+    return path.join(baseDir, `stryker-bun-runner-${process.getuid!()}-${privateTempDir.pidSpace().tag}-${ppid}-${hash}-0`);
 }
 
 // The real resolveRunTempDir, captured before any spy replaces the namespace export, so
@@ -83,9 +83,9 @@ function setPpid(value: number): void {
 }
 
 /** Matches any (uid, cwd, ppid, slot) registry file path — used where the exact hash doesn't matter. */
-const REGISTRY_FILE_RE = /stryker-bun-runner-\d+-[0-9a-f]{16}-\d+\/registry\.json$/;
+const REGISTRY_FILE_RE = /stryker-bun-runner-\d+-[0-9a-f]{8}-\d+-[0-9a-f]{16}-\d+\/registry\.json$/;
 /** Matches any (uid, cwd, ppid, slot) registry .tmp file path — used where the exact hash doesn't matter. */
-const REGISTRY_TMP_FILE_RE = /stryker-bun-runner-\d+-[0-9a-f]{16}-\d+\/registry\.json\.tmp$/;
+const REGISTRY_TMP_FILE_RE = /stryker-bun-runner-\d+-[0-9a-f]{8}-\d+-[0-9a-f]{16}-\d+\/registry\.json\.tmp$/;
 
 describe('BunTestRunner', () => {
     let mockLogger: Logger;
@@ -4328,7 +4328,7 @@ tests/example.test.ts:
                 expect(result.status).toBe(DryRunStatus.Error);
                 if(result.status === DryRunStatus.Error) {
                     // Names the file it looked for, the consequence, and the likely causes.
-                    expect(result.errorMessage).toMatch(/stryker-bun-runner-\d+-[0-9a-f]{16}-\d+\/coverage-\d+\.json/);
+                    expect(result.errorMessage).toMatch(/stryker-bun-runner-\d+-[0-9a-f]{8}-\d+-[0-9a-f]{16}-\d+\/coverage-\d+\.json/);
                     expect(result.errorMessage).toContain('full test suite for every mutant');
                     expect(result.errorMessage).toContain('preload');
                     expect(result.errorMessage).toContain('not writable');
@@ -8341,7 +8341,7 @@ tests/example.test.ts:
                 return renameCall![1] as string;
             }
 
-            it('derives registry.json inside tmpdir()/stryker-bun-runner-<uid>-<sha256(cwd + ":" + ppid) sliced to 16 hex chars>-<slot>', async () => {
+            it('derives registry.json inside tmpdir()/stryker-bun-runner-<uid>-<pid space>-<ppid>-<sha256(cwd + ":" + ppid) sliced to 16 hex chars>-<slot>', async () => {
                 const actual = await runDryRunAndGetRegistryPath();
                 expect(actual).toBe(expectedRegistryPath());
             });

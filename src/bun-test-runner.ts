@@ -828,16 +828,17 @@ export class BunTestRunner implements TestRunner {
      * Single source of truth for the registry file name.
      *
      * Lives in the OS temp directory, not cwd: under Stryker's --inPlace mode
-     * cwd IS the user's real project root, and writing there would both
-     * pollute the user's project and never get cleaned up (dispose()
-     * deliberately never unlinks the registry itself — see its doc comment).
-     * The temp directory is OS-managed instead. Specifically it is the run's
+     * cwd IS the user's real project root, and writing there would pollute
+     * the user's project. No worker removes it (dispose() deliberately never
+     * unlinks the registry itself — see its doc comment); the run's Stryker
+     * main process removes the whole directory when it exits
+     * (removeRunTempDirsOnExit). Specifically it is the run's
      * private directory (src/utils/private-temp-dir.ts): owned by the current
      * user, mode 0700, re-resolved (and so re-verified) before every write and
      * before the lazy load, so another local user can neither plant nor read a
      * registry.
      *
-     * Keyed by sha256(cwd + ':' + ppid) (plus the uid, in the directory name): every worker process Stryker spawns
+     * Keyed by sha256(cwd + ':' + ppid) (plus the uid, the pid space and the ppid, in the directory name): every worker process Stryker spawns
      * for one run is a direct child of that run's single Stryker main
      * process, so all of them share BOTH process.cwd() (the sandbox
      * directory) AND process.ppid (the main process's pid) — and therefore
@@ -3634,16 +3635,6 @@ export class BunTestRunner implements TestRunner {
     }
 
     /**
-   * Cleanup resources
-   *
-   * Removes only this worker's own files. The registry, and so the run's private
-   * temp directory holding it, is deliberately left in place: Stryker gives a
-   * worker no signal that it is the last one, and maxTestRunnerReuse /
-   * crash recovery dispose a worker mid-run and start a fresh process that must
-   * still find the registry (with concurrency 1, the disposing worker IS the
-   * only one, so a "last one out" check would delete it from under its successor).
-   */
-    /**
      * Append the worker's profile summary, if profiling. Profiling is diagnostic
      * only: a summary that throws is warned about, never allowed to stop
      * dispose() from stopping the child and cleaning up.
@@ -3656,6 +3647,18 @@ export class BunTestRunner implements TestRunner {
         }
     }
 
+    /**
+     * Cleanup resources
+     *
+     * Removes only this worker's own files. The registry, and so the run's private
+     * temp directory holding it, is deliberately left in place: Stryker gives a
+     * worker no signal that it is the last one, and maxTestRunnerReuse, timeouts
+     * and crash recovery dispose (and kill) a worker before forking the fresh
+     * process that replaces it, which must still find the registry (with
+     * concurrency 1 no worker is alive in between, so a "last one out" check would
+     * delete it from under its successor). The run's Stryker main process removes
+     * the directory when it exits (removeRunTempDirsOnExit, src/index.ts).
+     */
     public async dispose(): Promise<void> {
         // Stryker disable next-line StringLiteral: logging message only
         this.logger.debug('Disposing BunTestRunner');

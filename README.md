@@ -637,7 +637,8 @@ also fails; see [Inspector diagnostics](docs/internals.md#inspector-diagnostics)
 - [The dry run in detail](docs/internals.md#the-dry-run-in-detail): the start and drain handshakes,
   the completeness gate, coverage checks
 - [Log output](docs/internals.md#log-output): start and end summaries, repeated warnings
-- [Temporary files](docs/internals.md#temporary-files): the private per-run directory
+- [Temporary files](docs/internals.md#temporary-files): the private per-run directory, removed when
+  the run ends
 - [Child processes](docs/internals.md#child-processes): process groups, orphan prevention,
   recursion containment
 - [Memory](docs/internals.md#memory) and

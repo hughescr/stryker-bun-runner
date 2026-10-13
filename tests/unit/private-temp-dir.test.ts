@@ -12,16 +12,24 @@
  */
 
 /* eslint-disable no-bitwise, sonarjs/file-permissions -- these tests read mode bitmasks and deliberately plant directories with unsafe permissions */
+/* eslint-disable n/no-sync -- the exit cleanup under test is synchronous, and so are its fixtures */
 
 import { createHash } from 'node:crypto';
+import { EventEmitter } from 'node:events';
+import { chmodSync, chownSync, lstatSync, mkdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import * as fsPromises from 'node:fs/promises';
 import * as os from 'node:os';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import {
+    computePidSpace,
     currentUid,
     ensurePrivateDir,
+    pidSpace,
+    processExists,
+    removeFinishedRunTempDirs,
+    removeRunTempDirsOnExit,
     resolveRunTempDir,
     runTempDirPrefix,
     RUN_TEMP_DIR_SLOTS,
@@ -110,14 +118,19 @@ describe('private-temp-dir', () => {
     });
 
     describe('runTempDirPrefix', () => {
-        it('names the directory stryker-bun-runner-<uid>-<sha256(cwd:ppid) first 16 hex chars> under the base dir', () => {
-            expect(runTempDirPrefix({ baseDir: root, cwd: '/sandbox/one', ppid: 4242, uid: 501 }))
-                .toBe(path.join(root, `stryker-bun-runner-501-${hash16('/sandbox/one:4242')}`));
+        it('names the directory stryker-bun-runner-<uid>-<pid space>-<ppid>-<sha256(cwd:ppid) first 16 hex chars> under the base dir', () => {
+            expect(runTempDirPrefix({ baseDir: root, cwd: '/sandbox/one', ppid: 4242, uid: 501, pidSpace: 'abcdef01' }))
+                .toBe(path.join(root, `stryker-bun-runner-501-abcdef01-4242-${hash16('/sandbox/one:4242')}`));
         });
 
-        it('defaults to os.tmpdir(), process.cwd(), process.ppid and the current uid', () => {
+        it('defaults to os.tmpdir(), process.cwd(), process.ppid, the current uid and this process\'s pid space', () => {
             const hash = hash16(`${process.cwd()}:${process.ppid}`);
-            expect(runTempDirPrefix()).toBe(path.join(tmpdir(), `stryker-bun-runner-${uid}-${hash}`));
+            expect(runTempDirPrefix()).toBe(path.join(tmpdir(), `stryker-bun-runner-${uid}-${pidSpace().tag}-${process.ppid}-${hash}`));
+        });
+
+        it('derives a different prefix in another pid space (another container sharing the temp directory)', () => {
+            const key = { baseDir: root, cwd: '/sandbox/one', ppid: 4242, uid };
+            expect(runTempDirPrefix({ ...key, pidSpace: 'abcdef01' })).not.toBe(runTempDirPrefix({ ...key, pidSpace: 'abcdef02' }));
         });
 
         it('derives the same prefix for every worker of one run (same cwd and Stryker main pid)', () => {
@@ -365,7 +378,7 @@ describe('private-temp-dir', () => {
             const cwdSpy = spyOn(process, 'cwd').mockReturnValue('/sandbox/defaults');
             const hash = hash16(`/sandbox/defaults:${process.ppid}`);
             try {
-                expect(await resolveRunTempDir()).toBe(path.join(root, `stryker-bun-runner-${uid}-${hash}-0`));
+                expect(await resolveRunTempDir()).toBe(path.join(root, `stryker-bun-runner-${uid}-${pidSpace().tag}-${process.ppid}-${hash}-0`));
             } finally {
                 cwdSpy.mockRestore();
                 tmpdirSpy.mockRestore();
@@ -588,4 +601,344 @@ describe('private-temp-dir', () => {
             expect(await fsPromises.readFile(victim, 'utf8')).toBe('untouched');
         });
     });
+
+    describe('pidSpace', () => {
+        const tag = (ids: string): string => createHash('sha256').update(ids).digest('hex').slice(0, 8);
+
+        it('tags a Linux pid space by its boot id and pid namespace', () => {
+            expect(computePidSpace('linux', () => 'boot-1:pid:[4026531836]')).toEqual({ tag: tag('boot-1:pid:[4026531836]'), known: true });
+            expect(computePidSpace('linux', () => 'boot-1:pid:[4026532001]').tag).not.toBe(computePidSpace('linux', () => 'boot-1:pid:[4026531836]').tag);
+            expect(computePidSpace('linux', () => 'boot-2:pid:[4026531836]').tag).not.toBe(computePidSpace('linux', () => 'boot-1:pid:[4026531836]').tag);
+        });
+
+        it('is unknown on Linux when /proc cannot tell it', () => {
+            expect(computePidSpace('linux', () => {
+                throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+            })).toEqual({ tag: tag(''), known: false });
+        });
+
+        it('is one known pid space per host elsewhere, without reading /proc', () => {
+            const read = (): string => {
+                throw new Error('must not be read');
+            };
+            expect(computePidSpace('darwin', read)).toEqual({ tag: tag(''), known: true });
+        });
+
+        it('reads this process\'s pid space once', () => {
+            expect(pidSpace()).toBe(pidSpace());
+            if(process.platform === 'linux') {
+                const ids = `${readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim()}:${readlinkSync('/proc/self/ns/pid')}`;
+                expect(pidSpace()).toEqual({ tag: tag(ids), known: true });
+            }
+        });
+    });
+
+    describe('processExists', () => {
+        it('is true for a running process', () => {
+            expect(processExists(process.pid)).toBe(true);
+        });
+
+        it('is false for a process that has exited and been reaped', () => {
+            const { pid } = Bun.spawnSync(['true']);
+            expect(processExists(pid)).toBe(false);
+        });
+
+        it('is true when the process exists but may not be signalled (EPERM): another user\'s process is not a dead one', () => {
+            const killSpy = spyOn(process, 'kill').mockImplementation(() => {
+                throw Object.assign(new Error('kill EPERM'), { code: 'EPERM' });
+            });
+            try {
+                expect(processExists(12_345)).toBe(true);
+            } finally {
+                killSpy.mockRestore();
+            }
+        });
+
+        it('never signals pid 0 or a negative pid (a process group) and reports them alive, as it does a non-integer', () => {
+            const killSpy = spyOn(process, 'kill');
+            try {
+                expect([0, -1, -4242, 1.5, Number.NaN].map(pid => processExists(pid))).toEqual([true, true, true, true, true]);
+                expect(killSpy).not.toHaveBeenCalled();
+            } finally {
+                killSpy.mockRestore();
+            }
+        });
+    });
+
+    // Owner pids above the kernel's pid_max (2^22 on Linux, 99998 on macOS), so never a real process; liveness is injected.
+    const DEAD = 5_000_001;
+    const LIVE = 5_000_002;
+    const EXITING = 5_000_003;
+    const isAlive = (pid: number): boolean => pid !== DEAD;
+    const byName = (a: string, b: string): number => a.localeCompare(b);
+
+    /** Create a run directory (mode 0700) of `owner`'s run under root, with a registry in it, and return its path. */
+    function runDir(owner: number, opts: { uid?: number, cwd?: string, slot?: number, pidSpace?: string } = {}): string {
+        const key = { baseDir: root, cwd: opts.cwd ?? '/sandbox/one', ppid: owner, uid: opts.uid ?? uid, pidSpace: opts.pidSpace };
+        const dir = `${runTempDirPrefix(key)}-${opts.slot ?? 0}`;
+        mkdirSync(dir, { mode: 0o700 });
+        writeFileSync(path.join(dir, 'registry.json'), '{"version":2}', { mode: 0o600 });
+        return dir;
+    }
+
+    function existsSync(p: string): boolean {
+        try {
+            lstatSync(p);
+            return true;
+        } catch{
+            return false;
+        }
+    }
+
+    describe('removeFinishedRunTempDirs', () => {
+        it('removes the directories of a run whose Stryker main process is gone, contents and all', () => {
+            const stale = runDir(DEAD);
+            const staleSlot = runDir(DEAD, { slot: 3 });
+
+            expect(removeFinishedRunTempDirs({ baseDir: root, isAlive }).toSorted(byName)).toEqual([stale, staleSlot].toSorted(byName));
+
+            expect(existsSync(stale)).toBe(false);
+            expect(existsSync(staleSlot)).toBe(false);
+        });
+
+        it('removes a symlink inside a finished run\'s directory, never what it points at', () => {
+            const outside = path.join(root, 'outside');
+            mkdirSync(outside, { mode: 0o700 });
+            writeFileSync(path.join(outside, 'precious'), 'keep');
+            const stale = runDir(DEAD);
+            symlinkSync(outside, path.join(stale, 'link-to-dir'));
+            symlinkSync(path.join(outside, 'precious'), path.join(stale, 'link-to-file'));
+
+            expect(removeFinishedRunTempDirs({ baseDir: root, isAlive })).toEqual([stale]);
+
+            expect(existsSync(stale)).toBe(false);
+            expect(readFileSync(path.join(outside, 'precious'), 'utf8')).toBe('keep');
+        });
+
+        it('leaves the directory of a run whose Stryker main process is alive, so a worker started or restarted later still finds the registry', () => {
+            const live = runDir(LIVE);
+
+            expect(removeFinishedRunTempDirs({ baseDir: root, isAlive })).toEqual([]);
+
+            expect(readFileSync(path.join(live, 'registry.json'), 'utf8')).toBe('{"version":2}');
+        });
+
+        it('removes the exiting process\'s own run directories, though it is still alive, and only those of the live ones', () => {
+            const mine = runDir(EXITING);
+            const mineOtherSandbox = runDir(EXITING, { cwd: '/sandbox/two' });
+            const concurrent = runDir(LIVE);
+
+            expect(removeFinishedRunTempDirs({ baseDir: root, isAlive, exitingPid: EXITING }).toSorted(byName)).toEqual([mine, mineOtherSandbox].toSorted(byName));
+
+            expect(existsSync(mine)).toBe(false);
+            expect(existsSync(mineOtherSandbox)).toBe(false);
+            expect(readFileSync(path.join(concurrent, 'registry.json'), 'utf8')).toBe('{"version":2}');
+        });
+
+        it('defaults to os.tmpdir(), the current uid and real process liveness, and treats no process as exiting', () => {
+            const { pid: dead } = Bun.spawnSync(['true']);
+            const stale = runDir(dead);
+            const ownedByMe = runDir(process.pid);
+            const tmpdirSpy = spyOn(os, 'tmpdir').mockReturnValue(root);
+            try {
+                expect(removeFinishedRunTempDirs()).toEqual([stale]);
+            } finally {
+                tmpdirSpy.mockRestore();
+            }
+            expect(existsSync(ownedByMe)).toBe(true);
+        });
+
+        it('works from the real path of a symlinked base directory (TMPDIR)', () => {
+            const real = path.join(root, 'real');
+            mkdirSync(real, { mode: 0o700 });
+            const link = path.join(root, 'link');
+            symlinkSync(real, link);
+            const stale = `${runTempDirPrefix({ baseDir: real, cwd: '/sandbox/one', ppid: DEAD, uid })}-0`;
+            mkdirSync(stale, { mode: 0o700 });
+
+            expect(removeFinishedRunTempDirs({ baseDir: link, isAlive })).toEqual([stale]);
+        });
+
+        it('never follows or removes a symlink named like a finished run\'s directory, nor what it points at', () => {
+            const target = path.join(root, 'target');
+            mkdirSync(target, { mode: 0o700 });
+            writeFileSync(path.join(target, 'precious'), 'keep');
+            const link = `${runTempDirPrefix({ baseDir: root, cwd: '/sandbox/one', ppid: DEAD, uid })}-0`;
+            symlinkSync(target, link);
+
+            expect(removeFinishedRunTempDirs({ baseDir: root, isAlive })).toEqual([]);
+
+            expect(lstatSync(link).isSymbolicLink()).toBe(true);
+            expect(readFileSync(path.join(target, 'precious'), 'utf8')).toBe('keep');
+        });
+
+        it('leaves a directory owned by another user, though its name carries ours (a squatted slot)', () => {
+            const squatted = runDir(DEAD);
+            const asOtherOwner = (p: string): DirStat => {
+                const st = lstatSync(p);
+                return { uid: p === squatted ? OTHER : st.uid, mode: st.mode, isDirectory: () => st.isDirectory(), isSymbolicLink: () => st.isSymbolicLink() };
+            };
+
+            expect(removeFinishedRunTempDirs({ baseDir: root, isAlive, lstat: asOtherOwner })).toEqual([]);
+
+            expect(existsSync(path.join(squatted, 'registry.json'))).toBe(true);
+        });
+
+        // Real chown needs root; the injected-owner test above covers the same check as any user.
+        it.if(uid === 0)('leaves a directory really owned by another (non-root) user', () => {
+            const squatted = runDir(DEAD);
+            chownSync(squatted, 1234, 1234);
+
+            expect(removeFinishedRunTempDirs({ baseDir: root, isAlive })).toEqual([]);
+
+            expect(existsSync(path.join(squatted, 'registry.json'))).toBe(true);
+        });
+
+        it('leaves a directory open to group or others, which the runner never made', () => {
+            const loose = runDir(DEAD);
+            chmodSync(loose, 0o750);
+
+            expect(removeFinishedRunTempDirs({ baseDir: root, isAlive })).toEqual([]);
+
+            expect(existsSync(loose)).toBe(true);
+        });
+
+        it('leaves entries that are not this user\'s run directories: another uid, a file, older names without an owner pid, and other names', () => {
+            const otherUid = runDir(DEAD, { uid: uid + 1 });
+            const file = `${runTempDirPrefix({ baseDir: root, cwd: '/sandbox/file', ppid: DEAD, uid })}-0`;
+            writeFileSync(file, 'not a directory');
+            // The name format of runner versions that did not record the owner: nothing says whose run it was.
+            const legacy = path.join(root, `stryker-bun-runner-${uid}-${hash16('/sandbox/one:1')}-0`);
+            mkdirSync(legacy, { mode: 0o700 });
+            // An owner pid without a pid space: not a name this runner makes, so not judged either.
+            const untaggedHash = hash16(`/sandbox/one:${DEAD}`);
+            const untagged = path.join(root, `stryker-bun-runner-${uid}-${DEAD}-${untaggedHash}-0`);
+            mkdirSync(untagged, { mode: 0o700 });
+            const unrelated = ['stryker-bun-runner-bench.lock', `stryker-bun-runner-${uid}-${DEAD}-nothex-0`, `x-stryker-bun-runner-${uid}-${DEAD}-${hash16('a')}-0`]
+                .map((name) => {
+                    const p = path.join(root, name);
+                    mkdirSync(p, { mode: 0o700 });
+                    return p;
+                });
+
+            expect(removeFinishedRunTempDirs({ baseDir: root, isAlive })).toEqual([]);
+
+            for(const p of [otherUid, file, legacy, untagged, ...unrelated]) {
+                expect(existsSync(p)).toBe(true);
+            }
+        });
+
+        it('never judges a directory from another pid space (a container sharing the temp directory): its pids are not ours, even one equal to the exiting pid', () => {
+            const other = pidSpace().tag === 'ffffffff' ? 'fffffffe' : 'ffffffff';
+            const foreignDead = runDir(DEAD, { pidSpace: other });
+            const foreignSamePid = runDir(EXITING, { pidSpace: other });
+            const mine = runDir(EXITING);
+
+            expect(removeFinishedRunTempDirs({ baseDir: root, isAlive, exitingPid: EXITING })).toEqual([mine]);
+
+            expect(existsSync(path.join(foreignDead, 'registry.json'))).toBe(true);
+            expect(existsSync(path.join(foreignSamePid, 'registry.json'))).toBe(true);
+        });
+
+        it('removes nothing when its own pid space is unknown, not even the exiting process\'s directories', () => {
+            const stale = runDir(DEAD);
+            const mine = runDir(EXITING);
+
+            expect(removeFinishedRunTempDirs({ baseDir: root, isAlive, exitingPid: EXITING, pidSpace: { tag: pidSpace().tag, known: false } })).toEqual([]);
+
+            expect(existsSync(stale)).toBe(true);
+            expect(existsSync(mine)).toBe(true);
+        });
+
+        it('removes nothing when another user could change a directory above the base (it could swap a run directory in after the checks)', () => {
+            const stale = runDir(DEAD);
+            chmodSync(root, 0o777);
+
+            expect(removeFinishedRunTempDirs({ baseDir: root, isAlive })).toEqual([]);
+
+            expect(existsSync(stale)).toBe(true);
+        });
+
+        it('removes nothing, and does not throw, when the base directory is missing or the uid unknown', () => {
+            expect(removeFinishedRunTempDirs({ baseDir: path.join(root, 'missing'), isAlive })).toEqual([]);
+            const stale = runDir(DEAD);
+            const getuid = process.getuid;
+            (process as { getuid?: () => number }).getuid = undefined;
+            try {
+                expect(removeFinishedRunTempDirs({ baseDir: root, isAlive })).toEqual([]);
+            } finally {
+                process.getuid = getuid;
+            }
+            expect(existsSync(stale)).toBe(true);
+        });
+
+        it('goes on with the other directories when one cannot be removed, and does not report it removed', () => {
+            const stuck = runDir(DEAD);
+            const stale = runDir(DEAD, { cwd: '/sandbox/two' });
+            const remove = (dir: string): void => {
+                if(dir === stuck) {
+                    throw Object.assign(new Error('EBUSY'), { code: 'EBUSY' });
+                }
+                rmSync(dir, { recursive: true });
+            };
+
+            expect(removeFinishedRunTempDirs({ baseDir: root, isAlive, remove })).toEqual([stale]);
+
+            expect(existsSync(stuck)).toBe(true);
+            expect(existsSync(stale)).toBe(false);
+        });
+
+        it('asks about the owner of this user\'s run directories only', () => {
+            runDir(LIVE, { uid: uid + 1 });
+            mkdirSync(path.join(root, `stryker-bun-runner-${uid}-${hash16('/sandbox/one:1')}-0`), { mode: 0o700 });
+            const asked: number[] = [];
+
+            removeFinishedRunTempDirs({ baseDir: root, isAlive: (pid) => {
+                asked.push(pid);
+                return true;
+            } });
+
+            expect(asked).toEqual([]);
+        });
+    });
+
+    // A stand-in for `process`, which is an EventEmitter, not an EventTarget.
+    /* eslint-disable unicorn/prefer-event-target -- see above */
+    describe('removeRunTempDirsOnExit', () => {
+        it('registers one exit listener per process however often it is called, which removes the exiting process\'s run directories', () => {
+            const proc = new EventEmitter();
+            const tmpdirSpy = spyOn(os, 'tmpdir').mockReturnValue(root);
+            const mine = `${runTempDirPrefix({ baseDir: root, cwd: '/sandbox/one', ppid: process.pid, uid })}-0`;
+            mkdirSync(mine, { mode: 0o700 });
+            // The listener checks real liveness: this test's parent process stands in for a concurrent run's main process.
+            const concurrent = runDir(process.ppid);
+            try {
+                removeRunTempDirsOnExit(proc);
+                removeRunTempDirsOnExit(proc);
+                expect(proc.listenerCount('exit')).toBe(1);
+                expect(existsSync(mine)).toBe(true);
+
+                proc.emit('exit', 0);
+            } finally {
+                tmpdirSpy.mockRestore();
+            }
+            expect(existsSync(mine)).toBe(false);
+            expect(existsSync(concurrent)).toBe(true);
+        });
+
+        it('never lets a cleanup failure escape the exit listener', () => {
+            const proc = new EventEmitter();
+            const getuidSpy = spyOn(process, 'getuid').mockImplementation(() => {
+                throw new Error('getuid failed');
+            });
+            try {
+                removeRunTempDirsOnExit(proc);
+                expect(() => proc.emit('exit', 0)).not.toThrow();
+                expect(getuidSpy).toHaveBeenCalled();
+            } finally {
+                getuidSpy.mockRestore();
+            }
+        });
+    });
+    /* eslint-enable unicorn/prefer-event-target -- end of the process stand-ins */
 });

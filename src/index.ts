@@ -5,6 +5,13 @@
 
 import { PluginKind, declareClassPlugin } from '@stryker-mutator/api/plugin';
 import { BunTestRunner } from './bun-test-runner.js';
+import { removeRunTempDirsOnExit } from './utils/private-temp-dir.js';
+
+// Stryker's plugin loader imports this module in the main process, which owns the run's
+// private temp directory and outlives every worker that uses it: remove the directory
+// when that process exits (see removeRunTempDirsOnExit, and docs/internals.md "Temporary files").
+// Stryker disable next-line all: only a real process exit runs the listener; tests/00-integration/run-temp-cleanup-integration.test.ts covers it in subprocesses, which mutant activation does not reach
+removeRunTempDirsOnExit();
 
 /**
  * Stryker plugin declarations
