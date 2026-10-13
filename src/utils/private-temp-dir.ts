@@ -442,10 +442,10 @@ function ancestorsSafe(top: string, uid: number, lstatFn: LstatSyncFn): boolean 
  * cannot be read or a directory from it up to `/` could be changed by a user
  * other than `uid`.
  */
-function listSafeBaseDir(baseDir: string | undefined, uid: number, lstatFn: LstatSyncFn): { base: string, names: string[] } | undefined {
+function listSafeBaseDir(baseDir: string | undefined, uid: number, lstatFn: LstatSyncFn, readdirFn: (dir: string) => string[] = listDir): { base: string, names: string[] } | undefined {
     try {
         const base = realpathSync(baseDir ?? tmpdir());
-        return ancestorsSafe(base, uid, lstatFn) ? { base, names: readdirSync(base) } : undefined;
+        return ancestorsSafe(base, uid, lstatFn) ? { base, names: readdirFn(base) } : undefined;
     } catch{
         return undefined;
     }
@@ -457,8 +457,13 @@ function runDirOwner(name: string, uid: number, space: string): number | undefin
     return match !== null && Number(match[1]) === uid && match[2] === space ? Number(match[3]) : undefined;
 }
 
+function listDir(dir: string): string[] {
+    return readdirSync(dir);
+}
+
+/** Remove `dir` and its contents. Throws if it is gone (it was just checked), so it is not reported removed. */
 function removeTree(dir: string): void {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true });
 }
 
 /** Options of {@link removeFinishedRunTempDirs}; every field defaults to the live process value. */
@@ -481,6 +486,8 @@ export interface FinishedRunCleanup {
     maxExamined?: number
     /** Injectable for tests, like {@link LstatFn}. */
     lstat?:       LstatSyncFn
+    /** Lists the names in the base directory, in the order they are examined. Injectable for tests (the real order is the filesystem's). */
+    readdir?:     (dir: string) => string[]
     /** Removes one directory and its contents. Injectable for tests. */
     remove?:      (dir: string) => void
 }
@@ -556,7 +563,7 @@ export function removeFinishedRunTempDirs(options: FinishedRunCleanup = {}): str
     const uid = options.uid ?? process.getuid?.();
     const space = options.pidSpace ?? pidSpace();
     const lstatFn = options.lstat ?? lstatSync;
-    const listing = uid === undefined || !space.known ? undefined : listSafeBaseDir(options.baseDir, uid, lstatFn);
+    const listing = uid === undefined || !space.known ? undefined : listSafeBaseDir(options.baseDir, uid, lstatFn, options.readdir);
     if(uid === undefined || listing === undefined) {
         return [];
     }

@@ -631,6 +631,17 @@ describe('private-temp-dir', () => {
             expect(computePidSpace('darwin', read)).toEqual({ tag: tag(''), known: true });
         });
 
+        // Not memoized like pidSpace(), so this test itself runs the /proc reads.
+        it.if(process.platform === 'linux')('reads the boot id (trimmed) and the pid namespace link from /proc by default', () => {
+            const bootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8');
+            const pidNs = readlinkSync('/proc/self/ns/pid');
+            expect(bootId).toMatch(/^[0-9a-f-]{36}\n$/);
+            expect(pidNs).toMatch(/^pid:\[\d+\]$/);
+
+            expect(computePidSpace('linux')).toEqual({ tag: tag(`${bootId.trim()}:${pidNs}`), known: true });
+            expect(computePidSpace()).toEqual(computePidSpace('linux'));
+        });
+
         it('reads this process\'s pid space once', () => {
             expect(pidSpace()).toBe(pidSpace());
             if(process.platform === 'linux') {
@@ -878,6 +889,35 @@ describe('private-temp-dir', () => {
             expect(existsSync(stale)).toBe(true);
         });
 
+        it('checks every directory above the base, up to the root, not just the base itself', () => {
+            const base = path.join(root, 'base');
+            mkdirSync(base, { mode: 0o700 });
+            const stale = `${runTempDirPrefix({ baseDir: base, cwd: '/sandbox/one', ppid: DEAD, uid })}-0`;
+            mkdirSync(stale, { mode: 0o700 });
+            age(stale);
+            // Safe base, unsafe parent: another user could rename the base away.
+            chmodSync(root, 0o777);
+            expect(removeFinishedRunTempDirs({ baseDir: base, isAlive })).toEqual([]);
+            expect(existsSync(stale)).toBe(true);
+
+            // And the walk reaches `/`: every directory up to it is looked at, then it stops.
+            chmodSync(root, 0o700);
+            const looked: string[] = [];
+            const recording = (p: string): RunDirStat => {
+                looked.push(p);
+                return lstatSync(p);
+            };
+            expect(removeFinishedRunTempDirs({ baseDir: base, isAlive, lstat: recording })).toEqual([stale]);
+            const ancestors: string[] = [];
+            for(let dir = base; ; dir = path.dirname(dir)) {
+                ancestors.push(dir);
+                if(dir === path.dirname(dir)) {
+                    break;
+                }
+            }
+            expect(looked).toEqual([...ancestors, stale]);
+        });
+
         it('removes nothing, and does not throw, when the base directory is missing or the uid unknown', () => {
             expect(removeFinishedRunTempDirs({ baseDir: path.join(root, 'missing'), isAlive })).toEqual([]);
             const stale = runDir(DEAD);
@@ -985,7 +1025,8 @@ describe('private-temp-dir', () => {
                 expect(asked).toEqual([]);
             });
 
-            it(`removes it once it has gone unchanged for STALE_RUN_DIR_AGE_MS (${STALE_RUN_DIR_AGE_MS} ms), not a millisecond before`, () => {
+            // A fixed title: one built from the constant would change under the mutants that change the constant.
+            it('removes it once it has gone unchanged for STALE_RUN_DIR_AGE_MS (an hour), not a millisecond before', () => {
                 expect(STALE_RUN_DIR_AGE_MS).toBe(60 * 60 * 1000);
                 const stale = runDir(DEAD, { ageMs: 0 });
                 const { mtimeMs } = lstatSync(stale);
@@ -1014,7 +1055,7 @@ describe('private-temp-dir', () => {
         });
 
         describe('cap', () => {
-            it(`examines at most MAX_RUN_DIRS_EXAMINED (${MAX_RUN_DIRS_EXAMINED}) directories by default`, () => {
+            it('examines at most MAX_RUN_DIRS_EXAMINED (1000) directories by default', () => {
                 expect(MAX_RUN_DIRS_EXAMINED).toBe(1000);
             });
 
@@ -1028,17 +1069,31 @@ describe('private-temp-dir', () => {
                 expect(removed).toContain(mine);
                 expect(stale.filter(dir => existsSync(dir))).toHaveLength(2);
             });
+
+            it('moves the exiting process\'s own directories ahead of the rest, keeping the listing\'s order otherwise', () => {
+                const stale = ['/sandbox/a', '/sandbox/b', '/sandbox/c', '/sandbox/d'].map(cwd => runDir(DEAD, { cwd }));
+                const mine = ['/sandbox/y', '/sandbox/z'].map(cwd => runDir(EXITING, { cwd }));
+                // The listing puts the exiting process's directories late.
+                const order = [stale[0], stale[1], mine[0], stale[2], mine[1], stale[3]].map(dir => path.basename(dir));
+                const readdir = (): string[] => order;
+
+                expect(removeFinishedRunTempDirs({ baseDir: root, isAlive, exitingPid: EXITING, maxExamined: 3, readdir })).toEqual([mine[0], mine[1], stale[0]]);
+                expect(removeFinishedRunTempDirs({ baseDir: root, isAlive, exitingPid: EXITING, maxExamined: 3, readdir: () => order.filter(name => existsSync(path.join(root, name))) }))
+                    .toEqual([stale[1], stale[2], stale[3]]);
+            });
         });
     });
 
     describe('touchRunTempDir', () => {
-        it('sets the directory\'s modification time to now', () => {
+        it('sets the directory\'s access and modification times to now (utimes takes seconds)', () => {
             const dir = runDir(LIVE);
             const now = Date.now();
 
             touchRunTempDir(dir, now);
 
-            expect(Math.abs(lstatSync(dir).mtimeMs - now)).toBeLessThan(1000);
+            const st = lstatSync(dir);
+            expect(Math.abs(st.mtimeMs - now)).toBeLessThan(1000);
+            expect(Math.abs(st.atimeMs - now)).toBeLessThan(1000);
         });
 
         it('defaults to the current time', () => {
