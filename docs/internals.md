@@ -237,6 +237,26 @@ run stopped at the deadline as a normal Timeout.
 Stryker shows Error as RuntimeError and leaves it out of the mutation score. Each Error is logged
 at warn (see [Log output](#log-output)).
 
+**Coloured output.** `FORCE_COLOR` set where Stryker runs reaches every `bun test` child, and bun
+then colours its output even when piped, printing `✗ name` for `(fail) name` with colour codes
+around both. The runner removes colour codes from each line before reading it, so failing tests,
+file headers and the summary read the same with or without colour, and so do `killedBy`, the
+reason below, and every result above.
+
+**The reason given for a kill.** A Killed mutant's reason (`statusReason` in Stryker's reports, shown
+for the mutant in the HTML report) is the report bun printed for each failing test: the code frame,
+the error, the expected/received diff and the stack. Bun prints that report *before* the test's
+`(fail)` line, so the runner takes the lines between the previous file header, test line or failing
+test and the `(fail)` line, starting at the code frame (or, without one, at the first `error:` or
+`…Error:` heading) so that whatever a test printed on stderr before failing is left out. A note bun
+prints right *after* the `(fail)` line is added to it: `^ this test timed out after 5000ms.`, and the
+note for a `.failing` test that passed. When the lines before such a note hold no code frame and no
+error heading (a timed-out test after other tests' output), the note alone is the reason. Each
+test's report is cut at 4,000 characters, before its notes are added, so a note is never cut; the reports of
+several failing tests (a run without bail) are joined with a blank line. A Killed run with no
+failing-test report, such as a test file that failed to load, gives the first 1,000 characters of
+bun's stderr instead.
+
 **Why load failures are Killed.** A mutant can stop a test file from loading: a source module
 throws at import (a mutated module-level constant or config object, say), a source file no longer
 parses, or a `describe` body throws. Bun reports that only in its summary. Stryker only mutates

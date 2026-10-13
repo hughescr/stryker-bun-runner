@@ -12,6 +12,7 @@ export interface TestResult {
     file?:           string
     status:          'passed' | 'failed' | 'skipped'
     duration?:       number
+    /** A failing test's error report, as bun printed it before the test's `(fail)` line; see failureMessageFrom. */
     failureMessage?: string
 }
 
@@ -154,9 +155,11 @@ function isWorkflowCommandLine(line: string): boolean {
     return workflowCommandRe.test(line);
 }
 
+/** The longest failureMessage the parser returns: a longer report keeps its start and says how much it left out. */
+export const MAX_FAILURE_MESSAGE_LENGTH = 4000;
+
 interface TestLineParseResult {
-    test?:                   TestResult
-    startedCollectingError?: boolean
+    test?: TestResult
 }
 
 /**
@@ -196,8 +199,7 @@ function parseTestLine(line: string, currentFile: string | undefined): TestLineP
                 file:     currentFile,
                 status:   'failed',
                 duration: failMatch[2] ? Number.parseFloat(failMatch[2]) : undefined
-            },
-            startedCollectingError: true
+            }
         };
     }
 
@@ -212,8 +214,7 @@ function parseTestLine(line: string, currentFile: string | undefined): TestLineP
                 file:     currentFile,
                 status:   'failed',
                 duration: bailFailMatch[2] ? Number.parseFloat(bailFailMatch[2]) : undefined
-            },
-            startedCollectingError: true
+            }
         };
     }
 
@@ -235,24 +236,77 @@ function parseTestLine(line: string, currentFile: string | undefined): TestLineP
 }
 
 /**
- * Finalize error message for current test
+ * A line that reports a test which did not fail, in bun 1.4's piped form or its FORCE_COLOR form
+ * (colour codes removed): `(pass) name [0.03ms]` / `✓ name`, `(skip) name` / `» name`, the
+ * pending-test line / `✎ name`, and older bun's `⏭ name`. Such a line ends the output a later
+ * failing test's error report can be in. (The `✓` and `⏭` forms are also read as tests by
+ * parseTestLine; nothing scores passing tests from the per-line output, so the others are not.)
  */
-function finalizeErrorMessage(currentTest: TestResult | null, errorLines: string[]): void {
-    if(currentTest && errorLines.length > 0) {
-        currentTest.failureMessage = errorLines.join('\n').trim();
-    }
+const NON_FAILING_RESULT_LINE = /^(?:\((?:pass|skip|todo)\)|[✓»✎⏭]) +\S/;
+
+/**
+ * A line of bun's code frame, which opens its report of an error: `12 | expect(a).toBe(b);`
+ * (`12 |` alone for a blank source line).
+ */
+const CODE_FRAME_LINE = /^\s*\d+ \|(?: |$)/;
+
+/**
+ * The heading line of bun's report of an error, which opens the report when bun has no source to
+ * frame: `error: message` for an Error, `TypeError: …`, `AssertionError [ERR_ASSERTION]: …`.
+ */
+const ERROR_HEADING_LINE = /^(?:error|\w*Error)(?: \[[^\]]*\])?: /;
+
+/**
+ * A note bun prints right AFTER a `(fail)` line, about that test: `  ^ this test timed out after
+ * 5000ms.`, `  ^ this test is marked as failing but it passed. …`. The caret under a code frame
+ * stands alone on its line, so it never matches.
+ */
+const AFTER_FAIL_NOTE_LINE = /^\s+\^ \S/;
+
+/** `message`, cut to {@link MAX_FAILURE_MESSAGE_LENGTH} characters with a note of what was cut. */
+function capFailureMessage(message: string): string {
+    return message.length > MAX_FAILURE_MESSAGE_LENGTH
+        ? `${message.slice(0, MAX_FAILURE_MESSAGE_LENGTH)}\n… (${message.length - MAX_FAILURE_MESSAGE_LENGTH} more characters)`
+        : message;
+}
+
+/** What bun printed for a failing test before its `(fail)` line, as {@link readFailureBlock} reads it. */
+interface FailureBlock {
+    /** The block from its code frame or error heading on (the whole block without either), trimmed; undefined when empty. */
+    text:     string | undefined
+    /** Whether the block has a code frame or an error heading: whether bun reported an error in it. */
+    reported: boolean
 }
 
 /**
- * Check if line should be collected as error message
+ * Read the lines between the previous file header, test line or failing test's note and a failing
+ * test's own `(fail)` line.
+ *
+ * Bun prints a failing test's report BEFORE its `(fail)` line: a code frame, the error heading,
+ * the expected/received diff, the stack. Without `onlyFailures` it comes right after the previous
+ * test's line. With it (mutant runs) no line marks where a passing test ended, so what a passing
+ * test, or the failing test itself, printed on stderr can come first; the text therefore starts
+ * at the first code-frame line, or without one at the first error heading, and is the whole block
+ * only when it has neither. GitHub Actions workflow commands are left out.
  */
-function shouldCollectErrorLine(line: string): boolean {
-    if(!line.trim()) {
-        return false;
-    }
-    // Skip summary lines
-    // Stryker disable next-line Regex: anchors and character classes are defensive; line detection pattern
-    return !(/^\s*\d+\s+(?:pass|fail|skip)/.test(line));
+function readFailureBlock(block: readonly string[]): FailureBlock {
+    const lines = block.filter(line => !isWorkflowCommandLine(line));
+    const frameStart = lines.findIndex(line => CODE_FRAME_LINE.test(line));
+    const start = frameStart === -1 ? lines.findIndex(line => ERROR_HEADING_LINE.test(line)) : frameStart;
+    const text = lines.slice(Math.max(start, 0)).join('\n').trim();
+    return { text: text === '' ? undefined : text, reported: start !== -1 };
+}
+
+/**
+ * A failing test's failureMessage: its block, cut to {@link MAX_FAILURE_MESSAGE_LENGTH}, then the
+ * `  ^ …` notes bun printed after its `(fail)` line, whole. A block with no error in it is output
+ * of other tests (or of this one) and gives way to the notes when there are any: a timed-out test's
+ * message is then just bun's timeout note. Undefined when there is nothing to say.
+ */
+function failureMessageFrom(block: FailureBlock, notes: readonly string[]): string | undefined {
+    const report = block.text !== undefined && (block.reported || notes.length === 0) ? capFailureMessage(block.text) : undefined;
+    const parts = report === undefined ? notes : [report, ...notes];
+    return parts.length === 0 ? undefined : parts.join('\n');
 }
 
 interface TestCounters {
@@ -261,21 +315,78 @@ interface TestCounters {
     skipped: number
 }
 
-/**
- * Update test counters based on test status
- */
-function updateCounters(test: TestResult, counters: TestCounters, parseResult: TestLineParseResult): boolean {
-    if(test.status === 'passed') {
-        counters.passed++;
-        return false; // not collecting error
-    } else if(test.status === 'failed') {
-        counters.failed++;
-        // Stryker disable next-line BooleanLiteral: default value in coalesce has no behavioral impact
-        return parseResult.startedCollectingError ?? false;
-    // After checking 'passed' and 'failed', only 'skipped' remains (TypeScript union exhaustiveness)
-    } else {
-        counters.skipped++;
-        return false; // not collecting error
+/** What {@link parseBunTestOutput} has read so far, line by line. */
+interface LineReader {
+    readonly lines:        readonly string[]
+    readonly isHeaderFile: (file: string) => boolean
+    readonly tests:        TestResult[]
+    readonly counters:     TestCounters
+    currentFile:           string | undefined
+    /**
+     * Where the output a failing test's error report can be in starts: the line after the last
+     * file header, test line or failing test's note (see readFailureBlock).
+     */
+    blockStart:            number
+    /**
+     * The failing test whose `(fail)` line (or a note after it) is the line just read, with its
+     * block and the notes read so far: bun prints a timeout's or a passing `.failing` test's
+     * `  ^ …` note right after that line.
+     */
+    lastFailed:            { test: TestResult, block: FailureBlock, notes: string[] } | undefined
+}
+
+/** Set `test`'s failure message, leaving it unset when there is none. */
+function setFailureMessage(test: TestResult, block: FailureBlock, notes: readonly string[]): void {
+    const failureMessage = failureMessageFrom(block, notes);
+    if(failureMessage !== undefined) {
+        test.failureMessage = failureMessage;
+    }
+}
+
+/** Record a test line's test, with its failure message when it failed. */
+function recordTest(reader: LineReader, test: TestResult, index: number): void {
+    if(test.status === 'failed') {
+        const block = readFailureBlock(reader.lines.slice(reader.blockStart, index));
+        setFailureMessage(test, block, []);
+        reader.lastFailed = { test, block, notes: [] };
+    }
+    reader.tests.push(test);
+    reader.counters[test.status]++;
+    reader.blockStart = index + 1;
+}
+
+/** Read line `index` of the output. */
+function readLine(reader: LineReader, index: number): void {
+    const line = reader.lines[index];
+    const filePath = parseFilePath(line);
+    if(filePath && reader.isHeaderFile(filePath)) {
+        reader.currentFile = filePath;
+        reader.blockStart = index + 1;
+        reader.lastFailed = undefined;
+        return;
+    }
+
+    // Skip GHA workflow-command lines (checked AFTER the header match above,
+    // so a ::group::-prefixed file header is consumed as a header first) —
+    // they must neither parse as test lines nor end up in failure messages.
+    if(isWorkflowCommandLine(line)) {
+        return;
+    }
+
+    if(reader.lastFailed && AFTER_FAIL_NOTE_LINE.test(line)) {
+        const { test, block, notes } = reader.lastFailed;
+        notes.push(line.trim());
+        setFailureMessage(test, block, notes);
+        reader.blockStart = index + 1;
+        return;
+    }
+    reader.lastFailed = undefined;
+
+    const { test } = parseTestLine(line, reader.currentFile);
+    if(test) {
+        recordTest(reader, test, index);
+    } else if(NON_FAILING_RESULT_LINE.test(line)) {
+        reader.blockStart = index + 1;
     }
 }
 
@@ -457,21 +568,30 @@ function parseSummaryLines(output: string): SummaryCounts {
 /**
  * Parse Bun test console output
  *
- * Example Bun output:
+ * Example Bun output (bun 1.4, piped; under FORCE_COLOR `✓`/`✗`/`»` replace
+ * `(pass)`/`(fail)`/`(skip)`, and every line is read without its colour codes):
  * ```
- * bun test v1.x.x
+ * bun test v1.4.2 (744846f84)
  *
  * tests/example.test.ts:
- * ✓ should pass [0.12ms]
- * ✗ should fail [0.05ms]
- *   error: Expected 1 to equal 2
- * ⏭ should skip
+ * (pass) should pass [0.12ms]
+ * 3 |     expect(1).toBe(2);
+ *                   ^
+ * error: expect(received).toBe(expected)
+ *       at <anonymous> (/project/tests/example.test.ts:3:15)
+ * (fail) should fail [0.05ms]
+ * (skip) should skip
  *
- *  2 pass
- *  1 fail
+ *  1 pass
  *  1 skip
- *  3 expect() calls
+ *  1 fail
+ *  2 expect() calls
+ * Ran 3 tests across 1 file. [7.00ms]
  * ```
+ *
+ * A failing test's report comes BEFORE its `(fail)` line and becomes its
+ * failureMessage (see {@link failureMessageFrom}). With `onlyFailures` (mutant
+ * runs) bun prints no `(pass)` or `(skip)` line.
  *
  * @param testFiles - The test files the run handed bun, when it handed it any:
  *          header lines naming other files are then ignored (see {@link headerFilter})
@@ -482,59 +602,23 @@ export function parseBunTestOutput(stdout: string, stderr: string, testFiles?: r
 
     // Combine stdout and stderr for parsing
     const output = `${stdout}\n${stderr}`;
-    const lines = output.split('\n');
-    const isHeaderFile = headerFilter(lines, testFiles);
-
-    let currentTest: TestResult | null = null;
-    // Stryker disable next-line BooleanLiteral: initial false state is defensive; finalizeErrorMessage guards against empty errorLines
-    let collectingError = false;
-    let errorLines: string[] = [];
-    let currentFile: string | undefined;
-
-    for(const line of lines) {
-        // Check if line is a file path
-        const filePath = parseFilePath(line);
-        if(filePath && isHeaderFile(filePath)) {
-            currentFile = filePath;
-            continue;
-        }
-
-        // Skip GHA workflow-command lines (checked AFTER the header match above,
-        // so a ::group::-prefixed file header is consumed as a header first) —
-        // they must neither parse as test lines nor collect into failure messages.
-        if(isWorkflowCommandLine(line)) {
-            continue;
-        }
-
-        // Try to parse as a test result line
-        const parseResult = parseTestLine(line, currentFile);
-        if(parseResult.test) {
-            // Finalize previous test's error message if needed
-            // Stryker disable next-line ConditionalExpression,LogicalOperator: finalizeErrorMessage guards against empty errorLines; condition is defensive
-            if(currentTest && collectingError) {
-                finalizeErrorMessage(currentTest, errorLines);
-                errorLines = [];
-            }
-
-            currentTest = parseResult.test;
-            tests.push(currentTest);
-
-            // Update counters based on test status
-            collectingError = updateCounters(currentTest, counters, parseResult);
-            continue;
-        }
-
-        // Collect error messages for failed tests
-        if(collectingError && currentTest && shouldCollectErrorLine(line)) {
-            errorLines.push(line);
-        }
+    // Every line is matched without its colour codes. Under FORCE_COLOR (which reaches the child
+    // from the environment Stryker runs in) bun colours its test lines even when piped:
+    // `ESC[0mESC[31m✗ESC[0m ESC[0mmathESC[2m >ESC[0mESC[1m adds…`, which no pattern below matches raw.
+    // Stripped line by line, so an unterminated escape sequence a test printed cannot swallow a newline.
+    const lines = output.split('\n').map(line => stripAnsi(line));
+    const reader: LineReader = {
+        lines,
+        isHeaderFile: headerFilter(lines, testFiles),
+        tests,
+        counters,
+        currentFile:  undefined,
+        blockStart:   0,
+        lastFailed:   undefined,
+    };
+    for(let index = 0; index < lines.length; index++) {
+        readLine(reader, index);
     }
-
-    // Finalize last test's error message if any. No conditional needed:
-    // finalizeErrorMessage guards internally (null currentTest / empty
-    // errorLines are no-ops), and errorLines is only ever non-empty while
-    // collectingError is true.
-    finalizeErrorMessage(currentTest, errorLines);
 
     // Parse summary lines and use them as fallback for counts. Only bun's own summary
     // block counts (see readBunSummary), read without colour codes.

@@ -1,0 +1,684 @@
+/**
+ * Byte-exact `bun test` output captured from real runs of bun 1.4.2 (744846f84) on Linux,
+ * stdout and stderr piped, with the AI-agent variables (CLAUDECODE, AI_AGENT, …) unset.
+ * Only the absolute fixture directory is replaced with `/project`.
+ *
+ * A fixture's name says its form: with or without `FORCE_COLOR=1` (`COLOUR`/`PLAIN`), and with
+ * the dry run's bunfig (`ALL`, every test printed) or the mutant-run bunfig (`ONLY_FAILURES`,
+ * `[test].onlyFailures = true`). EDGE_CASES comes in all four forms, TWO_FILES in all four plus
+ * two `_BAIL` forms, and HOOKS only plain with onlyFailures. Under FORCE_COLOR bun prints
+ * `✓`/`✗`/`»` for `(pass)`/`(fail)`/`(skip)` (and `✎` for a pending test) and wraps most of each
+ * line in colour codes; bun prints a failing test's error report BEFORE its `(fail)` line, and a per-test
+ * timeout's `^ this test timed out after Nms.` line after it.
+ *
+ * TWO_FILES: `bun test tests/a.test.ts tests/b.test.ts` of
+ *
+ * ```ts
+ * // tests/a.test.ts
+ * import { describe, expect, it } from 'bun:test';
+ * describe('math', () => {
+ *     it('adds', () => { expect(1 + 1).toBe(2); });
+ *     it('subtracts wrong', () => {
+ *         console.log('log from subtracts');
+ *         expect(3 - 1).toBe(5);
+ *     });
+ *     it.skip('skipped one', () => {});
+ *     it('throws', () => { throw new Error('boom from throws'); });
+ * });
+ * // tests/b.test.ts
+ * import { expect, it } from 'bun:test';
+ * it('b passes', () => { expect(true).toBe(true); });
+ * it('b fails', () => { console.error('stderr noise from b'); expect({ x: 1 }).toEqual({ x: 2 }); });
+ * ```
+ *
+ * The `_BAIL` forms add `--bail`. EDGE_CASES: `bun test tests/c.test.ts tests/d.test.ts` of
+ *
+ * ```ts
+ * // tests/c.test.ts
+ * import { expect, it } from 'bun:test';
+ * it('chatty pass', () => { console.log('chatter line 1'); console.error('error: chatter that looks like an error'); expect(1).toBe(1); });
+ * // (a pending test named 'later': `it.` + its pending-test modifier)
+ * it('thrown string', () => { throw 'just a string'; });
+ * it('slow', async () => { await new Promise(r => setTimeout(r, 200)); }, 20);
+ * it('after slow', () => { expect('a').toBe('b'); });
+ * // tests/d.test.ts
+ * import { expect, it } from 'bun:test';
+ * it('d first', () => { setTimeout(() => { throw new Error('stray async error'); }, 0); });
+ * it('d second', async () => { await new Promise(r => setTimeout(r, 20)); expect(2).toBe(3); });
+ * ```
+ *
+ * HOOKS_PLAIN_ONLY_FAILURES: `bun test tests/g.test.ts`, plain, onlyFailures, of
+ *
+ * ```ts
+ * import { afterEach, beforeAll, describe, expect, test } from 'bun:test';
+ * describe('hooks', () => {
+ *     beforeAll(() => { throw new Error('beforeAll threw'); });
+ *     test('h1', () => { expect(1).toBe(1); });
+ *     test('h2', () => { expect(1).toBe(1); });
+ * });
+ * describe('after', () => {
+ *     afterEach(() => { throw new Error('afterEach threw'); });
+ *     test('a1', () => { console.error('a1 says hi'); });
+ * });
+ * test.failing('unexpectedly passes', () => {});
+ * ```
+ */
+
+export interface BunOutput {
+    stdout: string
+    stderr: string
+}
+
+/*
+ * The error reports bun prints, in every TWO_FILES form, before each `(fail)` line: each failing
+ * test's failureMessage, colour codes removed.
+ */
+
+export const TWO_FILES_SUBTRACTS_WRONG_REPORT = [
+    "1 | import { describe, expect, it } from 'bun:test';",
+    "2 | describe('math', () => {",
+    "3 |     it('adds', () => { expect(1 + 1).toBe(2); });",
+    "4 |     it('subtracts wrong', () => {",
+    "5 |         console.log('log from subtracts');",
+    '6 |         expect(3 - 1).toBe(5);',
+    '                          ^',
+    'error: expect(received).toBe(expected)',
+    '',
+    'Expected: 5',
+    'Received: 2',
+    '',
+    '      at <anonymous> (/project/tests/a.test.ts:6:23)',
+].join('\n');
+
+export const TWO_FILES_THROWS_REPORT = [
+    "4 |     it('subtracts wrong', () => {",
+    "5 |         console.log('log from subtracts');",
+    '6 |         expect(3 - 1).toBe(5);',
+    '7 |     });',
+    "8 |     it.skip('skipped one', () => {});",
+    "9 |     it('throws', () => { throw new Error('boom from throws'); });",
+    '                                                               ^',
+    'error: boom from throws',
+    '      at <anonymous> (/project/tests/a.test.ts:9:60)',
+].join('\n');
+
+/** Without the `stderr noise from b` the test printed before it failed. */
+export const TWO_FILES_B_FAILS_REPORT = [
+    "1 | import { expect, it } from 'bun:test';",
+    "2 | it('b passes', () => { expect(true).toBe(true); });",
+    "3 | it('b fails', () => { console.error('stderr noise from b'); expect({ x: 1 }).toEqual({ x: 2 }); });",
+    '                                                                                 ^',
+    'error: expect(received).toEqual(expected)',
+    '',
+    '  {',
+    '-   "x": 2,',
+    '+   "x": 1,',
+    '  }',
+    '',
+    '- Expected  - 1',
+    '+ Received  + 1',
+    '',
+    '      at <anonymous> (/project/tests/b.test.ts:3:78)',
+].join('\n');
+
+export const TWO_FILES_PLAIN_ALL: BunOutput = {
+    stdout: [
+        'bun test v1.4.2 (744846f84)',
+        'log from subtracts',
+        '',
+    ].join('\n'),
+    stderr: [
+        '',
+        'tests/a.test.ts:',
+        '(pass) math > adds [0.03ms]',
+        "1 | import { describe, expect, it } from 'bun:test';",
+        "2 | describe('math', () => {",
+        "3 |     it('adds', () => { expect(1 + 1).toBe(2); });",
+        "4 |     it('subtracts wrong', () => {",
+        "5 |         console.log('log from subtracts');",
+        '6 |         expect(3 - 1).toBe(5);',
+        '                          ^',
+        'error: expect(received).toBe(expected)',
+        '',
+        'Expected: 5',
+        'Received: 2',
+        '',
+        '      at <anonymous> (/project/tests/a.test.ts:6:23)',
+        '(fail) math > subtracts wrong [0.47ms]',
+        '(skip) math > skipped one',
+        "4 |     it('subtracts wrong', () => {",
+        "5 |         console.log('log from subtracts');",
+        '6 |         expect(3 - 1).toBe(5);',
+        '7 |     });',
+        "8 |     it.skip('skipped one', () => {});",
+        "9 |     it('throws', () => { throw new Error('boom from throws'); });",
+        '                                                               ^',
+        'error: boom from throws',
+        '      at <anonymous> (/project/tests/a.test.ts:9:60)',
+        '(fail) math > throws [0.09ms]',
+        '',
+        'tests/b.test.ts:',
+        '(pass) b passes [0.02ms]',
+        'stderr noise from b',
+        "1 | import { expect, it } from 'bun:test';",
+        "2 | it('b passes', () => { expect(true).toBe(true); });",
+        "3 | it('b fails', () => { console.error('stderr noise from b'); expect({ x: 1 }).toEqual({ x: 2 }); });",
+        '                                                                                 ^',
+        'error: expect(received).toEqual(expected)',
+        '',
+        '  {',
+        '-   "x": 2,',
+        '+   "x": 1,',
+        '  }',
+        '',
+        '- Expected  - 1',
+        '+ Received  + 1',
+        '',
+        '      at <anonymous> (/project/tests/b.test.ts:3:78)',
+        '(fail) b fails [0.23ms]',
+        '',
+        ' 2 pass',
+        ' 1 skip',
+        ' 3 fail',
+        ' 4 expect() calls',
+        'Ran 6 tests across 2 files. [6.00ms]',
+        '',
+    ].join('\n'),
+};
+
+export const TWO_FILES_PLAIN_ONLY_FAILURES: BunOutput = {
+    stdout: [
+        'bun test v1.4.2 (744846f84)',
+        'log from subtracts',
+        '',
+    ].join('\n'),
+    stderr: [
+        '',
+        'tests/a.test.ts:',
+        "1 | import { describe, expect, it } from 'bun:test';",
+        "2 | describe('math', () => {",
+        "3 |     it('adds', () => { expect(1 + 1).toBe(2); });",
+        "4 |     it('subtracts wrong', () => {",
+        "5 |         console.log('log from subtracts');",
+        '6 |         expect(3 - 1).toBe(5);',
+        '                          ^',
+        'error: expect(received).toBe(expected)',
+        '',
+        'Expected: 5',
+        'Received: 2',
+        '',
+        '      at <anonymous> (/project/tests/a.test.ts:6:23)',
+        '(fail) math > subtracts wrong [0.32ms]',
+        "4 |     it('subtracts wrong', () => {",
+        "5 |         console.log('log from subtracts');",
+        '6 |         expect(3 - 1).toBe(5);',
+        '7 |     });',
+        "8 |     it.skip('skipped one', () => {});",
+        "9 |     it('throws', () => { throw new Error('boom from throws'); });",
+        '                                                               ^',
+        'error: boom from throws',
+        '      at <anonymous> (/project/tests/a.test.ts:9:60)',
+        '(fail) math > throws [0.07ms]',
+        '',
+        'tests/b.test.ts:',
+        'stderr noise from b',
+        "1 | import { expect, it } from 'bun:test';",
+        "2 | it('b passes', () => { expect(true).toBe(true); });",
+        "3 | it('b fails', () => { console.error('stderr noise from b'); expect({ x: 1 }).toEqual({ x: 2 }); });",
+        '                                                                                 ^',
+        'error: expect(received).toEqual(expected)',
+        '',
+        '  {',
+        '-   "x": 2,',
+        '+   "x": 1,',
+        '  }',
+        '',
+        '- Expected  - 1',
+        '+ Received  + 1',
+        '',
+        '      at <anonymous> (/project/tests/b.test.ts:3:78)',
+        '(fail) b fails [0.21ms]',
+        '',
+        ' 2 pass',
+        ' 1 skip',
+        ' 3 fail',
+        ' 4 expect() calls',
+        'Ran 6 tests across 2 files. [6.00ms]',
+        '',
+    ].join('\n'),
+};
+
+export const TWO_FILES_COLOUR_ALL: BunOutput = {
+    stdout: [
+        '\u001B[0m\u001B[1mbun test \u001B[0m\u001B[2mv1.4.2 (744846f84)\u001B[0m',
+        'log from subtracts',
+        '',
+    ].join('\n'),
+    stderr: [
+        '\u001B[0m',
+        'tests/a.test.ts:',
+        '\u001B[0m\u001B[32m✓\u001B[0m \u001B[0mmath\u001B[2m >\u001B[0m\u001B[1m adds\u001B[0m \u001B[0m\u001B[2m[0.03ms\u001B[0m\u001B[2m]\u001B[0m',
+        "\u001B[0m\u001B[1m1 |\u001B[0m \u001B[0m\u001B[35mimport\u001B[0m { describe, expect, it } \u001B[0m\u001B[35mfrom\u001B[0m \u001B[0m\u001B[32m'bun:test'\u001B[0m\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m2 |\u001B[0m describe(\u001B[0m\u001B[32m'math'\u001B[0m, () => {",
+        "\u001B[0m\u001B[1m3 |\u001B[0m     it(\u001B[0m\u001B[32m'adds'\u001B[0m, () => { expect(\u001B[0m\u001B[33m1\u001B[0m + \u001B[0m\u001B[33m1\u001B[0m)\u001B[0m\u001B[3m\u001B[1m.toBe\u001B[0m(\u001B[0m\u001B[33m2\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m })\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m4 |\u001B[0m     it(\u001B[0m\u001B[32m'subtracts wrong'\u001B[0m, () => {",
+        "\u001B[0m\u001B[1m5 |\u001B[0m         console\u001B[0m\u001B[3m\u001B[1m.log\u001B[0m(\u001B[0m\u001B[32m'log from subtracts'\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m",
+        '\u001B[0m\u001B[1m6 |\u001B[0m         expect(\u001B[0m\u001B[33m3\u001B[0m - \u001B[0m\u001B[33m1\u001B[0m)\u001B[0m\u001B[3m\u001B[1m.toBe\u001B[0m(\u001B[0m\u001B[33m5\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m',
+        '                          \u001B[31m\u001B[1m^\u001B[0m',
+        '\u001B[0m\u001B[31merror\u001B[0m\u001B[2m:\u001B[0m \u001B[1m\u001B[2mexpect(\u001B[0m\u001B[31mreceived\u001B[0m\u001B[2m).\u001B[0mtoBe\u001B[2m(\u001B[0m\u001B[32mexpected\u001B[0m\u001B[2m)\u001B[0m',
+        '',
+        'Expected: \u001B[32m5\u001B[0m',
+        'Received: \u001B[31m2\u001B[0m',
+        '\u001B[0m',
+        '\u001B[0m      \u001B[2mat \u001B[0m\u001B[0m\u001B[2m<anonymous>\u001B[0m\u001B[2m (\u001B[0m\u001B[0m\u001B[36m\u001B[2m/project/\u001B[0m\u001B[36mtests/a.test.ts\u001B[0m\u001B[2m:\u001B[0m\u001B[33m6\u001B[0m\u001B[2m:\u001B[33m23\u001B[0m\u001B[2m)\u001B[0m',
+        '\u001B[0m\u001B[31m✗\u001B[0m \u001B[0mmath\u001B[2m >\u001B[0m\u001B[1m subtracts wrong\u001B[0m \u001B[0m\u001B[2m[0.32ms\u001B[0m\u001B[2m]\u001B[0m',
+        '\u001B[0m\u001B[33m»\u001B[2m \u001B[0m\u001B[2mmath\u001B[2m >\u001B[0m\u001B[2m skipped one\u001B[0m',
+        "\u001B[0m\u001B[1m4 |\u001B[0m     it(\u001B[0m\u001B[32m'subtracts wrong'\u001B[0m, () => {",
+        "\u001B[0m\u001B[1m5 |\u001B[0m         console\u001B[0m\u001B[3m\u001B[1m.log\u001B[0m(\u001B[0m\u001B[32m'log from subtracts'\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m",
+        '\u001B[0m\u001B[1m6 |\u001B[0m         expect(\u001B[0m\u001B[33m3\u001B[0m - \u001B[0m\u001B[33m1\u001B[0m)\u001B[0m\u001B[3m\u001B[1m.toBe\u001B[0m(\u001B[0m\u001B[33m5\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m',
+        '\u001B[0m\u001B[1m7 |\u001B[0m     })\u001B[0m\u001B[2m;\u001B[0m',
+        "\u001B[0m\u001B[1m8 |\u001B[0m     it\u001B[0m\u001B[3m\u001B[1m.skip\u001B[0m(\u001B[0m\u001B[32m'skipped one'\u001B[0m, () => {})\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m9 |\u001B[0m     it(\u001B[0m\u001B[32m'throws'\u001B[0m, () => { \u001B[0m\u001B[35mthrow\u001B[0m \u001B[0m\u001B[35mnew\u001B[0m \u001B[0m\u001B[1mError\u001B[0m(\u001B[0m\u001B[32m'boom from throws'\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m })\u001B[0m\u001B[2m;\u001B[0m",
+        '                                                               \u001B[31m\u001B[1m^\u001B[0m',
+        '\u001B[0m\u001B[31merror\u001B[0m\u001B[2m:\u001B[0m \u001B[1mboom from throws\u001B[0m',
+        '\u001B[0m      \u001B[2mat \u001B[0m\u001B[0m\u001B[2m<anonymous>\u001B[0m\u001B[2m (\u001B[0m\u001B[0m\u001B[36m\u001B[2m/project/\u001B[0m\u001B[36mtests/a.test.ts\u001B[0m\u001B[2m:\u001B[0m\u001B[33m9\u001B[0m\u001B[2m:\u001B[33m60\u001B[0m\u001B[2m)\u001B[0m',
+        '\u001B[0m\u001B[31m✗\u001B[0m \u001B[0mmath\u001B[2m >\u001B[0m\u001B[1m throws\u001B[0m \u001B[0m\u001B[2m[0.09ms\u001B[0m\u001B[2m]\u001B[0m',
+        '\u001B[0m',
+        'tests/b.test.ts:',
+        '\u001B[0m\u001B[32m✓\u001B[0m\u001B[0m\u001B[1m b passes\u001B[0m \u001B[0m\u001B[2m[0.02ms\u001B[0m\u001B[2m]\u001B[0m',
+        '\u001B[0m\u001B[31mstderr noise from b\u001B[0m',
+        "\u001B[0m\u001B[1m1 |\u001B[0m \u001B[0m\u001B[35mimport\u001B[0m { expect, it } \u001B[0m\u001B[35mfrom\u001B[0m \u001B[0m\u001B[32m'bun:test'\u001B[0m\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m2 |\u001B[0m it(\u001B[0m\u001B[32m'b passes'\u001B[0m, () => { expect(\u001B[0m\u001B[33mtrue\u001B[0m)\u001B[0m\u001B[3m\u001B[1m.toBe\u001B[0m(\u001B[0m\u001B[33mtrue\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m })\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m3 |\u001B[0m it(\u001B[0m\u001B[32m'b fails'\u001B[0m, () => { console\u001B[0m\u001B[3m\u001B[1m.error\u001B[0m(\u001B[0m\u001B[32m'stderr noise from b'\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m expect({ x: \u001B[0m\u001B[33m1\u001B[0m })\u001B[0m\u001B[3m\u001B[1m.toEqual\u001B[0m({ x: \u001B[0m\u001B[33m2\u001B[0m })\u001B[0m\u001B[2m;\u001B[0m })\u001B[0m\u001B[2m;\u001B[0m",
+        '                                                                                 \u001B[31m\u001B[1m^\u001B[0m',
+        '\u001B[0m\u001B[31merror\u001B[0m\u001B[2m:\u001B[0m \u001B[1m\u001B[2mexpect(\u001B[0m\u001B[31mreceived\u001B[0m\u001B[2m).\u001B[0mtoEqual\u001B[2m(\u001B[0m\u001B[32mexpected\u001B[0m\u001B[2m)\u001B[0m',
+        '',
+        '  \u001B[0m\u001B[2m{\u001B[0m',
+        '\u001B[32m- \u001B[0m\u001B[32m  "x": \u001B[0m\u001B[32m2\u001B[0m\u001B[32m,\u001B[0m',
+        '\u001B[31m+ \u001B[0m\u001B[31m  "x": \u001B[0m\u001B[31m1\u001B[0m\u001B[31m,\u001B[0m',
+        '  \u001B[0m\u001B[2m}\u001B[0m',
+        '',
+        '\u001B[32m- Expected  - 1\u001B[0m',
+        '\u001B[31m+ Received  + 1\u001B[0m',
+        '\u001B[0m',
+        '\u001B[0m      \u001B[2mat \u001B[0m\u001B[0m\u001B[2m<anonymous>\u001B[0m\u001B[2m (\u001B[0m\u001B[0m\u001B[36m\u001B[2m/project/\u001B[0m\u001B[36mtests/b.test.ts\u001B[0m\u001B[2m:\u001B[0m\u001B[33m3\u001B[0m\u001B[2m:\u001B[33m78\u001B[0m\u001B[2m)\u001B[0m',
+        '\u001B[0m\u001B[31m✗\u001B[0m\u001B[0m\u001B[1m b fails\u001B[0m \u001B[0m\u001B[2m[0.21ms\u001B[0m\u001B[2m]\u001B[0m',
+        '',
+        '\u001B[0m\u001B[32m 2 pass\u001B[0m',
+        ' \u001B[0m\u001B[33m1 skip\u001B[0m',
+        '\u001B[0m\u001B[31m 3 fail\u001B[0m',
+        ' 4 expect() calls',
+        'Ran 6 tests across 2 files. \u001B[0m\u001B[2m[\u001B[1m6.00ms\u001B[0m\u001B[2m]\u001B[0m',
+        '',
+    ].join('\n'),
+};
+
+export const TWO_FILES_COLOUR_ONLY_FAILURES: BunOutput = {
+    stdout: [
+        '\u001B[0m\u001B[1mbun test \u001B[0m\u001B[2mv1.4.2 (744846f84)\u001B[0m',
+        'log from subtracts',
+        '',
+    ].join('\n'),
+    stderr: [
+        '\u001B[0m',
+        'tests/a.test.ts:',
+        "\u001B[0m\u001B[1m1 |\u001B[0m \u001B[0m\u001B[35mimport\u001B[0m { describe, expect, it } \u001B[0m\u001B[35mfrom\u001B[0m \u001B[0m\u001B[32m'bun:test'\u001B[0m\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m2 |\u001B[0m describe(\u001B[0m\u001B[32m'math'\u001B[0m, () => {",
+        "\u001B[0m\u001B[1m3 |\u001B[0m     it(\u001B[0m\u001B[32m'adds'\u001B[0m, () => { expect(\u001B[0m\u001B[33m1\u001B[0m + \u001B[0m\u001B[33m1\u001B[0m)\u001B[0m\u001B[3m\u001B[1m.toBe\u001B[0m(\u001B[0m\u001B[33m2\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m })\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m4 |\u001B[0m     it(\u001B[0m\u001B[32m'subtracts wrong'\u001B[0m, () => {",
+        "\u001B[0m\u001B[1m5 |\u001B[0m         console\u001B[0m\u001B[3m\u001B[1m.log\u001B[0m(\u001B[0m\u001B[32m'log from subtracts'\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m",
+        '\u001B[0m\u001B[1m6 |\u001B[0m         expect(\u001B[0m\u001B[33m3\u001B[0m - \u001B[0m\u001B[33m1\u001B[0m)\u001B[0m\u001B[3m\u001B[1m.toBe\u001B[0m(\u001B[0m\u001B[33m5\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m',
+        '                          \u001B[31m\u001B[1m^\u001B[0m',
+        '\u001B[0m\u001B[31merror\u001B[0m\u001B[2m:\u001B[0m \u001B[1m\u001B[2mexpect(\u001B[0m\u001B[31mreceived\u001B[0m\u001B[2m).\u001B[0mtoBe\u001B[2m(\u001B[0m\u001B[32mexpected\u001B[0m\u001B[2m)\u001B[0m',
+        '',
+        'Expected: \u001B[32m5\u001B[0m',
+        'Received: \u001B[31m2\u001B[0m',
+        '\u001B[0m',
+        '\u001B[0m      \u001B[2mat \u001B[0m\u001B[0m\u001B[2m<anonymous>\u001B[0m\u001B[2m (\u001B[0m\u001B[0m\u001B[36m\u001B[2m/project/\u001B[0m\u001B[36mtests/a.test.ts\u001B[0m\u001B[2m:\u001B[0m\u001B[33m6\u001B[0m\u001B[2m:\u001B[33m23\u001B[0m\u001B[2m)\u001B[0m',
+        '\u001B[0m\u001B[31m✗\u001B[0m \u001B[0mmath\u001B[2m >\u001B[0m\u001B[1m subtracts wrong\u001B[0m \u001B[0m\u001B[2m[0.34ms\u001B[0m\u001B[2m]\u001B[0m',
+        "\u001B[0m\u001B[1m4 |\u001B[0m     it(\u001B[0m\u001B[32m'subtracts wrong'\u001B[0m, () => {",
+        "\u001B[0m\u001B[1m5 |\u001B[0m         console\u001B[0m\u001B[3m\u001B[1m.log\u001B[0m(\u001B[0m\u001B[32m'log from subtracts'\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m",
+        '\u001B[0m\u001B[1m6 |\u001B[0m         expect(\u001B[0m\u001B[33m3\u001B[0m - \u001B[0m\u001B[33m1\u001B[0m)\u001B[0m\u001B[3m\u001B[1m.toBe\u001B[0m(\u001B[0m\u001B[33m5\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m',
+        '\u001B[0m\u001B[1m7 |\u001B[0m     })\u001B[0m\u001B[2m;\u001B[0m',
+        "\u001B[0m\u001B[1m8 |\u001B[0m     it\u001B[0m\u001B[3m\u001B[1m.skip\u001B[0m(\u001B[0m\u001B[32m'skipped one'\u001B[0m, () => {})\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m9 |\u001B[0m     it(\u001B[0m\u001B[32m'throws'\u001B[0m, () => { \u001B[0m\u001B[35mthrow\u001B[0m \u001B[0m\u001B[35mnew\u001B[0m \u001B[0m\u001B[1mError\u001B[0m(\u001B[0m\u001B[32m'boom from throws'\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m })\u001B[0m\u001B[2m;\u001B[0m",
+        '                                                               \u001B[31m\u001B[1m^\u001B[0m',
+        '\u001B[0m\u001B[31merror\u001B[0m\u001B[2m:\u001B[0m \u001B[1mboom from throws\u001B[0m',
+        '\u001B[0m      \u001B[2mat \u001B[0m\u001B[0m\u001B[2m<anonymous>\u001B[0m\u001B[2m (\u001B[0m\u001B[0m\u001B[36m\u001B[2m/project/\u001B[0m\u001B[36mtests/a.test.ts\u001B[0m\u001B[2m:\u001B[0m\u001B[33m9\u001B[0m\u001B[2m:\u001B[33m60\u001B[0m\u001B[2m)\u001B[0m',
+        '\u001B[0m\u001B[31m✗\u001B[0m \u001B[0mmath\u001B[2m >\u001B[0m\u001B[1m throws\u001B[0m \u001B[0m\u001B[2m[0.09ms\u001B[0m\u001B[2m]\u001B[0m',
+        '\u001B[0m',
+        'tests/b.test.ts:',
+        '\u001B[0m\u001B[31mstderr noise from b\u001B[0m',
+        "\u001B[0m\u001B[1m1 |\u001B[0m \u001B[0m\u001B[35mimport\u001B[0m { expect, it } \u001B[0m\u001B[35mfrom\u001B[0m \u001B[0m\u001B[32m'bun:test'\u001B[0m\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m2 |\u001B[0m it(\u001B[0m\u001B[32m'b passes'\u001B[0m, () => { expect(\u001B[0m\u001B[33mtrue\u001B[0m)\u001B[0m\u001B[3m\u001B[1m.toBe\u001B[0m(\u001B[0m\u001B[33mtrue\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m })\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m3 |\u001B[0m it(\u001B[0m\u001B[32m'b fails'\u001B[0m, () => { console\u001B[0m\u001B[3m\u001B[1m.error\u001B[0m(\u001B[0m\u001B[32m'stderr noise from b'\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m expect({ x: \u001B[0m\u001B[33m1\u001B[0m })\u001B[0m\u001B[3m\u001B[1m.toEqual\u001B[0m({ x: \u001B[0m\u001B[33m2\u001B[0m })\u001B[0m\u001B[2m;\u001B[0m })\u001B[0m\u001B[2m;\u001B[0m",
+        '                                                                                 \u001B[31m\u001B[1m^\u001B[0m',
+        '\u001B[0m\u001B[31merror\u001B[0m\u001B[2m:\u001B[0m \u001B[1m\u001B[2mexpect(\u001B[0m\u001B[31mreceived\u001B[0m\u001B[2m).\u001B[0mtoEqual\u001B[2m(\u001B[0m\u001B[32mexpected\u001B[0m\u001B[2m)\u001B[0m',
+        '',
+        '  \u001B[0m\u001B[2m{\u001B[0m',
+        '\u001B[32m- \u001B[0m\u001B[32m  "x": \u001B[0m\u001B[32m2\u001B[0m\u001B[32m,\u001B[0m',
+        '\u001B[31m+ \u001B[0m\u001B[31m  "x": \u001B[0m\u001B[31m1\u001B[0m\u001B[31m,\u001B[0m',
+        '  \u001B[0m\u001B[2m}\u001B[0m',
+        '',
+        '\u001B[32m- Expected  - 1\u001B[0m',
+        '\u001B[31m+ Received  + 1\u001B[0m',
+        '\u001B[0m',
+        '\u001B[0m      \u001B[2mat \u001B[0m\u001B[0m\u001B[2m<anonymous>\u001B[0m\u001B[2m (\u001B[0m\u001B[0m\u001B[36m\u001B[2m/project/\u001B[0m\u001B[36mtests/b.test.ts\u001B[0m\u001B[2m:\u001B[0m\u001B[33m3\u001B[0m\u001B[2m:\u001B[33m78\u001B[0m\u001B[2m)\u001B[0m',
+        '\u001B[0m\u001B[31m✗\u001B[0m\u001B[0m\u001B[1m b fails\u001B[0m \u001B[0m\u001B[2m[0.22ms\u001B[0m\u001B[2m]\u001B[0m',
+        '',
+        '\u001B[0m\u001B[32m 2 pass\u001B[0m',
+        ' \u001B[0m\u001B[33m1 skip\u001B[0m',
+        '\u001B[0m\u001B[31m 3 fail\u001B[0m',
+        ' 4 expect() calls',
+        'Ran 6 tests across 2 files. \u001B[0m\u001B[2m[\u001B[1m6.00ms\u001B[0m\u001B[2m]\u001B[0m',
+        '',
+    ].join('\n'),
+};
+
+export const TWO_FILES_PLAIN_ONLY_FAILURES_BAIL: BunOutput = {
+    stdout: [
+        'bun test v1.4.2 (744846f84)',
+        'log from subtracts',
+        '',
+    ].join('\n'),
+    stderr: [
+        '',
+        'tests/a.test.ts:',
+        "1 | import { describe, expect, it } from 'bun:test';",
+        "2 | describe('math', () => {",
+        "3 |     it('adds', () => { expect(1 + 1).toBe(2); });",
+        "4 |     it('subtracts wrong', () => {",
+        "5 |         console.log('log from subtracts');",
+        '6 |         expect(3 - 1).toBe(5);',
+        '                          ^',
+        'error: expect(received).toBe(expected)',
+        '',
+        'Expected: 5',
+        'Received: 2',
+        '',
+        '      at <anonymous> (/project/tests/a.test.ts:6:23)',
+        '(fail) math > subtracts wrong [0.26ms]',
+        'Ran 2 tests across 1 file. [5.00ms]',
+        'Bailed out after 1 failure',
+        '',
+    ].join('\n'),
+};
+
+export const TWO_FILES_COLOUR_ONLY_FAILURES_BAIL: BunOutput = {
+    stdout: [
+        '\u001B[0m\u001B[1mbun test \u001B[0m\u001B[2mv1.4.2 (744846f84)\u001B[0m',
+        'log from subtracts',
+        '',
+    ].join('\n'),
+    stderr: [
+        '\u001B[0m',
+        'tests/a.test.ts:',
+        "\u001B[0m\u001B[1m1 |\u001B[0m \u001B[0m\u001B[35mimport\u001B[0m { describe, expect, it } \u001B[0m\u001B[35mfrom\u001B[0m \u001B[0m\u001B[32m'bun:test'\u001B[0m\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m2 |\u001B[0m describe(\u001B[0m\u001B[32m'math'\u001B[0m, () => {",
+        "\u001B[0m\u001B[1m3 |\u001B[0m     it(\u001B[0m\u001B[32m'adds'\u001B[0m, () => { expect(\u001B[0m\u001B[33m1\u001B[0m + \u001B[0m\u001B[33m1\u001B[0m)\u001B[0m\u001B[3m\u001B[1m.toBe\u001B[0m(\u001B[0m\u001B[33m2\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m })\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m4 |\u001B[0m     it(\u001B[0m\u001B[32m'subtracts wrong'\u001B[0m, () => {",
+        "\u001B[0m\u001B[1m5 |\u001B[0m         console\u001B[0m\u001B[3m\u001B[1m.log\u001B[0m(\u001B[0m\u001B[32m'log from subtracts'\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m",
+        '\u001B[0m\u001B[1m6 |\u001B[0m         expect(\u001B[0m\u001B[33m3\u001B[0m - \u001B[0m\u001B[33m1\u001B[0m)\u001B[0m\u001B[3m\u001B[1m.toBe\u001B[0m(\u001B[0m\u001B[33m5\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m',
+        '                          \u001B[31m\u001B[1m^\u001B[0m',
+        '\u001B[0m\u001B[31merror\u001B[0m\u001B[2m:\u001B[0m \u001B[1m\u001B[2mexpect(\u001B[0m\u001B[31mreceived\u001B[0m\u001B[2m).\u001B[0mtoBe\u001B[2m(\u001B[0m\u001B[32mexpected\u001B[0m\u001B[2m)\u001B[0m',
+        '',
+        'Expected: \u001B[32m5\u001B[0m',
+        'Received: \u001B[31m2\u001B[0m',
+        '\u001B[0m',
+        '\u001B[0m      \u001B[2mat \u001B[0m\u001B[0m\u001B[2m<anonymous>\u001B[0m\u001B[2m (\u001B[0m\u001B[0m\u001B[36m\u001B[2m/project/\u001B[0m\u001B[36mtests/a.test.ts\u001B[0m\u001B[2m:\u001B[0m\u001B[33m6\u001B[0m\u001B[2m:\u001B[33m23\u001B[0m\u001B[2m)\u001B[0m',
+        '\u001B[0m\u001B[31m✗\u001B[0m \u001B[0mmath\u001B[2m >\u001B[0m\u001B[1m subtracts wrong\u001B[0m \u001B[0m\u001B[2m[0.22ms\u001B[0m\u001B[2m]\u001B[0m',
+        'Ran 2 tests across 1 file. \u001B[0m\u001B[2m[\u001B[1m4.00ms\u001B[0m\u001B[2m]\u001B[0m',
+        'Bailed out after 1 failure\u001B[0m',
+        '',
+    ].join('\n'),
+};
+
+export const EDGE_CASES_PLAIN_ALL: BunOutput = {
+    stdout: [
+        'bun test v1.4.2 (744846f84)',
+        'chatter line 1',
+        '',
+    ].join('\n'),
+    stderr: [
+        '',
+        'tests/c.test.ts:',
+        'error: chatter that looks like an error',
+        '(pass) chatty pass [0.06ms]',
+        '(todo) later',
+        "1 | import { expect, it } from 'bun:test';",
+        "2 | it('chatty pass', () => { console.log('chatter line 1'); console.error('error: chatter that looks like an error'); expect(1).toBe(1); });",
+        "3 | it.todo('later');",
+        "4 | it('thrown string', () => { throw 'just a string'; });",
+        '                                      ^',
+        'error: just a string',
+        '      at <anonymous> (/project/tests/c.test.ts:4:35)',
+        '(fail) thrown string [0.17ms]',
+        '(fail) slow [20.18ms]',
+        '  ^ this test timed out after 20ms.',
+        "1 | import { expect, it } from 'bun:test';",
+        "2 | it('chatty pass', () => { console.log('chatter line 1'); console.error('error: chatter that looks like an error'); expect(1).toBe(1); });",
+        "3 | it.todo('later');",
+        "4 | it('thrown string', () => { throw 'just a string'; });",
+        "5 | it('slow', async () => { await new Promise(r => setTimeout(r, 200)); }, 20);",
+        "6 | it('after slow', () => { expect('a').toBe('b'); });",
+        '                                         ^',
+        'error: expect(received).toBe(expected)',
+        '',
+        'Expected: "b"',
+        'Received: "a"',
+        '',
+        '      at <anonymous> (/project/tests/c.test.ts:6:38)',
+        '(fail) after slow [0.39ms]',
+        '',
+        'tests/d.test.ts:',
+        '(pass) d first [0.07ms]',
+        "1 | import { expect, it } from 'bun:test';",
+        "2 | it('d first', () => { setTimeout(() => { throw new Error('stray async error'); }, 0); });",
+        '                                                                                ^',
+        'error: stray async error',
+        '      at <anonymous> (/project/tests/d.test.ts:2:77)',
+        '(fail) d second [1.26ms]',
+        '',
+        ' 2 pass',
+        ' 1 todo',
+        ' 4 fail',
+        ' 2 expect() calls',
+        'Ran 7 tests across 2 files. [27.00ms]',
+        '',
+    ].join('\n'),
+};
+
+export const EDGE_CASES_PLAIN_ONLY_FAILURES: BunOutput = {
+    stdout: [
+        'bun test v1.4.2 (744846f84)',
+        'chatter line 1',
+        '',
+    ].join('\n'),
+    stderr: [
+        '',
+        'tests/c.test.ts:',
+        'error: chatter that looks like an error',
+        "1 | import { expect, it } from 'bun:test';",
+        "2 | it('chatty pass', () => { console.log('chatter line 1'); console.error('error: chatter that looks like an error'); expect(1).toBe(1); });",
+        "3 | it.todo('later');",
+        "4 | it('thrown string', () => { throw 'just a string'; });",
+        '                                      ^',
+        'error: just a string',
+        '      at <anonymous> (/project/tests/c.test.ts:4:35)',
+        '(fail) thrown string [0.17ms]',
+        '(fail) slow [20.13ms]',
+        '  ^ this test timed out after 20ms.',
+        "1 | import { expect, it } from 'bun:test';",
+        "2 | it('chatty pass', () => { console.log('chatter line 1'); console.error('error: chatter that looks like an error'); expect(1).toBe(1); });",
+        "3 | it.todo('later');",
+        "4 | it('thrown string', () => { throw 'just a string'; });",
+        "5 | it('slow', async () => { await new Promise(r => setTimeout(r, 200)); }, 20);",
+        "6 | it('after slow', () => { expect('a').toBe('b'); });",
+        '                                         ^',
+        'error: expect(received).toBe(expected)',
+        '',
+        'Expected: "b"',
+        'Received: "a"',
+        '',
+        '      at <anonymous> (/project/tests/c.test.ts:6:38)',
+        '(fail) after slow [0.36ms]',
+        '',
+        'tests/d.test.ts:',
+        "1 | import { expect, it } from 'bun:test';",
+        "2 | it('d first', () => { setTimeout(() => { throw new Error('stray async error'); }, 0); });",
+        '                                                                                ^',
+        'error: stray async error',
+        '      at <anonymous> (/project/tests/d.test.ts:2:77)',
+        '(fail) d second [1.26ms]',
+        '',
+        ' 2 pass',
+        ' 1 todo',
+        ' 4 fail',
+        ' 2 expect() calls',
+        'Ran 7 tests across 2 files. [27.00ms]',
+        '',
+    ].join('\n'),
+};
+
+export const EDGE_CASES_COLOUR_ALL: BunOutput = {
+    stdout: [
+        '\u001B[0m\u001B[1mbun test \u001B[0m\u001B[2mv1.4.2 (744846f84)\u001B[0m',
+        'chatter line 1',
+        '',
+    ].join('\n'),
+    stderr: [
+        '\u001B[0m',
+        'tests/c.test.ts:',
+        '\u001B[0m\u001B[31merror: chatter that looks like an error\u001B[0m',
+        '\u001B[0m\u001B[32m✓\u001B[0m\u001B[0m\u001B[1m chatty pass\u001B[0m \u001B[0m\u001B[2m[0.07ms\u001B[0m\u001B[2m]\u001B[0m',
+        '\u001B[0m\u001B[35m✎\u001B[0m\u001B[0m\u001B[2m later\u001B[0m',
+        "\u001B[0m\u001B[1m1 |\u001B[0m \u001B[0m\u001B[35mimport\u001B[0m { expect, it } \u001B[0m\u001B[35mfrom\u001B[0m \u001B[0m\u001B[32m'bun:test'\u001B[0m\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m2 |\u001B[0m it(\u001B[0m\u001B[32m'chatty pass'\u001B[0m, () => { console\u001B[0m\u001B[3m\u001B[1m.log\u001B[0m(\u001B[0m\u001B[32m'chatter line 1'\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m console\u001B[0m\u001B[3m\u001B[1m.error\u001B[0m(\u001B[0m\u001B[32m'error: chatter that looks like an error'\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m expect(\u001B[0m\u001B[33m1\u001B[0m)\u001B[0m\u001B[3m\u001B[1m.toBe\u001B[0m(\u001B[0m\u001B[33m1\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m })\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m3 |\u001B[0m it\u001B[0m\u001B[3m\u001B[1m.todo\u001B[0m(\u001B[0m\u001B[32m'later'\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m4 |\u001B[0m it(\u001B[0m\u001B[32m'thrown string'\u001B[0m, () => { \u001B[0m\u001B[35mthrow\u001B[0m \u001B[0m\u001B[32m'just a string'\u001B[0m\u001B[0m\u001B[2m;\u001B[0m })\u001B[0m\u001B[2m;\u001B[0m",
+        '                                      \u001B[31m\u001B[1m^\u001B[0m',
+        '\u001B[0m\u001B[31merror\u001B[0m\u001B[2m:\u001B[0m \u001B[1mjust a string\u001B[0m',
+        '\u001B[0m      \u001B[2mat \u001B[0m\u001B[0m\u001B[2m<anonymous>\u001B[0m\u001B[2m (\u001B[0m\u001B[0m\u001B[36m\u001B[2m/project/\u001B[0m\u001B[36mtests/c.test.ts\u001B[0m\u001B[2m:\u001B[0m\u001B[33m4\u001B[0m\u001B[2m:\u001B[33m35\u001B[0m\u001B[2m)\u001B[0m',
+        '\u001B[0m\u001B[31m✗\u001B[0m\u001B[0m\u001B[1m thrown string\u001B[0m \u001B[0m\u001B[2m[0.20ms\u001B[0m\u001B[2m]\u001B[0m',
+        '\u001B[0m\u001B[31m✗\u001B[0m\u001B[0m\u001B[1m slow\u001B[0m \u001B[0m\u001B[2m[\u001B[1m20.13ms\u001B[0m\u001B[2m]\u001B[0m',
+        '  \u001B[2m^\u001B[0m \u001B[31mthis test timed out after 20ms.\u001B[0m',
+        "\u001B[0m\u001B[1m1 |\u001B[0m \u001B[0m\u001B[35mimport\u001B[0m { expect, it } \u001B[0m\u001B[35mfrom\u001B[0m \u001B[0m\u001B[32m'bun:test'\u001B[0m\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m2 |\u001B[0m it(\u001B[0m\u001B[32m'chatty pass'\u001B[0m, () => { console\u001B[0m\u001B[3m\u001B[1m.log\u001B[0m(\u001B[0m\u001B[32m'chatter line 1'\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m console\u001B[0m\u001B[3m\u001B[1m.error\u001B[0m(\u001B[0m\u001B[32m'error: chatter that looks like an error'\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m expect(\u001B[0m\u001B[33m1\u001B[0m)\u001B[0m\u001B[3m\u001B[1m.toBe\u001B[0m(\u001B[0m\u001B[33m1\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m })\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m3 |\u001B[0m it\u001B[0m\u001B[3m\u001B[1m.todo\u001B[0m(\u001B[0m\u001B[32m'later'\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m4 |\u001B[0m it(\u001B[0m\u001B[32m'thrown string'\u001B[0m, () => { \u001B[0m\u001B[35mthrow\u001B[0m \u001B[0m\u001B[32m'just a string'\u001B[0m\u001B[0m\u001B[2m;\u001B[0m })\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m5 |\u001B[0m it(\u001B[0m\u001B[32m'slow'\u001B[0m, \u001B[0m\u001B[35masync\u001B[0m () => { \u001B[0m\u001B[35mawait\u001B[0m \u001B[0m\u001B[35mnew\u001B[0m \u001B[0m\u001B[1mPromise\u001B[0m(r => setTimeout(r, \u001B[0m\u001B[33m200\u001B[0m))\u001B[0m\u001B[2m;\u001B[0m }, \u001B[0m\u001B[33m20\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m6 |\u001B[0m it(\u001B[0m\u001B[32m'after slow'\u001B[0m, () => { expect(\u001B[0m\u001B[32m'a'\u001B[0m)\u001B[0m\u001B[3m\u001B[1m.toBe\u001B[0m(\u001B[0m\u001B[32m'b'\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m })\u001B[0m\u001B[2m;\u001B[0m",
+        '                                         \u001B[31m\u001B[1m^\u001B[0m',
+        '\u001B[0m\u001B[31merror\u001B[0m\u001B[2m:\u001B[0m \u001B[1m\u001B[2mexpect(\u001B[0m\u001B[31mreceived\u001B[0m\u001B[2m).\u001B[0mtoBe\u001B[2m(\u001B[0m\u001B[32mexpected\u001B[0m\u001B[2m)\u001B[0m',
+        '',
+        'Expected: \u001B[0m\u001B[32m"\u001B[0m\u001B[32mb\u001B[0m\u001B[32m"\u001B[0m',
+        'Received: \u001B[0m\u001B[31m"\u001B[0m\u001B[31ma\u001B[0m\u001B[31m"\u001B[0m',
+        '\u001B[0m',
+        '\u001B[0m      \u001B[2mat \u001B[0m\u001B[0m\u001B[2m<anonymous>\u001B[0m\u001B[2m (\u001B[0m\u001B[0m\u001B[36m\u001B[2m/project/\u001B[0m\u001B[36mtests/c.test.ts\u001B[0m\u001B[2m:\u001B[0m\u001B[33m6\u001B[0m\u001B[2m:\u001B[33m38\u001B[0m\u001B[2m)\u001B[0m',
+        '\u001B[0m\u001B[31m✗\u001B[0m\u001B[0m\u001B[1m after slow\u001B[0m \u001B[0m\u001B[2m[0.47ms\u001B[0m\u001B[2m]\u001B[0m',
+        '\u001B[0m',
+        'tests/d.test.ts:',
+        '\u001B[0m\u001B[32m✓\u001B[0m\u001B[0m\u001B[1m d first\u001B[0m \u001B[0m\u001B[2m[0.05ms\u001B[0m\u001B[2m]\u001B[0m',
+        "\u001B[0m\u001B[1m1 |\u001B[0m \u001B[0m\u001B[35mimport\u001B[0m { expect, it } \u001B[0m\u001B[35mfrom\u001B[0m \u001B[0m\u001B[32m'bun:test'\u001B[0m\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m2 |\u001B[0m it(\u001B[0m\u001B[32m'd first'\u001B[0m, () => { setTimeout(() => { \u001B[0m\u001B[35mthrow\u001B[0m \u001B[0m\u001B[35mnew\u001B[0m \u001B[0m\u001B[1mError\u001B[0m(\u001B[0m\u001B[32m'stray async error'\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m }, \u001B[0m\u001B[33m0\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m })\u001B[0m\u001B[2m;\u001B[0m",
+        '                                                                                \u001B[31m\u001B[1m^\u001B[0m',
+        '\u001B[0m\u001B[31merror\u001B[0m\u001B[2m:\u001B[0m \u001B[1mstray async error\u001B[0m',
+        '\u001B[0m      \u001B[2mat \u001B[0m\u001B[0m\u001B[2m<anonymous>\u001B[0m\u001B[2m (\u001B[0m\u001B[0m\u001B[36m\u001B[2m/project/\u001B[0m\u001B[36mtests/d.test.ts\u001B[0m\u001B[2m:\u001B[0m\u001B[33m2\u001B[0m\u001B[2m:\u001B[33m77\u001B[0m\u001B[2m)\u001B[0m',
+        '\u001B[0m\u001B[31m✗\u001B[0m\u001B[0m\u001B[1m d second\u001B[0m \u001B[0m\u001B[2m[1.29ms\u001B[0m\u001B[2m]\u001B[0m',
+        '',
+        '\u001B[0m\u001B[32m 2 pass\u001B[0m',
+        ' \u001B[0m\u001B[35m1 todo\u001B[0m',
+        '\u001B[0m\u001B[31m 4 fail\u001B[0m',
+        ' 2 expect() calls',
+        'Ran 7 tests across 2 files. \u001B[0m\u001B[2m[\u001B[1m27.00ms\u001B[0m\u001B[2m]\u001B[0m',
+        '',
+    ].join('\n'),
+};
+
+export const EDGE_CASES_COLOUR_ONLY_FAILURES: BunOutput = {
+    stdout: [
+        '\u001B[0m\u001B[1mbun test \u001B[0m\u001B[2mv1.4.2 (744846f84)\u001B[0m',
+        'chatter line 1',
+        '',
+    ].join('\n'),
+    stderr: [
+        '\u001B[0m',
+        'tests/c.test.ts:',
+        '\u001B[0m\u001B[31merror: chatter that looks like an error\u001B[0m',
+        "\u001B[0m\u001B[1m1 |\u001B[0m \u001B[0m\u001B[35mimport\u001B[0m { expect, it } \u001B[0m\u001B[35mfrom\u001B[0m \u001B[0m\u001B[32m'bun:test'\u001B[0m\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m2 |\u001B[0m it(\u001B[0m\u001B[32m'chatty pass'\u001B[0m, () => { console\u001B[0m\u001B[3m\u001B[1m.log\u001B[0m(\u001B[0m\u001B[32m'chatter line 1'\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m console\u001B[0m\u001B[3m\u001B[1m.error\u001B[0m(\u001B[0m\u001B[32m'error: chatter that looks like an error'\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m expect(\u001B[0m\u001B[33m1\u001B[0m)\u001B[0m\u001B[3m\u001B[1m.toBe\u001B[0m(\u001B[0m\u001B[33m1\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m })\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m3 |\u001B[0m it\u001B[0m\u001B[3m\u001B[1m.todo\u001B[0m(\u001B[0m\u001B[32m'later'\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m4 |\u001B[0m it(\u001B[0m\u001B[32m'thrown string'\u001B[0m, () => { \u001B[0m\u001B[35mthrow\u001B[0m \u001B[0m\u001B[32m'just a string'\u001B[0m\u001B[0m\u001B[2m;\u001B[0m })\u001B[0m\u001B[2m;\u001B[0m",
+        '                                      \u001B[31m\u001B[1m^\u001B[0m',
+        '\u001B[0m\u001B[31merror\u001B[0m\u001B[2m:\u001B[0m \u001B[1mjust a string\u001B[0m',
+        '\u001B[0m      \u001B[2mat \u001B[0m\u001B[0m\u001B[2m<anonymous>\u001B[0m\u001B[2m (\u001B[0m\u001B[0m\u001B[36m\u001B[2m/project/\u001B[0m\u001B[36mtests/c.test.ts\u001B[0m\u001B[2m:\u001B[0m\u001B[33m4\u001B[0m\u001B[2m:\u001B[33m35\u001B[0m\u001B[2m)\u001B[0m',
+        '\u001B[0m\u001B[31m✗\u001B[0m\u001B[0m\u001B[1m thrown string\u001B[0m \u001B[0m\u001B[2m[0.18ms\u001B[0m\u001B[2m]\u001B[0m',
+        '\u001B[0m\u001B[31m✗\u001B[0m\u001B[0m\u001B[1m slow\u001B[0m \u001B[0m\u001B[2m[\u001B[1m20.11ms\u001B[0m\u001B[2m]\u001B[0m',
+        '  \u001B[2m^\u001B[0m \u001B[31mthis test timed out after 20ms.\u001B[0m',
+        "\u001B[0m\u001B[1m1 |\u001B[0m \u001B[0m\u001B[35mimport\u001B[0m { expect, it } \u001B[0m\u001B[35mfrom\u001B[0m \u001B[0m\u001B[32m'bun:test'\u001B[0m\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m2 |\u001B[0m it(\u001B[0m\u001B[32m'chatty pass'\u001B[0m, () => { console\u001B[0m\u001B[3m\u001B[1m.log\u001B[0m(\u001B[0m\u001B[32m'chatter line 1'\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m console\u001B[0m\u001B[3m\u001B[1m.error\u001B[0m(\u001B[0m\u001B[32m'error: chatter that looks like an error'\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m expect(\u001B[0m\u001B[33m1\u001B[0m)\u001B[0m\u001B[3m\u001B[1m.toBe\u001B[0m(\u001B[0m\u001B[33m1\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m })\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m3 |\u001B[0m it\u001B[0m\u001B[3m\u001B[1m.todo\u001B[0m(\u001B[0m\u001B[32m'later'\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m4 |\u001B[0m it(\u001B[0m\u001B[32m'thrown string'\u001B[0m, () => { \u001B[0m\u001B[35mthrow\u001B[0m \u001B[0m\u001B[32m'just a string'\u001B[0m\u001B[0m\u001B[2m;\u001B[0m })\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m5 |\u001B[0m it(\u001B[0m\u001B[32m'slow'\u001B[0m, \u001B[0m\u001B[35masync\u001B[0m () => { \u001B[0m\u001B[35mawait\u001B[0m \u001B[0m\u001B[35mnew\u001B[0m \u001B[0m\u001B[1mPromise\u001B[0m(r => setTimeout(r, \u001B[0m\u001B[33m200\u001B[0m))\u001B[0m\u001B[2m;\u001B[0m }, \u001B[0m\u001B[33m20\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m6 |\u001B[0m it(\u001B[0m\u001B[32m'after slow'\u001B[0m, () => { expect(\u001B[0m\u001B[32m'a'\u001B[0m)\u001B[0m\u001B[3m\u001B[1m.toBe\u001B[0m(\u001B[0m\u001B[32m'b'\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m })\u001B[0m\u001B[2m;\u001B[0m",
+        '                                         \u001B[31m\u001B[1m^\u001B[0m',
+        '\u001B[0m\u001B[31merror\u001B[0m\u001B[2m:\u001B[0m \u001B[1m\u001B[2mexpect(\u001B[0m\u001B[31mreceived\u001B[0m\u001B[2m).\u001B[0mtoBe\u001B[2m(\u001B[0m\u001B[32mexpected\u001B[0m\u001B[2m)\u001B[0m',
+        '',
+        'Expected: \u001B[0m\u001B[32m"\u001B[0m\u001B[32mb\u001B[0m\u001B[32m"\u001B[0m',
+        'Received: \u001B[0m\u001B[31m"\u001B[0m\u001B[31ma\u001B[0m\u001B[31m"\u001B[0m',
+        '\u001B[0m',
+        '\u001B[0m      \u001B[2mat \u001B[0m\u001B[0m\u001B[2m<anonymous>\u001B[0m\u001B[2m (\u001B[0m\u001B[0m\u001B[36m\u001B[2m/project/\u001B[0m\u001B[36mtests/c.test.ts\u001B[0m\u001B[2m:\u001B[0m\u001B[33m6\u001B[0m\u001B[2m:\u001B[33m38\u001B[0m\u001B[2m)\u001B[0m',
+        '\u001B[0m\u001B[31m✗\u001B[0m\u001B[0m\u001B[1m after slow\u001B[0m \u001B[0m\u001B[2m[0.49ms\u001B[0m\u001B[2m]\u001B[0m',
+        '\u001B[0m',
+        'tests/d.test.ts:',
+        "\u001B[0m\u001B[1m1 |\u001B[0m \u001B[0m\u001B[35mimport\u001B[0m { expect, it } \u001B[0m\u001B[35mfrom\u001B[0m \u001B[0m\u001B[32m'bun:test'\u001B[0m\u001B[0m\u001B[2m;\u001B[0m",
+        "\u001B[0m\u001B[1m2 |\u001B[0m it(\u001B[0m\u001B[32m'd first'\u001B[0m, () => { setTimeout(() => { \u001B[0m\u001B[35mthrow\u001B[0m \u001B[0m\u001B[35mnew\u001B[0m \u001B[0m\u001B[1mError\u001B[0m(\u001B[0m\u001B[32m'stray async error'\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m }, \u001B[0m\u001B[33m0\u001B[0m)\u001B[0m\u001B[2m;\u001B[0m })\u001B[0m\u001B[2m;\u001B[0m",
+        '                                                                                \u001B[31m\u001B[1m^\u001B[0m',
+        '\u001B[0m\u001B[31merror\u001B[0m\u001B[2m:\u001B[0m \u001B[1mstray async error\u001B[0m',
+        '\u001B[0m      \u001B[2mat \u001B[0m\u001B[0m\u001B[2m<anonymous>\u001B[0m\u001B[2m (\u001B[0m\u001B[0m\u001B[36m\u001B[2m/project/\u001B[0m\u001B[36mtests/d.test.ts\u001B[0m\u001B[2m:\u001B[0m\u001B[33m2\u001B[0m\u001B[2m:\u001B[33m77\u001B[0m\u001B[2m)\u001B[0m',
+        '\u001B[0m\u001B[31m✗\u001B[0m\u001B[0m\u001B[1m d second\u001B[0m \u001B[0m\u001B[2m[1.24ms\u001B[0m\u001B[2m]\u001B[0m',
+        '',
+        '\u001B[0m\u001B[32m 2 pass\u001B[0m',
+        ' \u001B[0m\u001B[35m1 todo\u001B[0m',
+        '\u001B[0m\u001B[31m 4 fail\u001B[0m',
+        ' 2 expect() calls',
+        'Ran 7 tests across 2 files. \u001B[0m\u001B[2m[\u001B[1m27.00ms\u001B[0m\u001B[2m]\u001B[0m',
+        '',
+    ].join('\n'),
+};
+
+export const HOOKS_PLAIN_ONLY_FAILURES: BunOutput = {
+    stdout: [
+        'bun test v1.4.2 (744846f84)',
+        '',
+    ].join('\n'),
+    stderr: [
+        '',
+        'tests/g.test.ts:',
+        "1 | import { afterEach, beforeAll, describe, expect, test } from 'bun:test';",
+        "2 | describe('hooks', () => {",
+        "3 |     beforeAll(() => { throw new Error('beforeAll threw'); });",
+        '                                                           ^',
+        'error: beforeAll threw',
+        '      at <anonymous> (/project/tests/g.test.ts:3:56)',
+        '(fail) hooks > (unnamed) [0.25ms]',
+        'a1 says hi',
+        "3 |     beforeAll(() => { throw new Error('beforeAll threw'); });",
+        "4 |     test('h1', () => { expect(1).toBe(1); });",
+        "5 |     test('h2', () => { expect(1).toBe(1); });",
+        '6 | });',
+        "7 | describe('after', () => {",
+        "8 |     afterEach(() => { throw new Error('afterEach threw'); });",
+        '                                                           ^',
+        'error: afterEach threw',
+        '      at <anonymous> (/project/tests/g.test.ts:8:56)',
+        '(fail) after > a1 [0.07ms]',
+        '(fail) unexpectedly passes [0.01ms]',
+        '  ^ this test is marked as failing but it passed. Remove `.failing` if tested behavior now works',
+        '',
+        ' 0 pass',
+        ' 3 fail',
+        'Ran 3 tests across 1 file. [5.00ms]',
+        '',
+    ].join('\n'),
+};

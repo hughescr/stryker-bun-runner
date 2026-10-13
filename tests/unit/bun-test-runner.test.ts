@@ -26,6 +26,15 @@ import * as bunfigSanitizer from '../../src/utils/bunfig-sanitizer.js';
 import * as privateTempDir from '../../src/utils/private-temp-dir.js';
 import * as syncServerModule from '../../src/utils/sync-server.js';
 import * as testFileDiscovery from '../../src/utils/test-file-discovery.js';
+import {
+    TWO_FILES_B_FAILS_REPORT,
+    TWO_FILES_COLOUR_ONLY_FAILURES,
+    TWO_FILES_COLOUR_ONLY_FAILURES_BAIL,
+    TWO_FILES_PLAIN_ONLY_FAILURES,
+    TWO_FILES_PLAIN_ONLY_FAILURES_BAIL,
+    TWO_FILES_SUBTRACTS_WRONG_REPORT,
+    TWO_FILES_THROWS_REPORT
+} from '../helpers/bun-output-fixtures.js';
 import { runUntilSettled, trackTimers } from '../helpers/fake-clock.js';
 import { mockRename, mockWriteFile, resetAllMocks, resetFsMocks } from '../test-preload.js';
 
@@ -2308,8 +2317,8 @@ tests/example.test.ts:
 bun test v1.1.0
 
 tests/example.test.ts:
-✗ failed test [0.05ms]
   error: Test failed with assertion
+✗ failed test [0.05ms]
 
  0 pass
  1 fail
@@ -4810,6 +4819,25 @@ tests/example.test.ts:
                 }
             });
 
+            it('COMPLETE branch: takes the console failure message from the failing test\'s line, not a passing test whose name contains it', async () => {
+                // Under FORCE_COLOR bun's `✓` lines parse as passing tests, listed before the failing one here.
+                mockProcessResult({ exitCode: 1, stdout: '\u001B[32m✓\u001B[0m my test too [0.10ms]\nerror: from the console\n\u001B[31m✗\u001B[0m my test [0.20ms]\n 1 pass\n 1 fail' });
+                const testHierarchy: TestInfo[] = [
+                    { id: 1, name: 'my test too', fullName: 'my test too', type: 'test', status: 'pass' },
+                    { id: 2, name: 'my test', fullName: 'my test', type: 'test', status: 'fail', error: { message: 'from the inspector' } },
+                ];
+                mockInspectorClient.getTests.mockReturnValue(testHierarchy);
+                mockInspectorClient.getExecutionOrder.mockReturnValue([1, 2]);
+
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                const result = await runner.dryRun();
+
+                expect(result.status).toBe(DryRunStatus.Complete);
+                const failed = result.status === DryRunStatus.Complete ? result.tests.find(t => t.status === TestStatus.Failed) : undefined;
+                expect(failed?.status === TestStatus.Failed ? failed.failureMessage : undefined).toBe('error: from the console');
+            });
+
             it('COMPLETE branch: does NOT append anything when the inspector error has no stack', async () => {
                 // Distinguishes the real `stack && !baseFailureMessage.includes(stack)` guard
                 // from a mutant that forces this to always-true: with no `stack` at all,
@@ -6388,8 +6416,8 @@ bun test v1.1.0
 
 tests/example.test.ts:
 ✗ test 1 [0.05ms]
-✗ test 2 [0.05ms]
   error: Expected 2 but received 3
+✗ test 2 [0.05ms]
 
  0 pass
  2 fail
@@ -6435,12 +6463,12 @@ tests/example.test.ts:
 bun test v1.1.0
 
 tests/example.test.ts:
-✗ test alpha [0.05ms]
   error: Alpha failed
-✗ test beta [0.05ms]
+✗ test alpha [0.05ms]
   error: Beta failed
-✗ test gamma [0.05ms]
+✗ test beta [0.05ms]
   error: Gamma failed
+✗ test gamma [0.05ms]
 
  0 pass
  3 fail
@@ -6842,10 +6870,10 @@ bun test v1.1.0
 
 tests/example.test.ts:
 ✓ passing test [0.05ms]
-✗ failing test 1 [0.05ms]
   error: First error
-✗ failing test 2 [0.05ms]
+✗ failing test 1 [0.05ms]
   error: Second error
+✗ failing test 2 [0.05ms]
 
  1 pass
  2 fail
@@ -7107,6 +7135,83 @@ tests/example.test.ts:
                 const result = await run(['a.test.ts > a1', 'a.test.ts > a2', 'a.test.ts > a3']);
 
                 expect(result.status).toBe(MutantRunStatus.Survived);
+                expect((mockLogger.warn as ReturnType<typeof mock>).mock.calls.filter(call => String(call[0]).includes('rather than Survived'))).toEqual([]);
+            });
+        });
+
+        describe('real bun 1.4.2 output, with and without FORCE_COLOR (tests/helpers/bun-output-fixtures.ts)', () => {
+            // Under FORCE_COLOR bun colours its `(fail)` lines (as `✗ …`) even when piped. Read raw, no
+            // failing test was found in them: every kill had an empty killedBy (so Stryker's incremental
+            // mode could not reuse it), and an early exit 0 after a failing test scored Error.
+            const SUBTRACTS = 'tests/a.test.ts > math > subtracts wrong';
+            const THROWS = 'tests/a.test.ts > math > throws';
+            const B_FAILS = 'tests/b.test.ts > b fails';
+            const COVERING = [SUBTRACTS, THROWS, B_FAILS, 'tests/a.test.ts > math > adds', 'tests/b.test.ts > b passes'];
+
+            const run = async (disableBail: boolean) => {
+                const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                await runner.init();
+                return runner.mutantRun({
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+                    activeMutant:    { id: '1' } as any,
+                    testFilter:      COVERING,
+                    sandboxFileName: 'sandbox',
+                    disableBail,
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+                } as any);
+            };
+            const unattributedWarns = (): unknown[] => (mockLogger.warn as ReturnType<typeof mock>).mock.calls.filter(call => String(call[0]).includes('no killing test identifiable'));
+
+            it.each([
+                ['plain', TWO_FILES_PLAIN_ONLY_FAILURES_BAIL],
+                ['FORCE_COLOR', TWO_FILES_COLOUR_ONLY_FAILURES_BAIL],
+            ])('%s, with bail: Killed by the failing test', async (_label, output) => {
+                mockRunBunTests.mockResolvedValue({ exitCode: 1, ...output, timedOut: false });
+
+                expect(await run(false)).toMatchObject({ status: MutantRunStatus.Killed, killedBy: [SUBTRACTS], nrOfTests: 1 });
+                expect(unattributedWarns()).toEqual([]);
+            });
+
+            it.each([
+                ['plain', TWO_FILES_PLAIN_ONLY_FAILURES],
+                ['FORCE_COLOR', TWO_FILES_COLOUR_ONLY_FAILURES],
+            ])('%s, without bail: Killed by every failing test', async (_label, output) => {
+                mockRunBunTests.mockResolvedValue({ exitCode: 1, ...output, timedOut: false });
+
+                expect(await run(true)).toMatchObject({ status: MutantRunStatus.Killed, killedBy: [SUBTRACTS, THROWS, B_FAILS], nrOfTests: 6 });
+                expect(unattributedWarns()).toEqual([]);
+            });
+
+            it.each([
+                ['plain', TWO_FILES_PLAIN_ONLY_FAILURES_BAIL],
+                ['FORCE_COLOR', TWO_FILES_COLOUR_ONLY_FAILURES_BAIL],
+            ])('%s, with bail: the failureMessage (Stryker\'s statusReason) is the error report bun printed before the (fail) line', async (_label, output) => {
+                // Not the `Ran 2 tests across 1 file.` and `Bailed out after 1 failure` lines bun prints after it.
+                mockRunBunTests.mockResolvedValue({ exitCode: 1, ...output, timedOut: false });
+
+                expect(await run(false)).toMatchObject({ status: MutantRunStatus.Killed, failureMessage: TWO_FILES_SUBTRACTS_WRONG_REPORT });
+            });
+
+            it.each([
+                ['plain', TWO_FILES_PLAIN_ONLY_FAILURES],
+                ['FORCE_COLOR', TWO_FILES_COLOUR_ONLY_FAILURES],
+            ])('%s, without bail: the failureMessage holds each failing test\'s own report, in order', async (_label, output) => {
+                mockRunBunTests.mockResolvedValue({ exitCode: 1, ...output, timedOut: false });
+
+                expect(await run(true)).toMatchObject({
+                    status:         MutantRunStatus.Killed,
+                    failureMessage: [TWO_FILES_SUBTRACTS_WRONG_REPORT, TWO_FILES_THROWS_REPORT, TWO_FILES_B_FAILS_REPORT].join('\n\n'),
+                });
+            });
+
+            it.each([
+                ['plain', TWO_FILES_PLAIN_ONLY_FAILURES],
+                ['FORCE_COLOR', TWO_FILES_COLOUR_ONLY_FAILURES],
+            ])('%s, an exit 0 before the summary after two tests failed: Killed by them, not Error', async (_label, output) => {
+                // As if b.test.ts called process.exit(0) at load: everything up to its header, then nothing.
+                mockRunBunTests.mockResolvedValue({ exitCode: 0, stdout: output.stdout, stderr: output.stderr.slice(0, output.stderr.indexOf('tests/b.test.ts:')), timedOut: false });
+
+                expect(await run(true)).toMatchObject({ status: MutantRunStatus.Killed, killedBy: [SUBTRACTS, THROWS] });
                 expect((mockLogger.warn as ReturnType<typeof mock>).mock.calls.filter(call => String(call[0]).includes('rather than Survived'))).toEqual([]);
             });
         });
@@ -10354,10 +10459,10 @@ error: Failed B
                     stdout:   `
 test/file.test.ts:
 ✓ passing test [0.12ms]
-✗ fail 1 [0.05ms]
 error: Message 1
-✗ fail 2 [0.05ms]
+✗ fail 1 [0.05ms]
 error: Message 2
+✗ fail 2 [0.05ms]
 
  1 pass
  2 fail
@@ -10910,10 +11015,10 @@ error: Test failure
                     stdout:   `
 test/file.test.ts:
 ✓ passing test [0.12ms]
-✗ failed test 1 [0.05ms]
 error: Error message 1
-✗ failed test 2 [0.05ms]
+✗ failed test 1 [0.05ms]
 error: Error message 2
+✗ failed test 2 [0.05ms]
 
  1 pass
  2 fail
@@ -10948,8 +11053,8 @@ error: Error message 2
                     stdout:   `
 test/file.test.ts:
 ✗ failed test without message [0.05ms]
-✗ failed test with message [0.05ms]
 error: Actual error message
+✗ failed test with message [0.05ms]
 
  0 pass
  2 fail
@@ -10985,8 +11090,8 @@ error: Actual error message
 test/file.test.ts:
 ✓ passing test A [0.12ms]
 ✓ passing test B [0.12ms]
-✗ failed test [0.05ms]
 error: Expected error
+✗ failed test [0.05ms]
 
  2 pass
  1 fail
@@ -11022,8 +11127,8 @@ error: Expected error
             });
 
             it('falls back to the trimmed, 1000-char-capped stderr when no failed test carries a message', async () => {
-                // The failed test comes before a passing one, so it collects no error lines and
-                // the stderr (a whitespace line, then 2000 chars) is not collected into it.
+                // Bun printed nothing before the failed test's line (its file header comes right
+                // before it), and the stderr (a whitespace line, then 2000 chars) comes after it.
                 mockRunBunTests.mockResolvedValue({
                     exitCode: 1,
                     stdout:   '\ntest/file.test.ts:\n✗ failed test [0.05ms]\n✓ passing test [0.12ms]\n\n 1 pass\n 1 fail\n',
@@ -11055,8 +11160,8 @@ error: Expected error
                     stdout:   `
 test/file.test.ts:
 ✗ failed test 1 [0.05ms]
-✗ failed test 2 [0.05ms]
 error: Only this message
+✗ failed test 2 [0.05ms]
 
  0 pass
  2 fail
@@ -11092,12 +11197,12 @@ error: Only this message
                     exitCode: 1,
                     stdout:   `
 test/file.test.ts:
-✗ test > suite > first failing test [0.05ms]
 error: First failure message
-✗ test > suite > second failing test [0.05ms]
+✗ test > suite > first failing test [0.05ms]
 error: Second failure message
-✗ test > suite > third failing test [0.05ms]
+✗ test > suite > second failing test [0.05ms]
 error: Third failure message
+✗ test > suite > third failing test [0.05ms]
 
  0 pass
  3 fail

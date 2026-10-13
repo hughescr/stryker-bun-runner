@@ -389,7 +389,7 @@ function buildTestNameIndex(
  * a partial miss, only a total one.
  */
 // Stryker disable next-line Regex: version-coupled to bun's exact wording; see the doc comment above and mutantRun/checkRuntimeError's behavioral tests
-const ZERO_MATCH_TEST_PATTERN_RE = /matched 0 tests\./;
+export const ZERO_MATCH_TEST_PATTERN_RE = /matched 0 tests\./;
 
 /** What a failed test says when neither bun's console recap nor the inspector says why. */
 function defaultFailureMessage(testInfo: TestInfo): string {
@@ -1573,7 +1573,9 @@ export class BunTestRunner implements TestRunner {
    * are all unaffected; only failureMessage content is enriched.
    */
     private buildFailureMessage(testInfo: TestInfo, parsed: ParsedTestResults): string {
-        const parsedTest = parsed.tests.find(t => t.name.includes(testInfo.name));
+        // Only a failing test's line carries a failure message. Under FORCE_COLOR bun's `✓` lines
+        // parse as passing tests too, and one whose name contains this test's must not shadow it.
+        const parsedTest = parsed.tests.find(t => t.status === 'failed' && t.name.includes(testInfo.name));
         const baseFailureMessage = parsedTest?.failureMessage ?? testInfo.error?.message ?? defaultFailureMessage(testInfo);
         const stack = testInfo.error?.stack;
         return stack && !baseFailureMessage.includes(stack)

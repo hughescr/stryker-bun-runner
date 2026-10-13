@@ -62,9 +62,9 @@ tests/example.test.ts:
 bun test v1.1.0
 
 tests/example.test.ts:
-✗ should multiply numbers [0.08ms]
   error: Expected 6 but received 5
   at /path/to/test.ts:10:15
+✗ should multiply numbers [0.08ms]
 
  0 pass
  1 fail
@@ -112,11 +112,11 @@ tests/example.test.ts:
 bun test v1.1.0
 
 tests/example.test.ts:
-✗ should handle complex errors [0.15ms]
   error: Expected object to match
   Expected: { foo: 'bar' }
   Received: { foo: 'baz' }
   at /path/to/test.ts:15:20
+✗ should handle complex errors [0.15ms]
 
  0 pass
  1 fail
@@ -211,10 +211,10 @@ tests/example.test.ts:
 bun test v1.1.0
 
 tests/example.test.ts:
-✗ first failure [0.05ms]
   error: First error message
-✗ second failure [0.08ms]
+✗ first failure [0.05ms]
   error: Second error message
+✗ second failure [0.08ms]
 
  0 pass
  2 fail
@@ -223,8 +223,8 @@ tests/example.test.ts:
 
             expect(result.failed).toBe(2);
             expect(result.tests).toHaveLength(2);
-            expect(result.tests[0].failureMessage).toContain('First error message');
-            expect(result.tests[1].failureMessage).toContain('Second error message');
+            expect(result.tests[0].failureMessage).toBe('error: First error message');
+            expect(result.tests[1].failureMessage).toBe('error: Second error message');
         });
     });
 
@@ -365,9 +365,9 @@ tests/example.test.ts:
 bun test v1.1.0
 
 tests/example.test.ts:
-(fail) should catch mutation [0.08ms]
   error: Expected true but got false
   at /path/to/test.ts:10:15
+(fail) should catch mutation [0.08ms]
 
 Bailed out after 1 failure
 `;
@@ -390,8 +390,8 @@ Bailed out after 1 failure
 bun test v1.1.0
 
 tests/example.test.ts:
-(fail) should catch mutation
   error: Expected true but got false
+(fail) should catch mutation
 
 Bailed out after 1 failure
 `;
@@ -428,10 +428,10 @@ Bailed out after 1 failure
 bun test v1.1.0
 
 tests/example.test.ts:
-(fail) should catch first mutation [0.08ms]
   error: First failure
-(fail) should catch second mutation [0.05ms]
+(fail) should catch first mutation [0.08ms]
   error: Second failure
+(fail) should catch second mutation [0.05ms]
 
 Bailed out after 2 failures
 `;
@@ -440,108 +440,56 @@ Bailed out after 2 failures
             expect(result.failed).toBe(2);
             expect(result.totalTests).toBe(2);
             expect(result.tests).toHaveLength(2);
-            expect(result.tests[0].failureMessage).toContain('First failure');
-            expect(result.tests[1].failureMessage).toContain('Second failure');
+            expect(result.tests[0].failureMessage).toBe('error: First failure');
+            expect(result.tests[1].failureMessage).toBe('error: Second failure');
         });
     });
 
-    describe('shouldCollectErrorLine mutation tests', () => {
-        it('should not collect summary lines starting with digits (line 127 killer)', () => {
-            // Kills regex mutations on line 127 - ensures summary lines are not collected as errors
+    describe('what a failure report keeps', () => {
+        it('leaves out the summary bun prints after the last (fail) line', () => {
             const output = `
 bun test v1.1.0
 
 tests/example.test.ts:
+error: Test error message
 ✗ should fail [0.05ms]
-  error: Test failed
- 1 fail
-`;
-            const result = parseBunTestOutput(output, '');
-
-            // Error message should not include the " 1 fail" summary line
-            expect(result.tests[0].failureMessage).toBe('error: Test failed');
-            expect(result.tests[0].failureMessage).not.toContain('1 fail');
-        });
-
-        it('should not collect lines that are only whitespace (line 127 killer)', () => {
-            // Tests the !line.trim() check - blank lines should not be collected
-            const output = `
-bun test v1.1.0
-
-tests/example.test.ts:
-✗ should fail [0.05ms]
-  error: First line
-
-  error: Second line
-
- 0 pass
- 1 fail
-`;
-            const result = parseBunTestOutput(output, '');
-
-            // Error message should contain both error lines but blank lines shouldn't add extra content
-            expect(result.tests[0].failureMessage).toContain('First line');
-            expect(result.tests[0].failureMessage).toContain('Second line');
-        });
-
-        it('should not collect summary lines with pass/fail/skip keywords (line 127 killer)', () => {
-            // Tests the regex that matches summary lines with pass/fail/skip
-            const output = `
-bun test v1.1.0
-
-tests/example.test.ts:
-✗ should fail [0.05ms]
-  error: Test error message
  10 pass
  2 fail
  1 skip
-`;
-            const result = parseBunTestOutput(output, '');
-
-            // Error should not contain any summary lines
-            expect(result.tests[0].failureMessage).toBe('error: Test error message');
-            expect(result.tests[0].failureMessage).not.toContain('pass');
-            expect(result.tests[0].failureMessage).not.toContain('fail');
-            expect(result.tests[0].failureMessage).not.toContain('skip');
-        });
-
-        it('should collect error lines that contain "pass" but are not summary (line 127 killer)', () => {
-            // Tests that we only skip lines matching the specific summary pattern
-            const output = `
-bun test v1.1.0
-
-tests/example.test.ts:
-✗ should fail [0.05ms]
-  error: Expected password to pass validation
-  at test.ts:10:15
-
- 0 pass
- 1 fail
-`;
-            const result = parseBunTestOutput(output, '');
-
-            // Error message should contain the line with "pass" because it's not a summary line
-            expect(result.tests[0].failureMessage).toContain('Expected password to pass validation');
-        });
-
-        it('should collect expect() calls summary line because regex only filters pass/fail/skip', () => {
-            // The regex on line 127 only filters lines matching "N pass", "N fail", "N skip"
-            // It does NOT filter "N expect() calls" - that's intentional behavior
-            const output = `
-bun test v1.1.0
-
-tests/example.test.ts:
-✗ should fail [0.05ms]
-  error: Assertion failed
- 0 pass
- 1 fail
  4 expect() calls
+Ran 13 tests across 1 file. [5.00ms]
 `;
             const result = parseBunTestOutput(output, '');
 
-            // The "4 expect() calls" line will be collected as part of error message
-            // This is expected behavior - the regex only filters pass/fail/skip lines
-            expect(result.tests[0].failureMessage).toContain('error: Assertion failed');
+            expect(result.tests[0].failureMessage).toBe('error: Test error message');
+        });
+
+        it('keeps the blank lines inside a report, as bun separates its diff with them', () => {
+            const output = `
+tests/example.test.ts:
+error: expect(received).toEqual(expected)
+
+- Expected  - 1
++ Received  + 1
+
+      at <anonymous> (/project/tests/example.test.ts:3:78)
+✗ should fail [0.05ms]
+`;
+            const result = parseBunTestOutput(output, '');
+
+            expect(result.tests[0].failureMessage).toBe('error: expect(received).toEqual(expected)\n\n- Expected  - 1\n+ Received  + 1\n\n      at <anonymous> (/project/tests/example.test.ts:3:78)');
+        });
+
+        it('keeps report lines that look like summary counts', () => {
+            const output = `
+tests/example.test.ts:
+error: Expected password to pass validation
+ 2 fail
+✗ should fail [0.05ms]
+`;
+            const result = parseBunTestOutput(output, '');
+
+            expect(result.tests[0].failureMessage).toBe('error: Expected password to pass validation\n 2 fail');
         });
     });
 
@@ -551,9 +499,9 @@ tests/example.test.ts:
 bun test v1.1.0
 
 tests/example.test.ts:
-✗ should fail first [0.05ms]
   error: First test failure
   at /path/to/test.ts:10:15
+✗ should fail first [0.05ms]
 ✓ should pass after fail [0.12ms]
 
  1 pass
@@ -580,9 +528,9 @@ tests/example.test.ts:
 bun test v1.1.0
 
 tests/example.test.ts:
-✗ should fail first [0.05ms]
   error: Test failure message
   at /path/to/test.ts:10:15
+✗ should fail first [0.05ms]
 ⏭ should skip after fail
 
  0 pass
@@ -610,11 +558,11 @@ tests/example.test.ts:
 bun test v1.1.0
 
 tests/example.test.ts:
-✗ should fail with complex error [0.15ms]
   error: Expected object to match
   Expected: { foo: 'bar' }
   Received: { foo: 'baz' }
   at /path/to/test.ts:15:20
+✗ should fail with complex error [0.15ms]
 ✓ should pass after complex error [0.08ms]
 
  1 pass
@@ -876,8 +824,8 @@ tests/example.test.ts:
 bun test v1.1.0
 
 tests/example.test.ts:
-✗ should fail [0.05ms]
   error: Test failed
+✗ should fail [0.05ms]
 
  0 pass
  1 fail
@@ -922,19 +870,17 @@ tests/example.test.ts:
         });
 
         it('should handle stderr error messages with proper line breaks', () => {
-            // Test that stderr errors are properly separated from stdout
+            // Test that the end of stdout and the start of stderr stay separate lines
             const stdout = `bun test v1.1.0
 
 tests/example.test.ts:
+error: Assertion failed`;
+            const stderr = `  at /path/to/test.ts:10:15
 ✗ should fail [0.05ms]`;
-            const stderr = `  error: Assertion failed
-  at /path/to/test.ts:10:15`;
 
             const result = parseBunTestOutput(stdout, stderr);
 
-            // Error message from stderr should be properly captured
-            expect(result.tests[0].failureMessage).toContain('Assertion failed');
-            expect(result.tests[0].failureMessage).toContain('at /path/to/test.ts:10:15');
+            expect(result.tests[0].failureMessage).toBe('error: Assertion failed\n  at /path/to/test.ts:10:15');
         });
     });
 
@@ -945,8 +891,8 @@ tests/example.test.ts:
 bun test v1.1.0
 
 tests/example.test.ts:
-✗ should fail [0.05ms]
   error: Test failed
+✗ should fail [0.05ms]
 
  0 pass
  1 fail
@@ -965,10 +911,10 @@ tests/example.test.ts:
 bun test v1.1.0
 
 tests/example.test.ts:
-✗ should fail [0.05ms]
 
   error: Test failed
 
+✗ should fail [0.05ms]
 ✓ should pass [0.12ms]
 
  1 pass
@@ -990,10 +936,10 @@ tests/example.test.ts:
 bun test v1.1.0
 
 tests/example.test.ts:
-✗ should fail [0.05ms]
   error: Line 1
   error: Line 2
   error: Line 3
+✗ should fail [0.05ms]
 
  0 pass
  1 fail
@@ -1084,14 +1030,13 @@ tests/example.test.ts:
             expect(result.tests[0].failureMessage).toBeUndefined();
         });
 
-        it('should return true for failed test status when startedCollectingError is true (line 143-145)', () => {
-            // Tests the failed branch returns parseResult.startedCollectingError
+        it('should count a failed test and give it the report printed before its line', () => {
             const output = `
 bun test v1.1.0
 
 tests/example.test.ts:
-✗ should fail [0.05ms]
   error: Test failed
+✗ should fail [0.05ms]
 
  0 pass
  1 fail
@@ -1230,87 +1175,6 @@ bun test v1.1.0
             expect(result.passed).toBe(10);
             expect(result.failed).toBe(5);
             expect(result.skipped).toBe(2);
-        });
-    });
-
-    describe('shouldCollectErrorLine edge cases', () => {
-        it('should not collect empty string (line 123)', () => {
-            // Specifically tests empty string (not just whitespace)
-            const output = `
-bun test v1.1.0
-
-tests/example.test.ts:
-✗ should fail [0.05ms]
-  error: Error message
-
- 0 pass
- 1 fail
-`;
-            const result = parseBunTestOutput(output, '');
-            // Empty lines between error and summary shouldn't affect message
-            expect(result.tests[0].failureMessage).toBe('error: Error message');
-        });
-
-        it('should not collect tabs-only line (line 123)', () => {
-            // Tests that line.trim() handles tabs
-            const output = `
-bun test v1.1.0
-
-tests/example.test.ts:
-✗ should fail [0.05ms]
-  error: First
-\t\t
-  error: Second
-
- 0 pass
- 1 fail
-`;
-            const result = parseBunTestOutput(output, '');
-            // Tab-only line should not add content
-            expect(result.tests[0].failureMessage).toContain('First');
-            expect(result.tests[0].failureMessage).toContain('Second');
-        });
-
-        it('should not collect line starting with whitespace and digits (line 127)', () => {
-            // Tests the regex pattern for summary lines
-            const output = `
-bun test v1.1.0
-
-tests/example.test.ts:
-✗ should fail [0.05ms]
-  error: Test failed
-  10 pass
-  5 fail
-  2 skip
-
- 10 pass
- 5 fail
- 2 skip
-`;
-            const result = parseBunTestOutput(output, '');
-
-            // Summary lines with leading spaces should be filtered out
-            expect(result.tests[0].failureMessage).toBe('error: Test failed');
-            expect(result.tests[0].failureMessage).not.toContain('10 pass');
-        });
-
-        it('should collect lines with "pass" that do not match summary pattern (line 127)', () => {
-            // Tests that regex is specific - "password" or "bypass" should be collected
-            const output = `
-bun test v1.1.0
-
-tests/example.test.ts:
-✗ should fail [0.05ms]
-  error: Password bypass failed
-  at test.ts:10:15
-
- 0 pass
- 1 fail
-`;
-            const result = parseBunTestOutput(output, '');
-
-            // Lines containing "pass" but not matching summary format should be collected
-            expect(result.tests[0].failureMessage).toContain('Password bypass failed');
         });
     });
 
@@ -1671,7 +1535,7 @@ tests/example.test.ts:
             expect(result.tests[0].failureMessage).toBeUndefined();
         });
 
-        it('should collect error text after failed tests only', () => {
+        it('should collect the error report before failed tests only', () => {
             // Tests that error collection works correctly for failed tests
             // while confirming passed/skipped tests don't collect errors
             const output = `
@@ -1679,9 +1543,9 @@ bun test v1.1.0
 
 tests/example.test.ts:
 ✓ should pass [0.12ms]
-  this should not be collected
+  output the failing test printed before its error
+error: This should be collected
 ✗ should fail [0.05ms]
-  error: This should be collected
 ⏭ should skip
   this should not be collected either
 
@@ -1702,18 +1566,18 @@ tests/example.test.ts:
             expect(result.tests[2].failureMessage).toBeUndefined();
         });
 
-        it('should stop collecting error when next test starts', () => {
+        it('should start a new report after each test line', () => {
             // Tests that error collection state properly transitions between tests
             const output = `
 bun test v1.1.0
 
 tests/example.test.ts:
-✗ first fail [0.05ms]
   error: First error
   at /path/to/test.ts:10:15
+✗ first fail [0.05ms]
 ✓ then pass [0.12ms]
-✗ second fail [0.08ms]
   error: Second error
+✗ second fail [0.08ms]
 
  1 pass
  2 fail
@@ -1773,52 +1637,6 @@ tests/example.test.ts:
 
                 // With empty errorLines, failureMessage should be undefined, not ""
                 expect(result.tests[0].failureMessage).toBeUndefined();
-            });
-        });
-
-        describe('line 127-128: shouldCollectErrorLine mutations', () => {
-            it('should not collect whitespace-only lines as errors', () => {
-                // Kills mutation removing !line.trim() check on line 127
-                const output = `
-bun test v1.1.0
-
-tests/example.test.ts:
-✗ should fail [0.05ms]
-  error: Real error
-
-  more error text
-
- 0 pass
- 1 fail
-`;
-                const result = parseBunTestOutput(output, '');
-
-                // Whitespace-only lines should not be collected
-                expect(result.tests[0].failureMessage).toContain('Real error');
-                expect(result.tests[0].failureMessage).toContain('more error text');
-                // Should not have multiple consecutive newlines from whitespace lines
-                expect(result.tests[0].failureMessage).not.toContain('\n\n\n');
-            });
-
-            it('should return false for empty lines', () => {
-                // Kills mutation on line 128 changing "return false" to "return true"
-                const output = `
-bun test v1.1.0
-
-tests/example.test.ts:
-✗ should fail [0.05ms]
-  error: Error line 1
-
-  error: Error line 2
-
- 0 pass
- 1 fail
-`;
-                const result = parseBunTestOutput(output, '');
-
-                // Empty lines should not be collected (would cause extra spacing if true)
-                const lines = result.tests[0].failureMessage?.split('\n') ?? [];
-                expect(lines.every(line => line.trim().length > 0)).toBe(true);
             });
         });
 
@@ -1909,8 +1727,8 @@ tests/example.test.ts:
 bun test v1.1.0
 
 tests/example.test.ts:
-✗ should fail [0.05ms]
   error: Failed
+✗ should fail [0.05ms]
 
  0 pass
  1 fail
@@ -2057,38 +1875,33 @@ tests/example.test.ts:
                 expect(result.tests[0].failureMessage).toBeUndefined();
             });
 
-            it('should not collect when currentTest is null but collectingError is true', () => {
-                // Kills mutation on line 272: && to ||
-                // At start, currentTest is null but if collectingError were true, || would trigger
+            it('should drop console output the test printed before its error heading', () => {
                 const output = `
 bun test v1.1.0
 
 tests/example.test.ts:
-  error line before any test (should not be collected)
+  console output before the error (should not be collected)
+error: This should be collected
 ✗ should fail [0.05ms]
-  error: This should be collected
 
  0 pass
  1 fail
 `;
                 const result = parseBunTestOutput(output, '');
 
-                // First test should only have its own error, not the line before any test
                 expect(result.tests[0].failureMessage).toBe('error: This should be collected');
-                expect(result.tests[0].failureMessage).not.toContain('before any test');
             });
 
-            it('should only collect when both conditions are true', () => {
-                // Kills mutation changing && to always-true
+            it('should collect the lines between the previous test line and the failing one, and none after', () => {
                 const output = `
 bun test v1.1.0
 
 tests/example.test.ts:
 ✓ pass before fail [0.12ms]
-  should not collect this
-✗ should fail [0.05ms]
   error: Should collect this
   and this line too
+✗ should fail [0.05ms]
+  should not collect this
 
  1 pass
  1 fail
@@ -2097,11 +1910,7 @@ tests/example.test.ts:
 
                 // Passed test should have no error
                 expect(result.tests[0].failureMessage).toBeUndefined();
-                // Failed test should have its error
-                expect(result.tests[1].failureMessage).toContain('Should collect this');
-                expect(result.tests[1].failureMessage).toContain('and this line too');
-                // Failed test should NOT have lines from passed test
-                expect(result.tests[1].failureMessage).not.toContain('should not collect');
+                expect(result.tests[1].failureMessage).toBe('error: Should collect this\n  and this line too');
             });
         });
     });
@@ -2132,34 +1941,6 @@ tests/example.test.ts:
             // Check no double trailing whitespace by verifying trimEnd() removes nothing
             expect(result.tests[0].name.trimEnd()).toBe(result.tests[0].name);
             expect(result.tests[1].name).not.toMatch(/>\s{2,}/);
-        });
-
-        it('should not collect whitespace-only lines between error lines - line 127 killer', () => {
-            // CRITICAL: Kills line.trim() removal on line 127
-            // If !line.trim() check is removed, whitespace lines would be collected
-            const output = `
-bun test v1.1.0
-
-tests/example.test.ts:
-✗ should fail [0.05ms]
-  error: First line
-
-  error: Second line
-
-  error: Third line
-
- 0 pass
- 1 fail
-`;
-            const result = parseBunTestOutput(output, '');
-
-            // Count actual non-empty lines in error message
-            const errorLines = result.tests[0].failureMessage?.split('\n').filter(l => l.trim()) ?? [];
-            // Should have exactly 3 lines, not 5 (with whitespace lines)
-            expect(errorLines).toHaveLength(3);
-            expect(result.tests[0].failureMessage).toContain('First line');
-            expect(result.tests[0].failureMessage).toContain('Second line');
-            expect(result.tests[0].failureMessage).toContain('Third line');
         });
 
         it('should increment passed counter exactly N times for N tests - line 146 killer', () => {
@@ -2477,35 +2258,6 @@ tests/example.test.ts:
             expect(result.tests[0].name).not.toContain('     ');
             expect(result.tests[0].name).not.toContain('   ');
         });
-
-        it('CRITICAL: kills line.trim() removal on line 127 in shouldCollectErrorLine', () => {
-            // Without line.trim(), whitespace-only lines would be collected as errors
-            const output = `
-bun test v1.1.0
-
-tests/example.test.ts:
-✗ should fail [0.05ms]
-  error: Line 1
-
-  error: Line 2
-
-  error: Line 3
-
- 0 pass
- 1 fail
-`;
-            const result = parseBunTestOutput(output, '');
-
-            // Count non-empty lines in error message
-            const errorLines = result.tests[0].failureMessage?.split('\n') ?? [];
-            const nonEmptyLines = errorLines.filter(line => line.trim().length > 0);
-
-            // EXACT count - should have 3 error lines, not 5 (with whitespace lines)
-            expect(nonEmptyLines.length).toBe(3);
-            expect(result.tests[0].failureMessage).toContain('Line 1');
-            expect(result.tests[0].failureMessage).toContain('Line 2');
-            expect(result.tests[0].failureMessage).toContain('Line 3');
-        });
     });
 
     describe('MUTATION KILLERS: Arithmetic mutations (line 204)', () => {
@@ -2631,10 +2383,9 @@ bun test v1.1.0
 
 tests/example.test.ts:
 ✓ first pass [0.12ms]
-  should not collect (currentTest exists, collectingError=false)
-✗ then fail [0.05ms]
   error: Should collect this
   and this too
+✗ then fail [0.05ms]
 ✓ second pass [0.08ms]
   should not collect again
 
@@ -2990,43 +2741,16 @@ tests/example.test.ts:
             expect(result.tests[0].name).not.toMatch(/^\s/); // No leading space in test portion
             expect(result.tests[0].name).not.toMatch(/\s$/); // No trailing space
         });
-
-        it('KILLS line 127: line.trim() removal in shouldCollectErrorLine', () => {
-            // Without line.trim(), "   " (whitespace-only) would not be detected as empty
-            // and the !line.trim() check would fail to filter it
-            const output = `bun test v1.1.0
-
-tests/example.test.ts:
-✗ fail [0.05ms]
-  error: Start
-
-  error: End`;
-            const result = parseBunTestOutput(output, '');
-
-            // Error message should NOT contain whitespace-only lines
-            const lines = result.tests[0].failureMessage?.split('\n') ?? [];
-            const whitespaceOnlyLines = lines.filter(l => l.length > 0 && l.trim().length === 0);
-            expect(whitespaceOnlyLines.length).toBe(0);
-
-            // Should contain both error lines
-            expect(result.tests[0].failureMessage).toContain('Start');
-            expect(result.tests[0].failureMessage).toContain('End');
-        });
     });
 
-    describe('MUTATION KILLERS: Logical operators && to || (lines 260, 280)', () => {
-        it('KILLS line 260: currentTest && collectingError to ||', () => {
-            // Line 260: if(currentTest && collectingError)
-            // && requires BOTH to be true
-            // || would be true if EITHER is true (wrong!)
-
-            // Case 1: currentTest exists but NOT collecting error
+    describe('failure reports and passing tests', () => {
+        it('gives the report to the failing test, not the passing test before it', () => {
             const output1 = `bun test v1.1.0
 
 tests/example.test.ts:
 ✓ passing test [0.05ms]
-✗ second test [0.05ms]
-  error: This error should be on second test only`;
+  error: This error should be on second test only
+✗ second test [0.05ms]`;
             const result1 = parseBunTestOutput(output1, '');
 
             // Passing test should not have error message
@@ -3035,16 +2759,14 @@ tests/example.test.ts:
             expect(result1.tests[1].failureMessage).toContain('This error should be on second test only');
         });
 
-        it('KILLS line 280: currentTest && collectingError to ||', () => {
-            // Line 280: if(currentTest && collectingError)
-            // Same logic as line 260 - finalizing error at end of parsing
+        it('keeps the stack lines of a report that ends the output', () => {
             const output = `bun test v1.1.0
 
 tests/example.test.ts:
 ✓ pass [0.05ms]
-✗ fail [0.05ms]
   error: Error message
-  at file.ts:10`;
+  at file.ts:10
+✗ fail [0.05ms]`;
             const result = parseBunTestOutput(output, '');
 
             // Only failed test should have error
@@ -3053,14 +2775,13 @@ tests/example.test.ts:
             expect(result.tests[1].failureMessage).toContain('at file.ts:10');
         });
 
-        it('KILLS lines 260, 280: true replacement mutations', () => {
-            // Replacing condition with true would always finalize error
+        it('gives a passing test no failure message', () => {
             const output = `bun test v1.1.0
 
 tests/example.test.ts:
 ✓ pass [0.05ms]
-✗ fail [0.05ms]
-  error: Only on failed test`;
+  error: Only on failed test
+✗ fail [0.05ms]`;
             const result = parseBunTestOutput(output, '');
 
             // Passed test must not have error message
@@ -3069,16 +2790,14 @@ tests/example.test.ts:
         });
     });
 
-    describe('MUTATION KILLERS: Boolean literal line 244', () => {
-        it('KILLS line 244: collectingError = false to true', () => {
-            // Line 244: let collectingError = false;
-            // If initialized to true, would collect lines before first test
+    describe('failure reports and file headers', () => {
+        it('starts the first report after the file header', () => {
             const output = `bun test v1.1.0
 
 Preamble line that should be ignored
 tests/example.test.ts:
-✗ fail [0.05ms]
-  error: Actual error`;
+  error: Actual error
+✗ fail [0.05ms]`;
             const result = parseBunTestOutput(output, '');
 
             // Error should only contain "error: Actual error"
@@ -3153,33 +2872,6 @@ Ran 5 tests across 1 file.`;
     });
 
     describe('FINAL MUTATION KILLERS: Remaining survivors', () => {
-        it('KILLS line 127: trim() removal on whitespace-only error lines', () => {
-            // Mutation 83: line.trim() -> line
-            // If trim() is removed, "   " (spaces only) would be truthy and get collected
-            // We need to create a scenario where the input has a line with ONLY spaces (not empty)
-            // After split('\n'), this becomes a non-empty string containing only whitespace
-            const output = 'bun test v1.1.0\n\ntests/example.test.ts:\n✗ should fail [0.05ms]\n  error: Real error\n   \n  more error text\n\n 0 pass\n 1 fail\n';
-            const result = parseBunTestOutput(output, '');
-
-            // With trim(): "   ".trim() === "" → !("") === true → return false (don't collect)
-            // Without trim(): !"   " === false → return true → line gets collected
-            const msg = result.tests[0].failureMessage ?? '';
-
-            // The error should have both lines but not the whitespace-only line
-            expect(msg).toContain('Real error');
-            expect(msg).toContain('more error text');
-
-            // Count actual content lines - with mutation, we'd get 3 lines (including whitespace line)
-            // Without mutation, we get 2 lines
-            const lines = msg.split('\n').filter(l => l.length > 0);
-            expect(lines).toHaveLength(2);
-
-            // Verify no whitespace-only content
-            for(const line of lines) {
-                expect(line.trim().length).toBeGreaterThan(0);
-            }
-        });
-
         it('KILLS line 152: (test.status === "skipped") to true', () => {
             // Mutation 110: test.status === 'skipped' -> true
             // If replaced with true, would treat ALL tests as skipped
@@ -3187,8 +2879,8 @@ Ran 5 tests across 1 file.`;
 
 tests/example.test.ts:
 ✓ should pass [0.12ms]
-✗ should fail [0.05ms]
   error: Test error
+✗ should fail [0.05ms]
 
  1 pass
  1 fail
@@ -3269,17 +2961,15 @@ Ran 3 tests across 1 file.`;
             expect(result.totalTests).toBe(3);
         });
 
-        it('KILLS line 244: collectingError = false to true', () => {
-            // Mutation 180: let collectingError = false -> true
-            // If starts true, would collect lines before first test
+        it('leaves what came before the file header out of the first report', () => {
             const output = `bun test v1.1.0
 
 Random preamble text
 More preamble
 tests/example.test.ts:
-✗ should fail [0.05ms]
   error: Actual error
   at file.ts:10
+✗ should fail [0.05ms]
 
  0 pass
  1 fail
@@ -3292,16 +2982,14 @@ tests/example.test.ts:
             expect(result.tests[0].failureMessage ?? '').not.toContain('More preamble');
         });
 
-        it('KILLS line 260: (currentTest && collectingError) to true', () => {
-            // Mutation 189: Condition replaced with true
-            // Would always finalize error, even for passed tests
+        it('gives passing tests before a failure no failure message', () => {
             const output = `bun test v1.1.0
 
 tests/example.test.ts:
 ✓ first pass [0.12ms]
 ✓ second pass [0.08ms]
-✗ should fail [0.05ms]
   error: Error message
+✗ should fail [0.05ms]
 
  2 pass
  1 fail
@@ -3315,26 +3003,22 @@ tests/example.test.ts:
             expect(result.tests[2].failureMessage).toContain('Error message');
         });
 
-        it('KILLS line 260: (currentTest && collectingError) to ||', () => {
-            // Mutation 191: && to ||
-            // Would finalize when either condition is true, not both
+        it('starts a report without a code frame at its error heading', () => {
             const output = `bun test v1.1.0
 
 tests/example.test.ts:
 ✓ should pass [0.12ms]
-  random text after pass
+  random text the failing test printed
+error: Real error
 ✗ should fail [0.05ms]
-  error: Real error
 
  1 pass
  1 fail
 `;
             const result = parseBunTestOutput(output, '');
 
-            // With &&: currentTest exists but collectingError=false, so no finalization
-            // With ||: would finalize because currentTest is truthy
             expect(result.tests[0].failureMessage).toBeUndefined();
-            expect(result.tests[1].failureMessage).toContain('Real error');
+            expect(result.tests[1].failureMessage).toBe('error: Real error');
         });
 
         it('KILLS line 280: (currentTest && collectingError) to true', () => {
@@ -3812,7 +3496,6 @@ tests/example.test.ts:
         it('skips workflow-command lines while collecting a failure message', () => {
             const output = [
                 '::group::tests/foo.test.ts:',
-                '(fail) Suite > kills the mutant [0.42ms]',
                 '  error: expect(received).toBe(expected)',
                 '::error file=tests/foo.test.ts,line=12::expect(received).toBe(expected)',
                 '::warning file=tests/foo.test.ts::flaky test detected',
@@ -3821,6 +3504,7 @@ tests/example.test.ts:
                 '::add-mask::secretvalue',
                 '::add-matcher::path/to/matcher.json',
                 '::remove-matcher owner=eslint::',
+                '(fail) Suite > kills the mutant [0.42ms]',
                 '::endgroup::',
                 '',
                 ' 0 pass',
@@ -3837,9 +3521,9 @@ tests/example.test.ts:
             const output = [
                 '::group::Install dependencies',
                 'tests/foo.test.ts:',
-                '✗ fails [0.20ms]',
                 '  error: boom',
                 '::group::Some Section',
+                '✗ fails [0.20ms]',
                 '',
                 ' 0 pass',
                 ' 1 fail',
@@ -3878,9 +3562,9 @@ tests/example.test.ts:
         it('does not treat stack-trace or line-number lines as file headers (no-colon-in-path anchor)', () => {
             const output = [
                 'tests/a.test.ts:',
-                '✗ first fails [0.10ms]',
                 '  at tests/foo.test.ts:12:5',
                 'tests/foo.test.ts:12:',
+                '✗ first fails [0.10ms]',
                 '✓ second [0.10ms]',
                 '',
                 ' 1 pass',
@@ -3889,7 +3573,7 @@ tests/example.test.ts:
             const result = parseBunTestOutput(output, '');
 
             // Neither the stack-trace line nor the line-number-suffixed line may
-            // change currentFile — "second" stays under tests/a.test.ts.
+            // change currentFile — both tests stay under tests/a.test.ts.
             expect(result.tests[0].name).toBe('tests/a.test.ts > first fails');
             expect(result.tests[1].name).toBe('tests/a.test.ts > second');
             // The stack-trace line is still collected as part of the error message
