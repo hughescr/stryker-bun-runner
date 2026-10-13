@@ -21,6 +21,7 @@ coverage so that each mutant runs only the tests that reach it.
   - [Before you start](#before-you-start) · [Install](#1-install) · [Configure](#2-configure) ·
     [Run](#3-run) · [Reading the output](#reading-the-output) ·
     [Optional: skip mutants that do not compile](#optional-skip-mutants-that-do-not-compile)
+- [Upgrading from 1.5](#upgrading-from-15)
 - [Upgrading from 1.4](#upgrading-from-14)
 - [Terms](#terms)
 - [Requirements and compatibility](#requirements-and-compatibility)
@@ -163,7 +164,37 @@ export default await withTestFilesExcludedFromTypeCheck({
 });
 ```
 
+## Upgrading from 1.5
+
+Most projects need no config change, but these differ from 1.5:
+
+- **Faster.** On the repo's benchmark fixture (remeda, 1766 mutants, 4 workers, `coverageAnalysis:
+  'perTest'`) a full run takes about 37% less wall time than 1.5.2, with no change in which
+  mutants are caught. The main reasons: a much cheaper parent-death watch in every `bun test`
+  child; static mutants run their likeliest killing test files first; mutant runs ask bun to print
+  only failing tests; and a cheaper dry run on large suites. [bench/README.md](bench/README.md)
+  explains how it is measured.
+- **Some verdicts change, toward correctness** ([How results are scored](#how-results-are-scored)).
+  A mutant that makes a test, hook or module call `process.exit(0)` before bun prints its summary
+  is Error, not Survived (Killed when a failing test was reported first). With `FORCE_COLOR` set,
+  failing tests are now read, so `killedBy` is filled in and some Error verdicts become Killed. A
+  Killed mutant's reason is now the error bun printed for the test; before, it was often unrelated
+  lines. Incremental mode keeps the old verdict of mutants it reuses; run once with `--force` to
+  re-score.
+- **Mutant-run file order.** Static mutants (and other planned full-suite runs) run the test
+  files most likely to kill them first, judged from the dry run's coverage, then cheapest first.
+  The order can differ between mutants, so the runner assumes an order-independent suite
+  ([Mutant runs](docs/internals.md#mutant-runs)).
+- **Temporary files.** Each run's private temp directory is now removed when the Stryker run
+  ends, and the directories of runs that died are swept by later runs after an hour. The
+  directory names changed. Directories left by older versions are safe to delete by hand
+  ([Temporary files](docs/internals.md#temporary-files)).
+- **Profiling.** The new opt-in `STRYKER_BUN_PROFILE=/abs/path.jsonl` writes a per-run phase
+  timing profile ([Profiling a run](CONTRIBUTING.md#profiling-a-run)).
+
 ## Upgrading from 1.4
+
+Coming from 1.4, also read [Upgrading from 1.5](#upgrading-from-15) for what changed since.
 
 Most projects need no config change, but these differ from 1.4:
 
@@ -609,7 +640,7 @@ also fails; see [Inspector diagnostics](docs/internals.md#inspector-diagnostics)
 | `bun test child exceeded maxChildRss` | A run went over `bun.maxChildRss`; scored Timeout. | Expected for runaway mutants; raise the limit if many hit it. |
 | Many mutants Timeout | Stryker's timeout is tight for your suite, or many mutants loop forever. Infinite loops stopped by the hit limit carry the reason `Hit limit reached (count/limit)`: open the mutant in the HTML report, or read `statusReason` in Stryker's JSON report. | For the others, raise `timeoutMS` or `timeoutFactor`. |
 | Every mutant runs the whole suite | No per-test coverage: `coverageAnalysis` is not `'perTest'`, or coverage was missing. | Use `'perTest'` and check the dry-run warnings. |
-| The score changed after upgrading this plugin | Scoring has changed over time (for example, a crash without a matching failing test is now Error, and a test file that a mutant stops from loading is Killed). | Expected. See [Upgrading from 1.4](#upgrading-from-14), [How results are scored](#how-results-are-scored), and the [commit history](https://github.com/hughescr/stryker-bun-runner/commits/main) for what changed. |
+| The score changed after upgrading this plugin | Scoring has changed over time (for example, a crash without a matching failing test is now Error, and a test file that a mutant stops from loading is Killed). | Expected. See [Upgrading from 1.5](#upgrading-from-15), [Upgrading from 1.4](#upgrading-from-14), [How results are scored](#how-results-are-scored), and the [commit history](https://github.com/hughescr/stryker-bun-runner/commits/main) for what changed. |
 
 ## Limitations
 
