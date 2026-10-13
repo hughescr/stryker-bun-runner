@@ -162,6 +162,18 @@ describe('failureMessage boundaries', () => {
         expect(parse('a.test.ts:\n(fail) f [1.00ms]\n\n 0 pass\n 1 fail\n')).toEqual([['a.test.ts > f', undefined]]);
     });
 
+    it('leaves failureMessage unset (not set to undefined) when there is nothing to say', () => {
+        const [test] = parseBunTestOutput('a.test.ts:\n(fail) f [1.00ms]\n\n 0 pass\n 1 fail\n', '').tests;
+
+        expect(test.status).toBe('failed');
+        expect(Object.hasOwn(test, 'failureMessage')).toBe(false);
+    });
+
+    it('keeps a `  ^ ` note attached to its (fail) line across a workflow command line between them', () => {
+        expect(parse('(fail) f [1.00ms]\n::warning file=x::careful\n  ^ this test timed out after 5ms.\n'))
+            .toEqual([['f', '^ this test timed out after 5ms.']]);
+    });
+
     it('takes a `  ^ ` line only right after a (fail) line', () => {
         expect(parse('(fail) f [1.00ms]\n  ^ this test timed out after 5ms.\n  ^ and another note\n  ^ x\n(fail) g [1.00ms]\n')).toEqual([
             ['f', '^ this test timed out after 5ms.\n^ and another note\n^ x'],
