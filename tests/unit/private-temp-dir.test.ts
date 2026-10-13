@@ -16,7 +16,7 @@
 
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { chmodSync, chownSync, lstatSync, mkdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, chownSync, lstatSync, mkdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import * as fsPromises from 'node:fs/promises';
 import * as os from 'node:os';
 import { tmpdir } from 'node:os';
@@ -26,17 +26,22 @@ import {
     computePidSpace,
     currentUid,
     ensurePrivateDir,
+    MAX_RUN_DIRS_EXAMINED,
     pidSpace,
     processExists,
     removeFinishedRunTempDirs,
     removeRunTempDirsOnExit,
     resolveRunTempDir,
+    RUN_DIR_TOUCH_INTERVAL_MS,
     runTempDirPrefix,
     RUN_TEMP_DIR_SLOTS,
+    STALE_RUN_DIR_AGE_MS,
+    touchRunTempDir,
     UnsafeTempDirError,
     writePrivateFile,
     type DirStat,
-    type LstatFn
+    type LstatFn,
+    type RunDirStat
 } from '../../src/utils/private-temp-dir.js';
 import { mockMkdir, resetFsMocks } from '../test-preload.js';
 
@@ -611,10 +616,12 @@ describe('private-temp-dir', () => {
             expect(computePidSpace('linux', () => 'boot-2:pid:[4026531836]').tag).not.toBe(computePidSpace('linux', () => 'boot-1:pid:[4026531836]').tag);
         });
 
-        it('is unknown on Linux when /proc cannot tell it', () => {
-            expect(computePidSpace('linux', () => {
+        it('is unknown on Linux when /proc cannot tell it, with a sentinel tag of its own, never another platform\'s constant', () => {
+            const unknown = computePidSpace('linux', () => {
                 throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
-            })).toEqual({ tag: tag(''), known: false });
+            });
+            expect(unknown).toEqual({ tag: tag('stryker-bun-runner: unknown Linux pid space'), known: false });
+            expect(unknown.tag).not.toBe(computePidSpace('darwin').tag);
         });
 
         it('is one known pid space per host elsewhere, without reading /proc', () => {
@@ -633,14 +640,21 @@ describe('private-temp-dir', () => {
         });
     });
 
+    // Owner pids above every kernel's pid range (pid_max is at most 2^22 on Linux; macOS pids stay below 100000),
+    // so no process ever has them: DEAD is dead for real. LIVE and EXITING are alive only through the injected isAlive.
+    const DEAD = 5_000_001;
+    const LIVE = 5_000_002;
+    const EXITING = 5_000_003;
+    const isAlive = (pid: number): boolean => pid !== DEAD;
+    const byName = (a: string, b: string): number => a.localeCompare(b);
+
     describe('processExists', () => {
         it('is true for a running process', () => {
             expect(processExists(process.pid)).toBe(true);
         });
 
-        it('is false for a process that has exited and been reaped', () => {
-            const { pid } = Bun.spawnSync(['true']);
-            expect(processExists(pid)).toBe(false);
+        it('is false for a pid no process has (above every kernel\'s pid range)', () => {
+            expect(processExists(DEAD)).toBe(false);
         });
 
         it('is true when the process exists but may not be signalled (EPERM): another user\'s process is not a dead one', () => {
@@ -665,19 +679,22 @@ describe('private-temp-dir', () => {
         });
     });
 
-    // Owner pids above the kernel's pid_max (2^22 on Linux, 99998 on macOS), so never a real process; liveness is injected.
-    const DEAD = 5_000_001;
-    const LIVE = 5_000_002;
-    const EXITING = 5_000_003;
-    const isAlive = (pid: number): boolean => pid !== DEAD;
-    const byName = (a: string, b: string): number => a.localeCompare(b);
+    /** How long ago {@link runDir} sets a directory's modification time by default: past the age gate. */
+    const TWO_HOURS = 2 * 60 * 60 * 1000;
 
-    /** Create a run directory (mode 0700) of `owner`'s run under root, with a registry in it, and return its path. */
-    function runDir(owner: number, opts: { uid?: number, cwd?: string, slot?: number, pidSpace?: string } = {}): string {
+    /** Set `p`'s modification time `ageMs` into the past. */
+    function age(p: string, ageMs: number = TWO_HOURS): void {
+        const then = (Date.now() - ageMs) / 1000;
+        utimesSync(p, then, then);
+    }
+
+    /** Create a run directory (mode 0700) of `owner`'s run under root, with a registry in it, last changed `ageMs` ago, and return its path. */
+    function runDir(owner: number, opts: { uid?: number, cwd?: string, slot?: number, pidSpace?: string, ageMs?: number } = {}): string {
         const key = { baseDir: root, cwd: opts.cwd ?? '/sandbox/one', ppid: owner, uid: opts.uid ?? uid, pidSpace: opts.pidSpace };
         const dir = `${runTempDirPrefix(key)}-${opts.slot ?? 0}`;
         mkdirSync(dir, { mode: 0o700 });
         writeFileSync(path.join(dir, 'registry.json'), '{"version":2}', { mode: 0o600 });
+        age(dir, opts.ageMs);
         return dir;
     }
 
@@ -708,6 +725,8 @@ describe('private-temp-dir', () => {
             const stale = runDir(DEAD);
             symlinkSync(outside, path.join(stale, 'link-to-dir'));
             symlinkSync(path.join(outside, 'precious'), path.join(stale, 'link-to-file'));
+            // Adding the links changed the directory: back past the age gate.
+            age(stale);
 
             expect(removeFinishedRunTempDirs({ baseDir: root, isAlive })).toEqual([stale]);
 
@@ -736,8 +755,7 @@ describe('private-temp-dir', () => {
         });
 
         it('defaults to os.tmpdir(), the current uid and real process liveness, and treats no process as exiting', () => {
-            const { pid: dead } = Bun.spawnSync(['true']);
-            const stale = runDir(dead);
+            const stale = runDir(DEAD);
             const ownedByMe = runDir(process.pid);
             const tmpdirSpy = spyOn(os, 'tmpdir').mockReturnValue(root);
             try {
@@ -755,6 +773,7 @@ describe('private-temp-dir', () => {
             symlinkSync(real, link);
             const stale = `${runTempDirPrefix({ baseDir: real, cwd: '/sandbox/one', ppid: DEAD, uid })}-0`;
             mkdirSync(stale, { mode: 0o700 });
+            age(stale);
 
             expect(removeFinishedRunTempDirs({ baseDir: link, isAlive })).toEqual([stale]);
         });
@@ -774,9 +793,9 @@ describe('private-temp-dir', () => {
 
         it('leaves a directory owned by another user, though its name carries ours (a squatted slot)', () => {
             const squatted = runDir(DEAD);
-            const asOtherOwner = (p: string): DirStat => {
+            const asOtherOwner = (p: string): RunDirStat => {
                 const st = lstatSync(p);
-                return { uid: p === squatted ? OTHER : st.uid, mode: st.mode, isDirectory: () => st.isDirectory(), isSymbolicLink: () => st.isSymbolicLink() };
+                return { uid: p === squatted ? OTHER : st.uid, mode: st.mode, mtimeMs: st.mtimeMs, isDirectory: () => st.isDirectory(), isSymbolicLink: () => st.isSymbolicLink() };
             };
 
             expect(removeFinishedRunTempDirs({ baseDir: root, isAlive, lstat: asOtherOwner })).toEqual([]);
@@ -899,6 +918,140 @@ describe('private-temp-dir', () => {
             } });
 
             expect(asked).toEqual([]);
+        });
+
+        it('judges only names written the way the runner writes them: no leading zero, no pid 0', () => {
+            const space = pidSpace().tag;
+            const hash = hash16('/sandbox/one:x');
+            const odd = [
+                `stryker-bun-runner-0${uid}-${space}-${DEAD}-${hash}-0`,
+                `stryker-bun-runner-${uid}-${space}-0${DEAD}-${hash}-0`,
+                `stryker-bun-runner-${uid}-${space}-0-${hash}-0`,
+                `stryker-bun-runner-${uid}-${space}-${DEAD}-${hash}-01`,
+                `stryker-bun-runner-+${uid}-${space}-${DEAD}-${hash}-0`,
+            ].map((name) => {
+                const p = path.join(root, name);
+                mkdirSync(p, { mode: 0o700 });
+                age(p);
+                return p;
+            });
+            const asked: number[] = [];
+
+            expect(removeFinishedRunTempDirs({ baseDir: root, isAlive: (pid) => {
+                asked.push(pid);
+                return false;
+            } })).toEqual([]);
+
+            expect(asked).toEqual([]);
+            for(const p of odd) {
+                expect(existsSync(p)).toBe(true);
+            }
+        });
+
+        it('checks the directory with lstat before it probes the owner: a symlink, a loose or a foreign directory never costs a signal', () => {
+            const loose = runDir(DEAD);
+            chmodSync(loose, 0o750);
+            const target = path.join(root, 'target');
+            mkdirSync(target, { mode: 0o700 });
+            symlinkSync(target, `${runTempDirPrefix({ baseDir: root, cwd: '/sandbox/link', ppid: DEAD, uid })}-0`);
+            const foreign = runDir(DEAD, { cwd: '/sandbox/foreign' });
+            const asForeign = (p: string): RunDirStat => {
+                const st = lstatSync(p);
+                return { uid: p === foreign ? OTHER : st.uid, mode: st.mode, mtimeMs: st.mtimeMs, isDirectory: () => st.isDirectory(), isSymbolicLink: () => st.isSymbolicLink() };
+            };
+            const asked: number[] = [];
+
+            const recording = (pid: number): boolean => {
+                asked.push(pid);
+                return false;
+            };
+            expect(removeFinishedRunTempDirs({ baseDir: root, lstat: asForeign, isAlive: recording })).toEqual([]);
+
+            expect(asked).toEqual([]);
+        });
+
+        describe('age gate', () => {
+            it('leaves a dead owner\'s directory changed within the last hour: its pid may only look dead (a VM snapshot clone shares the tag, not the process table)', () => {
+                const fresh = runDir(DEAD, { ageMs: 0 });
+                const asked: number[] = [];
+
+                expect(removeFinishedRunTempDirs({ baseDir: root, isAlive: (pid) => {
+                    asked.push(pid);
+                    return false;
+                } })).toEqual([]);
+
+                expect(existsSync(path.join(fresh, 'registry.json'))).toBe(true);
+                // Not even probed: the age is checked first.
+                expect(asked).toEqual([]);
+            });
+
+            it(`removes it once it has gone unchanged for STALE_RUN_DIR_AGE_MS (${STALE_RUN_DIR_AGE_MS} ms), not a millisecond before`, () => {
+                expect(STALE_RUN_DIR_AGE_MS).toBe(60 * 60 * 1000);
+                const stale = runDir(DEAD, { ageMs: 0 });
+                const { mtimeMs } = lstatSync(stale);
+
+                expect(removeFinishedRunTempDirs({ baseDir: root, isAlive, now: mtimeMs + STALE_RUN_DIR_AGE_MS - 1 })).toEqual([]);
+                expect(removeFinishedRunTempDirs({ baseDir: root, isAlive, now: mtimeMs + STALE_RUN_DIR_AGE_MS })).toEqual([stale]);
+            });
+
+            it('takes the minimum age from the options', () => {
+                const stale = runDir(DEAD, { ageMs: 10_000 });
+
+                expect(removeFinishedRunTempDirs({ baseDir: root, isAlive, minAgeMs: 60_000 })).toEqual([]);
+                expect(removeFinishedRunTempDirs({ baseDir: root, isAlive, minAgeMs: 5000 })).toEqual([stale]);
+            });
+
+            it('does not delay the exiting process\'s own directories, however recently changed', () => {
+                const mine = runDir(EXITING, { ageMs: 0 });
+
+                expect(removeFinishedRunTempDirs({ baseDir: root, isAlive, exitingPid: EXITING })).toEqual([mine]);
+            });
+
+            it('is kept fresh by a working run: workers refresh their directory well within it', () => {
+                expect(RUN_DIR_TOUCH_INTERVAL_MS).toBe(10 * 60 * 1000);
+                expect(RUN_DIR_TOUCH_INTERVAL_MS * 3).toBeLessThan(STALE_RUN_DIR_AGE_MS);
+            });
+        });
+
+        describe('cap', () => {
+            it(`examines at most MAX_RUN_DIRS_EXAMINED (${MAX_RUN_DIRS_EXAMINED}) directories by default`, () => {
+                expect(MAX_RUN_DIRS_EXAMINED).toBe(1000);
+            });
+
+            it('examines at most maxExamined directories, the exiting process\'s own first', () => {
+                const stale = ['/sandbox/a', '/sandbox/b', '/sandbox/c'].map(cwd => runDir(DEAD, { cwd }));
+                const mine = runDir(EXITING, { cwd: '/sandbox/z' });
+
+                const removed = removeFinishedRunTempDirs({ baseDir: root, isAlive, exitingPid: EXITING, maxExamined: 2 });
+
+                expect(removed).toHaveLength(2);
+                expect(removed).toContain(mine);
+                expect(stale.filter(dir => existsSync(dir))).toHaveLength(2);
+            });
+        });
+    });
+
+    describe('touchRunTempDir', () => {
+        it('sets the directory\'s modification time to now', () => {
+            const dir = runDir(LIVE);
+            const now = Date.now();
+
+            touchRunTempDir(dir, now);
+
+            expect(Math.abs(lstatSync(dir).mtimeMs - now)).toBeLessThan(1000);
+        });
+
+        it('defaults to the current time', () => {
+            const dir = runDir(LIVE);
+            const before = Date.now();
+
+            touchRunTempDir(dir);
+
+            expect(lstatSync(dir).mtimeMs).toBeGreaterThanOrEqual(before - 1000);
+        });
+
+        it('never throws, for a directory that is gone', () => {
+            expect(() => touchRunTempDir(path.join(root, 'gone'), Date.now())).not.toThrow();
         });
     });
 

@@ -47,14 +47,15 @@
  * its name (with the tag of the pid space that ppid belongs to, {@link pidSpace}):
  * no worker can tell whether it is the last one (Stryker disposes a
  * worker before forking its replacement), so none removes it. The main process
- * removes it when it exits, and a run killed outright leaves it to the next
- * run's exit ({@link removeRunTempDirsOnExit}, {@link removeFinishedRunTempDirs}).
+ * removes it when it exits, and a run killed outright leaves it to a later
+ * run's exit, once it has gone unchanged for {@link STALE_RUN_DIR_AGE_MS}
+ * ({@link removeRunTempDirsOnExit}, {@link removeFinishedRunTempDirs}).
  */
 
 /* eslint-disable no-bitwise -- file modes are bitmasks; testing permission bits is the point of this module */
 
 import { createHash } from 'node:crypto';
-import { lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync } from 'node:fs';
+import { lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, utimesSync } from 'node:fs';
 import { lstat, mkdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -106,16 +107,19 @@ function readLinuxPidSpaceIds(): string {
  * Exported for tests; the runner uses {@link pidSpace}.
  */
 export function computePidSpace(platform: NodeJS.Platform = process.platform, readIds: () => string = readLinuxPidSpaceIds): PidSpace {
-    let ids = '';
-    let known = true;
-    if(platform === 'linux') {
-        try {
-            ids = readIds();
-        } catch{
-            known = false;
-        }
+    if(platform !== 'linux') {
+        return { tag: tagOf(''), known: true };
     }
-    return { tag: createHash('sha256').update(ids).digest('hex').slice(0, 8), known };
+    try {
+        return { tag: tagOf(readIds()), known: true };
+    } catch{
+        // A tag of its own, never equal to another platform's constant or a real Linux pid space's.
+        return { tag: tagOf('stryker-bun-runner: unknown Linux pid space'), known: false };
+    }
+}
+
+function tagOf(ids: string): string {
+    return createHash('sha256').update(ids).digest('hex').slice(0, 8);
 }
 
 let currentPidSpace: PidSpace | undefined;
@@ -131,9 +135,17 @@ let currentPidSpace: PidSpace | undefined;
  *
  * On Linux the tag is derived from the boot id (/proc/sys/kernel/random/boot_id,
  * random per boot and per host; containers share their host's) and the pid
- * namespace (/proc/self/ns/pid). Without them the tag is unknown, and
- * {@link removeFinishedRunTempDirs} removes nothing. Other platforms have one pid
- * space per host and a constant tag. Memoized: neither changes during a process's life.
+ * namespace (/proc/self/ns/pid). Without them the tag is a sentinel of its own,
+ * marked unknown, and {@link removeFinishedRunTempDirs} removes nothing. Other
+ * platforms have one pid space per host and a constant tag. Memoized: neither
+ * changes during a process's life.
+ *
+ * Assumption: one tag, one process table. It fails where separate process
+ * tables share a tag and a temp directory, such as clones of one VM snapshot
+ * (same boot id, same initial pid namespace) sharing a TMPDIR. A live run there
+ * can look dead to the other side; {@link removeFinishedRunTempDirs}' age gate,
+ * with workers refreshing their directory ({@link touchRunTempDir}), is what
+ * protects it.
  */
 export function pidSpace(): PidSpace {
     currentPidSpace ??= computePidSpace();
@@ -347,11 +359,51 @@ export async function writePrivateFile(file: string, data: string): Promise<void
     await writeFile(file, data, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
 }
 
-/** A synchronous {@link LstatFn}: the cleanup below runs in an 'exit' listener, where nothing asynchronous completes. */
-export type LstatSyncFn = (p: string) => DirStat;
+/** What the cleanup reads of an lstat result: the checks' fields, and the modification time. */
+export interface RunDirStat extends DirStat {
+    readonly mtimeMs: number
+}
 
-/** A run directory's name, `stryker-bun-runner-<uid>-<pid space>-<owner pid>-<hash>-<slot>`; captures the uid, the pid space and the owner pid. */
-const RUN_DIR_NAME_RE = /^stryker-bun-runner-(\d+)-([0-9a-f]{8})-(\d+)-[0-9a-f]{16}-\d+$/;
+/** A synchronous lstat: the cleanup below runs in an 'exit' listener, where nothing asynchronous completes. */
+export type LstatSyncFn = (p: string) => RunDirStat;
+
+/**
+ * A run directory's name, `stryker-bun-runner-<uid>-<pid space>-<owner pid>-<hash>-<slot>`, with every
+ * number written the way the runner writes it (no sign, no leading zero); captures the uid, the pid space
+ * and the owner pid.
+ */
+const RUN_DIR_NAME_RE = /^stryker-bun-runner-(0|[1-9]\d*)-([0-9a-f]{8})-([1-9]\d*)-[0-9a-f]{16}-(?:0|[1-9]\d*)$/;
+
+/**
+ * How long a run directory whose owner looks dead must have gone unchanged before
+ * another process removes it (the exiting owner removes its own at once). A live
+ * run changes its directory well within this: every worker start writes files in
+ * it, and a worker refreshes it at least every {@link RUN_DIR_TOUCH_INTERVAL_MS}
+ * while it runs mutants. So only a directory nobody has worked in for an hour can
+ * go, which protects a live run whose pid merely looks dead to the process
+ * judging it (see {@link pidSpace}'s assumption).
+ */
+export const STALE_RUN_DIR_AGE_MS = 60 * 60 * 1000;
+
+/** How often a worker refreshes its run directory's modification time while it runs mutants ({@link touchRunTempDir}). */
+export const RUN_DIR_TOUCH_INTERVAL_MS = 10 * 60 * 1000;
+
+/** At most this many run directories are examined per cleanup, so an exit never stalls on a temp directory full of them. */
+export const MAX_RUN_DIRS_EXAMINED = 1000;
+
+/**
+ * Set the run directory `dir`'s modification time to `now`, marking it in use
+ * (see {@link STALE_RUN_DIR_AGE_MS}). Never throws: a directory that is gone or
+ * cannot be touched only loses that protection.
+ */
+export function touchRunTempDir(dir: string, now: number = Date.now()): void {
+    try {
+        // eslint-disable-next-line n/no-sync -- one syscall every few minutes; an async call would hang under the fake timers of the runner's tests
+        utimesSync(dir, now / 1000, now / 1000);
+    } catch{
+        // Gone, or not ours to touch: nothing to protect.
+    }
+}
 
 /**
  * Whether a process with this pid exists (signal 0). Only ESRCH means it does
@@ -412,19 +464,57 @@ function removeTree(dir: string): void {
 /** Options of {@link removeFinishedRunTempDirs}; every field defaults to the live process value. */
 export interface FinishedRunCleanup {
     /** Directory the run directories are in. Defaults to os.tmpdir(), resolved like {@link resolveRunTempDir} resolves it. */
-    baseDir?:    string
+    baseDir?:     string
     /** The user whose run directories are removed. Defaults to process.getuid(); without one, nothing is removed. */
-    uid?:        number
+    uid?:         number
     /** The pid space whose run directories are judged. Defaults to {@link pidSpace}; if it is not known, nothing is removed. */
-    pidSpace?:   PidSpace
+    pidSpace?:    PidSpace
     /** A process that is exiting: the runs it owns are over, although it is still alive. */
-    exitingPid?: number
+    exitingPid?:  number
     /** Whether a run's owner is alive. Defaults to {@link processExists}. */
-    isAlive?:    (pid: number) => boolean
+    isAlive?:     (pid: number) => boolean
+    /** How long another run's directory must have gone unchanged. Defaults to {@link STALE_RUN_DIR_AGE_MS}. */
+    minAgeMs?:    number
+    /** The current time, in ms since the epoch. Defaults to Date.now(). */
+    now?:         number
+    /** How many run directories to examine at most. Defaults to {@link MAX_RUN_DIRS_EXAMINED}. */
+    maxExamined?: number
     /** Injectable for tests, like {@link LstatFn}. */
-    lstat?:      LstatSyncFn
+    lstat?:       LstatSyncFn
     /** Removes one directory and its contents. Injectable for tests. */
-    remove?:     (dir: string) => void
+    remove?:      (dir: string) => void
+}
+
+/** A run directory found in the base directory, and the owner pid in its name. */
+interface RunDirCandidate {
+    readonly dir:   string
+    readonly owner: number
+}
+
+/** What {@link runIsOver} judges by. */
+interface RunJudge {
+    readonly uid:        number
+    readonly lstatFn:    LstatSyncFn
+    readonly exitingPid: number | undefined
+    readonly isAlive:    (pid: number) => boolean
+    readonly minAgeMs:   number
+    readonly now:        number
+}
+
+/**
+ * Whether `candidate` is a private directory of ours (lstat, first: nothing is
+ * probed for a directory that is not) whose run is over: its owner is the exiting
+ * process, or it has gone unchanged for the minimum age and its owner no longer exists.
+ */
+function runIsOver({ dir, owner }: RunDirCandidate, judge: RunJudge): boolean {
+    const st = judge.lstatFn(dir);
+    if(dirProblem(st, judge.uid) !== undefined) {
+        return false;
+    }
+    if(owner === judge.exitingPid) {
+        return true;
+    }
+    return judge.now - st.mtimeMs >= judge.minAgeMs && !judge.isAlive(owner);
 }
 
 /**
@@ -438,20 +528,26 @@ export interface FinishedRunCleanup {
  * while the main process lives, a worker may still need the registry, however
  * many workers are alive at the moment, and once it has exited, no worker of
  * that run can start again. A run is therefore over when its owner is
- * {@link FinishedRunCleanup.exitingPid} or no longer exists. A pid reused by an
- * unrelated process reads as alive, which only delays the removal. A pid from
- * another pid space ({@link pidSpace}: another container sharing the temp
- * directory, another host) says nothing here, so such directories are never
- * judged, and with no known pid space of our own nothing is.
+ * {@link FinishedRunCleanup.exitingPid}, or when its owner no longer exists and its
+ * directory has gone unchanged for {@link STALE_RUN_DIR_AGE_MS} (a live run's pid
+ * can look dead where one tag covers two process tables; see {@link pidSpace}).
+ * A pid reused by an unrelated process reads as alive, which only delays the
+ * removal. A pid from another pid space ({@link pidSpace}: another container
+ * sharing the temp directory, another host) says nothing here, so such
+ * directories are never judged, and with no known pid space of our own nothing is.
+ * At most {@link MAX_RUN_DIRS_EXAMINED} directories are examined, the exiting
+ * process's own first.
  *
  * Nothing is removed that the run directory checks would not accept as ours: an
  * entry is removed only if its name is a run directory's with our uid and pid
- * space in it, and lstat shows a real directory (a symlink is never followed or removed) owned by
- * us with no group or other permission bits. And nothing at all is removed if a
- * directory from the base up could be changed by another user, who could
- * otherwise swap a run directory for something else after the checks. Under a
- * safe base, only we (or root) can rename or replace our 0700 directory or
- * anything in it, so the checked directory is the one removed.
+ * space in it, and lstat shows a real directory (a symlink is never followed or
+ * removed) owned by us with no group or other permission bits. And nothing at all
+ * is removed if a directory from the base up could be changed by another user, who
+ * could otherwise swap a run directory for something else after the checks. Under
+ * a safe base, only we (or root) can rename or replace our 0700 directory or
+ * anything in it. The removal itself works by path (Node's recursive rm), so the
+ * guarantee is per user: another user's files are never touched, while a process
+ * of our own uid could still race it, as it could anything else of ours.
  *
  * Never throws: an entry that cannot be checked or removed is left as it is.
  * Synchronous, for use in an 'exit' listener ({@link removeRunTempDirsOnExit}).
@@ -464,28 +560,34 @@ export function removeFinishedRunTempDirs(options: FinishedRunCleanup = {}): str
     if(uid === undefined || listing === undefined) {
         return [];
     }
-    const isAlive = options.isAlive ?? processExists;
-    const finished = listing.names.filter((name) => {
-        const owner = runDirOwner(name, uid, space.tag);
-        return owner !== undefined && (owner === options.exitingPid || !isAlive(owner));
-    });
-    return removeVerifiedDirs(finished.map(name => path.join(listing.base, name)), uid, lstatFn, options.remove ?? removeTree);
-}
-
-/** Remove each of `dirs` that lstat shows to be a private directory of `uid`; return the ones removed. Never throws. */
-function removeVerifiedDirs(dirs: string[], uid: number, lstatFn: LstatSyncFn, remove: (dir: string) => void): string[] {
-    return dirs.filter((dir) => {
+    const { exitingPid } = options;
+    const candidates = listing.names
+        .map(name => ({ dir: path.join(listing.base, name), owner: runDirOwner(name, uid, space.tag) }))
+        .filter((candidate): candidate is RunDirCandidate => candidate.owner !== undefined)
+        // The exiting process's own directories first, so the cap below never leaves one of them behind.
+        .toSorted((a, b) => Number(b.owner === exitingPid) - Number(a.owner === exitingPid))
+        .slice(0, options.maxExamined ?? MAX_RUN_DIRS_EXAMINED);
+    const judge: RunJudge = {
+        uid,
+        lstatFn,
+        exitingPid,
+        isAlive:  options.isAlive ?? processExists,
+        minAgeMs: options.minAgeMs ?? STALE_RUN_DIR_AGE_MS,
+        now:      options.now ?? Date.now(),
+    };
+    const remove = options.remove ?? removeTree;
+    return candidates.filter((candidate) => {
         try {
-            if(dirProblem(lstatFn(dir), uid) !== undefined) {
+            if(!runIsOver(candidate, judge)) {
                 return false;
             }
-            remove(dir);
+            remove(candidate.dir);
             return true;
         } catch{
             // Gone already, or not removable: left as it is.
             return false;
         }
-    });
+    }).map(candidate => candidate.dir);
 }
 
 /* eslint-enable n/no-sync -- end of the synchronous cleanup */
@@ -502,9 +604,14 @@ const exitCleanupRegistered = new WeakSet<object>();
  * Called when the plugin is loaded (src/index.ts), which is how it gets into
  * Stryker's main process: Stryker gives a test runner no end-of-run hook, and
  * runs none of a test runner's code in the main process, but its plugin loader
- * imports the plugin there. The main process exits only after disposing every
- * worker (each disposed or, after 2 s, killed), so no worker of its run is left
- * to need the directory. In any other process the listener only removes
+ * imports the plugin there. At the end of a run the main process exits only
+ * after disposing every worker (each disposed or, after 2 s, killed), so no
+ * worker is left. On a signal, though, Stryker's handler disposes the sandbox
+ * and calls process.exit without disposing the worker pool, so workers can
+ * outlive it for a while. Their run is over all the same: nothing will take
+ * their results, an in-flight bun test child of theirs may fail for the missing
+ * files, and a worker whose parent has changed never recreates the directory
+ * (BunTestRunner's orphan guard). In any other process the listener only removes
  * directories of runs that are over, so it is harmless there.
  */
 export function removeRunTempDirsOnExit(proc: Pick<NodeJS.EventEmitter, 'once'> = process): void {

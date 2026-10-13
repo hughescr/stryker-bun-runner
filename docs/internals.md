@@ -617,27 +617,55 @@ between, so a "last one out" rule would delete the registry from under the next 
 need it too: with checkers configured, Stryker starts more workers once checking is done.
 
 The directory is needed for exactly as long as the Stryker main process lives: only that process
-forks the run's workers, and it exits only after disposing every one of them (each worker gets 2 s
-to dispose, then is killed). So the main process removes it: Stryker's plugin loader imports the
-plugin there too, and the plugin removes the run's directory when that process exits. That includes
-an exit on Ctrl-C, since Stryker turns the signal into an ordinary exit.
+forks the run's workers. So the main process removes it: Stryker's plugin loader imports the plugin
+there too, and the plugin removes the run's directory when that process exits.
+
+- **At the end of a run,** the main process disposes every worker before it exits (each gets 2 s
+  to dispose, then is killed), so no worker is left.
+- **On a signal** (Ctrl-C, `SIGTERM`), Stryker disposes the sandbox and calls `process.exit`
+  without disposing the workers, so the directory is removed while workers may still be running.
+  Their run is over all the same: nothing will take their results, and a `bun test` child that is
+  mid-run may fail for the missing files. A worker remembers its parent at `init()` and, once that
+  has changed, never creates the directory again, so an orphaned worker cannot leave a new one
+  behind under its new parent's pid.
 
 A run killed outright (`SIGKILL`, or a crash of the main process) runs no exit code and leaves its
-directory behind. The next Stryker run to exit removes it: on exit, the plugin also removes every
-run directory of yours whose main process no longer exists. Concurrent runs, of the same project or
-others, never remove each other's directories, because their main processes are alive. Nothing is
-removed unless it passes the same checks as a directory the runner uses (a real directory, not a
-symlink, owned by you, mode `0700`, named for your uid), and nothing at all if a directory above
-`$TMPDIR` fails the checks above. If a dead run's pid has been reused by another process, its
-directory stays until that process is gone too.
+directory behind. A later Stryker run removes it when it exits: on exit, the plugin also removes
+every run directory of yours whose main process no longer exists and that has not changed for an
+hour. Several things protect what is still in use:
+
+- **Concurrent runs** never remove each other's directories, because their main processes are
+  alive.
+- **The hour** protects a live run whose pid only looks dead to the process judging it (see the
+  assumption below). A working run changes its directory far more often: every worker start
+  writes files there, and each worker refreshes the directory's modification time at least every 10
+  minutes while it runs mutants. The exiting process's own directories go at once.
+- **The checks.** Nothing is removed unless it passes the same checks as a directory the runner
+  uses (a real directory, not a symlink, owned by you, mode `0700`, named for your uid). Nothing at
+  all is removed if a directory above `$TMPDIR` fails the checks above. These run before the
+  owner's pid is looked at.
+- **A reused pid.** If a dead run's pid has been reused by another process, its directory stays
+  until that process is gone too.
+- **A cap.** At most 1000 run directories are examined per exit, the exiting process's own first.
+
+The guarantee is per user: another user's files are never touched. The removal itself works by
+path (Node's recursive `rm`), so another process running as you could race it, as it could anything
+else of yours.
+
+The pids in names are judged under one assumption: **one `<space>`, one process table.** Separate
+process tables that share a `<space>` and a `$TMPDIR` break it. An example is clones of one VM
+snapshot, which keep the boot id and the initial pid namespace. There, a live run's pid can look
+dead from the other side, and only the hour protects it.
 
 Some directories are never judged, because their `<pid>` says nothing to the process that would
 judge them:
 
-- A directory with another `<space>`: one from another container sharing the temp directory, or
-  one left from before a reboot, on Linux. Its own container removes it, or the OS's temp cleaning
-  does.
+- A directory with another `<space>`, on Linux. That covers one from another container sharing the
+  temp directory, one from an earlier start of the same container (a restarted container gets a
+  new pid namespace, and with it a new `<space>`), and one from before a reboot. Only the OS's temp
+  cleaning, or a reboot that clears `$TMPDIR`, removes these.
 - On Linux without a readable `/proc` the runner cannot tell its own `<space>`, and removes nothing.
+  Its directories get a `<space>` of their own that matches no other.
 - Directories left by versions of the runner that did not put the main process's pid in the name
   (`stryker-bun-runner-<uid>-<hash>-<n>`). Nothing records whose run those were. Delete them by hand
   once no Stryker run is going.

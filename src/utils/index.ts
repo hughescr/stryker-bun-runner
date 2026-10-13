@@ -14,4 +14,4 @@ export { buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery } from 
 export { MutantWarnAggregator } from './mutant-warn-aggregator.js';
 export { TestFileCoverage, namedAfter, mutantIdsInInstrumentedSource, orderLikelyKillersFirst } from './likely-killer-order.js';
 export type { KillerRank, TestFileCoverageJson } from './likely-killer-order.js';
-export { ensurePrivateDir, resolveRunTempDir, writePrivateFile, UnsafeTempDirError } from './private-temp-dir.js';
+export { ensurePrivateDir, resolveRunTempDir, touchRunTempDir, writePrivateFile, RUN_DIR_TOUCH_INTERVAL_MS, UnsafeTempDirError } from './private-temp-dir.js';

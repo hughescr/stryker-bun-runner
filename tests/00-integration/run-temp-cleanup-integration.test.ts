@@ -19,7 +19,7 @@
 
 /* eslint-disable n/no-sync -- fixtures and checks between process events; nothing else runs meanwhile */
 
-import { chownSync, lstatSync, mkdirSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chownSync, lstatSync, lutimesSync, mkdirSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -32,10 +32,12 @@ const privateTempDirUrl = new URL('../../src/utils/private-temp-dir.ts', import.
 
 /**
  * A worker. `dry` writes the registry the way the dry run does (a private tmp file renamed into
- * place); `mutant` writes a file of its own and removes it again, as dispose() does. Both then
- * read the registry and print what they saw.
+ * place); `mutant` writes a file of its own and removes it again, as dispose() does; `plugin` is a
+ * `mutant` that loads the plugin entry first, as a real Stryker worker does, and so exits with the
+ * plugin's exit cleanup armed. All of them then read the registry and print what they saw.
  */
 const WORKER = [
+    `if(process.env.WORKER_ACTION === 'plugin') await import(${JSON.stringify(indexUrl)});`,
     `const { resolveRunTempDir, writePrivateFile } = await import(${JSON.stringify(privateTempDirUrl)});`,
     "const { readFile, rename, rm } = await import('node:fs/promises');",
     'const dir = await resolveRunTempDir();',
@@ -130,8 +132,13 @@ function runDirsIn(base: string): string[] {
 }
 
 /** A pid that belonged to a process that has exited and been reaped. */
-function deadPid(): number {
-    return Bun.spawnSync(['true']).pid;
+/** A pid above every kernel's pid range (pid_max is at most 2^22 on Linux; macOS pids stay below 100000): never a live process. */
+const DEAD_PID = 5_000_001;
+
+/** Set `p`'s modification time two hours into the past, beyond the cleanup's age gate (lutimes: a symlink itself, not its target). */
+function makeOld(p: string): void {
+    const then = (Date.now() - (2 * 60 * 60 * 1000)) / 1000;
+    lutimesSync(p, then, then);
 }
 
 describe('the run directory is removed when the run ends', () => {
@@ -234,7 +241,7 @@ describe('the run directory is removed when the run ends', () => {
         expect(runDirsIn(base)).toEqual([]);
     }, 30_000);
 
-    it('the directory of a run that was killed outright is removed when a later run ends', async () => {
+    it('the directory of a run that was killed outright is removed by a later run\'s exit, once it has gone unchanged for the age gate', async () => {
         await freshBase();
         const killed = startRun('dry;hang');
         const { dir } = JSON.parse(await killed.next()) as WorkerReport;
@@ -245,8 +252,27 @@ describe('the run directory is removed when the run ends', () => {
         await killed.proc.exited;
         expect(exists(path.join(dir, 'registry.json'))).toBe(true);
 
+        // Changed moments ago: its owner looks dead, but a later run leaves it alone for now.
+        await run('dry');
+        expect(runDirsIn(base)).toEqual([dir]);
+
+        makeOld(dir);
         await run('dry');
 
+        expect(runDirsIn(base)).toEqual([]);
+    }, 30_000);
+
+    it('a worker that loads the plugin and exits normally mid-run leaves the directory to the run, whose later workers still find the registry', async () => {
+        await freshBase();
+
+        // The `plugin` worker exits with the plugin's exit cleanup armed, as a real Stryker worker
+        // can (it imports the plugin too). The run's directory belongs to the still-running main process.
+        const reports = await run('dry;plugin;mutant');
+
+        const [dry, plugin, after] = reports;
+        expect(plugin.registry).toEqual({ writer: dry.pid });
+        expect(after.dir).toBe(dry.dir);
+        expect(after.registry).toEqual({ writer: dry.pid });
         expect(runDirsIn(base)).toEqual([]);
     }, 30_000);
 
@@ -258,6 +284,8 @@ describe('the run directory is removed when the run ends', () => {
         const liveDir = `${runTempDirPrefix({ baseDir: base, cwd: '/elsewhere', ppid: owner.pid, uid })}-0`;
         mkdirSync(liveDir, { mode: 0o700 });
         writeFileSync(path.join(liveDir, 'registry.json'), '{}');
+        // Old enough that only its owner's being alive keeps it.
+        makeOld(liveDir);
 
         await run('dry');
 
@@ -267,18 +295,21 @@ describe('the run directory is removed when the run ends', () => {
 
     it('never touches a symlink named like a finished run\'s directory, what it points at, or a directory another user owns', async () => {
         await freshBase();
-        const dead = deadPid();
         const target = path.join(base, 'target');
         mkdirSync(target, { mode: 0o700 });
         writeFileSync(path.join(target, 'precious'), 'keep');
-        const link = `${runTempDirPrefix({ baseDir: base, cwd: '/elsewhere', ppid: dead, uid })}-0`;
+        const link = `${runTempDirPrefix({ baseDir: base, cwd: '/elsewhere', ppid: DEAD_PID, uid })}-0`;
         symlinkSync(target, link);
+        // Old enough, and with a dead owner: only the checks keep these.
+        makeOld(link);
+        makeOld(target);
         const kept = [link];
         // Real chown needs root; tests/unit/private-temp-dir.test.ts covers the ownership check as any user.
         if(uid === 0) {
-            const foreign = `${runTempDirPrefix({ baseDir: base, cwd: '/elsewhere', ppid: dead, uid })}-1`;
+            const foreign = `${runTempDirPrefix({ baseDir: base, cwd: '/elsewhere', ppid: DEAD_PID, uid })}-1`;
             mkdirSync(foreign, { mode: 0o700 });
             chownSync(foreign, 1234, 1234);
+            makeOld(foreign);
             kept.push(foreign);
         }
 
