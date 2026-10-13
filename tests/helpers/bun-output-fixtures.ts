@@ -45,12 +45,80 @@
  * it('d first', () => { setTimeout(() => { throw new Error('stray async error'); }, 0); });
  * it('d second', async () => { await new Promise(r => setTimeout(r, 20)); expect(2).toBe(3); });
  * ```
+ *
+ * HOOKS_PLAIN_ONLY_FAILURES: `bun test tests/g.test.ts`, plain, onlyFailures, of
+ *
+ * ```ts
+ * import { afterEach, beforeAll, describe, expect, test } from 'bun:test';
+ * describe('hooks', () => {
+ *     beforeAll(() => { throw new Error('beforeAll threw'); });
+ *     test('h1', () => { expect(1).toBe(1); });
+ *     test('h2', () => { expect(1).toBe(1); });
+ * });
+ * describe('after', () => {
+ *     afterEach(() => { throw new Error('afterEach threw'); });
+ *     test('a1', () => { console.error('a1 says hi'); });
+ * });
+ * test.failing('unexpectedly passes', () => {});
+ * ```
  */
 
 export interface BunOutput {
     stdout: string
     stderr: string
 }
+
+/*
+ * The error reports bun prints, in every TWO_FILES form, before each `(fail)` line: each failing
+ * test's failureMessage, colour codes removed.
+ */
+
+export const TWO_FILES_SUBTRACTS_WRONG_REPORT = [
+    "1 | import { describe, expect, it } from 'bun:test';",
+    "2 | describe('math', () => {",
+    "3 |     it('adds', () => { expect(1 + 1).toBe(2); });",
+    "4 |     it('subtracts wrong', () => {",
+    "5 |         console.log('log from subtracts');",
+    '6 |         expect(3 - 1).toBe(5);',
+    '                          ^',
+    'error: expect(received).toBe(expected)',
+    '',
+    'Expected: 5',
+    'Received: 2',
+    '',
+    '      at <anonymous> (/project/tests/a.test.ts:6:23)',
+].join('\n');
+
+export const TWO_FILES_THROWS_REPORT = [
+    "4 |     it('subtracts wrong', () => {",
+    "5 |         console.log('log from subtracts');",
+    '6 |         expect(3 - 1).toBe(5);',
+    '7 |     });',
+    "8 |     it.skip('skipped one', () => {});",
+    "9 |     it('throws', () => { throw new Error('boom from throws'); });",
+    '                                                               ^',
+    'error: boom from throws',
+    '      at <anonymous> (/project/tests/a.test.ts:9:60)',
+].join('\n');
+
+/** Without the `stderr noise from b` the test printed before it failed. */
+export const TWO_FILES_B_FAILS_REPORT = [
+    "1 | import { expect, it } from 'bun:test';",
+    "2 | it('b passes', () => { expect(true).toBe(true); });",
+    "3 | it('b fails', () => { console.error('stderr noise from b'); expect({ x: 1 }).toEqual({ x: 2 }); });",
+    '                                                                                 ^',
+    'error: expect(received).toEqual(expected)',
+    '',
+    '  {',
+    '-   "x": 2,',
+    '+   "x": 1,',
+    '  }',
+    '',
+    '- Expected  - 1',
+    '+ Received  + 1',
+    '',
+    '      at <anonymous> (/project/tests/b.test.ts:3:78)',
+].join('\n');
 
 export const TWO_FILES_PLAIN_ALL: BunOutput = {
     stdout: [
@@ -574,6 +642,42 @@ export const EDGE_CASES_COLOUR_ONLY_FAILURES: BunOutput = {
         '\u001B[0m\u001B[31m 4 fail\u001B[0m',
         ' 2 expect() calls',
         'Ran 7 tests across 2 files. \u001B[0m\u001B[2m[\u001B[1m27.00ms\u001B[0m\u001B[2m]\u001B[0m',
+        '',
+    ].join('\n'),
+};
+
+export const HOOKS_PLAIN_ONLY_FAILURES: BunOutput = {
+    stdout: [
+        'bun test v1.4.2 (744846f84)',
+        '',
+    ].join('\n'),
+    stderr: [
+        '',
+        'tests/g.test.ts:',
+        "1 | import { afterEach, beforeAll, describe, expect, test } from 'bun:test';",
+        "2 | describe('hooks', () => {",
+        "3 |     beforeAll(() => { throw new Error('beforeAll threw'); });",
+        '                                                           ^',
+        'error: beforeAll threw',
+        '      at <anonymous> (/project/tests/g.test.ts:3:56)',
+        '(fail) hooks > (unnamed) [0.25ms]',
+        'a1 says hi',
+        "3 |     beforeAll(() => { throw new Error('beforeAll threw'); });",
+        "4 |     test('h1', () => { expect(1).toBe(1); });",
+        "5 |     test('h2', () => { expect(1).toBe(1); });",
+        '6 | });',
+        "7 | describe('after', () => {",
+        "8 |     afterEach(() => { throw new Error('afterEach threw'); });",
+        '                                                           ^',
+        'error: afterEach threw',
+        '      at <anonymous> (/project/tests/g.test.ts:8:56)',
+        '(fail) after > a1 [0.07ms]',
+        '(fail) unexpectedly passes [0.01ms]',
+        '  ^ this test is marked as failing but it passed. Remove `.failing` if tested behavior now works',
+        '',
+        ' 0 pass',
+        ' 3 fail',
+        'Ran 3 tests across 1 file. [5.00ms]',
         '',
     ].join('\n'),
 };

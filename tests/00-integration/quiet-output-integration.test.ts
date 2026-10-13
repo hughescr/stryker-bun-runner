@@ -205,22 +205,24 @@ describe('the mutant-run bunfig in a real bun test child', () => {
         const parsed = parseBunTestOutput(result.stdout, result.stderr, testFiles);
         const stderr = stripAnsi(result.stderr);
         return {
-            exitCode:       result.exitCode,
-            signal:         result.signal,
-            failedTests:    parsed.tests.filter(t => t.status === 'failed').map(t => t.name),
-            parsedTests:    parsed.tests.length,
-            failed:         parsed.failed,
-            totalTests:     parsed.totalTests,
-            summaryPassed:  parsed.summaryPassed,
-            summaryFailed:  parsed.summaryFailed,
-            summarySkipped: parsed.summarySkipped,
-            summaryTodo:    parsed.summaryTodo,
-            summaryErrors:  parsed.summaryErrors,
-            summaryPrinted: parsed.summaryPrinted,
-            zeroMatch:      stderr.includes('matched 0 tests.'),
-            unhandled:      stderr.includes('# Unhandled error between tests'),
-            ranLine:        /^Ran \d+ tests? across/m.exec(stderr)?.[0],
-            bailLine:       /^Bailed out after \d+ failures?$/m.exec(stderr)?.[0],
+            exitCode:        result.exitCode,
+            signal:          result.signal,
+            failedTests:     parsed.tests.filter(t => t.status === 'failed').map(t => t.name),
+            // Each failing test's report, which bun prints before its (fail) line.
+            failureMessages: parsed.tests.filter(t => t.status === 'failed').map(t => t.failureMessage),
+            parsedTests:     parsed.tests.length,
+            failed:          parsed.failed,
+            totalTests:      parsed.totalTests,
+            summaryPassed:   parsed.summaryPassed,
+            summaryFailed:   parsed.summaryFailed,
+            summarySkipped:  parsed.summarySkipped,
+            summaryTodo:     parsed.summaryTodo,
+            summaryErrors:   parsed.summaryErrors,
+            summaryPrinted:  parsed.summaryPrinted,
+            zeroMatch:       stderr.includes('matched 0 tests.'),
+            unhandled:       stderr.includes('# Unhandled error between tests'),
+            ranLine:         /^Ran \d+ tests? across/m.exec(stderr)?.[0],
+            bailLine:        /^Bailed out after \d+ failures?$/m.exec(stderr)?.[0],
         };
     }
 
@@ -338,8 +340,20 @@ describe('mutant-run verdicts through a real BunTestRunner', () => {
         }
     }
 
-    test('under FORCE_COLOR, a covering test fails: Killed by it', async () => {
-        expect(await withForceColor(() => mutantRun('kill', [id('a1'), id('a2')]))).toMatchObject({ status: MutantRunStatus.Killed, killedBy: [id('a2')], nrOfTests: 1 });
+    /** The report bun prints for a2 when it fails: its failureMessage, Stryker's statusReason. */
+    const A2_REPORT = /^1 \| import [\s\S]*\n5 \| {5}test\('a2'[^\n]*\n +\^\nerror: expect\(received\)\.toBe\(expected\)\n\nExpected: 1\nReceived: 2\n\n +at <anonymous> \(\/\S+\/a\.test\.ts:5:\d+\)$/;
+
+    test('a covering test fails: its failureMessage is the report bun printed before its (fail) line', async () => {
+        const result = await mutantRun('kill', [id('a1'), id('a2')]);
+
+        expect((result as { failureMessage: string }).failureMessage).toMatch(A2_REPORT);
+    }, 60_000);
+
+    test('under FORCE_COLOR, a covering test fails: Killed by it, with the same failureMessage', async () => {
+        const result = await withForceColor(() => mutantRun('kill', [id('a1'), id('a2')]));
+
+        expect(result).toMatchObject({ status: MutantRunStatus.Killed, killedBy: [id('a2')], nrOfTests: 1 });
+        expect((result as { failureMessage: string }).failureMessage).toMatch(A2_REPORT);
     }, 60_000);
 
     test('under FORCE_COLOR, a test fails and a later one exits 0, without bail: Killed by the failing test', async () => {
