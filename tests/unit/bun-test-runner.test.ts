@@ -7062,6 +7062,23 @@ tests/example.test.ts:
                 }
             });
 
+            it('scores it the same way when tests reported passing before the exit, as none failed', async () => {
+                mockRunBunTests.mockResolvedValue({
+                    exitCode: 0,
+                    stdout:   'bun test v1.4.2 (744846f84)\n',
+                    stderr:   '\ne.test.ts:\n✓ e1 [0.10ms]\n⏭ e2\n',
+                    timedOut: false,
+                });
+
+                const result = await run(['e.test.ts > e1', 'e.test.ts > e2', 'e.test.ts > e3 exits']);
+
+                expect(result.status).toBe(MutantRunStatus.Error);
+                if(result.status === MutantRunStatus.Error) {
+                    expect(result.errorMessage).toStartWith(`${EARLY_EXIT_REASON}: `);
+                    expect(result.errorMessage).toContain('but no test reported a failure: ');
+                }
+            });
+
             it('quotes the last 500 characters of the output, where the exit happened, without colour codes', async () => {
                 mockRunBunTests.mockResolvedValue({
                     exitCode: 0,

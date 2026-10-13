@@ -614,12 +614,13 @@ describe('BunTestRunner cheapest-first file order and fixed test order in mutant
                 expect(lastMutantSpawn().testFiles).toEqual([GAMMA, BETA, ALPHA]);
             });
 
-            it('ranks by the mutant\'s own coverage alone when its source file cannot be read', async () => {
+            it('ranks by the mutant\'s own coverage alone when its source file cannot be read, and says why at debug', async () => {
                 const runner = await worker({ mutantTestFiles: coverageOf({ [ALPHA]: ['7'], [GAMMA]: ['8'] }) }, {});
 
                 await runMutant(runner, '7', LIB, []);
 
                 expect(lastMutantSpawn().testFiles).toEqual([ALPHA, BETA, GAMMA]);
+                expect(debugCalls('Could not read')).toEqual([[expect.any(String), SANDBOX_LIB, 'ENOENT']]);
             });
 
             it('ranks by coverage when Stryker names no source file', async () => {
