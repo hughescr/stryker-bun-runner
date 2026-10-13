@@ -267,3 +267,66 @@ describe('legacy mapping with unknown inspector ids', () => {
         expect(coverage!.perTest).toEqual({ 'unknown-5': { '2': 1 } });
     });
 });
+
+describe('record sharing with the raw coverage', () => {
+    const testHierarchy = new Map<number, TestInfo>([
+        [1, { id: 1, name: 'plain', fullName: 'plain', type: 'test', url: fileUrl('tests/a.test.ts') }],
+        [2, { id: 2, name: 'static-hit', fullName: 'static-hit', type: 'test', url: fileUrl('tests/a.test.ts') }],
+    ]);
+
+    it('hands on the raw record of a test credited with one key and no static mutant, and copies one that holds a static mutant', () => {
+        // Copying every record hit by hit costs the dry run of a large suite tens of milliseconds
+        // in allocation and garbage collection; only a record that must change is copied.
+        const rawCoverage: MutantCoverage = {
+            'static': { '9': 1 },
+            perTest:  {
+                'tests/a.test.ts@@test-1': { '1': 2 },
+                'tests/a.test.ts@@test-2': { '2': 3, '9': 4 },
+            },
+        };
+        const snapshot = structuredClone(rawCoverage);
+
+        const { coverage } = mapCoverageToInspectorIds(rawCoverage, [1, 2], testHierarchy);
+
+        expect(coverage).toEqual({
+            'static': { '9': 5 },
+            perTest:  { 'tests/a.test.ts > plain': { '1': 2 }, 'tests/a.test.ts > static-hit': { '2': 3 } },
+        });
+        expect(coverage!.perTest['tests/a.test.ts > plain']).toBe(rawCoverage.perTest['tests/a.test.ts@@test-1']);
+        expect(coverage!.perTest['tests/a.test.ts > static-hit']).not.toBe(rawCoverage.perTest['tests/a.test.ts@@test-2']);
+        expect(rawCoverage).toEqual(snapshot);
+    });
+
+    it('never writes into a shared record when an orphaned key adds hits to it', () => {
+        const rawCoverage: MutantCoverage = {
+            'static': {},
+            perTest:  {
+                'tests/a.test.ts@@test-1':    { '1': 2 },
+                'tests/gone.test.ts@@test-1': { '1': 30 },
+            },
+        };
+        const snapshot = structuredClone(rawCoverage);
+
+        const { coverage } = mapCoverageToInspectorIds(rawCoverage, [1], testHierarchy);
+
+        expect(coverage!.perTest).toEqual({ 'tests/a.test.ts > plain': { '1': 32 } });
+        expect(rawCoverage).toEqual(snapshot);
+    });
+});
+
+describe('legacy mapping of a test whose every mutant is static', () => {
+    it('leaves no empty perTest entry for it', () => {
+        const rawCoverage: MutantCoverage = {
+            'static': { '5': 1 },
+            perTest:  { 'test-1': { '5': 2 }, 'test-2': { '6': 1 } },
+        };
+        const testHierarchy = new Map<number, TestInfo>([
+            [1, { id: 1, name: 'only-static', fullName: 'only-static', type: 'test' }],
+            [2, { id: 2, name: 'own-mutant', fullName: 'own-mutant', type: 'test' }],
+        ]);
+
+        const { coverage } = mapCoverageToInspectorIds(rawCoverage, [1, 2], testHierarchy);
+
+        expect(coverage).toEqual({ 'static': { '5': 3 }, perTest: { 'own-mutant': { '6': 1 } } });
+    });
+});

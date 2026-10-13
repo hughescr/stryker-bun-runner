@@ -44,7 +44,7 @@ import type { StrykerBunOptions } from './options.js';
 import { parseBunTestOutput, type ParsedTestResults } from './parsers/console-parser.js';
 import { runBunTests, stripAnsi, STDIO_CLOSE_GRACE_MS, type BunProcessResult } from './process-runner.js';
 import { createWorkerProfiler, mutantRunScope, profileInspectorHandlers, type RunProfile, type WorkerProfiler } from './run-profile.js';
-import { type DroppedBunfigKey, assertSupportedBunArgs, splitBunConfigArg, stripRandomizeArgs, checkBunVersion, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, mutantRunBunfigPath, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, TEST_FILE_SUFFIX_RE, discoverTestFiles, findBuildOutputTestFiles, buildTestFileArgs, MAX_TEST_FILE_ARGS_BYTES, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery, resolveRunTempDir, writePrivateFile, MutantWarnAggregator, TestFileCoverage, namedAfter, mutantIdsInInstrumentedSource, orderLikelyKillersFirst, type KillerRank, type TestFileCoverageJson } from './utils/index.js';
+import { type DroppedBunfigKey, assertSupportedBunArgs, splitBunConfigArg, stripRandomizeArgs, checkBunVersion, SyncServer, generateSanitizedBunfig, cleanupSanitizedBunfig, mutantRunBunfigPath, normalizeTestFilePath, normalizeTestName, buildUniqueTestName, buildProjectFileTestName, buildTestNamePattern, TEST_FILE_SUFFIX_RE, discoverTestFiles, findBuildOutputTestFiles, buildTestFileArgs, MAX_TEST_FILE_ARGS_BYTES, buildDiscoveryOrderIndex, sortDuplicateGroupByLineThenDiscovery, resolveRunTempDir, touchRunTempDir, RUN_DIR_TOUCH_INTERVAL_MS, writePrivateFile, MutantWarnAggregator, TestFileCoverage, namedAfter, mutantIdsInInstrumentedSource, orderLikelyKillersFirst, type KillerRank, type TestFileCoverageJson } from './utils/index.js';
 
 /**
  * Event-driven wait for the inspector URL bun prints on startup.
@@ -698,6 +698,10 @@ export class BunTestRunner implements TestRunner {
     private sanitizedBunfigPath?:         string;
     private sanitizedBunfigCwd?:          string;
     private tempDir?:                     string;
+    /** When this worker last marked tempDir in use (see keepRunTempDirFresh). */
+    private tempDirTouchedAt = 0;
+    /** process.ppid at the first init(): the Stryker main process that owns the run (see assertRunOwnerIsParent). */
+    private runOwnerPid?:                 number;
     private cachedTestNames?:             Set<string>;
     private baseNameIndex?:               Map<string, string[]>;
     private testNameIndex?:               Map<string, string>;
@@ -828,16 +832,17 @@ export class BunTestRunner implements TestRunner {
      * Single source of truth for the registry file name.
      *
      * Lives in the OS temp directory, not cwd: under Stryker's --inPlace mode
-     * cwd IS the user's real project root, and writing there would both
-     * pollute the user's project and never get cleaned up (dispose()
-     * deliberately never unlinks the registry itself — see its doc comment).
-     * The temp directory is OS-managed instead. Specifically it is the run's
+     * cwd IS the user's real project root, and writing there would pollute
+     * the user's project. No worker removes it (dispose() deliberately never
+     * unlinks the registry itself — see its doc comment); the run's Stryker
+     * main process removes the whole directory when it exits
+     * (removeRunTempDirsOnExit). Specifically it is the run's
      * private directory (src/utils/private-temp-dir.ts): owned by the current
      * user, mode 0700, re-resolved (and so re-verified) before every write and
      * before the lazy load, so another local user can neither plant nor read a
      * registry.
      *
-     * Keyed by sha256(cwd + ':' + ppid) (plus the uid, in the directory name): every worker process Stryker spawns
+     * Keyed by sha256(cwd + ':' + ppid) (plus the uid, the pid space and the ppid, in the directory name): every worker process Stryker spawns
      * for one run is a direct child of that run's single Stryker main
      * process, so all of them share BOTH process.cwd() (the sandbox
      * directory) AND process.ppid (the main process's pid) — and therefore
@@ -875,7 +880,40 @@ export class BunTestRunner implements TestRunner {
      * invoked — rather than the orchestrator's cwd at module-load time.
      */
     private async resolveRegistryPath(): Promise<string> {
+        this.assertRunOwnerIsParent();
         return path.join(await resolveRunTempDir(), 'registry.json');
+    }
+
+    /**
+     * Refuse to resolve (and so create) the run directory once this worker's parent
+     * has changed since init(): the Stryker main process that owned the run has
+     * exited, and has removed the directory or will, and this worker has been
+     * reparented. Stryker's signal path exits without disposing the workers, so one
+     * can still be finishing a run. Under its new parent it would derive, and
+     * create, a directory named for a process that never ran Stryker, which no
+     * cleanup would ever judge finished.
+     */
+    private assertRunOwnerIsParent(): void {
+        if(this.runOwnerPid !== undefined && process.ppid !== this.runOwnerPid) {
+            throw new Error(
+                `stryker-bun-runner: the Stryker main process (pid ${this.runOwnerPid}) that owns this run has exited `
+                + `(this worker's parent is now pid ${process.ppid}); not recreating the run's temporary directory`
+            );
+        }
+    }
+
+    /**
+     * Mark the run directory in use at most every RUN_DIR_TOUCH_INTERVAL_MS, so a
+     * live run's directory never looks abandoned to another process's cleanup
+     * (see STALE_RUN_DIR_AGE_MS in src/utils/private-temp-dir.ts). One syscall
+     * every few minutes; skipped once this worker is orphaned.
+     */
+    private keepRunTempDirFresh(now: number): void {
+        if(this.tempDir === undefined || now - this.tempDirTouchedAt < RUN_DIR_TOUCH_INTERVAL_MS || process.ppid !== this.runOwnerPid) {
+            return;
+        }
+        this.tempDirTouchedAt = now;
+        touchRunTempDir(this.tempDir, now);
     }
 
     /**
@@ -952,16 +990,16 @@ export class BunTestRunner implements TestRunner {
    * files with no recorded duration — every file, when there are no durations at
    * all — go last in their old order. `files` itself is not modified.
    */
-    private orderCheapestFirst(files: readonly string[] | undefined, projectFiles: ReadonlyMap<string, string> = this.projectFilesOf(files)): string[] | undefined {
+    private orderCheapestFirst(files: readonly string[], projectFiles: ReadonlyMap<string, string>): string[] {
         // Each file's cost is looked up once, not on every comparison.
-        const costed = files?.map(file => ({ file, cost: this.testFileDurations?.get(projectFiles.get(file)!) ?? Number.POSITIVE_INFINITY }));
+        const costed = files.map(file => ({ file, cost: this.testFileDurations?.get(projectFiles.get(file)!) ?? Number.POSITIVE_INFINITY }));
         // Infinity - Infinity is NaN, which a sort comparator treats as "equal".
-        return costed?.toSorted((a, b) => a.cost - b.cost).map(entry => entry.file);
+        return costed.toSorted((a, b) => a.cost - b.cost).map(entry => entry.file);
     }
 
     /** Each of `files` mapped to its project-relative path, normalized once, for the orderings of one mutant run to share. */
-    private projectFilesOf(files: readonly string[] | undefined): Map<string, string> {
-        return new Map((files ?? []).map(file => [file, normalizeTestFilePath(file) ?? file]));
+    private projectFilesOf(files: readonly string[]): Map<string, string> {
+        return new Map(files.map(file => [file, normalizeTestFilePath(file) ?? file]));
     }
 
     /**
@@ -992,24 +1030,25 @@ export class BunTestRunner implements TestRunner {
    * order, so with no signal at all the order is cheapest first.
    */
     private orderForMutantRun(files: readonly string[] | undefined, ctx: MutantRunContext): string[] | undefined {
+        if(files === undefined) {
+            return undefined;
+        }
         const projectFiles = this.projectFilesOf(files);
         const cheapest = this.orderCheapestFirst(files, projectFiles);
-        if(cheapest === undefined || cheapest.length < 2 || !this.ordersLikelyKillersFirst(ctx.options, ctx.coveringTestCount)) {
+        if(!this.ordersLikelyKillersFirst(ctx.options, ctx.coveringTestCount)) {
             return cheapest;
         }
         const { id: mutantId, fileName } = ctx.options.activeMutant;
         const mutantFiles = this.testFileCoverage?.filesCovering(mutantId);
-        const isNamedAfterSource = (fileName as string | undefined) === undefined ? () => false : namedAfter(fileName);
+        // A mutant without a fileName (Stryker's type says it always has one) matches no test file by name.
+        const isNamedAfterSource = namedAfter(fileName);
         const rankOf = (file: string): KillerRank => {
             const projectFile = projectFiles.get(file)!;
-            const sourceMutants = ctx.sourceCoverage?.get(projectFile) ?? 0;
-            let coverage: KillerRank['coverage'] = 2;
-            if(mutantFiles?.has(projectFile)) {
-                coverage = 0;
-            } else if(sourceMutants > 0) {
-                coverage = 1;
-            }
-            return { coverage, sourceMutants, namedAfter: isNamedAfterSource(file) };
+            return {
+                coverage:      mutantFiles?.has(projectFile) ? 0 : 1,
+                sourceMutants: ctx.sourceCoverage?.get(projectFile) ?? 0,
+                namedAfter:    isNamedAfterSource(file),
+            };
         };
         const ordered = orderLikelyKillersFirst(cheapest, rankOf);
         if(ordered[0] !== cheapest[0]) {
@@ -1364,7 +1403,11 @@ export class BunTestRunner implements TestRunner {
         // bunfig) goes in the run's private directory, verified before anything is
         // written: an unsafe directory (another user's, a symlink, group/other
         // access) fails init loudly rather than letting the preload be swapped.
+        // The parent now is the Stryker main process that owns the run and its directory.
+        this.runOwnerPid ??= process.ppid;
         const tempDir = await this.ensureRunTempDir();
+        // init() just wrote files in it, so the directory is fresh as of now.
+        this.tempDirTouchedAt = Date.now();
         this.coverageFilePath = path.join(tempDir, `coverage-${Date.now()}.json`);
 
         // Stryker disable next-line StringLiteral: logging message only
@@ -1413,6 +1456,7 @@ export class BunTestRunner implements TestRunner {
 
     /** Create/verify the run's private temp directory (see src/utils/private-temp-dir.ts) and remember it as this worker's tempDir. */
     private async ensureRunTempDir(): Promise<string> {
+        this.assertRunOwnerIsParent();
         this.tempDir = await resolveRunTempDir();
         return this.tempDir;
     }
@@ -2544,6 +2588,7 @@ export class BunTestRunner implements TestRunner {
         const profile = this.profiler?.startRun('mutant', options.activeMutant.id);
         // Stryker disable next-line StringLiteral: logging message only
         this.logger.debug('Running mutant run for mutant %s', options.activeMutant.id);
+        this.keepRunTempDirFresh(startedAt);
 
         // Stryker disable next-line ArrayDeclaration: equivalent mutant — options.testFilter is always a non-null array in all tests; ?? fallback never fires, so ['Stryker was here'] = [] in practice
         const requestedFilter = options.testFilter ?? [];
@@ -3634,16 +3679,6 @@ export class BunTestRunner implements TestRunner {
     }
 
     /**
-   * Cleanup resources
-   *
-   * Removes only this worker's own files. The registry, and so the run's private
-   * temp directory holding it, is deliberately left in place: Stryker gives a
-   * worker no signal that it is the last one, and maxTestRunnerReuse /
-   * crash recovery dispose a worker mid-run and start a fresh process that must
-   * still find the registry (with concurrency 1, the disposing worker IS the
-   * only one, so a "last one out" check would delete it from under its successor).
-   */
-    /**
      * Append the worker's profile summary, if profiling. Profiling is diagnostic
      * only: a summary that throws is warned about, never allowed to stop
      * dispose() from stopping the child and cleaning up.
@@ -3656,6 +3691,18 @@ export class BunTestRunner implements TestRunner {
         }
     }
 
+    /**
+     * Cleanup resources
+     *
+     * Removes only this worker's own files. The registry, and so the run's private
+     * temp directory holding it, is deliberately left in place: Stryker gives a
+     * worker no signal that it is the last one, and maxTestRunnerReuse, timeouts
+     * and crash recovery dispose (and kill) a worker before forking the fresh
+     * process that replaces it, which must still find the registry (with
+     * concurrency 1 no worker is alive in between, so a "last one out" check would
+     * delete it from under its successor). The run's Stryker main process removes
+     * the directory when it exits (removeRunTempDirsOnExit, src/index.ts).
+     */
     public async dispose(): Promise<void> {
         // Stryker disable next-line StringLiteral: logging message only
         this.logger.debug('Disposing BunTestRunner');

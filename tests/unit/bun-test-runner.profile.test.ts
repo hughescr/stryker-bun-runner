@@ -35,7 +35,7 @@ import { mockRename, mockWriteFile, resetAllMocks } from '../test-preload.js';
 
 function expectedRunTempDir(): string {
     const hash = createHash('sha256').update(`${process.cwd()}:${process.ppid}`).digest('hex').slice(0, 16);
-    return path.join(tmpdir(), `stryker-bun-runner-${process.getuid!()}-${hash}-0`);
+    return path.join(tmpdir(), `stryker-bun-runner-${process.getuid!()}-${privateTempDir.pidSpace().tag}-${process.ppid}-${hash}-0`);
 }
 
 const ALPHA = 'tests/alpha.test.ts';
@@ -53,6 +53,7 @@ describe('BunTestRunner run profile', () => {
     let mockRunBunTests: ReturnType<typeof mock>;
     let inspectorClientSpy: ReturnType<typeof spyOn>;
     let appendSpy: ReturnType<typeof spyOn>;
+    let setDrainHandler: ReturnType<typeof mock>;
     let restoreEnv: () => void;
     let dir: string;
     let file: string;
@@ -101,14 +102,15 @@ describe('BunTestRunner run profile', () => {
         spyOn(bunfigSanitizer, 'generateSanitizedBunfig').mockResolvedValue('/tmp/stryker-bun-runner-bunfig-0-0.toml');
         spyOn(bunfigSanitizer, 'cleanupSanitizedBunfig').mockResolvedValue(undefined);
 
+        setDrainHandler = mock();
         const mockSyncServer = {
-            start:           mock().mockResolvedValue(undefined),
-            signalReady:     mock(),
-            setDrainHandler: mock(),
-            close:           mock().mockResolvedValue(undefined),
-            clientCount:     0,
-            port:            6500,
-            token:           'run-token',
+            start:       mock().mockResolvedValue(undefined),
+            signalReady: mock(),
+            setDrainHandler,
+            close:       mock().mockResolvedValue(undefined),
+            clientCount: 0,
+            port:        6500,
+            token:       'run-token',
         };
         // @ts-expect-error - Mocking constructor, type system doesn't understand this pattern
         spyOn(syncServerModule, 'SyncServer').mockImplementation(() => mockSyncServer);
@@ -169,6 +171,12 @@ describe('BunTestRunner run profile', () => {
         } as any);
         expect(result.status).toBe(MutantRunStatus.Survived);
         await runner.dispose();
+    }
+
+    /** The profile file's run lines, in order. */
+    async function runRecords(): Promise<RunRecord[]> {
+        const text = await fs.promises.readFile(file, 'utf8');
+        return text.trimEnd().split('\n').map(line => JSON.parse(line) as RunRecord);
     }
 
     const spawnProfiles = (): (RunProfile | undefined)[] => (mockRunBunTests.mock.calls as [SpawnOptions][]).map(([options]) => options.profile);
@@ -271,5 +279,50 @@ describe('BunTestRunner run profile', () => {
         expect(times.at(-1)).toBeLessThanOrEqual(dry.totalMs);
         // Mutant runs carry no detail.
         expect(mutant.detail).toBeUndefined();
+    });
+
+    it('marks when the dry run\'s drain request arrived and when the drain settled', async () => {
+        process.env[processRunner.PROFILE_ENV] = file;
+        const handlerRegistered = new Promise<() => Promise<void>>((resolve) => {
+            setDrainHandler.mockImplementation((handler: () => Promise<void>) => resolve(handler));
+        });
+        // The child's preload asks for the drain before it exits.
+        mockRunBunTests.mockImplementationOnce(async (options: SpawnOptions) => {
+            options.profile?.beginSpawn(false, options.testFiles, options.testNamePattern);
+            options.profile?.mark('spawned');
+            options.onInspectorReady?.('ws://127.0.0.1:6499/inspector');
+            const drain = await handlerRegistered;
+            await drain();
+            options.profile?.mark('close');
+            return { exitCode: 0, stdout: '', stderr: ' 1 pass\n', timedOut: false };
+        });
+
+        await workerLife();
+
+        const [dry] = await runRecords();
+        const detail = dry.detail ?? {};
+        expect(detail['at.drainRequest']).toBeNumber();
+        expect(detail['at.drainSettled']).toBeGreaterThanOrEqual(detail['at.drainRequest']);
+    });
+
+    it('records a mutant run over Stryker\'s testFiles selection with the files scope', async () => {
+        process.env[processRunner.PROFILE_ENV] = file;
+        // Stryker's testFiles option hands over paths of test files that exist.
+        const selected = path.join(dir, 'selected.test.ts');
+        await Bun.write(selected, '');
+        const runner = new BunTestRunner(mockLogger, {} as StrykerOptions);
+        await runner.init();
+        await runner.dryRun();
+
+        await runner.mutantRun({
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test mock object
+            activeMutant: { id: '7' } as any,
+            testFilter:   [selected],
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- test uses simplified mock data
+        } as any);
+        await runner.dispose();
+
+        const [, mutant] = await runRecords();
+        expect(mutant).toMatchObject({ kind: 'mutant', mutant: '7', scope: 'files', files: 1 });
     });
 });

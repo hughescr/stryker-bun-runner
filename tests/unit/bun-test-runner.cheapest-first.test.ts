@@ -50,7 +50,7 @@ import { mockReadFile, mockRename, mockWriteFile, resetAllMocks } from '../test-
 /** The run's private temp directory, derived independently (see survivors-a's copy of this helper). */
 function expectedRunTempDir(cwd: string = process.cwd(), ppid: number = process.ppid): string {
     const hash = createHash('sha256').update(`${cwd}:${ppid}`).digest('hex').slice(0, 16);
-    return path.join(tmpdir(), `stryker-bun-runner-${process.getuid!()}-${hash}-0`);
+    return path.join(tmpdir(), `stryker-bun-runner-${process.getuid!()}-${privateTempDir.pidSpace().tag}-${ppid}-${hash}-0`);
 }
 
 const REGISTRY_PATH = (): string => path.join(expectedRunTempDir(), 'registry.json');
@@ -614,12 +614,13 @@ describe('BunTestRunner cheapest-first file order and fixed test order in mutant
                 expect(lastMutantSpawn().testFiles).toEqual([GAMMA, BETA, ALPHA]);
             });
 
-            it('ranks by the mutant\'s own coverage alone when its source file cannot be read', async () => {
+            it('ranks by the mutant\'s own coverage alone when its source file cannot be read, and says why at debug', async () => {
                 const runner = await worker({ mutantTestFiles: coverageOf({ [ALPHA]: ['7'], [GAMMA]: ['8'] }) }, {});
 
                 await runMutant(runner, '7', LIB, []);
 
                 expect(lastMutantSpawn().testFiles).toEqual([ALPHA, BETA, GAMMA]);
+                expect(debugCalls('Could not read')).toEqual([[expect.any(String), SANDBOX_LIB, 'ENOENT']]);
             });
 
             it('ranks by coverage when Stryker names no source file', async () => {

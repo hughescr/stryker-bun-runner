@@ -152,6 +152,15 @@ describe('process-runner run profile', () => {
         expect(seen).toEqual({ 'profiled dry run': '1', 'profiled mutant run': undefined, 'unprofiled dry run': undefined });
     });
 
+    it('sets the preload timings variable for a profiled dry run even when none is inherited', async () => {
+        delete process.env[PRELOAD_TIMINGS_ENV];
+        const profiler = new WorkerProfiler(file, {} as Logger);
+        const resultPromise = runBunTests({ bunPath: 'bun', timeout: 5000, syncPort: 4321, profile: profiler.startRun('dry') });
+        fake.emit('child', 'close', 0, null);
+        await resultPromise;
+        expect(spawnedEnv()[PRELOAD_TIMINGS_ENV]).toBe('1');
+    });
+
     it('leaves an unprofiled spawn\'s environment alone and writes nothing', async () => {
         process.env[PROFILE_ENV] = file;
         const resultPromise = runBunTests({ bunPath: 'bun', timeout: 5000 });

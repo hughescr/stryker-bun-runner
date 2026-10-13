@@ -195,6 +195,10 @@ describe('computePhases', () => {
     it('returns no phases for no marks', () => {
         expect(computePhases([])).toEqual({});
     });
+
+    it('returns no phases for a single mark, which has no gap after it', () => {
+        expect(computePhases([['requested', 5]])).toEqual({});
+    });
 });
 
 describe('percentile and summarize', () => {
@@ -430,6 +434,69 @@ describe('WorkerProfiler and RunProfile', () => {
         expect(run.marks[0].firstFile).toBe(12);
     });
 
+    it('reads the first whole line after an over-long one from its very start', async () => {
+        const profile = profiler.startRun('mutant', '1');
+        profile.beginSpawn(true, undefined, undefined);
+        clock.at(10);
+        profile.onStderr(Buffer.from('x'.repeat(5000)));
+        clock.at(11);
+        // The summary line is anchored at its start, so anything left over from the long line would hide it.
+        profile.onStderr(Buffer.from('tail\nRan 1 test across 1 file.\n'));
+        profile.finish('survived');
+        const run = await onlyRun();
+        expect(run.decisive).toBe('summary');
+        expect(run.marks[0].decisive).toBe(11);
+    });
+
+    it('keeps skipping through a short chunk that has no newline in it', async () => {
+        const profile = profiler.startRun('mutant', '1');
+        profile.beginSpawn(true, undefined, undefined);
+        profile.onStderr(Buffer.from('x'.repeat(5000)));
+        // Short, so it alone would not start another skip: only the skipping state can drop it.
+        profile.onStderr(Buffer.from('tests/z'));
+        // Together with the middle chunk this would be a whole header, but both are the long line's tail.
+        profile.onStderr(Buffer.from('.test.ts:\ntests/a.test.ts:\n'));
+        profile.finish('survived');
+        const run = await onlyRun();
+        expect(run.fileHeaders).toBe(1);
+    });
+
+    it('reads the line right after an over-long one when the long line ended at a chunk boundary', async () => {
+        const profile = profiler.startRun('mutant', '1');
+        profile.beginSpawn(true, undefined, undefined);
+        clock.at(10);
+        profile.onStderr(Buffer.from('x'.repeat(5000)));
+        clock.at(11);
+        // The newline that ends the long line is this chunk's first character.
+        profile.onStderr(Buffer.from('\nRan 1 test across 1 file.\n'));
+        profile.finish('survived');
+        const run = await onlyRun();
+        expect(run.decisive).toBe('summary');
+        expect(run.marks[0].decisive).toBe(11);
+    });
+
+    it('reads every later chunk normally once an over-long line has ended', async () => {
+        const profile = profiler.startRun('mutant', '1');
+        profile.beginSpawn(true, undefined, undefined);
+        profile.onStderr(Buffer.from('x'.repeat(5000)));
+        profile.onStderr(Buffer.from('tail\ntests/a.test.ts:\n'));
+        // Its first line would be dropped as the tail of a long line if the skip had not been ended.
+        profile.onStderr(Buffer.from('tests/b.test.ts:\n'));
+        profile.finish('survived');
+        const run = await onlyRun();
+        expect(run.fileHeaders).toBe(2);
+    });
+
+    it('reads a header whose line has a carriage return inside it as well as at its end', async () => {
+        const profile = profiler.startRun('mutant', '1');
+        profile.beginSpawn(true, undefined, undefined);
+        // Only the \r that ends the line is dropped; header names may hold others.
+        profile.onStderr(Buffer.from('a\rb/c.test.ts:\r\n'));
+        profile.finish('survived');
+        const run = await onlyRun();
+        expect(run.fileHeaders).toBe(1);
+    });
+
     it('still buffers a line of exactly the longest length it reads', async () => {
         const profile = profiler.startRun('mutant', '1');
         profile.beginSpawn(true, undefined, undefined);
@@ -593,11 +660,18 @@ describe('createWorkerProfiler', () => {
         const logger = makeLogger();
         expect(createWorkerProfiler(logger, { [PROFILE_ENV]: '1' })).toBeUndefined();
         expect(logger.warn).toHaveBeenCalledTimes(1);
+        expect(logger.warn).toHaveBeenCalledWith(
+            '%s must be the absolute path of a JSONL file to append to (got %s); profiling is off',
+            PROFILE_ENV,
+            '1'
+        );
         expect(createWorkerProfiler(logger, { [PROFILE_ENV]: 'profile.jsonl' })).toBeUndefined();
     });
 
     it('profiles to an absolute path', () => {
-        const profiler = createWorkerProfiler(makeLogger(), { [PROFILE_ENV]: '/tmp/x/profile.jsonl' });
+        const logger = makeLogger();
+        const profiler = createWorkerProfiler(logger, { [PROFILE_ENV]: '/tmp/x/profile.jsonl' });
+        expect(logger.debug).toHaveBeenCalledWith('Profiling every run to %s', '/tmp/x/profile.jsonl');
         expect(profiler).toBeInstanceOf(WorkerProfiler);
         expect(profiler?.file).toBe('/tmp/x/profile.jsonl');
         expect(profiler?.pid).toBe(process.pid);

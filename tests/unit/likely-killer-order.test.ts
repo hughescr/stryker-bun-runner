@@ -24,7 +24,7 @@ import {
  */
 const INSTRUMENTER_MODULE = '@stryker-mutator/instrumenter';
 
-const rank = (overrides: Partial<KillerRank> = {}): KillerRank => ({ coverage: 2, sourceMutants: 0, namedAfter: false, ...overrides });
+const rank = (overrides: Partial<KillerRank> = {}): KillerRank => ({ coverage: 1, sourceMutants: 0, namedAfter: false, ...overrides });
 
 describe('mutantIdsInInstrumentedSource', () => {
     it('collects every mutant id of a file instrumented by the installed Stryker instrumenter', async () => {
@@ -105,9 +105,14 @@ describe('TestFileCoverage', () => {
         ['an array', [['tests/a.test.ts', ['1']]]],
         ['files that are not an array', { files: 'tests/a.test.ts', mutants: {} }],
         ['a file that is not a string', { files: [7], mutants: {} }],
-        ['mutants that are not an object', { files: ['a'], mutants: [[0]] }],
+        ['one file that is not a string among strings', { files: ['a', 7], mutants: {} }],
+        ['mutants that are an array', { files: ['a'], mutants: [[0]] }],
+        ['mutants that are null', { files: ['a'], mutants: null }],
+        ['mutants that are a string', { files: ['a'], mutants: '' }],
         ['indices that are not an array', { files: ['a'], mutants: { '1': 0 } }],
+        ['one mutant with indices that are not an array among valid ones', { files: ['a'], mutants: { '1': [0], '2': 0 } }],
         ['an index past the table', { files: ['a'], mutants: { '1': [1] } }],
+        ['one index past the table among valid ones', { files: ['a', 'b'], mutants: { '1': [0, 2] } }],
         ['a negative index', { files: ['a'], mutants: { '1': [-1] } }],
         ['a fractional index', { files: ['a', 'b'], mutants: { '1': [0.5] } }],
     ])('rejects a persisted form that is %s', (_label, value) => {
@@ -131,12 +136,18 @@ describe('namedAfter', () => {
     ])('does not match %s to %s', (testFile, sourceFile) => {
         expect(namedAfter(sourceFile)(testFile)).toBe(false);
     });
+
+    it('matches no test file to an undefined source file', () => {
+        const isNamedAfter = namedAfter(undefined);
+
+        expect(['tests/foo.test.ts', 'tests/undefined.test.ts', '.test.ts'].map(file => isNamedAfter(file))).toEqual([false, false, false]);
+    });
 });
 
 describe('compareKillerRanks', () => {
-    it('puts better coverage first, whatever the source-file count and name', () => {
+    it('puts the files that executed the mutant first, whatever the source-file count and name', () => {
         expect(compareKillerRanks(rank({ coverage: 0 }), rank({ coverage: 1, sourceMutants: 9, namedAfter: true }))).toBeLessThan(0);
-        expect(compareKillerRanks(rank({ coverage: 2 }), rank({ coverage: 1 }))).toBeGreaterThan(0);
+        expect(compareKillerRanks(rank({ coverage: 1, sourceMutants: 9, namedAfter: true }), rank({ coverage: 0 }))).toBeGreaterThan(0);
     });
 
     it('puts more of the source file\'s mutants first among equal coverage, whatever the name', () => {
@@ -156,7 +167,7 @@ describe('compareKillerRanks', () => {
 describe('orderLikelyKillersFirst', () => {
     it('keeps the given order between files that rank the same, and leaves the input alone', () => {
         const files = ['c', 'a', 'd', 'b'];
-        const ranks: Record<string, KillerRank> = { c: rank(), a: rank({ coverage: 1 }), d: rank(), b: rank({ coverage: 1 }) };
+        const ranks: Record<string, KillerRank> = { c: rank(), a: rank({ coverage: 0 }), d: rank(), b: rank({ coverage: 0 }) };
 
         const ordered = orderLikelyKillersFirst(files, file => ranks[file]);
 

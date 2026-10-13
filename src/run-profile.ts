@@ -394,13 +394,19 @@ export class RunProfile {
         if(!state.scanning) {
             return;
         }
-        const lines = (state.pending + state.decoder.write(chunk)).split('\n');
+        let text = state.decoder.write(chunk);
+        if(state.skippingLine) {
+            // Nothing is buffered while the rest of an over-long line goes by.
+            const newline = text.indexOf('\n');
+            if(newline === -1) {
+                return;
+            }
+            text = text.slice(newline + 1);
+            state.skippingLine = false;
+        }
+        const lines = (state.pending + text).split('\n');
         state.pending = lines.pop()!;
         for(const line of lines) {
-            if(state.skippingLine) {
-                state.skippingLine = false;
-                continue;
-            }
             if(!this.readLine(state, stripAnsi(line).replace(/\r$/, ''), at)) {
                 return;
             }

@@ -9,10 +9,10 @@
  * the mutated module, so this module ranks the files by how likely each is to
  * kill it, and keeps cheapest-first between files with the same rank:
  *
- * 1. Files whose tests executed this mutant in the dry run, then files whose
- *    tests executed another mutant of the same source file, then the rest.
+ * 1. Files whose tests executed this mutant in the dry run, then the rest.
  * 2. Among those, the files whose tests executed more of the source file's
- *    mutants first: usually the module's own unit tests.
+ *    mutants first (so a file that executed none comes after one that executed
+ *    some): usually the module's own unit tests.
  * 3. Then the test file named after the source file (`src/foo.ts` →
  *    `foo.test.ts`).
  *
@@ -135,17 +135,24 @@ export class TestFileCoverage {
 /**
  * A test that says whether a test file is named after `sourceFile`: `src/foo.ts`
  * and `tests/foo.test.ts` or `foo.spec.tsx`, case-insensitive. The source file's
- * stem is worked out once, not per test file.
+ * stem is worked out once, not per test file. No test file is named after an
+ * undefined source file.
  */
-export function namedAfter(sourceFile: string): (testFile: string) => boolean {
+export function namedAfter(sourceFile: string | undefined): (testFile: string) => boolean {
+    if(sourceFile === undefined) {
+        return () => false;
+    }
     const sourceStem = path.parse(sourceFile).name.toLowerCase();
     return testFile => path.basename(testFile).replace(TEST_FILE_SUFFIX_RE, '').toLowerCase() === sourceStem;
 }
 
 /** How a test file ranks for one mutant run; lower sorts first. */
 export interface KillerRank {
-    /** 0: its tests executed the mutant in the dry run; 1: another mutant of the same source file; 2: neither, or unknown. */
-    coverage:      0 | 1 | 2
+    /**
+     * 0: its tests executed the mutant in the dry run; 1: they did not, or unknown. Files that executed
+     * the source file's other mutants come next through {@link sourceMutants}, so they need no rank here.
+     */
+    coverage:      0 | 1
     /** How many of the source file's mutants its tests executed in the dry run. */
     sourceMutants: number
     /** Named after the source file. */

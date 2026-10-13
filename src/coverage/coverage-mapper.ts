@@ -533,10 +533,9 @@ function buildMappedCoverage(
     const staticCounts: Record<string, number> = { ...rawCoverage.static };
     const staticIds = new Set(Object.keys(staticCounts));
     const creditedByName = new Map<string, Record<string, number>>();
-    // The records built here, which may be written to. A test credited with exactly one
-    // key's hits, none of them static (most tests), shares that key's raw record instead
-    // of copying it hit by hit; a shared record is copied before anything is added to it.
-    const owned = new Set<Record<string, number>>();
+    // A test credited with exactly one key's hits, none of them static (most tests), shares
+    // that key's raw record instead of copying it hit by hit; any other test gets a copy
+    // before anything is added to it.
     const orphaned: Record<string, number>[] = [];
 
     for(const [i, key] of counterIds.entries()) {
@@ -552,16 +551,12 @@ function buildMappedCoverage(
             creditedByName.set(finalName, incoming);
             continue;
         }
-        let writable = credited;
-        if(!writable || !owned.has(writable)) {
-            writable = { ...credited };
-            owned.add(writable);
-            creditedByName.set(finalName, writable);
-        }
+        const writable = { ...credited };
+        creditedByName.set(finalName, writable);
         creditHits(incoming, writable, staticIds, staticCounts);
     }
 
-    const perTest = nonEmptyTests(creditedByName, orphaned.length > 0 ? owned : undefined);
+    const perTest = nonEmptyTests(creditedByName, orphaned.length > 0);
     if(orphaned.length > 0) {
         creditOrphanedHits(orphaned, staticCounts, perTest);
     }
@@ -588,17 +583,17 @@ function creditHits(
 
 /**
  * The tests credited with any mutant, in the order they were first credited. With
- * `owned` (when more hits are still to be added), each record not in it — one shared
- * with the raw coverage — is copied, so the raw coverage is never written to.
+ * `copy` (when more hits are still to be added), each record is copied, since one may be
+ * shared with the raw coverage, which is never written to.
  */
 function nonEmptyTests(
     creditedByName: ReadonlyMap<string, Record<string, number>>,
-    owned: ReadonlySet<Record<string, number>> | undefined
+    copy: boolean
 ): Record<string, Record<string, number>> {
     const perTest: Record<string, Record<string, number>> = {};
     for(const [name, counts] of creditedByName) {
         if(Object.keys(counts).length > 0) {
-            perTest[name] = owned && !owned.has(counts) ? { ...counts } : counts;
+            perTest[name] = copy ? { ...counts } : counts;
         }
     }
     return perTest;

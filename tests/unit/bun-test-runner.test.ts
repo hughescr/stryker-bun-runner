@@ -55,7 +55,7 @@ const realFindDryRunDataLoss = dryRunCompleteness.findDryRunDataLoss;
  */
 function expectedRunTempDir(cwd: string = process.cwd(), ppid: number = process.ppid, baseDir: string = tmpdir()): string {
     const hash = createHash('sha256').update(`${cwd}:${ppid}`).digest('hex').slice(0, 16);
-    return path.join(baseDir, `stryker-bun-runner-${process.getuid!()}-${hash}-0`);
+    return path.join(baseDir, `stryker-bun-runner-${process.getuid!()}-${privateTempDir.pidSpace().tag}-${ppid}-${hash}-0`);
 }
 
 // The real resolveRunTempDir, captured before any spy replaces the namespace export, so
@@ -83,9 +83,9 @@ function setPpid(value: number): void {
 }
 
 /** Matches any (uid, cwd, ppid, slot) registry file path — used where the exact hash doesn't matter. */
-const REGISTRY_FILE_RE = /stryker-bun-runner-\d+-[0-9a-f]{16}-\d+\/registry\.json$/;
+const REGISTRY_FILE_RE = /stryker-bun-runner-\d+-[0-9a-f]{8}-\d+-[0-9a-f]{16}-\d+\/registry\.json$/;
 /** Matches any (uid, cwd, ppid, slot) registry .tmp file path — used where the exact hash doesn't matter. */
-const REGISTRY_TMP_FILE_RE = /stryker-bun-runner-\d+-[0-9a-f]{16}-\d+\/registry\.json\.tmp$/;
+const REGISTRY_TMP_FILE_RE = /stryker-bun-runner-\d+-[0-9a-f]{8}-\d+-[0-9a-f]{16}-\d+\/registry\.json\.tmp$/;
 
 describe('BunTestRunner', () => {
     let mockLogger: Logger;
@@ -4328,7 +4328,7 @@ tests/example.test.ts:
                 expect(result.status).toBe(DryRunStatus.Error);
                 if(result.status === DryRunStatus.Error) {
                     // Names the file it looked for, the consequence, and the likely causes.
-                    expect(result.errorMessage).toMatch(/stryker-bun-runner-\d+-[0-9a-f]{16}-\d+\/coverage-\d+\.json/);
+                    expect(result.errorMessage).toMatch(/stryker-bun-runner-\d+-[0-9a-f]{8}-\d+-[0-9a-f]{16}-\d+\/coverage-\d+\.json/);
                     expect(result.errorMessage).toContain('full test suite for every mutant');
                     expect(result.errorMessage).toContain('preload');
                     expect(result.errorMessage).toContain('not writable');
@@ -7062,6 +7062,23 @@ tests/example.test.ts:
                 }
             });
 
+            it('scores it the same way when tests reported passing before the exit, as none failed', async () => {
+                mockRunBunTests.mockResolvedValue({
+                    exitCode: 0,
+                    stdout:   'bun test v1.4.2 (744846f84)\n',
+                    stderr:   '\ne.test.ts:\n✓ e1 [0.10ms]\n⏭ e2\n',
+                    timedOut: false,
+                });
+
+                const result = await run(['e.test.ts > e1', 'e.test.ts > e2', 'e.test.ts > e3 exits']);
+
+                expect(result.status).toBe(MutantRunStatus.Error);
+                if(result.status === MutantRunStatus.Error) {
+                    expect(result.errorMessage).toStartWith(`${EARLY_EXIT_REASON}: `);
+                    expect(result.errorMessage).toContain('but no test reported a failure: ');
+                }
+            });
+
             it('quotes the last 500 characters of the output, where the exit happened, without colour codes', async () => {
                 mockRunBunTests.mockResolvedValue({
                     exitCode: 0,
@@ -8341,7 +8358,7 @@ tests/example.test.ts:
                 return renameCall![1] as string;
             }
 
-            it('derives registry.json inside tmpdir()/stryker-bun-runner-<uid>-<sha256(cwd + ":" + ppid) sliced to 16 hex chars>-<slot>', async () => {
+            it('derives registry.json inside tmpdir()/stryker-bun-runner-<uid>-<pid space>-<ppid>-<sha256(cwd + ":" + ppid) sliced to 16 hex chars>-<slot>', async () => {
                 const actual = await runDryRunAndGetRegistryPath();
                 expect(actual).toBe(expectedRegistryPath());
             });
@@ -8400,6 +8417,96 @@ tests/example.test.ts:
                 expect(writePrivateFileSpy.mock.invocationCallOrder[writeCall]).toBeLessThan(renameSpy.mock.invocationCallOrder[0]);
                 // Exclusive, owner-only create
                 expect(writeFileSpy).toHaveBeenCalledWith(tmpPath, expect.any(String), { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+            });
+
+            describe('orphaned worker (the Stryker main process exited without disposing it)', () => {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- simplified mutant run options
+                const mutantRunOptions = { activeMutant: { id: '1' }, testFilter: [], sandboxFileName: 'sandbox' } as any;
+
+                it('never resolves, and so never recreates, the run directory once its parent has changed since init: the registry write fails instead', async () => {
+                    const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                    await runner.init();
+                    resolveRunTempDirSpy.mockClear();
+                    setPpid(originalPpid + 1);
+
+                    await runner.dryRun();
+
+                    expect(resolveRunTempDirSpy).not.toHaveBeenCalled();
+                    expect(renameSpy.mock.calls.some((args: unknown[]) => REGISTRY_FILE_RE.test(String(args[1])))).toBe(false);
+                    expect(mockLogger.warn).toHaveBeenCalledWith(
+                        'Failed to write dryRun registry file: %s',
+                        `stryker-bun-runner: the Stryker main process (pid ${originalPpid}) that owns this run has exited (this worker's parent is now pid ${originalPpid + 1}); not recreating the run's temporary directory`
+                    );
+                });
+
+                it('fails a mutant run that would load the registry, without resolving the run directory or refreshing it', async () => {
+                    const touchSpy = spyOn(privateTempDir, 'touchRunTempDir').mockImplementation(() => undefined);
+                    const nowSpy = spyOn(Date, 'now').mockReturnValue(1_000_000_000_000);
+                    try {
+                        const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                        await runner.init();
+                        resolveRunTempDirSpy.mockClear();
+                        setPpid(originalPpid + 1);
+                        // Long past the refresh interval: only the orphan check can skip the refresh.
+                        nowSpy.mockReturnValue(1_000_000_000_000 + (60 * 60 * 1000));
+
+                        await expect(runner.mutantRun(mutantRunOptions)).rejects.toThrow(`the Stryker main process (pid ${originalPpid}) that owns this run has exited`);
+
+                        expect(resolveRunTempDirSpy).not.toHaveBeenCalled();
+                        expect(touchSpy).not.toHaveBeenCalled();
+                    } finally {
+                        nowSpy.mockRestore();
+                        touchSpy.mockRestore();
+                    }
+                });
+            });
+
+            it('refreshes the run directory at most every RUN_DIR_TOUCH_INTERVAL_MS while it runs mutants, so another run\'s cleanup never takes it for abandoned', async () => {
+                const touchSpy = spyOn(privateTempDir, 'touchRunTempDir').mockImplementation(() => undefined);
+                const start = 1_000_000_000_000;
+                const nowSpy = spyOn(Date, 'now').mockReturnValue(start);
+                const minute = 60 * 1000;
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any -- simplified mutant run options
+                const options = { activeMutant: { id: '1' }, testFilter: [], sandboxFileName: 'sandbox' } as any;
+                try {
+                    expect(privateTempDir.RUN_DIR_TOUCH_INTERVAL_MS).toBe(10 * minute);
+                    const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                    await runner.init();
+                    const runAt = async (offset: number): Promise<void> => {
+                        nowSpy.mockReturnValue(start + offset);
+                        await runner.mutantRun(options);
+                    };
+
+                    // init() wrote files in the directory just now: fresh until the interval has passed.
+                    await runAt(minute);
+                    await runAt((10 * minute) - 1);
+                    expect(touchSpy).not.toHaveBeenCalled();
+
+                    await runAt(10 * minute);
+                    expect(touchSpy.mock.calls).toEqual([[expectedRunTempDir(), start + (10 * minute)]]);
+
+                    await runAt(15 * minute);
+                    expect(touchSpy).toHaveBeenCalledTimes(1);
+
+                    await runAt(20 * minute);
+                    expect(touchSpy.mock.calls[1]).toEqual([expectedRunTempDir(), start + (20 * minute)]);
+                    expect(touchSpy).toHaveBeenCalledTimes(2);
+                } finally {
+                    nowSpy.mockRestore();
+                    touchSpy.mockRestore();
+                }
+            });
+
+            it('does not refresh a directory it never resolved (no init)', async () => {
+                const touchSpy = spyOn(privateTempDir, 'touchRunTempDir').mockImplementation(() => undefined);
+                try {
+                    const runner = new BunTestRunner(mockLogger, {} as unknown as StrykerOptions);
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- simplified mutant run options
+                    await runner.mutantRun({ activeMutant: { id: '1' }, testFilter: [], sandboxFileName: 'sandbox' } as any).catch(() => undefined);
+                    expect(touchSpy).not.toHaveBeenCalled();
+                } finally {
+                    touchSpy.mockRestore();
+                }
             });
         });
 
